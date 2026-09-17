@@ -119,6 +119,11 @@ struct RetrievalInstruction {
   std::string dataset_registry_id;
   std::string signed_url;
   std::string provider_key;
+  //  ★ 上游的下载位置是 `AzureFileDmsDownloadLocation{signedUrl, fileSource, createdBy,
+  //    expiryTime}`（`StorageServiceImpl.java:268`）—— 只回 `signedUrl` 会少三个键（C6.7）。
+  std::string file_source;
+  std::string created_by;
+  std::int64_t expires_at_epoch_seconds = 0;
 };
 
 struct CopyFileOutcome {

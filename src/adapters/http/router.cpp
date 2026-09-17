@@ -313,23 +313,28 @@ void Router::Register(fss::http::Server& server) {
   //  · 字段大小写：DMS/delivery 是 **camelCase**（`providerKey`/`signedUrl`），
   //    与 §2.1 的 `FileID`/`SignedURL` 不同（见 dto.h 的说明）。
   // ---------------------------------------------------------------------------
-  const auto storage_instructions = [this](fss::http::Request& request,
-                                          const app::CallerContext& caller)
-      -> fss::Result<fss::http::Response> {
-    app::GetStorageInstructions usecase(ports_);
-    FSS_TRY(result, usecase.Execute(caller, request.Query("expiryTime")));
-    StorageInstructionsResponse response;
-    response.provider_key = result.provider_key;
-    response.storage_location.signed_url = result.signed_url;
-    response.storage_location.file_source = result.file_source;
-    response.storage_location.created_by = result.created_by;
-    response.storage_location.expires_at_epoch_seconds = result.expires_at_epoch_seconds;
-    return fss::http::Response::Json(200, fss::json::Dump(ToJson(response)));
+  //  ★ `files/*` 与 `file-collections/*` 的上传/下载位置**键名不同**（集合版是
+  //    `fileCollectionSource` + `fileCount`/`fileNames`，见 dto.h）→ 用参数化工厂而不是
+  //    "共用一个 lambda"（共享会把集合版写成 `fileSource`，P6-D11）。
+  const auto make_storage_instructions = [this](bool collection) {
+    return [this, collection](fss::http::Request& request, const app::CallerContext& caller)
+               -> fss::Result<fss::http::Response> {
+      app::GetStorageInstructions usecase(ports_);
+      FSS_TRY(result, usecase.Execute(caller, request.Query("expiryTime")));
+      StorageInstructionsResponse response;
+      response.provider_key = result.provider_key;
+      response.storage_location.signed_url = result.signed_url;
+      response.storage_location.file_source = result.file_source;
+      response.storage_location.created_by = result.created_by;
+      response.storage_location.expires_at_epoch_seconds = result.expires_at_epoch_seconds;
+      response.storage_location.collection = collection;
+      return fss::http::Response::Json(200, fss::json::Dump(ToJson(response)));
+    };
   };
 
-  const auto retrieval_instructions = [this](fss::http::Request& request,
-                                            const app::CallerContext& caller)
-      -> fss::Result<fss::http::Response> {
+  const auto make_retrieval_instructions = [this](bool collection) {
+    return [this, collection](fss::http::Request& request, const app::CallerContext& caller)
+               -> fss::Result<fss::http::Response> {
     FSS_TRY(value, fss::json::ParseObject(request.body));
     std::vector<std::string> registry_ids;
     if (const auto it = value.find("datasetRegistryIds"); it != value.end()) {
@@ -343,17 +348,23 @@ void Router::Register(fss::http::Server& server) {
         registry_ids.push_back(item.get<std::string>());
       }
     }
-    app::GetRetrievalInstructions usecase(ports_);
-    FSS_TRY(result, usecase.Execute(caller, registry_ids, request.Query("expiryTime")));
-    RetrievalInstructionsResponse response;
-    for (const auto& instruction : result) {
-      RetrievalInstructionDto dto;
-      dto.dataset_registry_id = instruction.dataset_registry_id;
-      dto.retrieval_properties.signed_url = instruction.signed_url;
-      dto.provider_key = instruction.provider_key;
-      response.datasets.push_back(std::move(dto));
-    }
-    return fss::http::Response::Json(200, fss::json::Dump(ToJson(response)));
+      app::GetRetrievalInstructions usecase(ports_);
+      FSS_TRY(result, usecase.Execute(caller, registry_ids, request.Query("expiryTime")));
+      RetrievalInstructionsResponse response;
+      for (const auto& instruction : result) {
+        RetrievalInstructionDto dto;
+        dto.dataset_registry_id = instruction.dataset_registry_id;
+        dto.provider_key = instruction.provider_key;
+        auto& properties = dto.retrieval_properties;
+        properties.signed_url = instruction.signed_url;
+        properties.file_source = instruction.file_source;
+        properties.created_by = instruction.created_by;
+        properties.expires_at_epoch_seconds = instruction.expires_at_epoch_seconds;
+        properties.collection = collection;
+        response.datasets.push_back(std::move(dto));
+      }
+      return fss::http::Response::Json(200, fss::json::Dump(ToJson(response)));
+    };
   };
 
   const auto copy_files = [this](fss::http::Request& request,
@@ -402,10 +413,12 @@ void Router::Register(fss::http::Server& server) {
   };
 
   for (const std::string& prefix : {"/v2/files", "/v2/file-collections"}) {
+    const bool collection = prefix == "/v2/file-collections";
     server.Post(base + prefix + "/storageInstructions", MakeRoute("dms.storage_instructions"),
-                Wrap(storage_instructions));
+                Wrap(make_storage_instructions(collection)));
     server.Post(base + prefix + "/retrievalInstructions",
-                MakeRoute("dms.retrieval_instructions"), Wrap(retrieval_instructions));
+                MakeRoute("dms.retrieval_instructions"),
+                Wrap(make_retrieval_instructions(collection)));
     server.Post(base + prefix + "/copy", MakeRoute("dms.copy"), Wrap(copy_files));
   }
 

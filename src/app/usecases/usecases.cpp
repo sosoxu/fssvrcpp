@@ -576,6 +576,9 @@ fss::Result<std::vector<RetrievalInstruction>> GetRetrievalInstructions::Execute
     instruction.dataset_registry_id = registry_id;
     instruction.signed_url = signed_url.value().signed_url;
     instruction.provider_key = ProviderKeyOf(location.value());
+    instruction.file_source = location.value().file_source;
+    instruction.created_by = caller.user_id;
+    instruction.expires_at_epoch_seconds = signed_url.value().expires_at_epoch_seconds;
     out.push_back(std::move(instruction));
   }
   return out;

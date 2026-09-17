@@ -57,25 +57,58 @@ json::Value ToJson(const VersionInfoResponse& response) {
   return body;
 }
 
-json::Value ToJson(const StorageInstructionsResponse& response) {
-  json::Value location = json::Value::object();
-  location["signedUrl"] = response.storage_location.signed_url;
-  location["fileSource"] = response.storage_location.file_source;
-  location["createdBy"] = response.storage_location.created_by;
-  location["expiryTime"] =
-      time::ToOsduTimestamp(response.storage_location.expires_at_epoch_seconds, 0);
+namespace {
 
+//  `fileNames` 里的"文件名"= 路径最后一段（上游从目录列表里取文件名，本项目一个指令一个对象）
+std::string FileNameOf(const std::string& path) {
+  const auto slash = path.rfind('/');
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+//  上传/下载位置的两套键集合：files 版 `fileSource`；集合版 `fileCollectionSource`
+//  + `fileCount` + `fileNames`（上游 `AzureFileDmsUploadLocation` /
+//  `AzureFileCollectionDmsUploadLocation`）
+json::Value LocationToJson(const std::string& signed_url, const std::string& source,
+                           const std::string& created_by, std::int64_t expires_at_epoch_seconds,
+                           bool collection, int file_count,
+                           const std::vector<std::string>& file_names) {
+  json::Value location = json::Value::object();
+  location["signedUrl"] = signed_url;
+  location[collection ? "fileCollectionSource" : "fileSource"] = source;
+  if (collection) {
+    //  本项目一个指令 = 一个对象：调用方没给名字时按 `fileCollectionSource` 的最后一段推导
+    std::vector<std::string> names = file_names;
+    if (names.empty() && !source.empty()) names.push_back(FileNameOf(source));
+    json::Value array = json::Value::array();
+    for (const auto& name : names) array.push_back(name);
+    location["fileCount"] = names.empty() ? file_count : static_cast<int>(names.size());
+    location["fileNames"] = std::move(array);
+  }
+  location["createdBy"] = created_by;
+  location["expiryTime"] = time::ToOsduTimestamp(expires_at_epoch_seconds, 0);
+  return location;
+}
+
+}  // namespace
+
+json::Value ToJson(const StorageInstructionsResponse& response) {
+  const auto& dto = response.storage_location;
   json::Value body = json::Value::object();
   body["providerKey"] = response.provider_key;
-  body["storageLocation"] = std::move(location);
+  body["storageLocation"] =
+      LocationToJson(dto.signed_url, dto.file_source, dto.created_by,
+                     dto.expires_at_epoch_seconds, dto.collection, dto.file_count, dto.file_names);
   return body;
 }
 
 json::Value ToJson(const RetrievalInstructionsResponse& response) {
   json::Value datasets = json::Value::array();
   for (const auto& entry : response.datasets) {
-    json::Value properties = json::Value::object();
-    properties["signedUrl"] = entry.retrieval_properties.signed_url;
+    const auto& dto = entry.retrieval_properties;
+    json::Value properties =
+        LocationToJson(dto.signed_url, dto.file_source, dto.created_by,
+                       dto.expires_at_epoch_seconds, dto.collection, dto.file_count,
+                       dto.file_names);
 
     json::Value item = json::Value::object();
     item["datasetRegistryId"] = entry.dataset_registry_id;

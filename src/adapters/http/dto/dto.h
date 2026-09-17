@@ -101,9 +101,15 @@ json::Value ToJson(const VersionInfoResponse& response);
 //     不能"统一风格"。`expiryTime` 用与 `CreatedAt` 相同的 OSDU 时间戳格式。
 struct StorageLocationDto {
   std::string signed_url;                     // → `signedUrl`
-  std::string file_source;                    // → `fileSource`
+  std::string file_source;                    // → `fileSource`（集合版 → `fileCollectionSource`）
   std::string created_by;                     // → `createdBy`
   std::int64_t expires_at_epoch_seconds = 0;  // → `expiryTime`（ISO-8601）
+  //  ★ `/v2/file-collections/*` 用的是**另一套模型**（上游
+  //    `AzureFileCollectionDmsUploadLocation`）：键名是 `fileCollectionSource`，
+  //    并额外带 `fileCount` / `fileNames`，**没有** `fileSource`。
+  bool collection = false;
+  int file_count = 0;                 // → `fileCount`（仅集合版）
+  std::vector<std::string> file_names;  // → `fileNames`（仅集合版）
 };
 
 struct StorageInstructionsResponse {
@@ -117,7 +123,13 @@ json::Value ToJson(const StorageInstructionsResponse& response);
 //  §2.9 DMS —— `RetrievalInstructionsResponse`
 // -----------------------------------------------------------------------------
 struct RetrievalPropertiesDto {
-  std::string signed_url;  // → `signedUrl`
+  std::string signed_url;                     // → `signedUrl`
+  std::string file_source;                    // → `fileSource` / `fileCollectionSource`
+  std::string created_by;                     // → `createdBy`
+  std::int64_t expires_at_epoch_seconds = 0;  // → `expiryTime`
+  bool collection = false;
+  int file_count = 0;                   // → `fileCount`（仅集合版）
+  std::vector<std::string> file_names;  // → `fileNames`（仅集合版）
 };
 
 struct RetrievalInstructionDto {

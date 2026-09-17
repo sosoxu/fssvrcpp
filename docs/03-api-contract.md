@@ -456,17 +456,48 @@ checksum = storageUtil.getChecksum(persistentLocation)
 | `POST /api/file/v2/file-collections/retrievalInstructions?expiryTime=` | `service.dataset.viewers` | 同上 | 同上 |
 | `POST /api/file/v2/file-collections/copy` | `service.storage.creator`/`admin` | 同上 | 同上 |
 
-**响应结构（实测自 core-common）**
+**响应结构（逐键实测自上游 provider，vendored commit `d7c25c2d`）**
+
 ```json
-// StorageInstructionsResponse
-{ "providerKey": "POSIX", "storageLocation": { "signedUrl": "...", "fileSource": "...", "createdBy": "...", "expiryTime": "..." } }
+// StorageInstructionsResponse（files 版）
+{ "providerKey": "POSIX",
+  "storageLocation": { "signedUrl": "...", "fileSource": "...", "createdBy": "...",
+                       "expiryTime": "2023-11-14T23:13:20.000+0000" } }
 
-// RetrievalInstructionsResponse
-{ "datasets": [ { "datasetRegistryId": "...", "retrievalProperties": { "signedUrl": "..." }, "providerKey": "POSIX" } ] }
+// StorageInstructionsResponse（file-collections 版）★ 键名不同
+{ "providerKey": "POSIX",
+  "storageLocation": { "signedUrl": "...", "fileCollectionSource": "...", "fileCount": 1,
+                       "fileNames": ["<文件名>"], "createdBy": "...", "expiryTime": "..." } }
 
-// CopyDmsResponse (数组元素)
+// RetrievalInstructionsResponse（files 版）
+{ "datasets": [ { "datasetRegistryId": "...", "providerKey": "POSIX",
+                  "retrievalProperties": { "signedUrl": "...", "fileSource": "...",
+                                           "createdBy": "...", "expiryTime": "..." } } ] }
+
+// RetrievalInstructionsResponse（file-collections 版）
+{ "datasets": [ { "datasetRegistryId": "...", "providerKey": "POSIX",
+                  "retrievalProperties": { "signedUrl": "...", "fileCollectionSource": "...",
+                                           "fileCount": 1, "fileNames": ["..."],
+                                           "createdBy": "...", "expiryTime": "..." } } ] }
+
+// CopyDmsResponse（数组元素；`datasetBlobStoragePath` 是**目标（persistent）**位置）
 { "success": true, "datasetBlobStoragePath": "..." }
 ```
+
+> 一手依据：
+> `provider/file-azure/.../service/StorageServiceImpl.java:293`（`AzureFileDmsUploadLocation` =
+> `signedUrl`/`fileSource`/`createdBy`/`expiryTime`）与 `:268`（下载侧同形状）；
+> `provider/file-azure/.../service/FileCollectionStorageServiceImpl.java:103/179`
+> （`AzureFileCollectionDmsUploadLocation` = `signedUrl`/**`fileCollectionSource`**/`fileCount`/
+> `fileNames`/`createdBy`/`expiryTime`）；`file-core/.../service/FileDmsServiceImpl.java:113`
+> （copy 的路径取 `destinationPath`）。
+> **本项目一个指令 = 一个对象**：集合版的 `fileCount` 恒为 1、`fileNames` 是
+> `fileCollectionSource` 的最后一段（上游是按目录列出目录内全部文件——本仓库不实现"目录指令"）。
+> `expiryTime` 用与 `CreatedAt` 相同的 OSDU 时间戳格式（末尾 `+0000`，不是 `Z`）。
+>
+> ★ `/v2/files/*` 与 `/v2/file-collections/*` **不是同一套键**：集合版有
+> `fileCollectionSource` + `fileCount` + `fileNames`，且**没有** `fileSource`。
+> 逐键断言见 `tests/conformance/test_dms_delivery.cpp`。
 
 **`providerKey` 取值**：上游各家不同（Azure `"AZURE"`）。
 本项目用 `"POSIX"` / `"S3"`，可通过 `storage.provider_key_override` 覆盖以兼容既有客户端。
@@ -489,6 +520,10 @@ checksum = storageUtil.getChecksum(persistentLocation)
   "unprocessed": ["srn:file/unknown"]
 }
 ```
+
+- `processed` 的每个元素**恰好 4 个键**，且 `connectionString` 必须**存在且为 `null`**
+  （上游客户端按字段存在性判断）。
+- `srns` 里无法解析/查不到的条目进 `unprocessed`（**不是错误**）；`{"srns":[]}` 合法 → `200`。
 
 ### 2.11 `POST /api/file/v2/files/revokeURL`
 

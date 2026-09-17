@@ -280,6 +280,13 @@ fss_add_test(test_sqlite_metadata_repository
   LIBS    fss_metadata_sqlite fss_metadata_memory
   LABELS  "phase6;integration")
 
+# C6.7：DMS 6 端点 + Delivery 的响应键集合与端到端流程
+fss_add_test(test_dms_delivery
+  SOURCES conformance/test_dms_delivery.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+          fss_http_adapter fss_transfer Threads::Threads
+  LABELS  "phase6;conformance")
+
 # C6.6：getFileList 的 Spring Page 语义（字段名 / 分页 / 时间与用户过滤 / 上游负向样例）
 fss_add_test(test_file_list
   SOURCES integration/test_file_list.cpp

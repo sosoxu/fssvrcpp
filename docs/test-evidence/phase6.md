@@ -3,9 +3,9 @@
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P6（元数据记录语义完整化） |
-| 状态 | 🚧 **进行中 —— 切片 4/6 完成**（1：`SqliteMetadataRepository`；2：校验和 C6.4；3：12 步序列 C6.3；4：`getFileList` C6.6 + 角色 C6.8） |
+| 状态 | 🚧 **进行中 —— 切片 5/6 完成**（1：仓储；2：校验和 C6.4；3：12 步序列 C6.3；4：`getFileList` C6.6 + 角色 C6.8；5：DMS/Delivery C6.7） |
 | 门槛命令 | `ctest -L phase6` |
-| 退出码 | `0`（5 测试 / 997 断言） |
+| 退出码 | `0`（6 测试 / 1193 断言） |
 
 > 剩余：
 > GC 租约与幂等并发与 tmp 名唯一性（C6.11/C6.12/C6.13）、DMS/Delivery 语义收口（C6.7）、
@@ -185,6 +185,43 @@ RSS 增长必然 ≈ 对象大小 —— 那是**适配器**的固有开销，�
 
 ---
 
+## 5. 切片 5：DMS 6 端点 + Delivery（C6.7）
+
+### 交付物
+
+| 路径 | 变化 |
+| --- | --- |
+| `tests/conformance/test_dms_delivery.cpp` | 新增：7 用例 / 196 断言（每个响应的**键集合**、上游 DMS 端到端场景、copy/delivery 形状、状态码正反例） |
+| `src/adapters/http/dto/dto.{h,cpp}` | 上传/下载位置的两套键集合（files `fileSource`；collections `fileCollectionSource` + `fileCount` + `fileNames`）；`expiryTime` 同 OSDU 时间戳格式 |
+| `src/adapters/http/router.cpp` | DMS handler 改成**按前缀参数化**（此前两条路由共用同一个 lambda，集合版被写成 `fileSource`） |
+| `src/app/usecases/usecases.{h,cpp}` | `RetrievalInstruction` 补 `fileSource`/`createdBy`/`expiresAt`（上游下载位置是 4 个键，只回 `signedUrl` 少三个） |
+| `tests/unit/test_http_dto.cpp` | 一条断言改为**顺序无关**（`nlohmann::json` 的对象是 map，`Dump` 按字典序输出；原来把它当成了插入序） |
+
+### 键集合判定表（每一行都是"集合相等"，多一个少一个都失败）
+
+| 端点 | 顶层 | 位置对象 |
+| --- | --- | --- |
+| `files/storageInstructions` | `{providerKey, storageLocation}` | `{signedUrl, fileSource, createdBy, expiryTime}`；**无** `fileCollectionSource` |
+| `file-collections/storageInstructions` | 同上 | `{signedUrl, fileCollectionSource, fileCount, fileNames, createdBy, expiryTime}`；**无** `fileSource` |
+| `files/retrievalInstructions` | `{datasets}`；`datasets[]` = `{datasetRegistryId, retrievalProperties, providerKey}` | `{signedUrl, fileSource, createdBy, expiryTime}` |
+| `file-collections/retrievalInstructions` | 同上 | 集合版（含 `fileCollectionSource`/`fileCount`/`fileNames`） |
+| `files|file-collections/copy` | 数组；元素 = `{success, datasetBlobStoragePath}` | `datasetBlobStoragePath` 是**目标**路径 |
+| `delivery/GetFileSignedUrl` | `{processed, unprocessed}` | 每个 `processed[srn]` = `{signedUrl, unsignedUrl, kind, connectionString}`，**`connectionString` 存在且为 `null`** |
+
+### 上游 DMS 端到端场景（逐字照 `IntegrationTest_DMS.feature`）
+
+`storageInstructions → 用返回的 signedUrl 上传 → 登记元数据 → retrievalInstructions → 用返回的 signedUrl 取回`
+——最后**断言取回的字节与上传的一模一样**（上游 feature 的最后一步就是这句）。
+
+### 状态码
+
+`datasetRegistryIds` 不是数组 / `datasetSources` 缺失 / `srns` 不是数组 → **400**；
+`{"srns":[]}` 与 `{"datasetSources":[]}` 是**合法**请求 → **200**（正例对照 R16，让 400 不至于"恒真"）。
+角色（`dataset.editors`/`dataset.viewers`/`storage.creator|admin`/`delivery.viewer`）与
+"403 先于 400"由切片 4 的 `test_roles` 覆盖 —— 本切片只补响应形状与状态码。
+
+---
+
 ## 5. 门槛命令与输出（累计）
 
 ```console
@@ -194,7 +231,8 @@ $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failur
     Start 36: test_checksum ........................   Passed    0.01 sec
     Start 37: test_file_list .......................   Passed    0.05 sec
     Start 38: test_roles ...........................   Passed    0.01 sec
-100% tests passed, 0 tests failed out of 5
+    Start 39: test_dms_delivery ....................   Passed    0.03 sec
+100% tests passed, 0 tests failed out of 6
 
 逐测试断言数：
   test_sqlite_metadata_repository   122 assertions in 2 test cases
@@ -207,8 +245,10 @@ $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failur
                                     ← C6.6（字段名 / 分页 / 时间与用户过滤 / 上游三条 fixture）
   test_roles                         74 assertions in 3 test cases
                                     ← C6.8（9 个常量 + 端点↔角色映射 + 403 先于 400）
+  test_dms_delivery                 196 assertions in 7 test cases
+                                    ← C6.7（DMS/Delivery 键集合 + 端到端场景 + 状态码）
   ─────────────────────────────────────────────
-  合计 997 个断言 / 31 个测试用例 / 5 个测试
+  合计 1193 个断言 / 38 个测试用例 / 6 个测试
 ```
 
 相关护栏（改动仓储 SQL 后必跑）：
@@ -231,6 +271,7 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | **C6.3** 12 步序列 + 故障注入 | ✅ | 切片 3：正常路径的顺序/副作用 + **7 个注入点**（计划要求 6 个，追加 `datasetDetails` 非致命点）；第 9/11 步的顺序用"staging 是否还在"证明；自证对照两处 | 
 | **C6.6** `getFileList` 语义 | ✅ | 切片 4：字段名集合相等、`CreatedAt` 格式、分页不重叠、闭区间时间过滤、用户过滤、上游三条 fixture 逐字 400、非法参数正反例 |
 | **C6.8** 角色常量 | ✅ | 切片 4：9 个字面量逐字节 + 端点↔角色映射（含两处"任一角色"）+ "403 先于 400"；两处自证对照 |
+| **C6.7** DMS 6 端点 + Delivery | ✅ | 切片 5：6 个端点 + delivery 的**键集合**逐键断言、上游 DMS 端到端（上传→登记→取回字节一致）、copy 目标路径、`connectionString: null`、状态码正反例 |
 | C6.9 大文件搬迁 RSS | 🚧 部分 | 切片 2 已证 **64 MiB** 对象跨 store 搬迁 + 校验和回算的 RSS 增长 80 KiB，且有整块读回对照（65664 KiB）；**≥1 GiB + 绝对上限 < 64 MiB** 尚未测 |
 | C6.2 / C6.3 / C6.6 / C6.7 / C6.8 / C6.11 / C6.12 / C6.13 | ⬜ 未开始 | 见开头"剩余" |
 
@@ -247,6 +288,7 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | **P6-D06** | **第 7 步失败漏掉回滚**：第 12 步要求"任一步 6/7/9 失败 → remove(persistent) 回滚"，但第 7 步用的是 `FSS_TRY(...)`，失败时**直接 return** —— 已搬迁的 persistent 对象被留下成为无主副本（GC 会把它当成在途对象，或永久占空间） | 切片 3 的故障注入点③（对 `get` 注入故障）→ 旧实现下 `REQUIRE_FALSE(stat(persistent).exists)` 失败 | 抽出统一的 `RollbackCreatedObject`（删 persistent + `FAILED` + 审计），第 6/7/9 步共用；自证：拆掉回滚后用例必失败 |
 | **P6-D07** | **第 10 步只发了一个事件**：4 份文档（调研 §2.1/§2.3、设计 §2.6、契约 §2.6、计划任务 6）都写着"`status` + `datasetDetails`"，代码里**只有** `status` —— 典型的"只有描述没有实现"（R15） | 切片 3 的正常路径用例断言 `events.details.size() == 1` → 旧实现下为 0 | 新增 `DatasetDetailsEvent` + 端口方法 + 组合根实现 + 用例调用；`correlationId` 由 `x-correlation-id` 头透传（端到端用例证明） |
 | **P6-D08** | **第 11 步清理失败静默**：契约要求"忽略 + **审计告警**"，实现里只有 `(void)store->remove(...)` —— staging 里堆孤儿无人察觉 | 切片 3 的故障注入点⑥ | 记 `createMetadataStagingCleanupFailure`（result=failure），响应仍 `201`；自证：拆掉审计后用例必失败 |
+| **P6-D11** | **DMS 的两个响应形状与上游不符**：① `/v2/file-collections/{storageInstructions,retrievalInstructions}` 与 `/v2/files/*` 共用同一个 handler，返回 `fileSource` —— 上游集合版是 **`fileCollectionSource`** + `fileCount` + `fileNames`，**没有** `fileSource`（`FileCollectionStorageServiceImpl`）；② `retrievalInstructions` 的 `retrievalProperties` 只回了 `signedUrl`，上游下载位置还有 `fileSource`/`createdBy`/`expiryTime`（`StorageServiceImpl:268`）。客户端按键名取值会拿到空值 | 切片 5 的 `test_dms_delivery`（集合版键集合断言 + `retrievalProperties` 断言；旧实现 3 条失败） | handler 按前缀参数化（`make_*_instructions(collection)`）；DTO 拆出 `LocationToJson` 支持两套键集合；用例补 `fileSource`/`createdBy`/`expiresAt` |
 | **P6-D09** | **`getFileList` 的三处上游不兼容**：① `FileListRequest.items` 缺省 `10` → 上游 `{}`（缺 `Items`）必须 `400`，我们返回 `200`；② `Driver` 返回**大写** provider key，与 §2.2/§2.3（小写）及契约 §2.5 样例不一致；③ 无记录消息是自造的 `No record found`，上游 provider 是 `Nothing found for such filter and page(num: N, size: M).`。三处都被"发 `{}` 期望 200"的旧用例挡住（那条期望本身就是错的） | 切片 4 的 `test_file_list`（三条上游 fixture 逐字驱动）；`test_ops_endpoints` 修正后立即暴露 | `items` 缺省改 `0`；`Driver` 统一小写；消息对齐上游；同时纠正 `test_ops_endpoints` 的错误期望并登记 |
 | **P6-D10** | **ISO-8601 解析静默归一化越界时间**：`ParseIso8601` 直接交给 `timegm`，后者把 `2020-13-45T99:99:99Z` **归一化**成一个"看似合理"的错误时刻（月份 13 → 次年、小时 99 → +4 天）。用它当 `TimeFrom`/`TimeTo` 边界会**静默筛错数据**；`2020-1-01T...` 这类位数不符也被接受 | 切片 4 的 `TimeFrom: "2020-13-45T99:99:99Z"` 分支（旧实现返回 200） | 解析前补**形状**（`consumed == 19`）与**字段范围**（月/日/时/分/秒、含闰年 `DaysInMonth`、时区偏移）校验；`test_time.cpp` 增 11 条越界/形状用例 + 闰日正例对照（phase1 断言数 4970 → **4984**） |
 
@@ -257,6 +299,7 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | 切片 1 门槛（SQLite 元数据仓储 + 元数据契约） | ✅ 契约在 SQLite 上跑第二遍；两个护栏全绿 |
 | 切片 2 门槛（校验和 C6.4） | ✅ 覆写语义 + 算法跟随驱动 + 流式回算 + L1 公开向量都有断言 |
 | 切片 3 门槛（12 步序列 C6.3） | ✅ 正常路径的顺序/副作用 + 7 个故障注入点 + 端到端 `x-correlation-id` 透传 |
-| 切片 4 门槛（`getFileList` C6.6 + 角色 C6.8） | ✅ 上游三条 fixture 逐字 400 + 分页/时间/用户过滤 + 9 个角色常量与端点映射；`ctest -L phase6` **5 测试 / 997 断言**（顺带：phase1 因时间解析修复 4970 → 4984） |
-| 已满足判据 | **C2.10（元数据侧）、C6.3、C6.4、C6.5、C6.6、C6.8** |
+| 切片 4 门槛（`getFileList` C6.6 + 角色 C6.8） | ✅ 上游三条 fixture 逐字 400 + 分页/时间/用户过滤 + 9 个角色常量与端点映射（顺带：phase1 因时间解析修复 4970 → 4984） |
+| 切片 5 门槛（DMS/Delivery C6.7） | ✅ 6 端点 + delivery 的键集合逐键断言 + 上游 DMS 端到端；`ctest -L phase6` **6 测试 / 1193 断言** |
+| 已满足判据 | **C2.10（元数据侧）、C6.3、C6.4、C6.5、C6.6、C6.7、C6.8** |
 | P6 是否收口 | ❌ 未收口 |

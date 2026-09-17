@@ -149,7 +149,9 @@ TEST_CASE("★ C4.4 §2.9 DMS：camelCase（providerKey/signedUrl/datasetRegistr
   REQUIRE(retrieval_text.find("\"datasets\":[") != std::string::npos);
   REQUIRE(retrieval_text.find("\"datasetRegistryId\":\"opendes:dataset--File.Generic:abc\"") !=
           std::string::npos);
-  REQUIRE(retrieval_text.find("\"retrievalProperties\":{\"signedUrl\":") != std::string::npos);
+  //  ★ 键的**顺序**不能写进断言（`nlohmann::json` 的对象是 map，dump 会按字典序输出）：
+  //    这里只钉"前缀 + 键名"，逐键细节由 phase6 的 `test_dms_delivery` 覆盖
+  REQUIRE(retrieval_text.find("\"retrievalProperties\":{") != std::string::npos);
   REQUIRE(retrieval_text.find("\"providerKey\":\"POSIX\"") != std::string::npos);
 
   const std::vector<fss::adapters::http::CopyDmsResponse> copies = {
