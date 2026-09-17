@@ -111,6 +111,7 @@ getMetadataById(id)                                   —— 不存在 → 404 "
 | ACL 校验 | 本地做**结构**校验（非空 + 邮箱式组名正则），组成员是否存在由 Entitlements/Storage 负责 |
 | 校验和 | **服务端覆写**客户端传入的 `Checksum`/`ChecksumAlgorithm`（至少 Azure 实现如此） |
 | staging 清理 | 失败**静默忽略**（有意的：不能因为清理失败而让成功的元数据登记变失败）；我们额外落一条审计告警（`createMetadataStagingCleanupFailure`），否则"staging 里堆孤儿"会无人察觉 |
+| `getFileList` | 排序 = `PageRequest.of(pageNum, pageSize, ASC, CREATED_AT)`；无匹配记录时抛 `FileLocationNotFoundException("Nothing found for such filter and page(num: %s, size: %s).")` → `400`（`provider/file-azure/.../repository/FileLocationRepository.java`）。验收样例只覆盖三条 400：`{}`、缺 `Items`、无记录（`testing/file-test-*/.../input_payloads/GetLocation_FileList_FileLocation/`） |
 | 事件 | 第 10 步发**两个**：`status`（`status-changed`）+ `datasetDetails`；**两者失败都只告警**（上游 `log.warning("Failed to publish dataset details")`），不得影响 `201` |
 
 ---

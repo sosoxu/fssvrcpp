@@ -27,6 +27,11 @@ std::string ToUpper(std::string_view text) {
   return out;
 }
 
+std::string ToLower(std::string text) {
+  for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return text;
+}
+
 fss::Error Invalid(const std::string& message) {
   return Err(fss::ErrorKind::kInvalidArgument, message);
 }
@@ -38,6 +43,20 @@ fss::Result<void> AuthorizeCaller(UseCasePorts& ports, const CallerContext& call
     return Err(fss::ErrorKind::kUnauthenticated, "Missing partitionID");
   }
   return ports.authorizer.Authorize(role, caller.partition, caller.bearer_token);
+}
+
+//  "任一角色即通过"（上游 `hasPermission('a','b')`）。★ 空集合必须报错：
+//  "没有要求任何角色"如果被当成"放行"，就是一个静默的鉴权后门。
+fss::Result<void> AuthorizeCallerAny(UseCasePorts& ports, const CallerContext& caller,
+                                     std::span<const std::string_view> roles,
+                                     bool require_partition) {
+  if (require_partition && caller.partition.empty()) {
+    return Err(fss::ErrorKind::kUnauthenticated, "Missing partitionID");
+  }
+  if (roles.empty()) {
+    return Err(fss::ErrorKind::kInternal, "AuthorizeCallerAny 要求至少一个角色");
+  }
+  return ports.authorizer.AuthorizeAny(roles, caller.partition, caller.bearer_token);
 }
 
 //  审计失败**不影响**主流程（是否 fail-closed 由实现决定，端口只表达"要记"）
@@ -269,6 +288,13 @@ fss::Result<FileListResult> GetFileList::Execute(const CallerContext& caller,
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleEditors, true));
   if (request.items <= 0) return Invalid("Items 必须 > 0");
   if (request.page_num < 0) return Invalid("PageNum 必须 >= 0");
+  //  上游 `CommonFileListRequestValidator`：`TimeFrom` 必须早于 `TimeTo`
+  //  （`ValidationServiceTest` 期望消息 "should be before TimeTo"）。★ 这条必须在**查询之前**
+  //  报错：否则"区间反了"会被"区间内没有记录"掩盖，客户端拿到的是误导性的 No record found。
+  if (request.time_from_epoch_seconds >= 0 && request.time_to_epoch_seconds >= 0 &&
+      request.time_from_epoch_seconds > request.time_to_epoch_seconds) {
+    return Invalid("TimeFrom should be before TimeTo");
+  }
 
   domain::LocationQuery query;
   query.user_id = request.user_id;
@@ -278,9 +304,14 @@ fss::Result<FileListResult> GetFileList::Execute(const CallerContext& caller,
   query.offset = request.page_num * request.items;
 
   FSS_TRY(page, ports_.locations.List(caller.partition, query));
-  //  契约 §2.5：无匹配记录时上游返回 **400**（不是 200 + 空数组）
+  //  契约 §2.5：无匹配记录时上游返回 **400**（不是 200 + 空数组）。
+  //  消息逐字对齐上游 provider：`FileLocationRepository.findAll` 在 `page.isEmpty()` 时抛
+  //  `FileLocationNotFoundException("Nothing found for such filter and page(num: %s, size: %s).")`
+  //  （vendored：`provider/file-azure/.../repository/FileLocationRepository.java`）。
   if (page.total == 0 || page.records.empty()) {
-    return Invalid("No record found");
+    return Invalid("Nothing found for such filter and page(num: " +
+                   std::to_string(request.page_num) + ", size: " + std::to_string(request.items) +
+                   ").");
   }
 
   FileListResult out;
@@ -290,7 +321,9 @@ fss::Result<FileListResult> GetFileList::Execute(const CallerContext& caller,
   for (const auto& location : page.records) {
     FileListEntry entry;
     entry.file_id = location.file_id;
-    entry.driver = ProviderKeyOf(location);
+    //  ★ `Driver` 与 §2.2/§2.3 一致用小写驱动名（契约 §2.5 的样例是 `"posix"`）。
+    //    此前这里直接用 `ProviderKeyOf`（大写 provider key）→ 与 getFileLocation 不一致（P6-D09）。
+    entry.driver = ToLower(ProviderKeyOf(location));
     entry.location = PhysicalLocationOf(location);
     entry.created_at_epoch_seconds = location.created_at_epoch_seconds;
     entry.created_by = location.user_id;
@@ -471,7 +504,10 @@ fss::Result<domain::FileMetadataRecord> GetFileMetadata::Execute(
 // =============================================================================
 fss::Result<void> DeleteFileMetadata::Execute(const CallerContext& caller,
                                               std::string_view record_id) {
-  FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleEditors, true));
+  //  上游 `FileMetadataApi`：`hasPermission(FILE_EDITORS, FILE_ADMIN)` —— 任一即可
+  static constexpr std::string_view kRoles[] = {domain::kRoleFileEditors,
+                                                domain::kRoleFileAdmin};
+  FSS_TRY(AuthorizeCallerAny(ports_, caller, kRoles, true));
   FSS_TRY(record, ports_.metadata.GetById(caller.partition, record_id));
 
   FSS_TRY(ports_.metadata.Delete(caller.partition, record_id));
@@ -550,7 +586,10 @@ fss::Result<std::vector<RetrievalInstruction>> GetRetrievalInstructions::Execute
 // =============================================================================
 fss::Result<std::vector<CopyFileOutcome>> CopyFiles::Execute(
     const CallerContext& caller, const std::vector<CopyFileSource>& sources) {
-  FSS_TRY(AuthorizeCaller(ports_, caller, kRoleStorageCreator, true));
+  //  上游 `FileDmsApi`/`FileCollectionDmsApi`：`hasPermission(STORAGE_CREATOR, STORAGE_ADMIN)`
+  static constexpr std::string_view kRoles[] = {domain::kRoleStorageCreator,
+                                                domain::kRoleStorageAdmin};
+  FSS_TRY(AuthorizeCallerAny(ports_, caller, kRoles, true));
 
   std::vector<CopyFileOutcome> out;
   for (const auto& source : sources) {

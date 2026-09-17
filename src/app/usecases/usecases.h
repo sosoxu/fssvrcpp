@@ -51,12 +51,12 @@ struct CallerContext {
   std::string correlation_id;
 };
 
-//  角色名（契约 §1.3；viewers/editors 也在 domain::ports 里）
-inline constexpr std::string_view kRoleAdmin = "service.file.admin";
-inline constexpr std::string_view kRoleDatasetEditors = "service.dataset.editors";
-inline constexpr std::string_view kRoleDatasetViewers = "service.dataset.viewers";
-inline constexpr std::string_view kRoleStorageCreator = "service.storage.creator";
-inline constexpr std::string_view kRoleDeliveryViewer = "service.delivery.viewer";
+//  角色名的**短别名**：值只定义在 `domain::ports`（单一真相，C6.8），这里只做转发。
+inline constexpr std::string_view kRoleAdmin = domain::kRoleFileAdmin;
+inline constexpr std::string_view kRoleDatasetEditors = domain::kRoleDatasetEditors;
+inline constexpr std::string_view kRoleDatasetViewers = domain::kRoleDatasetViewers;
+inline constexpr std::string_view kRoleStorageCreator = domain::kRoleStorageCreator;
+inline constexpr std::string_view kRoleDeliveryViewer = domain::kRoleDeliveryViewer;
 
 //  组合根在 `src/main/` 组装后交给用例（R12：具体实现只在组合根创建）。
 struct UseCasePorts {
@@ -190,7 +190,11 @@ struct FileListRequest {
   std::int64_t time_from_epoch_seconds = -1;          // -1 = 无界（含端点）
   std::int64_t time_to_epoch_seconds = -1;
   int page_num = 0;                                   // 从 0 开始
-  int items = 10;
+  //  ★ 缺省 0（**不是** 10）：上游 `FileListRequest.items` 是基本类型，缺省 0 会被 `@Positive`
+  //    拒掉 —— 验收样例 `File_GetList_EmptyPayload.json`（`{}`）与
+  //    `File_GetList_InvalidPayload.json`（缺 `Items`）都期望 **400**。
+  //    给个"友好的默认 10"会让这两条上游样例变成 200（P6-D09）。
+  int items = 0;
 };
 
 class GetFileList {

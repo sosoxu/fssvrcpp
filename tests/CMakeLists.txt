@@ -280,6 +280,19 @@ fss_add_test(test_sqlite_metadata_repository
   LIBS    fss_metadata_sqlite fss_metadata_memory
   LABELS  "phase6;integration")
 
+# C6.6：getFileList 的 Spring Page 语义（字段名 / 分页 / 时间与用户过滤 / 上游负向样例）
+fss_add_test(test_file_list
+  SOURCES integration/test_file_list.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+          fss_http_adapter fss_transfer Threads::Threads
+  LABELS  "phase6;integration")
+
+# C6.8：鉴权角色常量与"端点 ↔ 角色"映射
+fss_add_test(test_roles
+  SOURCES unit/test_roles.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+  LABELS  "phase6;unit")
+
 # C6.4：校验和的 L1 基座（算法解析 / 规范名 / hex 结构 / 增量摘要公开向量）
 fss_add_test(test_checksum
   SOURCES unit/test_checksum.cpp

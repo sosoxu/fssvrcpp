@@ -223,6 +223,7 @@ class AllowAllAuthorizer final : public domain::IAuthorizer {
     (void)partition;
     ++calls;
     last_role = std::string(required_role);
+    last_roles = {last_role};
     if (bearer_token.empty()) {
       return Err(fss::ErrorKind::kUnauthenticated, "Missing authorization token");
     }
@@ -232,7 +233,26 @@ class AllowAllAuthorizer final : public domain::IAuthorizer {
     return Ok();
   }
 
+  //  "任一角色即通过"：替身仍然只表达"放行/拒绝"，但把角色集合记下来（C6.8 用它断言）
+  fss::Result<void> AuthorizeAny(std::span<const std::string_view> required_roles,
+                                 std::string_view partition,
+                                 std::string_view bearer_token) override {
+    (void)partition;
+    ++calls;
+    last_roles.clear();
+    for (const auto role : required_roles) last_roles.emplace_back(role);
+    last_role = last_roles.empty() ? std::string() : last_roles.front();
+    if (bearer_token.empty()) {
+      return Err(fss::ErrorKind::kUnauthenticated, "Missing authorization token");
+    }
+    if (deny) {
+      return Err(fss::ErrorKind::kPermissionDenied, "角色不足：" + last_role);
+    }
+    return Ok();
+  }
+
   std::string last_role;
+  std::vector<std::string> last_roles;
 };
 
 class NoopLegalValidator final : public domain::ILegalValidator {

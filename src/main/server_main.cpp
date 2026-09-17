@@ -82,6 +82,17 @@ class AllowAllAuthorizer final : public fss::domain::IAuthorizer {
     }
     return fss::Ok();
   }
+
+  //  "任一角色即通过"（上游 `hasPermission('a','b')`）。**鉴权尚未接入**（P8）：
+  //  与 `Authorize` 一样只做"缺 token / 缺 partition"的形式检查。
+  fss::Result<void> AuthorizeAny(std::span<const std::string_view> required_roles,
+                                 std::string_view partition,
+                                 std::string_view bearer_token) override {
+    if (required_roles.empty()) {
+      return fss::Err(fss::ErrorKind::kInternal, "AuthorizeAny 要求至少一个角色");
+    }
+    return Authorize(required_roles.front(), partition, bearer_token);
+  }
 };
 
 class NoopLegalValidator final : public fss::domain::ILegalValidator {

@@ -3,11 +3,11 @@
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P6（元数据记录语义完整化） |
-| 状态 | 🚧 **进行中 —— 切片 3/6 完成**（1：`SqliteMetadataRepository`；2：校验和 C6.4；3：12 步序列与故障注入 C6.3） |
+| 状态 | 🚧 **进行中 —— 切片 4/6 完成**（1：`SqliteMetadataRepository`；2：校验和 C6.4；3：12 步序列 C6.3；4：`getFileList` C6.6 + 角色 C6.8） |
 | 门槛命令 | `ctest -L phase6` |
-| 退出码 | `0`（3 测试 / 610 断言） |
+| 退出码 | `0`（5 测试 / 997 断言） |
 
-> 剩余：`getFileList` 语义（C6.6）、角色常量（C6.8）、
+> 剩余：
 > GC 租约与幂等并发与 tmp 名唯一性（C6.11/C6.12/C6.13）、DMS/Delivery 语义收口（C6.7）、
 > **1 GiB** 大文件搬迁 RSS（C6.9；64 MiB 流式已证，绝对上限 < 64 MiB 尚未测）、
 > 远端 Storage Service 仓储、组合根改接 `SqliteMetadataRepository`。
@@ -143,14 +143,58 @@ RSS 增长必然 ≈ 对象大小 —— 那是**适配器**的固有开销，�
 
 ---
 
-## 4. 门槛命令与输出（累计）
+## 4. 切片 4：`getFileList`（C6.6）+ 鉴权角色（C6.8）
+
+### 交付物
+
+| 路径 | 变化 |
+| --- | --- |
+| `tests/integration/test_file_list.cpp` | 新增：5 用例 / 313 断言（字段名精确、`CreatedAt` 格式、分页不重叠、时间/用户过滤、上游三条 fixture 逐字驱动、非法参数正反例） |
+| `tests/unit/test_roles.cpp` | 新增：3 用例 / 74 断言（9 个常量逐字节、端点↔角色映射、403 先于 400） |
+| `tests/conformance/fixtures/upstream/list/*.json` + README | vendored 上游 `getFileList` 的三条验收 payload（同 commit/Apache-2.0） |
+| `src/domain/ports/ports.h` | 9 个角色常量**集中为唯一真相**（补齐 `service.storage.viewer` / `service.storage.admin`）；`IAuthorizer::AuthorizeAny`（任一角色即通过） |
+| `src/app/usecases/usecases.{h,cpp}` | `FileListRequest.items` 缺省 10 → **0**（上游语义）；`TimeFrom > TimeTo` → 400；无记录消息对齐上游；`Driver` 改小写；`DeleteFileMetadata` / `CopyFiles` 改"任一角色" |
+| `src/common/time/time_format.cpp` | ISO-8601 解析补**形状 + 字段范围**校验（`timegm` 会静默归一化越界字段） |
+| `tests/framework/{app_fixture.h,fake_ports.h}` | `UseAuthorizer`；`AllowAllAuthorizer::AuthorizeAny` + 记录角色集合 |
+| `tests/conformance/test_ops_endpoints.cpp` | 修正一处**错误期望**：发 `{}` 却期望 200（与上游 `File_GetList_EmptyPayload.json` 的 400 冲突） |
+
+### C6.6 判定表
+
+| 情形 | 期望 | 断言点 |
+| --- | --- | --- |
+| 响应字段名 | 恰好 `Content`/`Number`/`NumberOfElements`/`Size`；每项恰好 5 个键 | 用**集合相等**断言（多一个少一个都失败） |
+| `CreatedAt` | `yyyy-MM-dd'T'HH:mm:ss.SSS+0000`（28 字符、末尾不是 `Z`） | 逐位 + 与注入时钟一致 |
+| `Driver` | 小写驱动名（内存装配 → `memory`） | 与 §2.2/§2.3 一致（此前 getFileList 返回大写，P6-D09） |
+| 分页 | `PageNum=0`（2 条）与 `1`（1 条）**不重叠**、并集完整、顺序稳定；超出范围 → 400 | 3 条记录 + `Items=2` |
+| 时间过滤 | 闭区间：`[t0,t1]`→2 条、`[t1,t1]`→恰好 1 条、`[t2,t2]`→1 条；区间内无记录 → 400 | memory 与 SQLite 语义一致（`LocationQuery`） |
+| 用户过滤 | `UserID=alice`→2 条、`bob`→1 条；与时间过滤**同时**生效 | 两个用户 + 三个时刻 |
+| 上游三条负向 | `{}`、缺 `Items`、无记录 → 全部 **400** | **逐字** fixture；并把"无记录"的消息与"解析失败"区分开 |
+| 非法参数 | `Items=0/-1`、`PageNum=-1`、非法/越界时间、`TimeFrom>TimeTo` → 400；合法参数 → **200**（正例对照 R16） | 6 条非法 + 1 条正例 |
+
+### C6.8 判定表
+
+| 检查 | 断言 |
+| --- | --- |
+| 9 个常量逐字节 | 字面量表（含新补的 `service.storage.viewer`/`admin`）；无重复值；`viewers`/`viewer` 不可互换 |
+| 单一真相 | app 层短名 == `domain` 常量 |
+| 端点 ↔ 角色 | 12 个用例逐个驱动（**一律拒绝**的作者器 → 授权是第一步，不需要合法输入），角色集合必须等于上游 `@PreAuthorize`（含两处"任一角色"） |
+| 安全属性 | 非法输入 + 拒绝的作者器 → 必须是 `403`（**不能**是 400/404），即授权先于输入校验 |
+
+> **自证对照（R1）**：① 把 `service.storage.viewer` 改成 `...viewers` → 逐字节用例必失败；
+> ② 把 `DeleteFileMetadata` 退回单角色 `editors` → 映射用例必失败。两处都实测过。
+
+---
+
+## 5. 门槛命令与输出（累计）
 
 ```console
 $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failure
     Start 34: test_sqlite_metadata_repository ......   Passed    0.01 sec
     Start 35: test_metadata_lifecycle ..............   Passed    0.54 sec
     Start 36: test_checksum ........................   Passed    0.01 sec
-100% tests passed, 0 tests failed out of 3
+    Start 37: test_file_list .......................   Passed    0.05 sec
+    Start 38: test_roles ...........................   Passed    0.01 sec
+100% tests passed, 0 tests failed out of 5
 
 逐测试断言数：
   test_sqlite_metadata_repository   122 assertions in 2 test cases
@@ -159,8 +203,12 @@ $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failur
                                     ← C6.4（覆写语义 + 流式 RSS）+ C6.3（12 步序列 + 7 个故障注入点）
   test_checksum                     106 assertions in 6 test cases
                                     ← C6.4 的 L1 基座（算法解析 / hex 结构 / 公开向量）
+  test_file_list                    313 assertions in 5 test cases
+                                    ← C6.6（字段名 / 分页 / 时间与用户过滤 / 上游三条 fixture）
+  test_roles                         74 assertions in 3 test cases
+                                    ← C6.8（9 个常量 + 端点↔角色映射 + 403 先于 400）
   ─────────────────────────────────────────────
-  合计 610 个断言 / 23 个测试用例 / 3 个测试
+  合计 997 个断言 / 31 个测试用例 / 5 个测试
 ```
 
 相关护栏（改动仓储 SQL 后必跑）：
@@ -172,7 +220,7 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 
 ---
 
-## 5. 判据进展
+## 6. 判据进展
 
 | 判据 | 状态 | 证据 |
 | --- | --- | --- |
@@ -181,12 +229,14 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | C6.1（黄金样例字段级往返） | 🚧 部分 | 仓储侧已无损（`data` 列存整条 JSON）；REST 侧的全字段比对已在 P4 的 C4.2 覆盖，尚缺"经 SQLite 仓储往返"的组合用例 |
 | **C6.4** 校验和（服务端计算并**覆写** / 算法跟随驱动 / 大对象流式） | ✅ | 切片 2：判定表 5 行全部有断言（未提供 / 客户端值被覆写 / 客户端点名别的算法 / 原生 MD5 / 原生不可用回退）+ L1 公开向量与算法解析两向断言。**旧表述**"客户端提供但不符 → 400 + 删除对象"已推翻（P6-D05） |
 | **C6.3** 12 步序列 + 故障注入 | ✅ | 切片 3：正常路径的顺序/副作用 + **7 个注入点**（计划要求 6 个，追加 `datasetDetails` 非致命点）；第 9/11 步的顺序用"staging 是否还在"证明；自证对照两处 | 
+| **C6.6** `getFileList` 语义 | ✅ | 切片 4：字段名集合相等、`CreatedAt` 格式、分页不重叠、闭区间时间过滤、用户过滤、上游三条 fixture 逐字 400、非法参数正反例 |
+| **C6.8** 角色常量 | ✅ | 切片 4：9 个字面量逐字节 + 端点↔角色映射（含两处"任一角色"）+ "403 先于 400"；两处自证对照 |
 | C6.9 大文件搬迁 RSS | 🚧 部分 | 切片 2 已证 **64 MiB** 对象跨 store 搬迁 + 校验和回算的 RSS 增长 80 KiB，且有整块读回对照（65664 KiB）；**≥1 GiB + 绝对上限 < 64 MiB** 尚未测 |
 | C6.2 / C6.3 / C6.6 / C6.7 / C6.8 / C6.11 / C6.12 / C6.13 | ⬜ 未开始 | 见开头"剩余" |
 
 ---
 
-## 6. 本阶段发现并修复的缺陷
+## 7. 本阶段发现并修复的缺陷
 
 | 编号 | 症状 / 根因 | 复现方式 | 修复 |
 | --- | --- | --- | --- |
@@ -197,13 +247,16 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | **P6-D06** | **第 7 步失败漏掉回滚**：第 12 步要求"任一步 6/7/9 失败 → remove(persistent) 回滚"，但第 7 步用的是 `FSS_TRY(...)`，失败时**直接 return** —— 已搬迁的 persistent 对象被留下成为无主副本（GC 会把它当成在途对象，或永久占空间） | 切片 3 的故障注入点③（对 `get` 注入故障）→ 旧实现下 `REQUIRE_FALSE(stat(persistent).exists)` 失败 | 抽出统一的 `RollbackCreatedObject`（删 persistent + `FAILED` + 审计），第 6/7/9 步共用；自证：拆掉回滚后用例必失败 |
 | **P6-D07** | **第 10 步只发了一个事件**：4 份文档（调研 §2.1/§2.3、设计 §2.6、契约 §2.6、计划任务 6）都写着"`status` + `datasetDetails`"，代码里**只有** `status` —— 典型的"只有描述没有实现"（R15） | 切片 3 的正常路径用例断言 `events.details.size() == 1` → 旧实现下为 0 | 新增 `DatasetDetailsEvent` + 端口方法 + 组合根实现 + 用例调用；`correlationId` 由 `x-correlation-id` 头透传（端到端用例证明） |
 | **P6-D08** | **第 11 步清理失败静默**：契约要求"忽略 + **审计告警**"，实现里只有 `(void)store->remove(...)` —— staging 里堆孤儿无人察觉 | 切片 3 的故障注入点⑥ | 记 `createMetadataStagingCleanupFailure`（result=failure），响应仍 `201`；自证：拆掉审计后用例必失败 |
+| **P6-D09** | **`getFileList` 的三处上游不兼容**：① `FileListRequest.items` 缺省 `10` → 上游 `{}`（缺 `Items`）必须 `400`，我们返回 `200`；② `Driver` 返回**大写** provider key，与 §2.2/§2.3（小写）及契约 §2.5 样例不一致；③ 无记录消息是自造的 `No record found`，上游 provider 是 `Nothing found for such filter and page(num: N, size: M).`。三处都被"发 `{}` 期望 200"的旧用例挡住（那条期望本身就是错的） | 切片 4 的 `test_file_list`（三条上游 fixture 逐字驱动）；`test_ops_endpoints` 修正后立即暴露 | `items` 缺省改 `0`；`Driver` 统一小写；消息对齐上游；同时纠正 `test_ops_endpoints` 的错误期望并登记 |
+| **P6-D10** | **ISO-8601 解析静默归一化越界时间**：`ParseIso8601` 直接交给 `timegm`，后者把 `2020-13-45T99:99:99Z` **归一化**成一个"看似合理"的错误时刻（月份 13 → 次年、小时 99 → +4 天）。用它当 `TimeFrom`/`TimeTo` 边界会**静默筛错数据**；`2020-1-01T...` 这类位数不符也被接受 | 切片 4 的 `TimeFrom: "2020-13-45T99:99:99Z"` 分支（旧实现返回 200） | 解析前补**形状**（`consumed == 19`）与**字段范围**（月/日/时/分/秒、含闰年 `DaysInMonth`、时区偏移）校验；`test_time.cpp` 增 11 条越界/形状用例 + 闰日正例对照（phase1 断言数 4970 → **4984**） |
 
-## 7. 结论
+## 8. 结论
 
 | 项 | 结论 |
 | --- | --- |
 | 切片 1 门槛（SQLite 元数据仓储 + 元数据契约） | ✅ 契约在 SQLite 上跑第二遍；两个护栏全绿 |
 | 切片 2 门槛（校验和 C6.4） | ✅ 覆写语义 + 算法跟随驱动 + 流式回算 + L1 公开向量都有断言 |
-| 切片 3 门槛（12 步序列 C6.3） | ✅ 正常路径的顺序/副作用 + 7 个故障注入点 + 端到端 `x-correlation-id` 透传；`ctest -L phase6` **3 测试 / 610 断言** |
-| 已满足判据 | **C2.10（元数据侧）、C6.3、C6.4、C6.5** |
+| 切片 3 门槛（12 步序列 C6.3） | ✅ 正常路径的顺序/副作用 + 7 个故障注入点 + 端到端 `x-correlation-id` 透传 |
+| 切片 4 门槛（`getFileList` C6.6 + 角色 C6.8） | ✅ 上游三条 fixture 逐字 400 + 分页/时间/用户过滤 + 9 个角色常量与端点映射；`ctest -L phase6` **5 测试 / 997 断言**（顺带：phase1 因时间解析修复 4970 → 4984） |
+| 已满足判据 | **C2.10（元数据侧）、C6.3、C6.4、C6.5、C6.6、C6.8** |
 | P6 是否收口 | ❌ 未收口 |

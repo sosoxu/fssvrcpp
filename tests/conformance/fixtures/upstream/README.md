@@ -38,6 +38,24 @@
   理由：该行上游未执行，且"更具体的消息"对客户端排障更有价值；差异已在
   `docs/03-api-contract.md` §3.4 与阶段证据中显式登记。
 
+## `list/` 子目录（C6.6 的一手依据）
+
+`getFileList` 的三条上游负向样例（逐字取自
+`file-acceptance-test/src/test/resources/input_payloads/GetLocation_FileList_FileLocation/`，
+同 commit、同许可证），以及它们在上游 feature 里的期望：
+
+| 文件 | 内容 | 上游期望（`IntegrationTest_File_Get_Location_FileLocation_FileList.feature`） |
+| --- | --- | --- |
+| `list/File_GetList_EmptyPayload.json` | `{}` | `400` |
+| `list/File_GetList_InvalidPayload.json` | 有 `PageNum`/`TimeFrom`/`UserID`/`TimeTo`，**缺 `Items`** | `400` |
+| `list/File_GetList_NoRecordPayload.json` | 完整请求，但库中没有匹配记录 | `400` |
+
+> ★ 注意：上游验收**只**覆盖了这三条 400；`TimeFrom`/`TimeTo`/`UserID` 的"必填"来自
+> 上游**单测**（`ValidationServiceTest#fileListRequestProvider` →
+> `@NotNull TimeFrom/TimeTo`、`@NotBlank UserID`、`@Positive Items`、`@PositiveOrZero PageNum`、
+> 且 `TimeFrom < TimeTo`）。本仓库对前三者**刻意放宽**（缺省 = 不过滤），
+> 理由与差异登记见 `docs/03-api-contract.md` §2.5。
+
 ## 占位符
 
 上游样例里的 `<tenant_name>` / `<acl_viewers>` / `<legal_tags>` / `<cloud_domain>` 等

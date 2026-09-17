@@ -16,7 +16,7 @@
 | **P3** | 集中存储驱动 + 位置仓储 + 数据面 | `PosixBlobStore`、`SqliteLocationRepository`、自签传输 token 与 `/v1/transfer` 内核 | `ctest -L phase3` | ✅ **已完成**（C3.1~C3.12；9 测试 / 580 断言；见 `docs/test-evidence/phase3.md`） |
 | **P4** | REST 适配层 + 端到端垂直切片（POSIX） | OSDU 全部端点、错误映射、DTO、三大错误体、`fss_server` 可启动 | `ctest -L phase4` | ✅ **已完成：19/19 路由 + `/metrics` + 上游样例逐字对齐（C4.3）+ 护栏 + 超时语义；C4.1~C4.11 全部满足** |
 | **P5** | 对象存储驱动（S3 SigV4） | `S3BlobStore`、SigV4 签名/验签、mock-S3、同一套契约测试跑 S3 | `ctest -L phase5` | ✅ **已完成：C5.1~C5.10 全部满足**（AWS 官方向量 5 条逐字节匹配、独立验签 mock、同一套契约跑第三遍、分页、错误映射、S3 端到端、按配置切驱动、ADR-005） |
-| **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | 🚧 **进行中（切片 3/6：`SqliteMetadataRepository` + 元数据契约跑第二遍；校验和 C6.4、12 步序列 C6.3 已满足）** |
+| **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | 🚧 **进行中（切片 4/6：元数据仓储 + 校验和 C6.4 + 12 步序列 C6.3 + `getFileList` C6.6 + 角色 C6.8 已满足）** |
 | **P7** | gRPC 适配层 + 双协议等价性 | `FileServiceAdapter`、流式数据面、错误等价、URL 结构等价 | `ctest -L phase7` | ⬜ |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ⬜ |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ⬜ |
@@ -432,7 +432,7 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase5 --output-on
 
 ### 阶段 6：元数据记录语义完整化  🚧 进行中
 
-> **当前进度（切片 3/6）**：
+> **当前进度（切片 4/6）**：
 > ① `src/infra/metadata/sqlite/sqlite_metadata_repository.{h,cpp}`
 > （版本链 + `is_latest` 部分唯一索引 + partition 隔离）+ 元数据契约在 SQLite 上跑第二遍
 > （闭合 C2.10 的**元数据侧**）→ C6.5 已满足；C6.1 部分（仓储侧无损，REST 侧见 C4.2）。
@@ -445,8 +445,11 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase5 --output-on
 > 补发第 10 步的第二个事件 `datasetDetails`（`correlationId` 由 `x-correlation-id` 透传）；
 > 第 11 步清理失败记审计告警；正常路径的顺序/副作用 + **7 个故障注入点**（计划要求 6 个，追加
 > `datasetDetails` 非致命点）。
-> **剩余**：`getFileList`（C6.6）、角色常量（C6.8）、
-> GC 租约/幂等并发/tmp 名（C6.11~C6.13）、DMS/Delivery（C6.7）、**1 GiB** 搬迁 RSS 绝对上限（C6.9）、远端仓储。
+> ④ **`getFileList`（C6.6）+ 角色（C6.8）**：上游三条验收 fixture 逐字驱动；`Items` 缺省 0、
+> `Driver` 小写、无记录消息对齐上游；9 个角色常量集中为唯一真相 + `AuthorizeAny`（任一角色）+
+> 端点↔角色映射；顺带修 `ParseIso8601` 的越界时间静默归一化（P6-D10）。
+> **剩余**：GC 租约/幂等并发/tmp 名（C6.11~C6.13）、DMS/Delivery（C6.7）、
+> **1 GiB** 搬迁 RSS 绝对上限（C6.9）、远端仓储。
 
 **目标**：把 `File.Generic` 记录语义、版本链、staging→persistent 搬迁与回滚、列表/DMS/Delivery 做完整。
 

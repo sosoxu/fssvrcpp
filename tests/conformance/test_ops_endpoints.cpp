@@ -217,7 +217,10 @@ TEST_CASE("★ C4.2(部分)/C4.8(0 字节边界) uploadURL → metadata → GET 
   REQUIRE(download_json.value()["SignedUrl"].is_string());  // ★ 小写 url
 
   //  ⑤ 列表能看到这条记录（Spring Page 结构）
-  const auto list = Do(port, "POST", "/api/file/v2/getFileList", Authed(), "{}");
+  //  ★ 请求体必须带 `Items`：`{}` 在上游是 **400**（`File_GetList_EmptyPayload.json`），
+  //    本用例此前发 `{}` 却期望 200，是在断言我们自己的"宽松默认值"（P6-D09 一并纠正）。
+  const auto list = Do(port, "POST", "/api/file/v2/getFileList", Authed(),
+                       R"({"PageNum":0,"Items":10})");
   REQUIRE(list.status == 200);
   const auto list_json = fss::json::ParseObject(list.body);
   REQUIRE(list_json.ok());

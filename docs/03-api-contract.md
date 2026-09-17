@@ -56,6 +56,27 @@
 
 鉴权判定：`authorizeAny(headers, roles)` —— **拥有任一角色即通过**。
 
+**端点 ↔ 角色（实测自上游各 `api/*.java` 的 `@PreAuthorize`，vendored commit `d7c25c2d`）**
+
+| 端点 | 上游注解 | 角色 |
+| --- | --- | --- |
+| `POST /v2/files/metadata` | `FileMetadataApi:56` | `service.file.editors` |
+| `GET /v2/files/{id}/metadata` | `FileMetadataApi:77` | `service.file.viewers` |
+| `DELETE /v2/files/{id}/metadata` | `FileMetadataApi:96` | `service.file.editors` **或** `service.file.admin` |
+| `POST /v2/getFileList` | `FileListApi:72` | `service.file.editors` |
+| `POST /v2/getLocation`、`POST /v2/getFileLocation`、`GET /v2/files/uploadURL` | `FileLocationApi:80/104/126` | `service.file.editors` |
+| `GET /v2/files/{id}/downloadURL` | `FileDeliveryApi:51` | **`service.file.viewers`**（不是 editors） |
+| `POST /v2/files/storageInstructions`、`POST /v2/file-collections/storageInstructions` | `FileDmsApi:82`、`FileCollectionDmsApi:78` | `service.dataset.editors` |
+| `POST /v2/files/retrievalInstructions`、`POST /v2/file-collections/retrievalInstructions` | `FileDmsApi:102`、`FileCollectionDmsApi:98` | `service.dataset.viewers` |
+| `POST /v2/files/copy`、`POST /v2/file-collections/copy` | `FileDmsApi:123`、`FileCollectionDmsApi:119` | `service.storage.creator` **或** `service.storage.admin` |
+| `POST /v2/delivery/GetFileSignedUrl` | `DeliveryApi:83` | `service.delivery.viewer` |
+| `POST /v2/files/revokeURL` | `FileAdminApi:47` | `service.file.admin` |
+| `/v2/info`、`/v2/liveness_check`、`/v2/readiness_check` | — | 不需要角色 |
+
+**授权发生在输入校验之前**（Spring Security 过滤器先于 controller）：未授权调用者拿到 `403`，
+不能靠 `400` 的差异探测数据是否存在。本实现由 `AuthorizeCaller`/`AuthorizeCallerAny` 在每个用例
+**入口第一步**完成，并由 `tests/unit/test_roles.cpp` 机械断言（含"上一句"这条安全属性）。
+
 ### 1.4 `expiryTime` 语义（唯一 query 参数）
 
 ```
@@ -300,11 +321,37 @@ accept 队列只有 5 个位置，多余的 SYN 被内核丢弃，客户端按 1
 ```
 
 **契约要点**
-- 字段是 `Content` / `Number` / `NumberOfElements` / `Size` —— **不是** `results` / `totalCount`。
+- 字段是 `Content` / `Number` / `NumberOfElements` / `Size` —— **不是** `results` / `totalCount`；
+  `Content` 每项恰好 5 个键：`FileID` / `Driver` / `Location` / `CreatedAt` / `CreatedBy`。
 - `CreatedAt` 格式 `yyyy-MM-dd'T'HH:mm:ss.SSSZ`（注意 `Z` 位置是 `+0000` 风格的偏移）。
-- `PageNum` 从 **0** 开始。
-- 无匹配记录时上游返回 `400`（验收测试 `File_GetList_NoRecordPayload.json`）；
-  **本项目遵循上游行为**，并在契约测试中固化（尽管 200 + 空数组更符合 REST 直觉）。
+- `Driver` 是**驱动上报的真实名字的小写形态**（`posix` / `s3` / `memory`），与 §2.2/§2.3 一致
+  （上游把所有云硬编码成 `"GCS"`，复刻该行为的开关见 §6 `storage.driver_report_override`）。
+- `PageNum` 从 **0** 开始；排序是**稳定全序**（`CreatedAt` 升序、同秒按 `FileID` 升序），
+  否则 offset 分页会漏项/重项。
+- 时间边界**含端点**（`>= TimeFrom` 且 `<= TimeTo`，`LocationQuery` 的语义）。
+- `Items` **必填**（上游 DTO 是基本类型，缺省 0 → `@Positive` 失败）：`{}` 与"缺 `Items`"都是 `400`。
+- 无匹配记录（含翻到超出范围的页）→ `400`，消息逐字对齐上游 provider：
+  `Nothing found for such filter and page(num: <n>, size: <m>).`
+  （`provider/file-azure/.../repository/FileLocationRepository.java` 的
+  `FileLocationNotFoundException`；排序也用 `PageRequest.of(pageNum, pageSize, ASC, CREATED_AT)`）。
+- `TimeFrom > TimeTo` → `400`（消息含 `should be before TimeTo`）；**不能**退化成"区间内无记录"。
+
+**⚠️ 一处刻意的放宽（与上游参考实现的差异，已登记）**
+上游参考实现的校验器把 `TimeFrom`/`TimeTo`/`UserID` 定为**必填**
+（`ValidationServiceTest#fileListRequestProvider` → `@NotNull`/`@NotBlank`）。
+本实现把三者视为**可选过滤器**（缺省 = 不过滤）。理由：
+① 上游**验收样例**没有覆盖这一差异（它的"非法"样例缺的是 `Items`，三条负向样例
+`File_GetList_{Empty,Invalid,NoRecord}Payload.json` 我们逐字驱动且全部 `400`）；
+② 该放宽方向只会让"上游能发的请求"继续成功，不会让上游的合法请求失败。
+上游 unit test 的必填规则若要在本仓库生效，只需在适配层补结构校验（不影响用例层）。
+
+**上游负向样例（vendored 到 `tests/conformance/fixtures/upstream/list/`）**
+
+| 文件 | 内容 | 期望 |
+| --- | --- | --- |
+| `File_GetList_EmptyPayload.json` | `{}` | `400` |
+| `File_GetList_InvalidPayload.json` | 缺 `Items` | `400` |
+| `File_GetList_NoRecordPayload.json` | 完整请求、库中无匹配 | `400` |
 
 ### 2.6 `POST /api/file/v2/files/metadata`
 

@@ -26,6 +26,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -200,9 +201,31 @@ class IPartitionRegistry {
   virtual Result<std::vector<PartitionConfig>> List() = 0;
 };
 
-// OSDU 的角色名（契约 §1.3）
-inline constexpr std::string_view kRoleViewers = "service.file.viewers";
-inline constexpr std::string_view kRoleEditors = "service.file.editors";
+// =============================================================================
+//  OSDU 的 9 个角色名（契约 §1.3；**唯一真相**，其它地方只能引用，不得再写字面量）
+// =============================================================================
+//  为什么集中在这里
+//    角色是字符串字面量：写错一个字母（`viewers` vs `viewer`）不会编译失败，
+//    只会让线上 403。把 9 个值放在一处 + `tests/unit/test_roles.cpp` 的逐字节断言，
+//    才让"拼写"变成可机械检查的东西（C6.8）。
+//
+//  上游一手依据（vendored 到 `/home/ll/osdu-file-upstream`，commit d7c25c2d）：
+//    · 值：`FileServiceRole` / `DatasetConstants` / `StorageRole` / `DeliveryRole`
+//      （`docs/01-osdu-research.md` §1.3 有实测表）
+//    · 用途：各 `api/*.java` 的 `@PreAuthorize("@authorizationFilter.hasPermission(...)")`
+inline constexpr std::string_view kRoleFileViewers = "service.file.viewers";
+inline constexpr std::string_view kRoleFileEditors = "service.file.editors";
+inline constexpr std::string_view kRoleFileAdmin = "service.file.admin";
+inline constexpr std::string_view kRoleDeliveryViewer = "service.delivery.viewer";
+inline constexpr std::string_view kRoleDatasetViewers = "service.dataset.viewers";
+inline constexpr std::string_view kRoleDatasetEditors = "service.dataset.editors";
+inline constexpr std::string_view kRoleStorageViewer = "service.storage.viewer";
+inline constexpr std::string_view kRoleStorageCreator = "service.storage.creator";
+inline constexpr std::string_view kRoleStorageAdmin = "service.storage.admin";
+
+//  历史短名（保留以免改动大量调用点；**值**仍然只有上面那一份）
+inline constexpr std::string_view kRoleViewers = kRoleFileViewers;
+inline constexpr std::string_view kRoleEditors = kRoleFileEditors;
 
 class IAuthorizer {
  public:
@@ -211,6 +234,11 @@ class IAuthorizer {
   //            缺 partition → kUnauthenticated（"Missing partitionID"）；角色不足 → kPermissionDenied
   virtual Result<void> Authorize(std::string_view required_role, std::string_view partition,
                                  std::string_view bearer_token) = 0;
+  //  **任一角色即通过**（上游 `hasPermission('a','b')`，见 `FileMetadataApi` 的 DELETE、
+  //  `FileDmsApi`/`FileCollectionDmsApi` 的 copy）。空集合必须报错（不能"空 = 放行"）。
+  virtual Result<void> AuthorizeAny(std::span<const std::string_view> required_roles,
+                                    std::string_view partition,
+                                    std::string_view bearer_token) = 0;
 };
 
 class ILegalValidator {

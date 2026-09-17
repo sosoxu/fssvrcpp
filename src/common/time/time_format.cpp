@@ -23,6 +23,21 @@ std::string Format(std::int64_t epoch_seconds, int millis, const char* fmt) {
 }
 
 // 解析 `YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM|±HHMM]`
+namespace {
+
+//  该年该月的天数（含闰年规则：4 年一闰、100 年不闰、400 年再闰）
+int DaysInMonth(int year, int month) {
+  static constexpr int kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month < 1 || month > 12) return 0;
+  if (month == 2) {
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    return leap ? 29 : 28;
+  }
+  return kDays[month - 1];
+}
+
+}  // namespace
+
 Result<std::int64_t> ParseCommon(std::string_view text) {
   if (text.size() < 19) return Err(ErrorKind::kInvalidArgument, "时间字符串过短");
   int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0, ms = 0;
@@ -30,6 +45,18 @@ Result<std::int64_t> ParseCommon(std::string_view text) {
   if (::sscanf(std::string(text).c_str(), "%4d-%2d-%2dT%2d:%2d:%2d%n", &y, &mo, &d, &h, &mi, &s,
                &consumed) != 6) {
     return Err(ErrorKind::kInvalidArgument, "时间格式不符合 ISO-8601");
+  }
+  //  ★ 形状校验：必须**恰好**是 `yyyy-MM-ddTHH:mm:ss`（19 个字符）。
+  //    `%2d` 对 "2020-1-01" 只吃 1 个字符 → `consumed` 会 ≠ 19，据此拒绝。
+  if (consumed != 19) {
+    return Err(ErrorKind::kInvalidArgument, "时间格式不符合 ISO-8601（要求 yyyy-MM-ddTHH:mm:ss）");
+  }
+  //  ★ 范围校验：`timegm` 会**静默归一化**越界字段（月份 13 → 次年、小时 99 → +4 天），
+  //    于是 `2020-13-45T99:99:99Z` 会变成一个"看似合理"的错误时刻 —— 用它做过过滤边界
+  //    会静默筛错数据（P6-D10）。这里必须先挡住。
+  if (mo < 1 || mo > 12 || d < 1 || d > DaysInMonth(y, mo) || h < 0 || h > 23 || mi < 0 ||
+      mi > 59 || s < 0 || s > 59) {
+    return Err(ErrorKind::kInvalidArgument, "时间字段越界");
   }
   std::size_t idx = static_cast<std::size_t>(consumed);
   if (idx < text.size() && text[idx] == '.') {
@@ -60,6 +87,9 @@ Result<std::int64_t> ParseCommon(std::string_view text) {
           return Err(ErrorKind::kInvalidArgument, "时区偏移格式错误");
       } else {
         return Err(ErrorKind::kInvalidArgument, "时区偏移格式错误");
+      }
+      if (oh > 23 || om > 59) {
+        return Err(ErrorKind::kInvalidArgument, "时区偏移越界");
       }
       offset_minutes = oh * 60 + om;
       if (c == '-') offset_minutes = -offset_minutes;

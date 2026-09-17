@@ -42,6 +42,8 @@ struct AppFixture {
   std::unique_ptr<fss::app::LocationIssuer> issuer;
   std::unique_ptr<fss::app::UseCasePorts> ports;
   fss::app::CallerContext caller{"opendes", "osdu-user", "Bearer test-token"};
+  //  `UseAuthorizer` 换进来的替身（未换时为 null，`ports` 用的是成员 `authorizer`）
+  domain::IAuthorizer* authorizer_override = nullptr;
 
   AppFixture() {
     issuer = std::make_unique<fss::app::LocationIssuer>(factory, locations, codec, clock, ids,
@@ -49,6 +51,14 @@ struct AppFixture {
     ports = std::make_unique<fss::app::UseCasePorts>(fss::app::UseCasePorts{
         factory, locations, metadata, authorizer, events, audit, partitions, legal, schema,
         *issuer, clock, ids});
+  }
+
+  //  用替代的**作者器**重建端口集合（C6.8 的角色映射测试用）。
+  void UseAuthorizer(domain::IAuthorizer& replacement) {
+    authorizer_override = &replacement;
+    ports = std::make_unique<fss::app::UseCasePorts>(fss::app::UseCasePorts{
+        factory, locations, metadata, *authorizer_override, events, audit, partitions, legal,
+        schema, *issuer, clock, ids});
   }
 
   //  用替代的元数据仓储**重建**端口集合（故障注入替身用）。
