@@ -9,8 +9,8 @@
 //    · 未实现的 RPC 明确回 `UNIMPLEMENTED`（不是静默成功、也不是 INTERNAL）——
 //      C7.1 逐条要求 17 个可调用，本文件按切片推进并如实标注。
 //
-//  实现进度（P7 切片 1）：`GetInfo`、`Check` 已实现；其余 15 个 → `UNIMPLEMENTED`
-//  （切片 2 = 其余一元 RPC + 等价性矩阵；切片 3 = 3 个流式/代理 RPC）。
+//  实现进度：**17 个 RPC 全部实现**（切片 1 = 运维 2 个；切片 2 = 其余 12 个一元 RPC；
+//  切片 3 = 3 个流式/代理 RPC）。流式字节的翻译在 `grpc_streaming_io.{h,cpp}`。
 // =============================================================================
 #pragma once
 
@@ -31,7 +31,7 @@ class FileServiceAdapter final : public osdu::file::v1::FileService::Service {
   ::grpc::Status Check(::grpc::ServerContext* context, const osdu::file::v1::CheckRequest* request,
                      osdu::file::v1::CheckResponse* response) override;
 
-  //  ---- 其余 RPC：本切片明确回 UNIMPLEMENTED ----
+  //  ---- 一元 RPC（切片 1/2）----
   ::grpc::Status GetUploadLocation(::grpc::ServerContext*, const osdu::file::v1::GetUploadLocationRequest*,
                                  osdu::file::v1::LocationResponse*) override;
   ::grpc::Status GetFileLocation(::grpc::ServerContext*, const osdu::file::v1::GetFileLocationRequest*,
@@ -68,7 +68,7 @@ class FileServiceAdapter final : public osdu::file::v1::FileService::Service {
                               const osdu::file::v1::ServerSideCopyRequest*,
                               osdu::file::v1::ServerSideCopyResponse*) override;
 
-  //  ---- 流式（切片 3）----
+  //  ---- 流式 / 代理（切片 3）----
   ::grpc::Status UploadFile(::grpc::ServerContext*,
                           ::grpc::ServerReader<osdu::file::v1::UploadFileRequest>*,
                           osdu::file::v1::UploadFileResponse*) override;

@@ -51,6 +51,10 @@ class SingleStoreFactory final : public fss::domain::IBlobStoreFactory {
   fss::Result<fss::domain::IBlobStore*> ForPartition(std::string_view, fss::domain::StorageZone) override {
     return store_;
   }
+  //  两个 zone 共用同一个 store，因此只换一个指针。C7.10 用它把**记账装饰器**
+  //  插到"用例/两条协议"与真实驱动之间：这样能直接断言"区间读没有退化成整文件读"，
+  //  而不是靠 RSS 间接推断（RSS 在 1 MiB 区间上分辨不出来）。
+  void SetZoneStore(fss::domain::IBlobStore& store) { store_ = &store; }
 
  private:
   fss::domain::IBlobStore* store_;

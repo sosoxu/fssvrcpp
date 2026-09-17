@@ -1,24 +1,15 @@
-// FileServiceAdapter 实现（P7 切片 1：运维两个 RPC + 其余明确 UNIMPLEMENTED）。
+// FileServiceAdapter 实现（P7 切片 3：17 个 RPC 全部实现）。
 #include "adapters/grpc/file_service_adapter.h"
 
 #include "adapters/grpc/dto/grpc_dto.h"
 #include "adapters/grpc/grpc_error_mapper.h"
+#include "adapters/grpc/grpc_streaming_io.h"
 #include "app/usecases/caller_context.h"
 #include "app/usecases/usecases.h"
 
 #include <string>
 
 namespace fss::adapters::grpc {
-
-namespace {
-
-//  未实现的 RPC 统一回 UNIMPLEMENTED（契约 §5：`kUnimplemented` ↔ `UNIMPLEMENTED`）
-::grpc::Status NotYet(const char* rpc) {
-  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
-                      std::string(rpc) + " 尚未实现（P7 切片 2/3）");
-}
-
-}  // namespace
 
 ::fss::app::CallerContext FileServiceAdapter::CallerFrom(::grpc::ServerContext* context) const {
   const auto& metadata = context->client_metadata();
@@ -263,22 +254,81 @@ namespace {
 }
 
 // ---------------------------------------------------------------------------
-//  切片 2 / 3 的实现位置（保留签名以免"忘了实现"变成编译错误而不是运行错误）
+//  ⑮ ServerSideCopy（扩展：服务端复制字节，不写任何记录）
 // ---------------------------------------------------------------------------
-::grpc::Status FileServiceAdapter::ServerSideCopy(::grpc::ServerContext*,
-                                                const osdu::file::v1::ServerSideCopyRequest*,
-                                                osdu::file::v1::ServerSideCopyResponse*) {
-  return NotYet("ServerSideCopy");
+::grpc::Status FileServiceAdapter::ServerSideCopy(
+    ::grpc::ServerContext* context, const osdu::file::v1::ServerSideCopyRequest* request,
+    osdu::file::v1::ServerSideCopyResponse* response) {
+  const auto caller = CallerFrom(context);
+  fss::app::ServerSideCopy usecase(ports_);
+  const auto result = usecase.Execute(caller, request->source_file_source(),
+                                      request->target_file_source(),
+                                      StorageZoneFromProto(request->target_zone()));
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  FillServerSideCopyProto(result.value(), response);
+  return ::grpc::Status::OK;
 }
-::grpc::Status FileServiceAdapter::UploadFile(::grpc::ServerContext*,
-                                            ::grpc::ServerReader<osdu::file::v1::UploadFileRequest>*,
-                                            osdu::file::v1::UploadFileResponse*) {
-  return NotYet("UploadFile");
+
+// ---------------------------------------------------------------------------
+//  ⑯ UploadFile（客户端流）：首片必须是 `info`，其后全是 `chunk`
+// ---------------------------------------------------------------------------
+::grpc::Status FileServiceAdapter::UploadFile(
+    ::grpc::ServerContext* context,
+    ::grpc::ServerReader<osdu::file::v1::UploadFileRequest>* reader,
+    osdu::file::v1::UploadFileResponse* response) {
+  const auto caller = CallerFrom(context);
+  osdu::file::v1::UploadFileRequest first;
+  if (!reader->Read(&first)) {
+    return ::grpc::Status(::grpc::StatusCode::INVALID_ARGUMENT,
+                          "UploadFile 的第一个分片必须携带 info");
+  }
+  if (!first.has_info()) {
+    //  ★ 明确的协议错误，不是"当作空文件上传成功"
+    return ::grpc::Status(::grpc::StatusCode::INVALID_ARGUMENT,
+                          "UploadFile 的第一个分片必须携带 info（chunk 不能作为首片）");
+  }
+  const auto request = UploadStreamRequestFromProto(first.info());
+  if (!request.ok()) {
+    AttachErrorMetadata(*context, request.error());
+    return ToGrpcStatus(request.error());
+  }
+  //  首片已消费 → 只把**后续**分片暴露成字节源
+  GrpcUploadSource source(*reader, *context);
+  fss::app::UploadFile usecase(ports_);
+  const auto result = usecase.Execute(caller, request.value(), source);
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  FillUploadFileResponse(result.value(), response);
+  return ::grpc::Status::OK;
 }
+
+// ---------------------------------------------------------------------------
+//  ⑰ DownloadFile（服务端流）：数据分片 + 一个尾块（totalSize/checksum）
+// ---------------------------------------------------------------------------
 ::grpc::Status FileServiceAdapter::DownloadFile(
-    ::grpc::ServerContext*, const osdu::file::v1::DownloadFileRequest*,
-    ::grpc::ServerWriter<osdu::file::v1::DownloadFileResponse>*) {
-  return NotYet("DownloadFile");
+    ::grpc::ServerContext* context, const osdu::file::v1::DownloadFileRequest* request,
+    ::grpc::ServerWriter<osdu::file::v1::DownloadFileResponse>* writer) {
+  const auto caller = CallerFrom(context);
+  GrpcDownloadSink sink(*writer);
+  fss::app::DownloadFile usecase(ports_);
+  const auto result = usecase.Execute(caller, request->file_id(), request->file_source(),
+                                      request->offset(), request->length(), sink);
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  //  ★ 尾块：`chunk` 为空，携带完整大小与校验和（0 字节对象也会走到这里）
+  osdu::file::v1::DownloadFileResponse trailer;
+  FillDownloadTrailer(result.value(), &trailer);
+  if (!writer->Write(trailer)) {
+    return ::grpc::Status(::grpc::StatusCode::UNAVAILABLE, "下载流已断开（尾块写失败）");
+  }
+  return ::grpc::Status::OK;
 }
 
 }  // namespace fss::adapters::grpc

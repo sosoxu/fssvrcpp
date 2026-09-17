@@ -312,6 +312,23 @@ fss_add_test(test_grpc_basics
   LIBS    fss_app fss_grpc_adapter fss_blob_memory fss_location_memory fss_metadata_memory
   LABELS  "phase7;integration")
 
+# C7.6 + C7.10：流式上传/下载（1 GiB / 0 字节 / 中途取消）+ 与 HTTP Range 的字节一致
+# ★ 必须挂真实 POSIX 存储：内存适配器把对象整体放进 RAM，"流式"就无从度量（P6-D13）
+fss_add_test(test_grpc_streaming
+  SOURCES integration/test_grpc_streaming.cpp
+  LIBS    fss_app fss_grpc_adapter fss_http_adapter fss_blob_posix fss_location_sqlite
+          fss_metadata_memory fss_transfer fss_test_support Threads::Threads
+  LABELS  "phase7;integration")
+
+# C7.8：**真实二进制**（组合根）两个端口同时服务 + 并发混合协议读写
+fss_add_test(test_dual_protocol_concurrency
+  SOURCES integration/test_dual_protocol_concurrency.cpp
+  LIBS    fss_app fss_grpc_adapter fss_http_adapter fss_blob_memory fss_location_memory
+          fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase7;integration")
+# 该用例把 build/bin/fss_server 拉起来当被测进程 → 构建它必须先于本测试
+add_dependencies(test_dual_protocol_concurrency fss_server)
+
 # C6.12：GC 租约（在途不删 / 过期回收 / 原子领取不重复删 / 有记录永不删）
 fss_add_test(test_gc_lease
   SOURCES integration/test_gc_lease.cpp

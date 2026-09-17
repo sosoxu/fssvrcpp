@@ -13,6 +13,8 @@
 //
 //  ⚠️ 鉴权在本阶段是 **allow-all**（只要求 token 非空），启动时必须打印显著告警
 //     （契约 §8 的 C8.5）；P8 会替换成真实的 JWT/Entitlements 校验。
+#include "adapters/grpc/file_service_adapter.h"
+#include "adapters/grpc/grpc_server.h"
 #include "adapters/http/router.h"
 #include "app/services/location_issuer.h"
 #include "app/usecases/usecases.h"
@@ -192,6 +194,10 @@ int main(int /*argc*/, char** /*argv*/) {
   const std::string sqlite_path = Env("FSS_SQLITE_PATH", storage_root + "/location.db");
   const std::string transfer_secret = Env("FSS_TRANSFER_SECRET", "dev-secret-change-me");
   const int port = EnvInt("FSS_HTTP_PORT", 8080);
+  //  ---- gRPC 面（P7）：与 REST **同一个进程、同一批端口实现**同时服务（C7.8）----
+  //    0  = 关闭（默认关闭，保持"RPC 是平台外扩展"的默认姿态，ADR-001）
+  //    -1 = 由系统分配端口（启动横幅里给出实际端口，供测试/脚本使用）
+  const int grpc_port_config = EnvInt("FSS_GRPC_PORT", 0);
   const std::string bind_address = Env("FSS_BIND_ADDRESS", "0.0.0.0");
   //  ★ 自签 URL 的 `<base>` 必须**包含路由 base path**：数据面挂在
   //    `/api/file/v1/transfer/{token}`（契约 §7 / §2 表），若这里只给 `host:port`，
@@ -311,6 +317,24 @@ int main(int /*argc*/, char** /*argv*/) {
 
   adapters::http::Router router(ports, transfers, router_options);
 
+  //  ---- gRPC 面：与 REST 共用**同一个** `UseCasePorts`（C7.8：双协议同时运行）----
+  //  ★ 与 HTTP 面一样，服务的具体实现只在这里创建（R12）；两个服务共用同一批
+  //    端口实现（同一个 blob/location/metadata 实例），因此两条链路看到同一份状态。
+  //  ★ 组合根**不直接**碰 grpc 类型：服务器的生命周期收在 `adapters/grpc/grpc_server.h`
+  //    的包装里（C7.7 的护栏要求 `src/` 全树除 adapters/grpc/ 外不出现 `<grpcpp/`；
+  //    与 `fss_http` 把 httplib 挡在适配层内是同一条纪律）。
+  std::unique_ptr<adapters::grpc::FileServiceAdapter> grpc_service;
+  std::unique_ptr<adapters::grpc::GrpcServerHandle> grpc_server;
+  if (grpc_port_config != 0) {
+    grpc_service = std::make_unique<adapters::grpc::FileServiceAdapter>(ports, "osdu-user");
+    grpc_server =
+        adapters::grpc::StartGrpcServer(*grpc_service, bind_address, grpc_port_config);
+    if (!grpc_server->ok()) {
+      std::cerr << grpc_server->last_error() << "\n";
+      return 1;
+    }
+  }
+
   http::ServerOptions server_options;
   server_options.bind_address = bind_address;
   server_options.port = port;
@@ -326,6 +350,10 @@ int main(int /*argc*/, char** /*argv*/) {
 
   std::cout << "fss_server 已启动\n"
             << "  bind           : " << bind_address << ":" << server.port() << "\n"
+            << "  grpc bind      : "
+            << (grpc_server ? bind_address + ":" + std::to_string(grpc_server->port())
+                            : std::string("disabled（FSS_GRPC_PORT=0）"))
+            << "\n"
             << "  base path      : " << router_options.base_path << "\n"
             << "  storage driver : " << storage_driver << "\n"
             << "  storage root   : " << storage_root << "\n"
@@ -336,5 +364,14 @@ int main(int /*argc*/, char** /*argv*/) {
   std::cout.flush();
 
   server.Listen();
+
+  //  ★ 退出路径必须**显式**关掉 gRPC 服务：`grpc::Server` 是 joinable 的资源，
+  //    提前 return 或析构顺序不当会让进程挂在 gRPC 的线程池上（与"先 stop 再 join"
+  //    同一条纪律，见 AGENTS.md §4.3）。
+  if (grpc_server) {
+    grpc_server->Shutdown();
+    grpc_server.reset();
+  }
+  grpc_service.reset();
   return 0;
 }

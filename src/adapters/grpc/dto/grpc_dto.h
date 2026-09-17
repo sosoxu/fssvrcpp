@@ -70,4 +70,21 @@ fss::Result<fss::app::FileListRequest> FileListRequestFromProto(
 std::vector<fss::app::CopyFileSource> CopySourcesFromProto(
     const osdu::file::v1::CopyDmsRequest& proto);
 
+//  ---- 扩展 RPC（P7 切片 3：流式上传/下载 + 服务端复制）----
+//  `UploadFileInfo` → 上传用例输入（`registerMetadata=true` 时带上 metadata 记录）。
+//  ★ 返回 `Result` 而不是"尽力而为"的结构体：`metadata` 段的结构错误必须**显式报错**，
+//    静默丢掉它会让 `registerMetadata=true` 变成"上传成功但没登记记录"。
+fss::Result<fss::app::UploadStreamRequest> UploadStreamRequestFromProto(
+    const osdu::file::v1::UploadFileInfo& proto);
+void FillUploadFileResponse(const fss::app::UploadStreamResult& result,
+                            osdu::file::v1::UploadFileResponse* out);
+//  下载流的**尾块**（`chunk` 为空，只携带 totalSize/checksum）
+void FillDownloadTrailer(const fss::app::DownloadStreamResult& result,
+                         osdu::file::v1::DownloadFileResponse* out);
+void FillServerSideCopyProto(const fss::app::ServerSideCopyResult& result,
+                             osdu::file::v1::ServerSideCopyResponse* out);
+//  proto 的 `targetZone` → 领域 zone。★ `STORAGE_ZONE_UNSPECIFIED` 取 **persistent**
+//  （该 RPC 的用途是"搬到持久区"；未指定时按这个语义处理，已在契约 §4 登记）。
+fss::domain::StorageZone StorageZoneFromProto(osdu::file::v1::StorageZone zone);
+
 }  // namespace fss::adapters::grpc

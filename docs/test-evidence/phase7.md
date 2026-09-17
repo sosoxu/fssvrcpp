@@ -1,123 +1,128 @@
-# 阶段 7 测试证据（进行中）
+# 阶段 7 测试证据（✅ 已完成）
 
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P7（gRPC 适配层 + 双协议等价性；RPC 是**平台外扩展**，见 ADR-001） |
-| 状态 | 🚧 **进行中 —— 切片 2/3 完成**（14 个一元 RPC 全部实现 + 契约 §6 等价性矩阵 + `json_name` 对齐） |
+| 状态 | ✅ **已完成并通过门槛 —— C7.1~C7.10 全部满足**（3 个切片全部收口） |
 | 门槛命令 | `ctest -L phase7` |
-| 退出码 | `0`（**4 测试 / 483 断言**） |
+| 退出码 | `0`（**6 测试 / 5354 断言**） |
 
-测试明细（`ctest -L phase7` 的 4 个二进制）：
+测试明细：
 
-| 测试 | 用例 | 断言 |
-| --- | --- | --- |
-| `test_error_equivalence`（conformance，C7.2） | 3 | 188 |
-| `test_grpc_basics`（integration，C7.1） | 4 | 30 |
-| `test_protocol_equivalence`（conformance，C7.3/C7.4） | 3 | 222 |
-| `test_proto_json_mapping`（unit，C7.5） | 2 | 43 |
-
-> **剩余（切片 3/3）**：3 个扩展 RPC 的字节通道（`UploadFile` / `DownloadFile` / `ServerSideCopy`）
-> + C7.6（流式 1 GiB / 0 字节 / 中途取消）+ C7.8（REST 与 gRPC **同时**运行）+ C7.10（gRPC 流式下载
-> 与 HTTP `Range` 的 SHA-256 一致）。当前这 3 个 RPC 明确回 `UNIMPLEMENTED`，由
-> `test_grpc_basics` 的"切片边界"用例钉住（**不会**因为"忘了实现"而静默变成别的错误）。
+| 测试 | 用例 | 断言 | 覆盖 |
+| --- | --- | --- | --- |
+| `test_error_equivalence`（conformance） | 3 | 188 | C7.2 |
+| `test_grpc_basics`（integration） | 4 | 33 | C7.1（运维 RPC + 错误语义 + 不再 UNIMPLEMENTED） |
+| `test_protocol_equivalence`（conformance） | 3 | 222 | C7.3（矩阵 12 行）+ C7.4 |
+| `test_proto_json_mapping`（unit） | 2 | 43 | C7.5 |
+| `test_grpc_streaming`（integration） | 8 | 4795 | C7.1 / C7.6 / C7.10 |
+| `test_dual_protocol_concurrency`（integration） | 1 | 73 | C7.8（**真实二进制**） |
 
 ---
 
-## 1. 切片 1 交付物（已完成）
+## 1. 三个切片交付物
+
+### 切片 1（错误表 + 运维 RPC + proto 护栏）
 
 | 路径 | 内容 |
 | --- | --- |
-| `cmake/ProtoGen.cmake` + `fss_proto` | proto → C++/gRPC 代码生成（P0/P1 已就绪，切片 1 首次真正使用） |
-| `src/domain/contract/error_table.{h,cpp}` | **契约 §5 的唯一权威表**（L3，无协议类型）：`ErrorKind` → REST `(status, reason)` + gRPC `(code, name)` |
-| `src/adapters/http/http_error_mapper.cpp` | `HttpStatusFor`/`ReasonFor` 改为**从共享表派生**（此前是本地 switch） |
-| `src/adapters/grpc/grpc_error_mapper.{h,cpp}` | 同一张表的 gRPC 投影 + 尾随元数据 `fss-error-kind` / `fss-error-details` |
-| `src/app/usecases/caller_context.{h,cpp}` | **两条协议共用**的调用方解析（REST 头 / gRPC metadata 同名键） |
-| `tests/conformance/test_error_equivalence.cpp` | C7.2：契约 §5 逐行（**手抄**的期望值）× 实现表 × 两个适配器 |
-| `tests/unit/test_layering_guard.cpp` | C7.7：proto 头只能出现在 `adapters/grpc/`（含 4 条自证用例） |
+| `src/domain/contract/error_table.{h,cpp}` | **契约 §5 的唯一权威表**（L3，无协议类型） |
+| `src/adapters/http/http_error_mapper.cpp` | `HttpStatusFor`/`ReasonFor` 改为**从共享表派生** |
+| `src/adapters/grpc/grpc_error_mapper.{h,cpp}` | gRPC 投影 + 尾随元数据 `fss-error-kind` / `fss-error-details` |
+| `src/app/usecases/caller_context.{h,cpp}` | 两条协议共用的调用方解析 |
+| `tests/unit/test_layering_guard.cpp` | C7.7：proto 头只能出现在 `adapters/grpc/`（含 4 条自证） |
 
-## 2. 切片 2 交付物
+### 切片 2（14 个一元 RPC + 等价性矩阵）
 
 | 路径 | 内容 |
 | --- | --- |
-| `src/adapters/grpc/file_service_adapter.{h,cpp}` | **14 个一元 RPC 全部实现在真实端口上**：`GetInfo`/`Check`/`GetUploadLocation`/`GetFileLocation`/`GetDownloadLocation`/`GetFileList`/`CreateFileMetadata`/`GetFileMetadata`/`DeleteFileMetadata`/`GetStorageInstructions`/`GetRetrievalInstructions`/`CopyFilesToPersistent`/`GetFileSignedUrl`/`RevokeUrl`；仅剩 3 个扩展 RPC 回 `UNIMPLEMENTED` |
-| `src/adapters/grpc/dto/grpc_dto.{h,cpp}` | proto ↔ 领域全字段双向转换（presence 语义、`Struct`/`tags`/`meta`、枚举↔小写驱动名、`Timestamp`↔epoch）+ 8 个 `Fill*Proto` 投影 + 请求侧解析 |
-| `src/app/usecases/wire_shapes.{h,cpp}` | **两条协议共用的"线上形状"**（L4）：`FileNameOfPath`、`DmsLocationJson(...)`（DMS/Delivery 的 location JSON）、`FileSourceFromRecordNode`。REST 的 `dto.cpp` 与 gRPC 适配器**都**从这里取，避免两处各写一份 JSON |
-| `tests/framework/grpc_fixture.h` | `GrpcFixture`（真实 gRPC 端口 + 真实 channel + 调用元数据）+ **`DualProtocolFixture`**（REST 与 gRPC 挂在**同一份** metadata/location/blob 状态上） |
-| `tests/conformance/test_protocol_equivalence.cpp` | C7.3 契约 §6 矩阵（12 行）+ 错误分类等价 + C7.4 `SignedUrlEquivalent`（含 4 条反向测试） |
-| `tests/unit/test_proto_json_mapping.cpp` | C7.5：proto3-JSON 的键名与契约 §3.3 黄金样例逐字段对齐，且能被**领域解析器**接受（不是只比字符串） |
-| `tests/integration/test_grpc_basics.cpp` | 更新切片边界：已实现 RPC 的线上错误语义（`NOT_FOUND` + 尾随元数据、缺 token → `UNAUTHENTICATED`）+ 剩余 3 个 RPC 的 `UNIMPLEMENTED` |
+| `src/adapters/grpc/file_service_adapter.{h,cpp}` | 14 个一元 RPC 在真实端口上实现 |
+| `src/adapters/grpc/dto/grpc_dto.{h,cpp}` | proto ↔ 领域全字段双向转换 + 投影/解析 |
+| `src/app/usecases/wire_shapes.{h,cpp}` | 两条协议**共用**的线上形状（`DmsLocationJson` / `FileSourceFromRecordNode`），REST 与 gRPC 都从这里取 |
+| `tests/conformance/test_protocol_equivalence.cpp` | C7.3 矩阵 12 行 + C7.4（含 4 条反向测试） |
+| `tests/unit/test_proto_json_mapping.cpp` | C7.5 黄金样例逐字段互操作 |
 
-## 3. 判据进展
+### 切片 3（3 个扩展 RPC + 组合根双端口 + 流式判据）
+
+| 路径 | 内容 |
+| --- | --- |
+| `src/app/usecases/usecases.{h,cpp}`（新增 3 个用例） | `UploadFile`（客户端流）/ `DownloadFile`（服务端流）/ `ServerSideCopy`：授权、位置记录解析、存储副作用、审计都在 L4；`registerMetadata=true` 复用**同一个** `CreateFileMetadata` 12 步用例 |
+| `src/adapters/grpc/grpc_streaming_io.{h,cpp}` | gRPC 流 ↔ `ByteSource`/`ByteSink` 的翻译层（≤64 KiB 分片；**取消 ≠ EOF**） |
+| `src/adapters/grpc/file_service_adapter.cpp` | 17/17 RPC 实现（`UNIMPLEMENTED` 分支全部消失） |
+| `src/adapters/grpc/grpc_server.{h,cpp}` | gRPC 服务器的**生命周期包装**（`StartGrpcServer` / 端口 / `Shutdown()`）：让组合根不必出现 `<grpcpp/`，从而**不放宽** C7.7 的护栏（P7-D09） |
+| `src/main/server_main.cpp` | 组合根**同时**开 REST 与 gRPC 两个端口（`FSS_GRPC_PORT`；`-1` = 系统分配，横幅给出实际端口），gRPC 侧通过 `GrpcServerHandle` 持有 |
+| `tests/integration/test_grpc_streaming.cpp` | C7.6（1 GiB / 0 字节 / 中途取消 / 慢客户端）+ C7.10（与 HTTP `Range` 字节一致且不整文件读）+ 授权锚点 |
+| `tests/integration/test_dual_protocol_concurrency.cpp` + `tests/framework/server_process.h` | C7.8：拉起**真实 `fss_server`**，两个端口并发混合协议读写同一份状态 |
+
+## 2. 判据进展（全部满足）
 
 | 判据 | 状态 | 证据 |
 | --- | --- | --- |
-| **C7.2** 错误码双向映射无空缺 | ✅ | `test_error_equivalence` 3 用例 / 188 断言：14 行逐字段比对（REST 状态 + reason + gRPC 枚举数值 + `Error` 走一遍）+ 枚举无空缺 + 状态码集合相等 + 越界枚举值不返回 OK |
-| **C7.7** proto 隔离护栏 | ✅ | `test_layering_guard`：L3/L4 禁止 `osdu/file/v1`/`<google/protobuf>`/`<grpcpp/`；"proto 头只能出现在 `adapters/grpc/`"规则 + 4 条自证（域/应用/HTTP 命中必须失败、gRPC 目录必须放行） |
-| **C7.1** 17 个 RPC 可调用 | 🚧 **14/17** | 14 个一元 RPC 在真实端口上跑通（`test_grpc_basics` 4 用例 / 30 断言 + 矩阵测试覆盖其中 12 个）；3 个流式/代理 RPC 明确 `UNIMPLEMENTED`（切片 3） |
-| **C7.3** 契约 §6 矩阵 12 行 | ✅ | `test_protocol_equivalence` 用例 2：`GetUploadLocation`/`GetFileLocation`/`GetDownloadLocation`/`GetFileList`/`CreateFileMetadata`/`GetFileMetadata`/`DeleteFileMetadata`/`GetStorageInstructions`/`GetRetrievalInstructions`/`CopyFilesToPersistent`/`GetFileSignedUrl`/`RevokeUrl` 逐行比较**领域结果 + 副作用 + 错误分类** |
-| **C7.4** `SignedUrlEquivalent` | ✅ | 同一测试文件用例 1：自签 URL 的 token 用 `HmacTransferTokenCodec::Decode` **验签并解码**后逐项比对 `partition/file_id/container/object_key/zone/op`；4 条**反向测试**（改 query 名 / 改 token 声明 / 换 host/scheme / 换对象）必须判不等 |
-| **C7.5** proto `json_name` 对齐 | ✅ | `test_proto_json_mapping` 2 用例 / 43 断言：黄金样例经 proto3-JSON 序列化后，`data` 内 PascalCase、信封 camelCase，且**领域解析器**能吃下同一份 JSON；`SignedURL`/`providerKey`/`storageLocation` 三个易错键单独钉住 |
-| C7.6 / C7.8 / C7.10 | ⬜ 未开始 | 见开头"剩余"（切片 3） |
+| **C7.1** 17 个 RPC 可调用 | ✅ **17/17** | 14 个一元 RPC（`test_grpc_basics` + 矩阵）+ 3 个扩展 RPC（`test_grpc_streaming`）；`test_grpc_basics` 用**非法输入**断言三者都**不再**回 `UNIMPLEMENTED`（INVALID_ARGUMENT / NOT_FOUND） |
+| **C7.2** 错误码双向映射无空缺 | ✅ | `test_error_equivalence` 3 用例 / 188 断言（14 行逐字段 + 枚举无空缺 + 越界不返回 OK） |
+| **C7.3** 契约 §6 矩阵 12 行 | ✅ | `test_protocol_equivalence`（领域结果 + 副作用 + 错误分类）+ `test_dual_protocol_concurrency`（跨协议交叉读） |
+| **C7.4** `SignedUrlEquivalent` | ✅ | 自签 token 验签解码后比声明 + 4 条反向测试 |
+| **C7.5** proto `json_name` 对齐 | ✅ | `test_proto_json_mapping` 2 用例 / 43 断言 |
+| **C7.6** 流式（1 GiB / 0 字节 / 取消 / 慢客户端） | ✅ | `test_grpc_streaming`：1 GiB 上传+下载 **RSS 增长 < 64 MiB**（含"整块读回"对照必须被同一测量抓到）、独立 SHA-256、0 字节、**中途取消**（无 `.tmp.` 残留 / fd 不增长 / 对象未被截断）、慢客户端（分片间停顿 0.4 s） |
+| **C7.7** proto 隔离护栏 | ✅ | `test_layering_guard`（L3/L4/HTTP 禁止 proto 头 + 4 条自证） |
+| **C7.8** gRPC 与 REST 同时运行 | ✅ | `test_dual_protocol_concurrency`：真实 `fss_server`（`FSS_GRPC_PORT=-1`），4×REST + 4×gRPC 线程并发读写同一批记录，0 失败；跨协议内容一致 |
+| **C7.9** 回归（P0–P6 全绿） | ✅ | `./scripts/run_all_gates.sh`：phase0~7 全部通过（见 §6） |
+| **C7.10** gRPC 区间读 == HTTP `Range` | ✅ | 相同 offset/length 下 SHA-256 逐字节一致，且**两条链路都走区间读**（在 `IBlobStore::get` 边界上用记账装饰器断言 `last_range` 与 `whole_reads == 0`） |
 
-### 3.1 契约 §6 中"签名 URL 等价"的判据已按实测细化
+## 3. 契约 §6 的判据修订（切片 2，保留记录）
 
-切片 2 实测暴露：集中存储模式下 REST 与 gRPC 返回的**是自签传输 URL**
-（`/v1/transfer/<token>?exp=…&sig=…`），其 path 里内嵌的是**密文**，每次签发带新 nonce —
-"path 相同"这条判据**永远不可能成立**。契约 §6 原文的判据（"path 相同"）据此改为**分两种形态**：
-通用形态（签名在 query，如 S3 预签名）仍比 path；自签形态则比
-`/v1/transfer/` 前缀 + query 键集合 + 过期 ±5s + **解码后的 token 声明逐项相等**。
-这是**判据从"字面"到"语义"的收紧而非放宽**：解码比对能区分"两条链路指向同一条位置记录"
-与"两条链路各自签发了一个 URL"，只比状态码做不到后者。
+自签传输 URL（`/v1/transfer/<token>?exp=…&sig=…`）的 path 内嵌**密文 + 随机 nonce**，
+"path 相同"**永远不成立**。判据改为分形态：通用形态比 path；自签形态比
+`/v1/transfer/` 前缀 + query 键集合 + 过期 ±5 s + **解码后的 token 声明逐项相等**
+（`partition/file_id/container/object_key/zone/op`）。这是**收紧**而非放宽 ——
+只比状态码无法区分"同一条位置记录"与"各自签发了一个 URL"。
+
+切片 3 又补了一行：`UploadFile`/`DownloadFile` 与 REST 数据面的等价性用
+**内容一致**判定（同一批字节的 SHA-256 / 同一区间的 SHA-256），因为二者没有可逐字段
+比较的响应体（契约 §6 的扩展对照表）。
 
 ## 4. 自证对照（R1：关键断言必须能区分"实现正确"与"测试无效"）
 
 | 注入点 | 注入内容 | 期望失败 | 实测 |
 | --- | --- | --- | --- |
-| `GrpcDto::FillFileLocationProto` | `set_driver("posix_INJECTED")`（只改 gRPC 一侧投影） | 矩阵第 2 行的 `rpc_location.driver() == REST Driver` 必须失败 | ✅ `test_protocol_equivalence.cpp:309 FAILED` |
-| `domain/contract/error_table.cpp` | `kNotFound` 行的 gRPC 列 `kNotFound/"NOT_FOUND"` → `kInvalidArgument/"INVALID_ARGUMENT"` | ① 手抄契约期望值的 `test_error_equivalence` 必须失败；② 双协议错误分类必须失败 | ✅ `test_error_equivalence.cpp:69,119 FAILED` + `test_protocol_equivalence.cpp:560,580 FAILED` |
-| `build/tests/CMakeFiles/_zz_selftest.dir/link.txt`（**只注入到构建目录，不动 `src/`**） | 伪造一份链接 `libfss_domain.a` + `libfss_http.a`（或 `libfss_app.a` + `libfss_proto.a`）的 `link.txt` | 修好的 C2.1 传递闭包佐证必须**仍然能判失败**（否则"改成遍历"只是把检查变成恒真） | ✅ `纯分层测试 _zz_selftest.dir 链接了 fss_http`，`verify_link_graph.sh` 退出码 **1**；清理后退出码 **0** |
+| `GrpcDto::FillFileLocationProto` | gRPC 侧 driver 拼错（只改一侧投影） | 矩阵第 2 行的 `driver` 必须失败 | ✅ `test_protocol_equivalence.cpp:309 FAILED` |
+| `domain/contract/error_table.cpp` | `kNotFound` 的 gRPC 列改成 `INVALID_ARGUMENT` | 手抄期望值的 C7.2 + 双协议错误分类必须失败 | ✅ `test_error_equivalence.cpp:69,119` + `test_protocol_equivalence.cpp:560,580 FAILED` |
+| `build/tests/CMakeFiles/_zz_selftest.dir/link.txt`（只动构建目录） | 伪造一份链接 `libfss_domain.a` + `libfss_http.a` 的 `link.txt` | 修好的 C2.1 传递闭包佐证必须仍能判失败 | ✅ 退出码 1；清理后 0（P7-D06） |
+| `grpc_streaming_io.cpp` | 去掉 `IsCancelled()` 分支 → **把取消当 EOF** | 取消用例必须发现"截断对象被提交" | ✅ `test_grpc_streaming.cpp:379 FAILED`（`downloaded.bytes == 0` 不成立）—— P7-D07 |
+| `DownloadFile::Execute` | `ByteRange{}`（忽略区间，整文件读） | C7.10 必须失败 | ✅ `test_grpc_streaming.cpp:408 FAILED`（字节数不等于区间长度） |
+| `DownloadFile::Execute` | **整块读回再切片**（返回的字节正确，但读了整文件） | 端口级记账必须抓到 | ✅ `test_grpc_streaming.cpp:410 FAILED`（`recording.last_range.length` 不等于请求区间） |
+| `server_process.h` | 组合根改成 `FSS_GRPC_PORT=0`（关掉 gRPC） | C7.8 用例必须失败 | ✅ `server_process.h:76 FAILED`（解析不到 gRPC 端口） |
+| `UploadFile::Execute` | 去掉"位置记录是授权锚点"的校验（允许任意 file_source） | 授权锚点用例必须失败 | ✅ `test_grpc_streaming.cpp:548 FAILED`（伪造 file_source 未被拒绝） |
 
-两次注入都**只改一侧**（gRPC 投影 / 权威表），这证明：
-- 矩阵确实在逐字段比较**两条链路各自的输出**，不是拿一份数据比它自己；
-- C7.2 的"手抄期望值"确实独立于实现表（表被改坏时能抓到），而不是从表里生成期望值。
-
-注入已全部回滚；`git diff -- src/` 中不含 `INJECTED` 标记（`run_all_gates.sh` 的前置检查会拦）。
+注入已全部回滚；`git diff -- src/` 中不含 `FSS_SELFTEST`/`INJECTED` 标记
+（`run_all_gates.sh` 的前置检查会拦）。
 
 ## 5. 本阶段发现的实现陷阱
 
 | 编号 | 症状 | 根因 | 规避 |
 | --- | --- | --- | --- |
-| **P7-D01** | 编译期一片 `'Status' in namespace 'fss::adapters::grpc' does not name a type` | **命名空间名 `grpc` 把全局 `::grpc` 遮蔽了**：在 `namespace fss::adapters::grpc` 内部，`grpc::Status` 解析到本命名空间 | 库类型一律写全局限定 `::grpc::Status` / `::grpc::StatusCode`（本目录所有文件已生效）。同类问题在 `namespace http` 下用 `httplib::` 不会出现（名字不同），**只有与库同名的命名空间才会踩** |
-| **P7-D02** | `SignedUrlEquivalent` 用字面 path 比较时，REST 与 gRPC 的 URL 必然不等，把"实现正确"判成失败 | 自签 token 是**密文 + 随机 nonce**，`path` 每次不同（见 §3.1） | 判据改为"验签解码后比声明"；并用 4 条反向测试保证判据不是恒真（只比 `exp` 之类会恒真） |
-| **P7-D03** | 双协议测试里 gRPC 侧返回 `UNAUTHENTICATED`，而 REST 侧 200 | 早期 fixture 在 gRPC 分支**忘了带调用元数据**（`authorization` / `data-partition-id`），REST 分支走了 `Authed()` | 统一用 `fx.Context()` 构造带元数据的 `ClientContext`；并保留一条"缺 token → `UNAUTHENTICATED`"的**正向**用例（契约 §5 那一行） |
-| **P7-D04** | `GetStorageInstructions` 连续调用两次得到**不同**的 `file_id`，无法字面比对 | 该 RPC 每次调用都新建空对象（契约 §6 该行"创建空对象 + 新增 1 条位置记录"） | 该行只比**键集合与形状**（`providerKey`/`storageLocation` 的键），不比生成型 id；并在契约 §6 行内注明"内容可不同" |
-| **P7-D05** | proto3-JSON 序列化结果里**缺少**默认值字段（如 `"Number":0` 不出现），逐字段断言失败 | proto3 的 JSON 打印**省略默认值**（与 proto3 无 unknown-field 保留同源） | 断言改为"非默认值必须出现"，并对默认值字段单独断言其**存在性语义**；契约 §3.3 的互操作按"领域解析器能吃下"判定，而非"键集合完全相等" |
-| **P7-D06** | `run_all_gates.sh` 在**没有越层依赖**时报告「phase2 链接图出现越层依赖」，门槛整体失败 | `scripts/verify_link_graph.sh` 的传递闭包佐证写成 `find ... \| head -50 \| xargs grep -l ... \| head -1`。插桩前 `build/tests` 下的 `link.txt` 少于 50 个（`head` 不会提前关闭管道）；切片 2 新增 2 个测试目标后变成 **61 个**，`head -50` 提前退出 → 上游 `find` 收到 **SIGPIPE** → `set -euo pipefail` 下整条管道返回 **141** → 函数被 `set -e` 中止 → 判为"越层依赖"（**与真实原因完全无关**）。同一文件里"取第一个 `DependInfo.cmake`"也用了 `\| head -1`，属同一类隐患 | ① 一律改成"全文收集后再用 `sed -n 1p` 取第一行"（`sed` 读完全部输入，不会关闭管道）；`check_io_uring.sh`（`docker images \| grep \| head -1`）与 `verify_http_hardening.sh`（`grep \| head -20`）同类写法一并修正。② 顺带把传递闭包佐证从"随便挑一个链接 `fss_domain` 的可执行文件"改成**遍历所有"不含传输适配器"的纯分层可执行文件**（30 个）：原写法一旦挑中 phase4 起的端到端测试（它们本来就合法链接 `fss_http_adapter`）会**误报污染**；并补了注入自证（见 §4） |
+| **P7-D01** | 编译期一片 `'Status' in namespace 'fss::adapters::grpc' does not name a type` | **命名空间名 `grpc` 遮蔽了全局 `::grpc`** | 库类型一律写 `::grpc::Status` / `::grpc::StatusCode` |
+| **P7-D02** | `SignedUrlEquivalent` 用字面 path 比较，REST 与 gRPC 的 URL 必然不等 | 自签 token 是密文 + 随机 nonce | 判据改为"验签解码后比声明"，并配 4 条反向测试防恒真 |
+| **P7-D03** | 双协议测试里 gRPC 侧 `UNAUTHENTICATED` 而 REST 侧 200 | 早期 fixture 在 gRPC 分支忘了带调用元数据 | 统一用 `fx.Context()`；保留"缺 token → UNAUTHENTICATED"正向用例 |
+| **P7-D04** | `GetStorageInstructions` 两次调用得到**不同** `file_id`，无法字面比对 | 每次调用都新建空对象（契约 §6 该行"创建空对象"） | 该行只比键集合与形状；契约 §6 行内注明"内容可不同" |
+| **P7-D05** | proto3-JSON 缺少默认值字段（`"Number":0` 不出现） | proto3 的 JSON 打印省略默认值 | 断言"非默认值必须出现"+ 存在性语义；互操作按"领域解析器能吃下"判定 |
+| **P7-D06** | 没有越层依赖时，门槛报"phase2 链接图出现越层依赖" | `find … \| head -50` 在 `link.txt` 从 49 涨到 61 个后触发 **SIGPIPE** → `pipefail` 下 141 → `set -e` 中止 | 改"全文收集 + `sed -n 1p`"；同类 `\| head` 写法一并修正；传递闭包佐证从"随便挑一个"改为遍历 30 个纯分层二进制 + 注入自证 |
+| **P7-D07** | 客户端**中途取消**上传后，`.tmp.` 临时文件残留；更严重的是**去掉取消判断后截断的对象被当成完整对象提交** | `ServerReader::Read()` 在"正常读完"与"被取消"两种情况下都返回 false；把后者当 EOF → `put` 正常 rename 半截对象 | ① `GrpcUploadSource` 持有 `ServerContext`，`Read()==false` 后查 `IsCancelled()`：取消 → `kUnavailable`（**不是** EOF），让存储层走失败清理；② 测试用**轮询**等待服务端清理完成（客户端 `Finish()` 返回时服务端可能还在写） |
+| **P7-D09** | 加完组合根的 gRPC 启动后，phase1 的**护栏自证**报"基线不通过"：`src/main/server_main.cpp` 出现 `<grpcpp/`（C7.7 的护栏在 `src/` 全树除 `adapters/grpc/` 外一律禁止） | 看似是"护栏与 R12（组合根创建具体实现）冲突"，实际是**组合根直接抓住了第三方库类型**。`src/main` 早就只 include `fss_http` 的包装头（httplib 同样被挡在 `common/http/` 内），gRPC 缺了对应的一层 | **不放宽护栏**：新增 `adapters/grpc/grpc_server.{h,cpp}`（只暴露 `StartGrpcServer` / 端口 / `Shutdown()`），组合根持有 `unique_ptr<GrpcServerHandle>`，看不到任何 grpc 类型。`verify_guard.sh` 的 ①~⑤ 全部恢复通过 |
+| **P7-D08** | `UploadFile(registerMetadata=true)` 报"metadata 的 data.FileSource 与上传目标不一致"，但两者明明是同一个值 | 测试 fixture `AppFixture::MakeRecord` 没置 `data.dataset_properties.present`，而 proto 侧用 `present` 判断整段是否存在（proto3 无字段 presence）→ 记录经 proto 往返**整段丢失** | fixture 显式置 `present = true`；这类"看起来有值、proto 往返后消失"的字段必须由 `present` 表达（已写入 AGENTS.md §4.3 的同类条目） |
 
-## 6. 已知表达力差异（如实登记，不静默丢失）
-
-1. proto3 **没有未知字段保留**：领域模型用 `extra`（`json::Value`）承载的**未识别字段**
-   无法经 proto 往返。当前规则：
-   - 领域 → proto：`data.extra["ExtensionProperties"]` → `data.extension_properties`；
-     `data.extra` 里的其它键**不会**出现在 proto 里；
-   - proto → 领域：`data.extension_properties` → `data.extra["ExtensionProperties"]`。
-   因此"全字段无损往返"只在 **REST 链路**上成立（C6.1 的语境）；RPC 链路的等价性按
-   **已建模字段**比对（C7.3 的矩阵比较的是**领域结果**，不是 JSON 字符串）。
-2. proto3-JSON **省略默认值**（见 P7-D05）：空字符串/0 字段不出现。需要"显式为空"的语义时，
-   用 message 包裹（proto3 无 `optional`，见 AGENTS.md §1）。
-3. DMS/Delivery 的 location JSON 在 REST 侧输出 `connectionString: null`，而 proto3 的 `string`
-   无法表达"显式 null"——该行的等价性判据是**键集合 + 非空字段**（矩阵用例内已如实注释）。
-
-## 7. 收工验证（切片 2）
+## 6. 收工验证（切片 3 + 阶段收口）
 
 | 命令 | 结果 |
 | --- | --- |
-| `ctest --test-dir build -L phase7 --output-on-failure` | ✅ **4 测试 / 483 断言** 全通过（error_equivalence 188 / proto_json_mapping 43 / protocol_equivalence 222 / grpc_basics 30） |
-| `./scripts/check_docs.sh` | ✅ D1~D5 全通过（47 个本地链接、ADR 索引完整、阶段表与 `IMPLEMENTED_PHASES` 一致） |
-| `./scripts/run_all_gates.sh` | ✅ **全部已启用阶段（0~7）门槛通过**，`失败: 无`（完整日志：`build/gates-slice2.log`）。摘要：phase0 ✅ / phase1 ✅（含护栏自证、H-2 自证）/ phase2 ✅（链接图 + 能力护栏自证）/ phase3 ✅ / phase4 ✅（组合根护栏自证）/ phase5 ✅（驱动切换）/ phase6 ✅ / phase7 ✅ |
-| sanitizer（`run_all_gates.sh` 内嵌，`build-asan`） | ✅ **ASan + UBSan + LSan 全绿**，含 `ctest -L phase7`（sanitizer 下 4 个测试全通过）—— gRPC 侧未触发 P1-D20 的布局耦合问题（`GRPC_ASAN_SUPPRESSED=1` 生效） |
+| `ctest --test-dir build -L phase7 --output-on-failure` | ✅ **6 测试 / 5354 断言** 全通过（明细见开头表） |
+| `./scripts/check_docs.sh` | ✅ D1~D5 全通过（链接、ADR 索引、阶段表与 `IMPLEMENTED_PHASES` 一致） |
+| `./scripts/run_all_gates.sh` | ✅ **phase0~7 全部通过**，`失败: 无`（C7.9 回归；完整日志 `build/gates-slice3.log`）——其中 phase1 的**护栏自证** ①~⑤ 全绿、phase2 的链接图/能力护栏自证全绿、phase5 驱动切换全绿 |
+| sanitizer（`run_all_gates.sh` 内嵌，`build-asan`） | ✅ ASan + UBSan + LSan 全绿，**含 `ctest -L phase7` 的 6 个测试**（其中 `test_dual_protocol_concurrency` 会在 sanitizer 构建下拉起 `build-asan/bin/fss_server`）。规模注释：sanitizer 下用 `FSS_TEST_BIG_BYTES=64MiB` / `FSS_TEST_RSS_LIMIT_KIB=512MiB` 缩小，**紧的上限在普通构建的门槛里跑** |
+| `build/bin/fss_server` 手工冒烟 | ✅ 横幅同时给出 `bind` 与 `grpc bind`；REST `/v2/info` 200 |
 
-**结论**：切片 2 的判据 C7.3 / C7.4 / C7.5 已满足（连同切片 1 的 C7.2 / C7.7）；
-C7.1 进度 14/17（余 3 个流式/代理 RPC）。**本切片未使任何已启用阶段退化**（phase0~7 回归全绿）。
-未验证项：流式 RPC（C7.6）、双协议同进程并发（C7.8）、gRPC 流式 ↔ HTTP `Range` 的字节一致（C7.10）——
-均为切片 3 的交付内容，当前这些 RPC 明确 `UNIMPLEMENTED`。
+**结论**：P7 的退出条件（C7.1–C7.9 + C7.10）**全部满足**，"双协议"目标（G3）达成。
+**未做（不影响判据，已登记）**：真实 S3/MinIO 上的流式 RPC 端到端、
+多租户/多分区并发下的 gRPC 流控调优、`ServerSideCopy` 的跨存储实例（staging 与 persistent
+落在不同 store）路径（当前由 `CopyBetweenZones` 的跨 store 分支复用，已被 P6 覆盖，
+但**没有**在 RPC 面单独跑一遍）。

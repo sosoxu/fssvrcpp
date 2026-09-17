@@ -91,25 +91,42 @@ TEST_CASE("★ C7.1 已实现的一元 RPC 在线上可用 + 错误码/尾随元
           ::grpc::StatusCode::UNAUTHENTICATED);
 }
 
-TEST_CASE("★ C7.1 切片边界：3 个扩展 RPC（流式/代理）明确回 UNIMPLEMENTED",
+TEST_CASE("★ C7.1 切片 3：扩展 RPC 不再是 UNIMPLEMENTED（17/17 全部有实现）",
           "[phase7][integration][c7.1]") {
   GrpcFixture fx;
-  //  14 个一元 RPC 已在切片 2 完成；剩下的是**扩展面**的 3 个（切片 3 实现字节通道）
+  //  ★ 判据从"明确回 UNIMPLEMENTED"变成"**不再**回 UNIMPLEMENTED"：
+  //    用三条**非法输入**触发各自的错误路径 —— 若某个 RPC 仍是空实现，
+  //    它会回 UNIMPLEMENTED，这里立刻失败（比"调用成功"更早暴露漏实现）。
   {
     auto context = fx.Context();
-    osdu::file::v1::ServerSideCopyRequest request;
+    osdu::file::v1::ServerSideCopyRequest request;  // 源为空 → 非法源路径
     osdu::file::v1::ServerSideCopyResponse response;
     const auto status = fx.stub->ServerSideCopy(context.get(), request, &response);
-    REQUIRE(status.error_code() == ::grpc::StatusCode::UNIMPLEMENTED);
-    REQUIRE(status.error_message().find("ServerSideCopy") != std::string::npos);
+    INFO("ServerSideCopy → " << status.error_code() << " " << status.error_message());
+    REQUIRE(status.error_code() != ::grpc::StatusCode::UNIMPLEMENTED);
+    REQUIRE(status.error_code() == ::grpc::StatusCode::INVALID_ARGUMENT);
   }
   {
     auto context = fx.Context();
     osdu::file::v1::DownloadFileRequest request;
+    request.set_file_id("opendes:dataset--File.Generic:" + std::string(32, 'f'));
     auto reader = fx.stub->DownloadFile(context.get(), request);
     osdu::file::v1::DownloadFileResponse chunk;
-    //  流式 RPC 未实现时，第一次 Read 就会拿到 UNIMPLEMENTED
-    REQUIRE_FALSE(reader->Read(&chunk));
-    REQUIRE(reader->Finish().error_code() == ::grpc::StatusCode::UNIMPLEMENTED);
+    REQUIRE_FALSE(reader->Read(&chunk));  // 只有尾块之前就失败 → 无数据
+    const auto status = reader->Finish();
+    INFO("DownloadFile → " << status.error_code() << " " << status.error_message());
+    REQUIRE(status.error_code() != ::grpc::StatusCode::UNIMPLEMENTED);
+    REQUIRE(status.error_code() == ::grpc::StatusCode::NOT_FOUND);
+  }
+  {
+    auto context = fx.Context();
+    auto writer = fx.stub->UploadFile(context.get(), nullptr);
+    osdu::file::v1::UploadFileResponse response;
+    //  一个分片都不发 → 服务端明确报"首片必须是 info"
+    writer->WritesDone();
+    const auto status = writer->Finish();
+    INFO("UploadFile → " << status.error_code() << " " << status.error_message());
+    REQUIRE(status.error_code() != ::grpc::StatusCode::UNIMPLEMENTED);
+    REQUIRE(status.error_code() == ::grpc::StatusCode::INVALID_ARGUMENT);
   }
 }

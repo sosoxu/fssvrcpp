@@ -17,7 +17,7 @@
 | **P4** | REST 适配层 + 端到端垂直切片（POSIX） | OSDU 全部端点、错误映射、DTO、三大错误体、`fss_server` 可启动 | `ctest -L phase4` | ✅ **已完成：19/19 路由 + `/metrics` + 上游样例逐字对齐（C4.3）+ 护栏 + 超时语义；C4.1~C4.11 全部满足** |
 | **P5** | 对象存储驱动（S3 SigV4） | `S3BlobStore`、SigV4 签名/验签、mock-S3、同一套契约测试跑 S3 | `ctest -L phase5` | ✅ **已完成：C5.1~C5.10 全部满足**（AWS 官方向量 5 条逐字节匹配、独立验签 mock、同一套契约跑第三遍、分页、错误映射、S3 端到端、按配置切驱动、ADR-005） |
 | **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | ✅ **已完成（C6.1~C6.13；9 测试 / 2578 断言）** |
-| **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | 🚧 **进行中（切片 2/3：14 个一元 RPC + 契约 §6 矩阵 12 行 + `json_name` 对齐；4 测试 / 483 断言）** |
+| **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | ✅ **已完成（C7.1~C7.10 全部满足；17/17 RPC；6 测试 / 5354 断言）** |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ⬜ |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ⬜ |
 
@@ -520,22 +520,24 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase6 --output-on
 
 ---
 
-### 阶段 7：gRPC 适配层 + 双协议等价性  🚧 进行中
+### 阶段 7：gRPC 适配层 + 双协议等价性  ✅ 已完成
 
-> **当前进度（切片 2/3）**：`ctest -L phase7` **4 测试 / 483 断言**（C7.2/C7.3/C7.4/C7.5/C7.7 已满足）。
+> **收口（切片 3/3）**：`ctest -L phase7` **6 测试 / 5354 断言**；
+> **C7.1~C7.10 全部满足**（C7.9 = 回归：`run_all_gates.sh` 全绿）。
 > 切片 1：① 契约 §5 的**唯一权威表**下沉到 L3（`domain/contract/error_table.*`）→ HTTP/gRPC 两个适配器
 > 从同一张表派生；`test_error_equivalence`（C7.2）用手抄的契约期望值同时钉住实现表与两个适配器。
 > ② `app::CallerFromHeaders` 抽出"REST 头 / gRPC metadata → `CallerContext`"的共用规则。
 > ③ C7.7 护栏：proto 头只能出现在 `adapters/grpc/`（含 4 条自证用例）。
-> 切片 2：④ **14 个一元 RPC 全部在真实端口上实现**（`GetUploadLocation`/`GetFileLocation`/
-> `GetDownloadLocation`/`GetFileList`/`CreateFileMetadata`/`GetFileMetadata`/`DeleteFileMetadata`/
-> `GetStorageInstructions`/`GetRetrievalInstructions`/`CopyFilesToPersistent`/`GetFileSignedUrl`/`RevokeUrl`
-> + 切片 1 的 `GetInfo`/`Check`）；⑤ `app::wire_shapes` 把"两条协议共用的线上形状"抽到 L4，
-> REST 的 `dto.cpp` 与 gRPC 适配器**都**从这里取，消除"两处各写一份 JSON"的漂移面；
+> 切片 2：④ **14 个一元 RPC 全部在真实端口上实现**；⑤ `app::wire_shapes` 把"两条协议共用的线上形状"
+> 抽到 L4，REST 的 `dto.cpp` 与 gRPC 适配器**都**从这里取，消除"两处各写一份 JSON"的漂移面；
 > ⑥ `test_protocol_equivalence`（C7.3 矩阵 12 行 + C7.4 自签 URL 的 token 解码比对，含 4 条反向测试）
 > 与 `test_proto_json_mapping`（C7.5 黄金样例逐字段互操作）。
-> **剩余**：切片 3 = 3 个流式/代理 RPC（`UploadFile`/`DownloadFile`/`ServerSideCopy`，现明确
-> `UNIMPLEMENTED` 并由 `test_grpc_basics` 钉住）+ C7.6/C7.8/C7.10。
+> 切片 3：⑦ 3 个扩展 RPC（`UploadFile` 客户端流 / `DownloadFile` 服务端流 / `ServerSideCopy`）
+> 的字节通道（`grpc_streaming_io.cpp`）+ L4 用例（`UploadFile`/`DownloadFile`/`ServerSideCopy`）；
+> ⑧ **组合根同时开两个端口**（`FSS_GRPC_PORT`），`test_dual_protocol_concurrency` 在**真实二进制**
+> 上用并发混合协议读写同一份状态（C7.8）；⑨ `test_grpc_streaming`：1 GiB/0 字节/中途取消/慢客户端
+> （C7.6）+ 与 HTTP `Range` 的字节一致与"不整文件读"（C7.10）。
+> **未做（已登记，不影响判据）**：真实 S3/MinIO 上的流式 RPC 端到端、多租户并发下的流控调优。
 
 **目标**：交付 RPC 面，并**机械地证明**它与 REST 面语义等价（ADR-001 的核心约束）。
 
@@ -582,8 +584,13 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase7 --output-on
 | C7.9 | 回归：P0–P6 全绿 |
 | **C7.10** | gRPC 流式下载与 HTTP `Range` 在**相同 offset/length** 下返回的字节完全一致（SHA-256 比对），且两者都不触发整文件读取 |
 
-**退出条件**：C7.1–C7.9 满足，证据写入 `docs/test-evidence/phase7.md`。
-**此时"双协议"目标（G3）达成。**
+**退出条件**：C7.1–C7.9 满足（另加 C7.10），证据写入 `docs/test-evidence/phase7.md`。
+**此时"双协议"目标（G3）达成。** ✅ **已达成**（2026-09-17，切片 3/3 收口）：
+- C7.1 17/17 RPC 在真实端口上可调用；C7.2 契约 §5 逐行；C7.3 矩阵 12 行 + 错误分类；
+- C7.4 `SignedUrlEquivalent`（含 4 条反向测试）；C7.5 `json_name` 逐字段互操作；
+- C7.6 1 GiB/0 字节/中途取消/慢客户端（真实 POSIX，RSS 上限 + 整块读回对照）；
+- C7.7 proto 隔离护栏；C7.8 **真实二进制**两个端口并发混合协议；C7.9 `run_all_gates.sh` 全绿；
+- C7.10 gRPC 区间读 == HTTP `Range`（端口级记账证明没有整文件读）。
 
 ---
 

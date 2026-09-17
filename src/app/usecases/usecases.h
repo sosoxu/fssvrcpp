@@ -22,6 +22,7 @@
 #pragma once
 
 #include "app/services/location_issuer.h"
+#include "common/bytes/bytes.h"
 #include "common/ids/id_generator.h"
 #include "common/result/result.h"
 #include "common/time/clock.h"
@@ -321,6 +322,88 @@ class GetInfo {
  public:
   explicit GetInfo(UseCasePorts& ports) : ports_(ports) {}
   Result<VersionInfo> Execute();
+
+ private:
+  UseCasePorts& ports_;
+};
+
+// =============================================================================
+//  ⑭⑮⑯ 扩展 RPC 的应用层用例（P7 切片 3）
+// =============================================================================
+//  这 3 个是 gRPC 的**平台外扩展**（ADR-001：REST 是唯一合规面）。它们没有 REST
+//  端点，但**业务规则仍然住在 L4**（授权、位置记录解析、存储副作用、审计、以及
+//  `register_metadata` 时复用同一个 `CreateFileMetadata` 12 步用例）。
+//
+//  与 REST 数据面的一致性（C7.3 的等价性依据）：
+//    · `UploadFile`    == `PUT /v1/transfer/{自签 token}`（同一批字节、同一个对象键）
+//    · `DownloadFile`  == `GET /v1/transfer/{自签 token}` + `Range`（同一区间语义）
+//    · `ServerSideCopy`== `/v2/files/copy` 的**物理复制**部分（不写元数据记录）
+//  适配层只做"proto 分片 ↔ ByteSource/ByteSink"的翻译，不做任何判定。
+struct UploadStreamRequest {
+  std::string file_source;  // 必填：由 GetUploadLocation 返回（位置记录是授权的锚点）
+  std::optional<std::string> container;  // 可选：显式坐标，必须与位置记录**一致**（防参数覆盖）
+  std::optional<std::string> key;
+  std::string content_type;
+  std::string expected_checksum;   // 非空时由驱动校验（不符 → kChecksumMismatch）
+  std::string checksum_algorithm;
+  bool register_metadata = false;  // true 时上传完成后调用 CreateFileMetadata
+  std::optional<domain::FileMetadataRecord> metadata;
+};
+
+struct UploadStreamResult {
+  std::string file_id;
+  std::string file_source;
+  std::string checksum;            // 存储侧算出的校验和（POSIX/memory 为 SHA-256）
+  std::string checksum_algorithm;
+  std::uint64_t bytes_written = 0;
+  std::string metadata_record_id;  // register_metadata=false 时为空
+};
+
+class UploadFile {
+ public:
+  explicit UploadFile(UseCasePorts& ports) : ports_(ports) {}
+  Result<UploadStreamResult> Execute(const CallerContext& caller,
+                                     const UploadStreamRequest& request,
+                                     bytes::ByteSource& body);
+
+ private:
+  UseCasePorts& ports_;
+};
+
+//  `length == 0` 表示"从 offset 到对象末尾"（proto3 没有 presence，无法区分 0 与缺省）
+struct DownloadStreamResult {
+  std::int64_t total_size = 0;   // 对象的完整大小（不是本次区间的大小）
+  std::string checksum;
+  std::string checksum_algorithm;
+  std::uint64_t bytes_written = 0;  // 本次区间实际写出的字节数
+};
+
+class DownloadFile {
+ public:
+  explicit DownloadFile(UseCasePorts& ports) : ports_(ports) {}
+  Result<DownloadStreamResult> Execute(const CallerContext& caller, std::string_view file_id,
+                                       std::string_view file_source, std::uint64_t offset,
+                                       std::uint64_t length, bytes::ByteSink& sink);
+
+ private:
+  UseCasePorts& ports_;
+};
+
+struct ServerSideCopyResult {
+  std::string file_source;         // 回显目标逻辑路径
+  std::uint64_t bytes_copied = 0;
+};
+
+//  纯**字节**原语：把 `source_file_source` 指向的对象复制到 `target_file_source`
+//  在 `target_zone` 下的对象键。**不改动任何位置/元数据记录**（记录迁移属于
+//  `CreateFileMetadata`）；目标已存在则覆盖（幂等）。
+class ServerSideCopy {
+ public:
+  explicit ServerSideCopy(UseCasePorts& ports) : ports_(ports) {}
+  Result<ServerSideCopyResult> Execute(const CallerContext& caller,
+                                       std::string_view source_file_source,
+                                       std::string_view target_file_source,
+                                       domain::StorageZone target_zone);
 
  private:
   UseCasePorts& ports_;

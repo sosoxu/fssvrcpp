@@ -107,4 +107,55 @@ struct DualProtocolFixture {
   }
 };
 
+// -----------------------------------------------------------------------------
+//  PosixDualProtocolFixture —— **真实 POSIX + SQLite** 栈上同时跑 REST 与 gRPC
+// -----------------------------------------------------------------------------
+//  为什么 C7.6 / C7.10 不能用内存适配器：
+//    · `InMemoryBlobStore` 把整个对象放进 RAM —— "1 GiB 上传 RSS < 64 MiB"在那里
+//      必然失败（那是适配器的固有开销，不是流式与否的信号；P6-D13 同类教训）。
+//    · C7.10 要求 HTTP `Range` 与 gRPC 区间读落在**同一条位置记录**上，因此两条
+//      协议必须共用同一个 blob/location 实例 —— 这正是本 fixture 提供的。
+//  `PosixStackFixture` 已经是一条真实的 REST 栈（真实文件系统 + 真实 SQLite +
+//  真实回环端口），这里只在**同一批 `ports`** 上再挂一个 gRPC 服务。
+struct PosixDualProtocolFixture {
+  fss::test::PosixStackFixture stack;
+  std::unique_ptr<fss::adapters::grpc::FileServiceAdapter> service;
+  std::unique_ptr<::grpc::Server> grpc_server;
+  std::unique_ptr<osdu::file::v1::FileService::Stub> stub;
+  int grpc_port = 0;
+
+  PosixDualProtocolFixture() {
+    service = std::make_unique<fss::adapters::grpc::FileServiceAdapter>(*stack.ports, "osdu-user");
+    ::grpc::ServerBuilder builder;
+    builder.AddListeningPort("127.0.0.1:0", ::grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(service.get());
+    grpc_server = builder.BuildAndStart();
+    REQUIRE(grpc_server != nullptr);
+    REQUIRE(grpc_port != 0);
+    stub = osdu::file::v1::FileService::NewStub(
+        ::grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                              ::grpc::InsecureChannelCredentials()));
+    REQUIRE(stub != nullptr);
+  }
+  ~PosixDualProtocolFixture() {
+    if (grpc_server) grpc_server->Shutdown();
+  }
+  PosixDualProtocolFixture(const PosixDualProtocolFixture&) = delete;
+  PosixDualProtocolFixture& operator=(const PosixDualProtocolFixture&) = delete;
+
+  int http_port() const { return stack.port(); }
+  //  POSIX 存储根（`<tempdir>/blobs`）：取消/残留用例直接检查磁盘上的临时文件
+  std::string blob_root() const { return stack.dir.child("blobs"); }
+
+  std::unique_ptr<::grpc::ClientContext> Context(
+      const std::string& token = "Bearer test-token", const std::string& partition = "opendes",
+      const std::string& correlation_id = "corr-streaming") const {
+    auto context = std::make_unique<::grpc::ClientContext>();
+    context->AddMetadata("authorization", token);
+    context->AddMetadata("data-partition-id", partition);
+    context->AddMetadata("correlation-id", correlation_id);
+    return context;
+  }
+};
+
 }  // namespace fss::test

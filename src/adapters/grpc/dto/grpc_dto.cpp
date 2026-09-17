@@ -386,4 +386,53 @@ std::vector<fss::app::CopyFileSource> CopySourcesFromProto(
   return sources;
 }
 
+// -----------------------------------------------------------------------------
+//  扩展 RPC（P7 切片 3）
+// -----------------------------------------------------------------------------
+fss::Result<fss::app::UploadStreamRequest> UploadStreamRequestFromProto(
+    const osdu::file::v1::UploadFileInfo& proto) {
+  fss::app::UploadStreamRequest request;
+  request.file_source = proto.file_source();
+  if (!proto.container().empty()) request.container = proto.container();
+  if (!proto.key().empty()) request.key = proto.key();
+  request.content_type = proto.content_type();
+  request.expected_checksum = proto.expected_checksum();
+  request.checksum_algorithm = proto.checksum_algorithm();
+  request.register_metadata = proto.register_metadata();
+  if (proto.has_metadata()) {
+    //  ★ 与 `CreateFileMetadata` 共用同一个 proto → 领域转换（同一套结构校验）；
+    //    错误**原样返回**（不静默丢弃，否则 registerMetadata=true 会退化成"没登记"）
+    FSS_TRY(record, MetadataFromProto(proto.metadata()));
+    request.metadata = std::move(record);
+  }
+  return request;
+}
+
+void FillUploadFileResponse(const fss::app::UploadStreamResult& result,
+                            osdu::file::v1::UploadFileResponse* out) {
+  out->set_file_id(result.file_id);
+  out->set_file_source(result.file_source);
+  out->set_checksum(result.checksum);
+  out->set_bytes_written(result.bytes_written);
+  out->set_metadata_record_id(result.metadata_record_id);
+}
+
+void FillDownloadTrailer(const fss::app::DownloadStreamResult& result,
+                         osdu::file::v1::DownloadFileResponse* out) {
+  out->clear_chunk();
+  out->set_total_size(result.total_size > 0 ? static_cast<std::uint64_t>(result.total_size) : 0);
+  out->set_checksum(result.checksum);
+}
+
+void FillServerSideCopyProto(const fss::app::ServerSideCopyResult& result,
+                             osdu::file::v1::ServerSideCopyResponse* out) {
+  out->set_file_source(result.file_source);
+  out->set_bytes_copied(result.bytes_copied);
+}
+
+fss::domain::StorageZone StorageZoneFromProto(osdu::file::v1::StorageZone zone) {
+  return zone == osdu::file::v1::STORAGE_ZONE_STAGING ? fss::domain::StorageZone::kStaging
+                                                     : fss::domain::StorageZone::kPersistent;
+}
+
 }  // namespace fss::adapters::grpc

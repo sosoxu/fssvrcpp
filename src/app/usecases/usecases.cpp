@@ -144,6 +144,23 @@ class HashingSink final : public bytes::ByteSink {
   std::size_t chunks_ = 0;
 };
 
+//  计数装饰器：把写出的字节数透传给内层 sink（`CountingSink` 是独立实现，不能包别人）
+class CountingProxySink final : public bytes::ByteSink {
+ public:
+  explicit CountingProxySink(bytes::ByteSink& inner) : inner_(inner) {}
+  fss::Result<void> Write(std::string_view data) override {
+    FSS_TRY(inner_.Write(data));
+    written_ += data.size();
+    return Ok();
+  }
+  fss::Result<void> Close() override { return inner_.Close(); }
+  std::uint64_t bytes_written() const { return written_; }
+
+ private:
+  bytes::ByteSink& inner_;
+  std::uint64_t written_ = 0;
+};
+
 //  流式计算某个对象的校验和（**不把对象读进内存**；C6.9 的 RSS 要求）
 fss::Result<std::string> ComputeChecksumStreaming(UseCasePorts& ports, std::string_view partition,
                                                  const domain::ObjectRef& ref,
@@ -759,6 +776,171 @@ fss::Result<VersionInfo> GetInfo::Execute() {
 #endif
   info.connected_outer_services = {"storage"};
   return info;
+}
+
+// =============================================================================
+//  ⑭ UploadFile（gRPC 扩展：客户端流 → 对象字节）
+// =============================================================================
+//  授权与 `GetUploadLocation` **同一个角色**（editors）：能拿到上传地址的人才能写字节。
+//  ★ 位置记录是授权的锚点：只允许写到"已经签发过位置记录"的 FileSource 上。
+//    显式 `container`/`key` 不接受覆盖，只做一致性校验（与 `/v1/transfer` 内核
+//    "对象键只来自 token 载荷"同一条防线）。
+fss::Result<UploadStreamResult> UploadFile::Execute(const CallerContext& caller,
+                                                    const UploadStreamRequest& request,
+                                                    bytes::ByteSource& body) {
+  FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleEditors, /*require_partition=*/true));
+  if (request.file_source.empty()) {
+    return Invalid("UploadFile 要求 file_source（先调用 GetUploadLocation 取得）");
+  }
+  const auto location = ports_.locations.FindByFileSource(caller.partition, request.file_source);
+  if (!location.ok()) {
+    RecordAudit(ports_, "uploadFileFailure", caller, "", false);
+    return Err(fss::ErrorKind::kNotFound,
+               "没有 FileSource = " + request.file_source + " 的位置记录（请先调用 GetUploadLocation）");
+  }
+  FSS_TRY(ref, ObjectRefFromLocation(location.value()));
+  if (request.container.has_value() && *request.container != ref.container) {
+    RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
+    return Err(fss::ErrorKind::kPermissionDenied,
+               "container 与已签发的位置记录不一致（不接受坐标覆盖）");
+  }
+  if (request.key.has_value() && *request.key != ref.key) {
+    RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
+    return Err(fss::ErrorKind::kPermissionDenied,
+               "key 与已签发的位置记录不一致（不接受坐标覆盖）");
+  }
+
+  FSS_TRY(store, ports_.blobs.ForPartition(caller.partition, location.value().zone));
+  //  纵深防御：容器由 LocationIssuer 在签发时保证存在（幂等）
+  FSS_TRY(store->ensure_container(ref.container));
+
+  domain::PutOptions options;
+  options.content_type = request.content_type;
+  options.expected_checksum = request.expected_checksum;
+  options.checksum_algorithm = request.checksum_algorithm;
+  const auto put = store->put(ref, body, options);
+  if (!put.ok()) {
+    RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
+    return put.error();
+  }
+
+  FSS_TRY(stat, store->stat(ref));
+  UploadStreamResult out;
+  out.file_id = location.value().file_id;
+  out.file_source = location.value().file_source;
+  out.bytes_written = stat.size > 0 ? static_cast<std::uint64_t>(stat.size) : 0;
+  out.checksum = stat.checksum;
+  out.checksum_algorithm = stat.checksum_algorithm;
+  if (out.checksum.empty()) {
+    //  驱动不提供校验和时**流式回算**（与第 7 步同一条路径），而不是留空或编一个值
+    FSS_TRY(computed, ComputeChecksumStreaming(ports_, caller.partition, ref,
+                                               location.value().zone,
+                                               crypto::ChecksumAlgorithm::kSha256));
+    out.checksum = computed;
+    out.checksum_algorithm = "SHA256";
+  }
+
+  //  `register_metadata=true` 时复用**同一个** 12 步用例（不另写一条注册路径）
+  if (request.register_metadata) {
+    if (!request.metadata.has_value()) {
+      RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
+      return Invalid("register_metadata=true 时必须提供 metadata");
+    }
+    const auto& declared =
+        request.metadata->data.dataset_properties.file_source_info.file_source;
+    if (declared != request.file_source) {
+      RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
+      return Invalid("metadata 的 data.FileSource 与上传目标不一致");
+    }
+    CreateFileMetadata create(ports_);
+    const auto created = create.Execute(caller, *request.metadata);
+    if (!created.ok()) {
+      RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
+      return created.error();
+    }
+    out.metadata_record_id = created.value();
+  }
+  RecordAudit(ports_, "uploadFileSuccess", caller, location.value().file_id, true);
+  return out;
+}
+
+// =============================================================================
+//  ⑮ DownloadFile（gRPC 扩展：对象字节 → 服务端流）
+// =============================================================================
+//  授权与 `GetDownloadLocation` 同一个角色（viewers）。定位方式二选一：
+//  `file_id` 优先（位置记录主键），否则用 `file_source`（幂等键）。
+fss::Result<DownloadStreamResult> DownloadFile::Execute(const CallerContext& caller,
+                                                        std::string_view file_id,
+                                                        std::string_view file_source,
+                                                        std::uint64_t offset,
+                                                        std::uint64_t length,
+                                                        bytes::ByteSink& sink) {
+  FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleViewers, /*require_partition=*/true));
+  if (file_id.empty() && file_source.empty()) {
+    return Invalid("DownloadFile 要求 file_id 或 file_source");
+  }
+  fss::Result<domain::FileLocation> location =
+      file_id.empty() ? ports_.locations.FindByFileSource(caller.partition, file_source)
+                      : ports_.locations.Find(caller.partition, file_id);
+  FSS_TRY(resolved, std::move(location));
+  FSS_TRY(ref, ObjectRefFromLocation(resolved));
+  FSS_TRY(store, ports_.blobs.ForPartition(caller.partition, resolved.zone));
+  FSS_TRY(stat, store->stat(ref));
+  if (!stat.exists) {
+    return Err(fss::ErrorKind::kNotFound, "对象不存在：" + ref.key);
+  }
+
+  //  ★ 与 HTTP `Range` 的语义对齐：`length == 0` = 从 `offset` 到末尾；
+  //    `offset` 越界由驱动报 `kInvalidArgument`（与 `/v1/transfer` 的 416 同类）。
+  const domain::ByteRange range{offset, length};
+  CountingProxySink counter(sink);
+  FSS_TRY(store->get(ref, counter, range));
+
+  DownloadStreamResult out;
+  out.total_size = stat.size;
+  out.checksum = stat.checksum;
+  out.checksum_algorithm = stat.checksum_algorithm;
+  out.bytes_written = static_cast<std::uint64_t>(counter.bytes_written());
+  return out;
+}
+
+// =============================================================================
+//  ⑯ ServerSideCopy（gRPC 扩展：服务端复制字节，供无存储凭证的调用方）
+// =============================================================================
+//  角色与 `/v2/files/copy` 相同（storage creator / storage admin）。
+//  ★ 只搬字节，不动任何记录：目标坐标由 `target_file_source` + `target_zone` 推导。
+//    记录迁移（staging→persistent 的 zone 更新）属于 `CreateFileMetadata`。
+fss::Result<ServerSideCopyResult> ServerSideCopy::Execute(
+    const CallerContext& caller, std::string_view source_file_source,
+    std::string_view target_file_source, domain::StorageZone target_zone) {
+  static constexpr std::string_view kRoles[] = {domain::kRoleStorageCreator,
+                                                domain::kRoleStorageAdmin};
+  FSS_TRY(AuthorizeCallerAny(ports_, caller, kRoles, /*require_partition=*/true));
+  if (!LooksLikeFileSource(source_file_source)) {
+    return Err(fss::ErrorKind::kInvalidSourcePath, "Invalid source file path to copy from " +
+                                                      std::string(source_file_source));
+  }
+  if (!LooksLikeFileSource(target_file_source)) {
+    return Invalid("target_file_source 非法：" + std::string(target_file_source));
+  }
+  FSS_TRY(source_location,
+          ports_.locations.FindByFileSource(caller.partition, source_file_source));
+  FSS_TRY(from_ref, ObjectRefFromLocation(source_location));
+  //  目标键由目标的 FileSource 按同一套安全策略推导（逐段白名单，避免任意键写入）
+  FSS_TRY(parts, ObjectKeyPolicy::ParseFileSource(target_file_source));
+  FSS_TRY(container, ObjectKeyPolicy::ContainerFor(caller.partition, target_zone));
+  domain::ObjectRef to_ref;
+  to_ref.container = container;
+  to_ref.key = ObjectKeyPolicy::MakePosixKey(parts);
+
+  FSS_TRY(stat, CopyBetweenZones(ports_, caller.partition, from_ref, to_ref,
+                                 source_location.zone, target_zone));
+
+  ServerSideCopyResult out;
+  out.file_source = std::string(target_file_source);
+  out.bytes_copied = stat.size > 0 ? static_cast<std::uint64_t>(stat.size) : 0;
+  RecordAudit(ports_, "serverSideCopySuccess", caller, source_location.file_id, true);
+  return out;
 }
 
 }  // namespace fss::app

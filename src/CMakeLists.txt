@@ -68,6 +68,8 @@ if(FSS_ENABLE_GRPC)
   add_library(fss_grpc_adapter STATIC
     adapters/grpc/file_service_adapter.cpp
     adapters/grpc/grpc_error_mapper.cpp
+    adapters/grpc/grpc_server.cpp
+    adapters/grpc/grpc_streaming_io.cpp
     adapters/grpc/dto/grpc_dto.cpp)
   target_include_directories(fss_grpc_adapter PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(fss_grpc_adapter PUBLIC fss_app fss_proto)
@@ -79,8 +81,8 @@ endif()
 add_executable(fss_server
   main/server_main.cpp)
 target_link_libraries(fss_server PRIVATE
-  fss_http_adapter fss_blob_posix fss_blob_s3 fss_location_sqlite fss_transfer fss_metadata_memory
-  fss_logging Threads::Threads)
+  fss_http_adapter fss_grpc_adapter fss_blob_posix fss_blob_s3 fss_location_sqlite fss_transfer
+  fss_metadata_memory fss_logging Threads::Threads)
 
 # -----------------------------------------------------------------------------
 #  L2 基础设施适配层：每个端口实现一个独立目标（依赖倒置：L2 → L3 端口）

@@ -712,8 +712,27 @@ checksum = storageUtil.getChecksum(persistentLocation)
 | `Check` | `GET /v2/{liveness,readiness}_check` | 否 |
 | `UploadFile` / `DownloadFile` / `ServerSideCopy` | — | ✅ **扩展** |
 
-> **实现状态（P7 切片 2/3）**：上表**前 14 行（一元 RPC）已实现**并跑在真实 gRPC 端口上；
-> 最后一行 3 个扩展 RPC 目前明确返回 `UNIMPLEMENTED`（切片 3 交付字节通道）。
+> **实现状态（P7 切片 3）**：上表**全部 17 个 RPC 已实现**并跑在真实 gRPC 端口上
+> （前 14 行是一元 RPC；最后一行的 3 个是本项目**扩展**，见 §4.4）。
+
+### 4.4 扩展 RPC 的语义（本合同之外的**扩展面**，实现即合同）
+
+这 3 个 RPC 没有 REST 等价端点（ADR-001：REST 是唯一合规面，RPC 是平台外扩展），
+因此它们的语义由本节钉住（实现、测试、文档同源）。
+
+| RPC | 授权角色 | 语义 | 副作用 |
+| --- | --- | --- | --- |
+| `UploadFile`（客户端流） | `users.datalake.editors`（同 `GetUploadLocation`） | 首片必须是 `info`（带 `file_source`）；其后全是 `chunk`。**只允许写到已签发的位置记录**：`info.container`/`key` 非空时只能与记录**一致**（不一致 → `PERMISSION_DENIED`，不接受坐标覆盖，与 `/v1/transfer` 内核同一条防线）。`registerMetadata=true` 时上传完成后复用 `CreateFileMetadata` 的 **12 步**用例（`metadata.data.FileSource` 必须等于上传目标） | 覆盖 staging 对象字节；`registerMetadata=true` 时额外：staging→persistent 复制、写元数据 v1、位置记录迁到 persistent |
+| `DownloadFile`（服务端流） | `users.datalake.viewers`（同 `GetDownloadLocation`） | `file_id` 优先，否则用 `file_source`；`offset`/`length` 语义 = HTTP `Range`（`length == 0` = 从 `offset` 到末尾；`offset` 越界 → `INVALID_ARGUMENT`）。数据分片 ≤ 64 KiB，**最后一个分片的 `chunk` 为空**，携带 `totalSize` 与 `checksum` | 无 |
+| `ServerSideCopy`（一元） | `service.storage.creator` / `service.storage.admin`（同 `/v2/files/copy`） | 把 `source_file_source` 的对象复制到 `target_file_source` 在 `target_zone`（`UNSPECIFIED` 按 **persistent** 处理）下的对象键；**纯字节原语，不改动任何位置/元数据记录**；目标已存在则覆盖（幂等） | 写入目标对象 |
+
+**为什么把语义写进合同**：这 3 个 RPC 是"实现即合同"的扩展面。不写下来，
+"取消算不算成功""`length=0` 是什么意思""复制是否要动记录"就只能靠读代码 ——
+而双协议等价性（§6）恰恰要求这些语义**可复述、可测试**。
+
+**取消语义（`UploadFile`）**：客户端中途取消时，服务端必须把**不完整的字节流**
+当作失败（`UNAVAILABLE`），**不能**当成"正常读完" —— 后者会把截断的对象
+rename 成正式对象（静默数据损坏，P7-D07）。失败路径必须清掉 `.tmp.*` 临时文件。
 
 ### 4.2 消息 ↔ JSON 字段映射（关键项）
 
@@ -816,13 +835,23 @@ REST 与 RPC 两次调用会生成**不同的**签名 URL（含不同时间戳/n
 `SignedUrlEquivalent(a, b)` 实现，并有**反向测试**（故意改一个 query 参数名、
 或换一条位置记录 → 判定必须为不等）。
 
+**扩展 RPC 与 REST 数据面的等价性（不在矩阵的 12 行里，但同样机械检查）**：
+`UploadFile`/`DownloadFile` 对应 REST 的 `/v1/transfer` 数据面，二者覆盖**同一份对象**，
+因此用"内容一致"而不是"响应字段一致"来判定：
+
+| 对照 | 判据 | 证据 |
+| --- | --- | --- |
+| `UploadFile` ↔ `PUT /v1/transfer/{token}` | 同一批字节写入后，`stat` 的大小与 SHA-256 相同 | `test_grpc_streaming` 的 1 GiB 用例（客户端独立算摘要） |
+| `DownloadFile` ↔ `GET /v1/transfer/{token}` + `Range` | **相同 `offset`/`length`** 下字节完全一致（SHA-256），且两者都**不整文件读取**（在 `IBlobStore::get` 边界上断言区间） | `test_grpc_streaming` 的 C7.10 用例（含"整块读回再切片"的注入对照） |
+| 权限 | 扩展 RPC 的角色要求与同语义 REST 端点一致（见 §4.4） | `test_roles` + `test_grpc_streaming` 的授权锚点用例 |
+
 ---
 
 ## 7. 非规范扩展清单（必须与 OSDU 命名空间隔离）
 
 | 扩展 | 位置 | 隔离方式 | 默认 |
 | --- | --- | --- | --- |
-| gRPC 服务 | 独立端口 `:50051` | 不同端口 | 启用（可关） |
+| gRPC 服务 | 独立端口（组合根用 `FSS_GRPC_PORT` 配置；`-1` = 系统分配） | 不同端口 | **默认关闭**（`FSS_GRPC_PORT=0`）：RPC 是平台外扩展，按需开启 |
 | 集中存储字节通道 | `/api/file/v1/transfer/{token}` | `/v1` 段（OSDU v1 已废弃，无冲突） | 仅 POSIX 驱动启用 |
 | 指标端点 | `/metrics` | 不在 `/api/file` 下 | 启用（可关） |
 | 错误格式开关 | `http.error_format` | 配置驱动，默认取规范值 | `apperror` |

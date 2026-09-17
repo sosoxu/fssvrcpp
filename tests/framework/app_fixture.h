@@ -86,6 +86,11 @@ struct AppFixture {
     record.data.name = name;
     record.data.endian = "LITTLE";
     record.data.dataset_properties.file_source_info.file_source = file_source;
+    //  ★ `present` 必须显式置位：proto 侧用它判断 `DatasetProperties` 段是否存在
+    //    （proto3 无法区分"字段缺席"与"默认值"，见 grpc_dto.cpp 的说明）。
+    //    不置位时，这份"看起来有 FileSource"的记录经 proto 往返会**丢掉整段** ——
+    //    在 UploadFile(registerMetadata=true) 这类用例里表现为"FileSource 不一致"。
+    record.data.dataset_properties.present = true;
     return record;
   }
 };
