@@ -1,0 +1,40 @@
+# 多实例一致性竞态 —— 实测原始结果
+# 环境：16 核 / Ubuntu 22.04 / WSL2；PostgreSQL 14.24（apt 解包 + 非 root 运行）
+# 方法：两个独立进程充当两个服务实例，通过共享 PostgreSQL / 共享目录交互
+
+## S3 共享存储上的临时文件名跨实例冲突（40 次，两实例同 idx 并发写同名 tmp）
+naive  tmp = .tmp_<idx>                        → 内容错乱 21/40  ❌
+       例：实例 B 的最终文件 f_B_7 内容 = "idx=7;writer=A;..."  （静默数据损坏）
+       另一种表现：rename 失败 ENOENT（tmp 已被对方改名走）
+fixed  tmp = .tmp_<inst>_<pid>_<counter>       → 内容错乱  0/40  ✅
+
+## S1 重复创建竞态（两实例并发用同一 fileSource 登记元数据，20 次）
+naive  无唯一约束，check-then-insert             → 重复记录 20/20，且 2 个实例都做了复制  ❌
+fixed  幂等键唯一约束 + ON CONFLICT 原子领取        → 重复记录  0/20，只有 1 个实例复制      ✅
+       （关键：唯一约束必须建在【幂等键 file_source】上，不能建在随机主键 id 上——
+         我第一次尝试把约束建在 UUID 主键上，冲突永不触发，修复版仍是 20/20 重复）
+
+## S2 GC 与在途写入竞态（实例 A 在途 500ms，实例 B 同时跑 GC，20 次）
+naive GC  删除所有"无元数据记录"的 staging 对象     → A 的数据被误删 20/20  ❌ 数据丢失
+fixed GC  租约未过期则跳过；DELETE..RETURNING 原子领取 → A 的数据被误删  0/20  ✅ 受保护
+
+## S4 SQLite 作为多实例共享状态
+① 每实例独立 DB 文件     → A 写入的记录 B 完全看不到（B 总记录数 = 0）
+                          ⇒ 状态发散，B 会接受同一 fileID 的第二次申请            ❌
+② 两进程共用同一 SQLite 文件（本地 ext4）→ 可用（400/400 条记录，无冲突）
+                          但 SQLite 官方明确【不支持在网络文件系统上并发写】；
+                          集中存储多实例必然使用 NFS/SAN ⇒ 不可作为共享状态      ❌
+
+## S5 自签传输 token 的 single_use_nonce 跨实例
+实例 A 签发 token（nonce=N）
+  ① 带回 A：接受（A 有该 nonce 记录）                       ✅ 符合预期
+  ② 带回 B：**接受**（B 没有该 nonce 记录）                  ❌ 跨实例无法拒绝重放
+  ③ 同一 token 再次回 A：A 未做记录则接受
+⇒ 用本地 nonce 表时，"一次性"语义在多实例下【不成立】
+   必须把 nonce 状态放进共享存储，或（推荐）默认关闭 single_use_nonce
+
+## 未验证项（如实标注）
+- NFS/SAN 上 rename 的原子性与 close-to-open 一致性 —— 本机无 NFS 可挂载，**未测**
+- NFS 上 fsync/syncfs 的耐久性语义（ADR-008 的 P4 协议依赖 syncfs 覆盖全批数据）—— **未测**
+- 真实网络分区（脑裂）行为 —— **未测**
+- 多实例下 PostgreSQL 的连接数/吞吐容量 —— **未测**（本轮只验证正确性，不验证性能）

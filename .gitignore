@@ -1,0 +1,15 @@
+# 构建产物
+build/
+build-*/
+compile_commands.json
+
+# 开发/测试用 PostgreSQL（scripts/dev_postgres.sh）
+.devpg/
+
+# 编辑器/临时文件
+*.swp
+*~
+.cache/
+
+# ★ 本机凭据（GitHub 账号信息）—— 永不入库
+github.txt

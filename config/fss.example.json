@@ -1,0 +1,304 @@
+// =============================================================================
+//  fssvrcpp 配置样例（格式：**带注释的 JSON**）
+// =============================================================================
+//
+//  为什么不是 YAML：本项目不引入 YAML 解析器（镜像 pool 只有 yaml-cpp 0.5.x 的
+//  古老 API，源码构建不划算）。nlohmann 原生支持 `//` 与 `/* */` 注释，
+//  所以人写的配置依然可读；解析错误也复用同一套行/列定位。
+//  ★ 不支持尾随逗号（那不是 JSON）。
+//
+//  优先级：命令行 > 环境变量 > 本文件 > 内置默认值
+//  环境变量命名：FSS_<PATH 大写、点换下划线>，例如
+//      server.http.port       → FSS_SERVER_HTTP_PORT
+//      storage.driver         → FSS_STORAGE_DRIVER
+//      metadata.postgres.dsn  → FSS_METADATA_POSTGRES_DSN
+//  密文引用：${ENV:VAR_NAME} —— 启动时读环境变量；日志与 /v2/info 一律打码。
+//
+//  校验：启动时**一次性**校验全部字段；任何不合法项 → 拒绝启动并**列出全部问题**。
+//
+//  每一项"为什么是这个值"的依据见：
+//      docs/00-final-design.md §6   参数总表与实测依据
+//      docs/05-capacity-and-concurrency.md   并发/容量
+//      docs/adr/ADR-008   写入耐久性协议
+//      docs/adr/ADR-009   多实例一致性
+//      docs/adr/ADR-010   I/O 引擎
+// =============================================================================
+{
+  "deployment": {
+    // single = 单实例（可用本地 SQLite）；multi = 多实例（状态必须外置到 PostgreSQL）
+    // ★ multi 会强制校验 5 条，任一条不满足 → 拒绝启动（ADR-009 §8.1）
+    "mode": "single",
+    "instance_id": "",
+    "clock_skew_tolerance_seconds": 60
+  },
+
+  "server": {
+    "http": {
+      // ★ 必须与上游 OSDU File Service 的 context path 一致
+      "base_path": "/api/file",
+      "bind": "0.0.0.0",
+      "port": 8080,
+
+      // 解析硬上限（ADR-002 的"拒绝优先"）
+      "max_header_bytes": 16384,
+      "max_uri_bytes": 8192,
+      "max_body_bytes": 10485760,
+
+      // ★ 必须为 true：关闭时 keep-alive 小请求因 Nagle+delayed-ACK 产生 ~40ms 停顿
+      //   （实测 23 req/s vs 21,062 req/s，相差 950 倍）
+      "tcp_nodelay": true,
+
+      // ★ 语义是【并发连接上限】（一条 keep-alive 连接占用一个工作线程直到连接结束），
+      //   不是"CPU 核数倍数"。0 = 按公式推导 max(64, 2×核数)
+      "worker_threads": 0,
+      "max_connections": 0,
+      "max_connections_per_partition": 0,
+
+      // 超时按路由分类，避免 TB 级传输被整体超时打断
+      "idle_timeout_seconds": 60,
+      "json_request_timeout_seconds": 15,
+      "transfer_idle_timeout_seconds": 120,
+
+      // 数据面：并发 × 缓冲 ≤ 预算，违反则拒绝启动
+      "transfer_max_body_bytes": 0,
+      "transfer_buffer_bytes": 262144,
+      "transfer_memory_budget_bytes": 268435456,
+
+      "large_file_plane": {
+        // ADR-006：独立数据面（自持 socket + sendfile），待 P9 受控复核定稿后开启
+        "enabled": false,
+        "bind": "0.0.0.0",
+        "port": 8081,
+        "use_sendfile": true,
+        "sendfile_chunk_bytes": 1073741824,
+        "workers": 0,
+        "max_connections": 0
+      }
+    },
+    "grpc": {
+      "enabled": true,
+      "bind": "0.0.0.0",
+      "port": 50051,
+      "max_message_bytes": 4194304,
+      "streaming_chunk_bytes": 262144
+    }
+  },
+
+  "storage": {
+    // posix（集中存储）| s3（对象存储）
+    "driver": "posix",
+    // auto = 按驱动能力决定地址形态；always = 强制服务代理所有字节
+    "proxy_mode": "auto",
+    // 上游把所有云的 Driver 硬编码为 "GCS"；留空则上报真实驱动（ADR-003）
+    "driver_report_override": "",
+    "provider_key_override": "",
+
+    // ★ I/O 引擎（ADR-010）：blocking | uring | auto
+    //   默认 blocking：默认容器 seccomp profile **会阻断 io_uring**（实测 EPERM）
+    //   启用前先跑：scripts/check_io_uring.sh
+    "io_engine": "blocking",
+    "io_uring": {
+      "queue_depth": 64,
+      "register_files": false
+    },
+
+    "posix": {
+      "root": "/var/lib/fss/data",
+      // ★ 两阶段批提交（ADR-008）：write all tmp → syncfs → rename all → fsync(dir)
+      //   batch    = 每批 1 次 syncfs + 1 次 fsync(dir)，与批大小无关（实测 31,478 文件/s）
+      //   per_file = 每文件 fdatasync + fsync(dir)：精确但慢（实测 383 文件/s）
+      //   ⚠️ 禁止 "rename 早于数据 durable" 的顺序（会造成文件存在但内容残缺）
+      "durability": "batch",
+      "group_commit_max_batch": 500,
+      "sync_dir_after_batch": true,
+      "fsync_threshold_bytes": 0,
+      "atomic_write": true,
+      "dir_mode": "0750",
+      "file_mode": "0640",
+      "fadvise_random": true,
+      "fadvise_dontneed_after_large_read": false,
+      // multi 下必须为 true（启动时会用探针文件校验共享挂载）
+      "shared_mount_required": false,
+      "one_filesystem_per_partition": false
+    },
+
+    "s3": {
+      "endpoint": "http://127.0.0.1:9000",
+      "region": "us-east-1",
+      "access_key": "${ENV:FSS_S3_ACCESS_KEY}",
+      "secret_key": "${ENV:FSS_S3_SECRET_KEY}",
+      // MinIO / Ceph RGW / SeaweedFS 需要 true
+      "force_path_style": true,
+      "verify_tls": true,
+      "connect_timeout_ms": 3000,
+      "total_timeout_ms": 30000,
+      "presign_default_seconds": 3600,
+      "presign_max_seconds": 604800
+    }
+  },
+
+  "self_signed": {
+    // 集中存储数据面的自签传输 URL
+    "enabled": true,
+    // 对外可达地址（反向代理后填外部地址）
+    "public_base_url": "http://127.0.0.1:8080",
+    // ★ 所有实例必须共享同一 signing_key/key_id，否则 A 签发的 URL 到 B 会被拒
+    "signing_key": "${ENV:FSS_TRANSFER_SIGNING_KEY}",
+    "key_id": "k1",
+    "default_ttl_seconds": 3600,
+    "max_ttl_seconds": 604800,
+    // ★ 多实例下必须保持 false：本地 nonce 表无法跨实例拒绝重放（ADR-009 M5）
+    "single_use_nonce": false,
+    "nonce_store": "memory"
+  },
+
+  "expiry": {
+    // 对齐上游实测：缺省 1 小时；超过上限**静默截断**；非法格式 → 400 + 固定消息
+    "default": "1H",
+    "max": "7D"
+  },
+
+  "http": {
+    // apperror（默认，OSDU 标准）| legacy | api_error
+    "error_format": "apperror"
+  },
+
+  "metadata": {
+    // sqlite（单实例默认）| postgres（★ 多实例必需）| remote（对接 OSDU Storage Service）
+    "repository": "sqlite",
+    "sqlite": {
+      "path": "/var/lib/fss/meta.db",
+      "busy_timeout_ms": 5000,
+      "journal_mode": "WAL",
+      "synchronous": "NORMAL",
+      "max_write_concurrency": 8,
+      "group_commit": true,
+      "group_commit_max_wait_ms": 5,
+      "group_commit_max_batch": 64
+    },
+    "postgres": {
+      "dsn": "${ENV:FSS_PG_DSN}",
+      // ★ 实例数 × 该值 ≤ PG max_connections（超限拒绝启动）
+      "max_connections": 16,
+      "statement_timeout_ms": 5000,
+      "schema_version_check": true
+    },
+    "remote": {
+      "base_url": "",
+      "token_provider": "static",
+      "static_token": "${ENV:FSS_STORAGE_TOKEN}",
+      "timeout_ms": 5000
+    }
+  },
+
+  "location": {
+    "repository": "sqlite",
+    "sqlite": {
+      "path": "/var/lib/fss/location.db",
+      "busy_timeout_ms": 10000,
+      "journal_mode": "WAL",
+      "synchronous": "NORMAL",
+      "max_write_concurrency": 8,
+      "group_commit": true,
+      "group_commit_max_wait_ms": 5,
+      "group_commit_max_batch": 64
+    },
+    "postgres": {
+      "dsn": "${ENV:FSS_PG_DSN}",
+      "max_connections": 8
+    }
+  },
+
+  // 在途状态租约（多实例必需）：防止 GC 误删"尚未登记元数据"的在途上传
+  "leases": {
+    "enabled": false,
+    "ttl_seconds": 60,
+    "renew_interval_seconds": 20,
+    // database = 用 PG 的 now()（推荐，消除实例间时钟偏移）
+    "time_source": "database"
+  },
+
+  // 单例后台任务（GC / 配额汇总 / 指标聚合）的领导者选举
+  "leader_election": {
+    "enabled": false,
+    "backend": "postgres_advisory_lock",
+    "lock_key": 1179865927
+  },
+
+  "auth": {
+    "mode": "jwt",
+    "jwt": {
+      "jwks_url": "",
+      "issuer": "",
+      "audience": "",
+      "verify_signature": true,
+      "roles_claim": "roles",
+      "user_id_claim": "email"
+    },
+    "local_roles": {
+      "admin@example.com": ["service.file.admin", "service.file.editors", "service.file.viewers",
+                            "service.dataset.editors", "service.dataset.viewers",
+                            "service.storage.creator", "service.storage.admin",
+                            "service.delivery.viewer"],
+      "editor@example.com": ["service.file.editors", "service.file.viewers"],
+      "viewer@example.com": ["service.file.viewers"]
+    },
+    "remote_entitlements": {
+      "base_url": "",
+      "timeout_ms": 3000,
+      // 必须为 true：Entitlements 不可用时**不可**降级为放行
+      "fail_closed": true
+    }
+  },
+
+  "legal": {
+    "validator": "noop",
+    "remote": { "base_url": "", "timeout_ms": 3000 }
+  },
+
+  "schema": {
+    "validator": "noop",
+    "remote": { "base_url": "", "timeout_ms": 3000 }
+  },
+
+  "events": {
+    "publisher": "log",
+    "webhook": { "url": "", "timeout_ms": 3000, "topic": "status-changed" }
+  },
+
+  "partition": {
+    "registry": "file",
+    "file": {
+      "opendes": {
+        "staging_container": "opendes-staging",
+        "persistent_container": "opendes-persistent",
+        "storage_driver": "posix",
+        "max_file_bytes": 0,
+        "allowed_checksum_algorithms": ["SHA-256", "MD5", "SHA-1"],
+        "default_checksum_algorithm": "SHA-256"
+      }
+    }
+  },
+
+  "gc": {
+    "enabled": false,
+    "dry_run": true,
+    // ★ 必须为 true：只回收"租约已到期 且 无元数据记录"的对象。
+    //   禁止"无元数据记录即删"——在途上传恰恰就是没有记录（实测 20/20 误删）
+    "require_lease_expiry": true,
+    "staging_ttl_hours": 24,
+    "orphan_grace_hours": 72,
+    "interval_seconds": 3600
+  },
+
+  "observability": {
+    "log_level": "info",
+    "log_format": "json",
+    "audit_enabled": true,
+    "audit_fail_closed": false,
+    "metrics_enabled": true,
+    "metrics_path": "/metrics",
+    "redact_keys": ["secret_key", "access_key", "token", "sig", "signature", "authorization",
+                    "x-amz-signature", "password", "signing_key", "dsn", "static_token"]
+  }
+}

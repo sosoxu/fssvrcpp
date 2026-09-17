@@ -1,0 +1,71 @@
+{
+	"id": "string",
+	"kind": "<tenant_name>:wks:dataset--File.Generic:1.0.0",
+	"meta": [
+		{
+			"name": {
+				"id": [
+					{
+						"kind": "12587932"
+					}
+				]
+			}
+		}
+	],
+	"tags": {
+		"dataflowId": "dataflowId",
+		"dataflowId-2": "dataflowId"
+	},
+	"acl": {
+		"viewers": [
+			"<acl_viewers>@<tenant_name>.<cloud_domain>"
+		],
+		"owners": [
+			"<acl_owners>@<tenant_name>.<cloud_domain>"
+		]
+	},
+	"legal": {
+		"legaltags": [
+			"<legal_tags>"
+		],
+		"otherRelevantDataCountries": [
+			"US"
+		],
+		"status": "compliant"
+	},
+	"data": {
+		"ResourceHomeRegionID": "namespace:reference-data--OSDURegion:AWSEastUSA:",
+		"ResourceHostRegionIDs": [
+			"namespace:reference-data--OSDURegion:AWSEastUSA:"
+		],
+		"ResourceCurationStatus": "namespace:reference-data--ResourceCurationStatus:CREATED:",
+		"ResourceLifecycleStatus": "namespace:reference-data--ResourceLifecycleStatus:LOADING:",
+		"ResourceSecurityClassification": "namespace:reference-data--ResourceSecurityClassification:RESTRICTED:",
+		"Source": "Example Data Source",
+		"ExistenceKind": "namespace:reference-data--ExistenceKind:Prototype:",
+		"Name": "Dataset X221/15",
+		"Description": "As originally delivered by ACME.com.",
+		"TotalSize": "13245217273",
+		"EncodingFormatTypeID": "namespace:reference-data--EncodingFormatType:text%2Fcsv:",
+		"SchemaFormatTypeID": "namespace:reference-data--SchemaFormatType:CWLS%20LAS3:",
+		"Endian": "BIG",
+		"DatasetProperties": {
+			"FileSourceInfo": {
+				"FileSource": "/osdu-user/1624011206350-2021-06-18-10-13-26-350/33a71a04d20f4240904b4b3fca4657b7",
+				"PreloadFilePath": "s3://staging-area/r7/raw-data/provided/documents/1000.witsml",
+				"PreloadFileCreateUser": "somebody@acme.org",
+				"PreloadFileCreateDate": "2019-12-16T11:46:20.163Z",
+				"PreloadFileModifyUser": "somebody.else@acme.org",
+				"PreloadFileModifyDate": "2019-12-20T17:20:05.356Z",
+				"Name": "1000.witsml",
+				"FileSize": "95463",
+				"EncodingFormatTypeID": "namespace:reference-data--EncodingFormatType:application%2Fgeo%2Bjson:",
+				"Checksum": "d41d8cd98f00b204e9800998ecf8427e",
+				"ChecksumAlgorithm": "SHA-256"
+			}
+		},
+		"Checksum": "d41d8cd98f00b204e9800998ecf8427e",
+		"ExtensionProperties": {
+		}
+	}
+}

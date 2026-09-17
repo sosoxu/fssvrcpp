@@ -1,0 +1,65 @@
+# POSIX 集中存储 I/O 路径实测原始结果（本机 16 核 / Ubuntu 22.04 / WSL2 内核 6.18.33）
+
+## 1. 单次 I/O 延迟分布（4 KiB 随机）
+页缓存命中（4 KiB 随机读）   平均   0.7 µs  p50  0.6  p95   0.9  p99   1.1  max    55.4 → 单线程 1,534,599 ops/s
+DONTNEED 后读（→设备）       平均   0.9 µs  p50  0.7  p95   1.2  p99   1.6  max   134.3 → 单线程 1,136,290 ops/s
+O_DIRECT（绕过页缓存）       平均 120.9 µs  p50 92.6  p95 144.0  p99 235.7  max 304212 → 单线程     8,269 ops/s
+写 4 KiB + fsync             平均1438.7 µs  p50 1283.6 p95 2207.5 p99 2757.2 max 8395.9 → 单线程    695 ops/s
+写 4 KiB（无 fsync）         平均   1.8 µs  p50  0.9  p95   8.7  p99  15.2  max   355.3 → 单线程   565,897 ops/s
+
+## 2. 非缓存读：线程模型 vs io_uring（O_DIRECT 4 KiB 随机读）
+线程模型（阻塞 pread）：
+  线程数   IOPS        每线程 IOPS   聚合带宽
+  1            8221        8221        32.1 MiB/s
+  2           16358        8179        63.9 MiB/s
+  4           30105        7526       117.6 MiB/s
+  8           51160        6395       199.8 MiB/s
+  16          73920        4620       288.7 MiB/s
+  32         108096        3378       422.2 MiB/s
+  64         111663        1745       436.2 MiB/s
+  128        118148         923       461.5 MiB/s     ← 设备饱和
+
+io_uring（单线程，手动 submit/reap 循环，无协程）：
+  队列深度  IOPS        提交线程   聚合带宽
+  4              32154   1          125.6 MiB/s
+  16             91722   1          358.3 MiB/s
+  64            132934   1          519.3 MiB/s     ← 设备饱和
+  256           136491   1          533.2 MiB/s
+  1024          136172   1          531.9 MiB/s
+
+★ io_uring 用 1 个线程达到 132,934 IOPS；线程模型用 128 个线程才 118,148 IOPS。
+
+## 3. 写入路径（每文件 4 KiB 写）
+A) 线程 1    每文件 fsync               →     760 文件/s  (1.32 ms/文件)
+A) 线程 16   每文件 fsync               →   5,900 文件/s  (0.17 ms/文件)
+A) 线程 64   每文件 fsync               →  16,104 文件/s  (0.06 ms/文件)
+B) io_uring 深度 16  write+fsync 链式   →  20,497 文件/s  (0.05 ms/文件)  ★ 1 线程
+B) io_uring 深度 64  write+fsync 链式   →  16,218 文件/s  (0.06 ms/文件)
+B) io_uring 深度 256 write+fsync 链式   →  16,538 文件/s  (0.06 ms/文件)
+C) 线程 16   组提交（每 500 文件 1 次 fsync+目录 fsync） → 58,741 文件/s (0.017 ms/文件) ★★
+C) 线程 64   组提交                                       → 59,248 文件/s (0.017 ms/文件)
+
+★ 组提交比 io_uring 快 2.9x，比 64 线程快 3.6x —— 且它不需要换 I/O 模型。
+
+## 4. io_uring 可用性
+内核 6.18.33.2-microsoft-standard-WSL2；liburing 2.1（apt 解包）
+io_uring_queue_init OK；异步读完成 res=4096 字节 → ★ 本机 io_uring 可用
+（注意：WSL2 内核，不代表真实部署环境；已列为门槛 C9.18）
+
+
+## 7. ★ io_uring 的可用性：默认容器运行时阻断（ADR-010 的决定性证据）
+宿主机                           io_uring_setup 成功  fd=3
+容器 + 默认 seccomp profile       io_uring_setup 失败  errno=1 EPERM (Operation not permitted)
+容器 + --security-opt seccomp=unconfined  io_uring_setup 成功  fd=3
+kernel.io_uring_disabled         = 0（内核层面允许；问题在容器运行时而非内核）
+
+复现：scripts/check_io_uring.sh
+结论：io_uring 不能作为必需依赖 —— 默认 Docker/K8s seccomp profile 会直接拒绝。
+      要启用必须自定义 seccomp profile 放行 io_uring_setup/enter/register（或 unconfined，
+      后者显著削弱隔离，多数安全策略不允许）。
+
+## 8. liburing 2.1（jammy）的能力边界
+提供的 prep 助手：io_uring_prep_read / write / fsync / splice
+缺失：io_uring_prep_sendfile（sendfile 的 io_uring 支持在更新的 liburing 中才有）
+⇒ 本版本无法把"零拷贝 sendfile"与 io_uring 直接结合；而 sendfile 的主要收益
+  （2.05x 吞吐、每 GiB CPU 少 42%）用**阻塞 sendfile**就能拿到，不依赖 io_uring。

@@ -1,0 +1,53 @@
+# 组提交耐久性验证 —— 原始结果
+# 环境：16 核 / Ubuntu 22.04 / WSL2 内核 6.18.33；每文件 4 KiB；总 5000 文件，批 500（除注明外）
+
+## 1. 吞吐（安全 vs 不安全）
+协议                                                              文件/s   fsync_file  fsync_dir  syncfs  R1不变量
+P0 无 sync（不安全上界）                                            61,131            0          0       0   ✗
+P1 严格：每文件 fdatasync + 每文件 fsync(dir)                          383        5,000      5,000       0   ✅
+P2 组提交：每文件 fdatasync + 每批 fsync(dir)                          784        5,000         11       0   ✅
+P4 ★两阶段：写全批 tmp → syncfs → 统一 rename → fsync(dir)          31,478            0         10      10   ✅
+P3 松散（不安全的原方案）：无数据 fsync + 每批 syncfs                  35,389            0          0      11   ✗
+
+★ P4 比 P1(严格) 快 82.3x；不安全的 P3 只比 P4 快 11%。
+
+## 2. 顺序不变量检查（model_check2.py 解析 strace；安全性的主要依据）
+协议                      rename  R1违反  最坏崩溃分支下"存在但残缺"文件数  判定
+P1 严格                        6       0                              0  ✅ 安全
+P2 组提交                      6       0                              0  ✅ 安全
+P4 ★两阶段                     6       0                              0  ✅ 安全
+P3 松散                        6       6                              6  ❌ 不安全
+
+P4 的实测 syscall 顺序（t4.trace）：
+  openat(.tmp_0) write   openat(.tmp_1) write   openat(.tmp_2) write
+  syncfs(3)                                      ← 全批数据落盘
+  rename(.tmp_0→f_0) rename(.tmp_1→f_1) rename(.tmp_2→f_2)
+  fdatasync(3)                                   ← 全批改名落盘
+
+P3 的实测 syscall 顺序（t3.trace）—— 危险点：
+  openat(.tmp_0) write   rename(.tmp_0→f_0)      ← ★ 数据尚未落盘就改名
+  openat(.tmp_1) write   rename(.tmp_1→f_1)
+  syncfs(3)                                      ← 批末才落盘
+
+## 3. 崩溃注入（SIGKILL，每协议 16 次随机时刻，总 6000 文件批 500）
+协议       I1 残缺文件   I2 残留tmp>批   I3 少于承诺   最大残留tmp
+P1              0/16          0/16          0/16            1
+P2              0/16          0/16          0/16            1
+P4              0/16          0/16          0/16            0
+P3              0/16          0/16          0/16            0
+※ SIGKILL 不丢弃页缓存 → 只能验证"可见性原子性"，不能验证断电丢数据。
+
+## 4. 检测器自证（对照组：协议 9 直接写最终路径，无 tmp+rename）
+12 次中 11 次检出残缺文件 ✅
+  例：('f_3073', '大小2048')、('f_3413', '大小0')、('f_3733', '大小2048')
+→ 证明"0 个残缺文件"不是因为检测器失灵
+
+## 5. 机制性证据：写入期间 /proc/meminfo Dirty 峰值（4000 文件 ≈ 16 MiB）
+P1 每文件 fdatasync      Dirty 峰值 =  1,344 kB   （内存几乎不积压）
+P3 批末 syncfs           Dirty 峰值 =  3,296 kB   （积压一批）
+P0 无 sync               Dirty 峰值 = 15,128 kB   （几乎全部数据只在内存）
+
+## 6. 失败/无结论的实验（如实保留）
+O_DIRECT 读回区分"已落盘/仅在内存"  → ❌ 无法区分（fdatasync 与不 sync 读回均正确；
+                                        ext4 对 O_DIRECT 与缓冲写有连贯性处理）
+真实断电实验                        → ❌ 未做（需 root: dm-log-writes/dm-flakey、VM 快照或硬件）

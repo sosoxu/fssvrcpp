@@ -1,0 +1,34 @@
+{
+  "id": "string",
+  "kind": "<tenant_name>:wks:dataset--File.Generic:1.0.0",
+  "legal": {
+    "legaltags": [
+      "<legal_tags>"
+    ],
+    "otherRelevantDataCountries": [
+      "US"
+    ],
+    "status": "compliant"
+  },
+  "data": {
+    "Name": "Dataset X221/15",
+    "Description": "As originally delivered by ACME.com.",
+    "TotalSize": "13245217273",
+    "Source": "Example Data Source",
+    "DatasetProperties": {
+      "FileSourceInfo": {
+        "FileSource": "/osdu-user/1624011206350-2021-06-18-10-13-26-350/33a71a04d20f4240904b4b3fca4657b7",
+        "Name": "1234"
+      }
+    },
+    "Endian": "BIG"
+  },
+  "acl": {
+    "viewers": [
+      "<acl_viewers>@<tenant_name>.<cloud_domain>"
+    ],
+    "owners": [
+      "<acl_owners>@<tenant_name>.<cloud_domain>"
+    ]
+  }
+}

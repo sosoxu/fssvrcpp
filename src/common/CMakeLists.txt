@@ -1,0 +1,13 @@
+# L1 通用库。每个子目录一个独立目标 —— 这样"谁依赖了什么"在链接期可见。
+add_subdirectory(result)
+add_subdirectory(crypto)
+add_subdirectory(json)
+add_subdirectory(fs)
+add_subdirectory(time)
+add_subdirectory(ids)
+add_subdirectory(config)
+add_subdirectory(logging)
+add_subdirectory(bytes)
+add_subdirectory(net)
+add_subdirectory(sys)
+add_subdirectory(http)

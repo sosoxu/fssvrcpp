@@ -1,0 +1,383 @@
+# =============================================================================
+#  测试工程
+# =============================================================================
+#
+#  分层
+#  ---------------------------------------------------------------------------
+#   tests/framework/  -> 极少数测试基建（临时目录、进程内服务器启动器等）
+#   tests/unit/       -> 纯内存、毫秒级、无 IO；每次提交必跑
+#   tests/integration/-> 启动真实组件（真实 HTTP/gRPC 端口、真实文件系统、
+#                        mock-S3 或临时目录），秒级
+#   tests/conformance/-> 与 OSDU 规范对齐性测试（黄金样例请求/响应比对）
+#
+#  统一使用 Catch2 v2（header-only，third_party/catch2/catch.hpp）。
+#  每个测试文件编译为独立可执行文件并注册到 CTest，便于按阶段筛选：
+#     ctest -L phase0
+# =============================================================================
+
+add_library(fss_test_support INTERFACE)
+target_include_directories(fss_test_support INTERFACE
+  ${CMAKE_CURRENT_SOURCE_DIR}/framework
+  ${CMAKE_CURRENT_SOURCE_DIR})
+#  ★ 所有测试都能拿到源码树位置：黄金样例/守卫脚本类的用例要按绝对路径读 fixtures。
+#   放在 INTERFACE 上而不是逐个目标加 —— 逐个加时"新测试忘了加"会表现成
+#   `FSS_REPO_ROOT was not declared`，而那是最容易照抄邻居修好的假错误。
+target_compile_definitions(fss_test_support INTERFACE FSS_REPO_ROOT="${CMAKE_SOURCE_DIR}")
+
+# 辅助函数：注册一个测试可执行文件
+#   fss_add_test(<name> SOURCES <src...> [LIBS <lib...>] [LABELS <label...>])
+function(fss_add_test TEST_NAME)
+  cmake_parse_arguments(ARG "" "" "SOURCES;LIBS;LABELS" ${ARGN})
+  # ★ 统一注入 Catch2 主入口：测试文件里**不要**自己写 CATCH_CONFIG_MAIN
+  #   （否则要么漏写导致 undefined reference to main，要么重复定义 main）
+  add_executable(${TEST_NAME}
+    ${CMAKE_CURRENT_SOURCE_DIR}/framework/catch_main.cpp
+    ${ARG_SOURCES})
+  target_link_libraries(${TEST_NAME} PRIVATE
+    fss_common fss_test_support ${ARG_LIBS})
+  if(NOT ARG_LABELS)
+    set(ARG_LABELS "unit")
+  endif()
+  add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+  set_tests_properties(${TEST_NAME} PROPERTIES
+    LABELS "${ARG_LABELS}"
+    TIMEOUT 300)
+endfunction()
+
+# -----------------------------------------------------------------------------
+#  阶段 0：工具链与契约可行性验证（本阶段唯一目标 —— 证明后续计划可执行）
+# -----------------------------------------------------------------------------
+fss_add_test(test_phase0_toolchain
+  SOURCES
+    integration/test_phase0_toolchain.cpp
+  LIBS
+    OpenSSL::Crypto
+    SQLite::SQLite3
+    CURL::libcurl
+    Threads::Threads
+  LABELS phase0 integration)
+
+if(FSS_ENABLE_GRPC)
+  target_link_libraries(test_phase0_toolchain PRIVATE fss_proto)
+  target_compile_definitions(test_phase0_toolchain PRIVATE FSS_ENABLE_GRPC=1)
+  # gRPC 生成的 stub 会触发告警，测试代码本身保持严格
+  target_compile_options(test_phase0_toolchain PRIVATE -Wno-unused-parameter)
+endif()
+
+# =============================================================================
+#  PostgreSQL 基建测试（真实 PG；可选，见 docs/development.md）
+# =============================================================================
+#
+#  为什么可选：默认构建必须能在**没有任何外部服务**的机器上通过
+#  （"每步先测"的前提是测试随时可跑）。因此默认 OFF，由门槛脚本或 CI 显式开启：
+#      cmake -S . -B build -DFSS_WITH_PG=ON
+#      ctest --test-dir build -L pg
+#
+#  这些测试验证的是**真实 PostgreSQL 才能验证的东西**（ADR-009）：
+#     · 唯一约束的冲突语义与 ON CONFLICT 的原子领取   → 支撑门槛 C6.11 / C9.26
+#     · 跨会话 advisory lock 的互斥与崩溃后释放        → 支撑门槛 C8.9 / C9.26
+#     · 迁移后的 schema 真的强制了那些不变量            → 支撑门槛 C2.10
+#
+#  测试用 CTest fixture 管理 PG 生命周期：pg_fixture_setup 先启动并应用迁移，
+#  三个测试都 FIXTURES_REQUIRED pg；teardown 默认不停服务（便于开发时排查），
+#  设 FSS_PG_TEARDOWN=ON 可在测试结束后自动停止。
+option(FSS_WITH_PG "Register the PostgreSQL-backed tests (requires scripts/dev_postgres.sh)" OFF)
+option(FSS_PG_TEARDOWN "Stop the dev PostgreSQL after PG tests" OFF)
+
+if(FSS_WITH_PG)
+  set(_pg_script "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/dev_postgres.sh")
+  set(_db_dir    "${CMAKE_CURRENT_SOURCE_DIR}/../db")
+  if(NOT EXISTS "${_pg_script}")
+    message(FATAL_ERROR "FSS_WITH_PG=ON 但找不到 ${_pg_script}")
+  endif()
+
+  add_test(NAME pg_fixture_setup
+           COMMAND "${_pg_script}" start)
+  set_tests_properties(pg_fixture_setup PROPERTIES
+    FIXTURES_SETUP pg
+    LABELS "pg;infra"
+    TIMEOUT 900)      # 首次运行需要 apt 解包二进制 + initdb，给足时间
+
+  add_test(NAME pg_schema_invariants
+           COMMAND "${_pg_script}" psql -v ON_ERROR_STOP=1 -q
+                   -f "${_db_dir}/tests/001_verify_invariants.sql")
+  set_tests_properties(pg_schema_invariants PROPERTIES
+    FIXTURES_REQUIRED pg
+    LABELS "pg;infra"
+    TIMEOUT 300)
+
+  add_test(NAME pg_advisory_lock
+           COMMAND "${_db_dir}/tests/002_advisory_lock.sh")
+  set_tests_properties(pg_advisory_lock PROPERTIES
+    FIXTURES_REQUIRED pg
+    LABELS "pg;infra"
+    TIMEOUT 300)
+
+  add_test(NAME pg_concurrent_claim
+           COMMAND "${_db_dir}/tests/003_concurrent_claim.sh" 10 8)
+  set_tests_properties(pg_concurrent_claim PROPERTIES
+    FIXTURES_REQUIRED pg
+    LABELS "pg;infra"
+    TIMEOUT 900)
+
+  if(FSS_PG_TEARDOWN)
+    add_test(NAME pg_fixture_teardown COMMAND "${_pg_script}" stop)
+    set_tests_properties(pg_fixture_teardown PROPERTIES
+      FIXTURES_CLEANUP pg
+      LABELS "pg;infra"
+      TIMEOUT 120)
+  else()
+    # 即使不停止服务，也要注册一个 cleanup fixture，否则 CTest 会告警
+    add_test(NAME pg_fixture_teardown COMMAND "${CMAKE_COMMAND}" -E echo "PG 保留运行（FSS_PG_TEARDOWN=OFF）")
+    set_tests_properties(pg_fixture_teardown PROPERTIES
+      FIXTURES_CLEANUP pg
+      LABELS "pg;infra"
+      TIMEOUT 30)
+  endif()
+endif()
+
+# -----------------------------------------------------------------------------
+#  阶段 1：分层骨架 + 通用库
+# -----------------------------------------------------------------------------
+fss_add_test(test_layering_guard
+  SOURCES unit/test_layering_guard.cpp
+  LIBS    fss_domain fss_app
+  LABELS  phase1 unit)
+# 护栏需要知道源码树位置（它是文件系统扫描，与构建系统无关）
+
+
+
+fss_add_test(test_result
+  SOURCES unit/test_result.cpp
+  LIBS    fss_result
+  LABELS  phase1 unit)
+
+fss_add_test(test_crypto
+  SOURCES unit/test_crypto.cpp
+  LIBS    fss_crypto
+  LABELS  phase1 unit)
+
+fss_add_test(test_json SOURCES unit/test_json.cpp LIBS fss_json LABELS "phase1;unit")
+fss_add_test(test_fs   SOURCES unit/test_fs.cpp   LIBS fss_fs   LABELS "phase1;unit")
+fss_add_test(test_time SOURCES unit/test_time.cpp LIBS fss_time LABELS "phase1;unit")
+fss_add_test(test_ids  SOURCES unit/test_ids.cpp  LIBS fss_ids  LABELS "phase1;unit")
+
+fss_add_test(test_config SOURCES unit/test_config.cpp LIBS fss_config LABELS "phase1;unit")
+
+fss_add_test(test_logging SOURCES unit/test_logging.cpp LIBS fss_logging LABELS "phase1;unit")
+
+fss_add_test(test_bytes SOURCES unit/test_bytes.cpp LIBS fss_bytes LABELS "phase1;unit")
+
+fss_add_test(test_net SOURCES unit/test_net.cpp LIBS fss_net LABELS "phase1;unit")
+
+fss_add_test(test_sys SOURCES unit/test_sys.cpp LIBS fss_sys LABELS "phase1;unit")
+
+fss_add_test(test_httplib_hardening
+  SOURCES integration/test_httplib_hardening.cpp
+  LIBS    fss_http
+  LABELS  phase1 integration)
+
+fss_add_test(test_http_server
+  SOURCES integration/test_http_server.cpp
+  LIBS    fss_http
+  LABELS  phase1 integration)
+
+fss_add_test(test_expiry_policy SOURCES unit/test_expiry_policy.cpp LIBS fss_app LABELS "phase2;unit")
+fss_add_test(test_kind_validator SOURCES unit/test_kind_validator.cpp LIBS fss_app LABELS "phase2;unit")
+fss_add_test(test_object_key_policy SOURCES unit/test_object_key_policy.cpp LIBS fss_app LABELS "phase2;unit")
+
+fss_add_test(test_file_metadata SOURCES unit/test_file_metadata.cpp LIBS fss_domain LABELS "phase2;unit")
+
+fss_add_test(test_ports SOURCES unit/test_ports.cpp LIBS fss_domain LABELS "phase2;unit")
+
+# C2.10：端口契约测试基类（tests/framework/port_contract.h）的第一个使用者。
+# 后续 POSIX/S3/SQLite/PostgreSQL 实现只加各自的"三行"实例化，语义断言不再重复。
+fss_add_test(test_port_contract_memory
+  SOURCES unit/test_port_contract_memory.cpp
+  LIBS    fss_blob_memory fss_location_memory fss_metadata_memory
+  LABELS  phase2 unit)
+
+# C2.6：LocationIssuer 在两种能力组合下的行为（借用内存数据面 + 能力装饰器）
+fss_add_test(test_location_issuer
+  SOURCES unit/test_location_issuer.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory
+  LABELS  phase2 unit)
+
+# C2.7：capabilities() 调用点护栏（源码扫描；自证见 scripts/verify_capability_guard.sh）
+fss_add_test(test_capability_guard
+  SOURCES unit/test_capability_guard.cpp
+  LIBS    fss_app
+  LABELS  phase2 unit)
+
+# C2.2：13 个用例的单元测试 + ErrorKind 覆盖率矩阵
+fss_add_test(test_usecases
+  SOURCES unit/test_usecases.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+  LABELS  phase2 unit)
+
+fss_add_test(test_error_kind_coverage
+  SOURCES unit/test_error_kind_coverage.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+  LABELS  phase2 unit)
+
+# -----------------------------------------------------------------------------
+#  阶段 3：集中存储驱动 + 位置仓储 + 数据面
+# -----------------------------------------------------------------------------
+# C3.1：与内存实现共用同一套契约测试；C3.2 路径安全；C3.3 原子写；C3.5 Range；C3.6 并发
+fss_add_test(test_posix_blob_store
+  SOURCES integration/test_posix_blob_store.cpp
+  LIBS    fss_blob_posix Threads::Threads
+  LABELS  phase3 integration)
+
+# C2.10/C3.8：SQLite 位置仓储（与内存实现共用同一套契约测试）
+fss_add_test(test_sqlite_location_repository
+  SOURCES integration/test_sqlite_location_repository.cpp
+  LIBS    fss_location_sqlite
+  LABELS  phase3 integration)
+
+# C3.9：SQL 必须带 partition_id 的护栏（源码扫描；含非空洞性断言）
+fss_add_test(test_sql_guardrail
+  SOURCES unit/test_sql_guardrail.cpp
+  LIBS    fss_domain
+  LABELS  phase3 unit)
+
+# C3.10：BlockingIoEngine 的 pread 定位读并发安全（含单线程基线对照）
+fss_add_test(test_blocking_io_engine
+  SOURCES integration/test_blocking_io_engine.cpp
+  LIBS    fss_io fss_fs Threads::Threads
+  LABELS  phase3 integration)
+
+# C3.11：fsync 分级策略（注入 IFileSync，直接数落盘次数）
+fss_add_test(test_fsync_policy
+  SOURCES integration/test_fsync_policy.cpp
+  LIBS    fss_blob_posix fss_io
+  LABELS  phase3 integration)
+
+# C3.7：自签传输 token + /v1/transfer 内核
+fss_add_test(test_transfer_endpoint
+  SOURCES integration/test_transfer_endpoint.cpp
+  LIBS    fss_transfer fss_blob_memory fss_crypto
+  LABELS  phase3 integration)
+
+# C3.4：≥1 GiB 流式写读的 RSS 峰值（规模与上限可用环境变量缩小，见 framework/big_file.h）
+fss_add_test(test_posix_large_file
+  SOURCES integration/test_posix_large_file.cpp
+  LIBS    fss_blob_posix
+  LABELS  phase3 integration)
+
+# C3.12：有界写并发（32 线程零 busy）
+fss_add_test(test_sqlite_write_concurrency
+  SOURCES integration/test_sqlite_write_concurrency.cpp
+  LIBS    fss_location_sqlite Threads::Threads
+  LABELS  phase3 integration)
+
+# -----------------------------------------------------------------------------
+#  阶段 6：元数据语义完整化
+# -----------------------------------------------------------------------------
+# C2.10（元数据侧）/C6.5：SqliteMetadataRepository 与内存实现共用同一套契约
+fss_add_test(test_sqlite_metadata_repository
+  SOURCES integration/test_sqlite_metadata_repository.cpp
+  LIBS    fss_metadata_sqlite fss_metadata_memory
+  LABELS  "phase6;integration")
+
+# -----------------------------------------------------------------------------
+#  阶段 5：对象存储驱动（S3 SigV4）
+# -----------------------------------------------------------------------------
+# C5.1/C5.5（单元部分）：SigV4 签名器、编码边界、签名覆盖性
+fss_add_test(test_sigv4_signer
+  SOURCES unit/test_sigv4_signer.cpp
+  LIBS    fss_blob_s3
+  LABELS  "phase5;unit")
+
+# C5.1：AWS 官方已知答案向量（来自 AWS Go SDK 的签名测试，逐字节比对）
+fss_add_test(test_sigv4_aws_vectors
+  SOURCES unit/test_sigv4_aws_vectors.cpp
+  LIBS    fss_blob_s3
+  LABELS  "phase5;unit")
+
+# C5.1/C5.5（独立实现对拍）：libcurl `--aws-sigv4` + Python 参照实现
+fss_add_test(test_sigv4_crosscheck
+  SOURCES integration/test_sigv4_crosscheck.cpp
+  LIBS    fss_blob_s3
+  LABELS  "phase5;integration")
+
+# C5.2：预签名/头部签名被 mock-S3（Python 独立验签）验过 + 篡改矩阵
+fss_add_test(test_s3_presign_verify
+  SOURCES integration/test_s3_presign_verify.cpp
+  LIBS    fss_blob_s3
+  LABELS  "phase5;integration")
+
+# C5.3/C5.6/C5.7：S3BlobStore 跑同一套端口契约 + 分页 + 错误映射
+fss_add_test(test_s3_blob_store
+  SOURCES integration/test_s3_blob_store.cpp
+  LIBS    fss_blob_s3
+  LABELS  "phase5;integration")
+
+# C5.8：S3 模式端到端（客户端直连存储端点，服务不代理字节）
+fss_add_test(test_upload_flow_s3
+  SOURCES integration/test_upload_flow_s3.cpp
+  LIBS    fss_http_adapter fss_blob_s3 fss_blob_memory fss_location_memory fss_metadata_memory
+          fss_transfer
+          Threads::Threads
+  LABELS  "phase5;integration")
+
+# -----------------------------------------------------------------------------
+#  阶段 4：REST 适配层 + 端到端垂直切片（POSIX）
+# -----------------------------------------------------------------------------
+# C4.5：ErrorKind → (status, reason) 权威表 + 三种错误体形态
+fss_add_test(test_http_error_mapper
+  SOURCES unit/test_http_error_mapper.cpp
+  LIBS    fss_http_adapter
+  LABELS  phase4 unit)
+
+# C4.6 + C4.1/4.2/4.5/4.7 的 HTTP 侧：真实回环端口上的运维/位置/元数据
+fss_add_test(test_ops_endpoints
+  SOURCES conformance/test_ops_endpoints.cpp
+  LIBS    fss_http_adapter fss_blob_memory fss_location_memory fss_metadata_memory Threads::Threads
+  LABELS  "phase4;conformance")
+
+# C4.4：DTO 字段大小写逐字符（线上契约）
+fss_add_test(test_http_dto
+  SOURCES unit/test_http_dto.cpp
+  LIBS    fss_http_adapter
+  LABELS  phase4 unit)
+
+# C4.9：组合根纪律护栏（R12；自证见 scripts/verify_composition_root.sh）
+fss_add_test(test_composition_root_guard
+  SOURCES unit/test_composition_root_guard.cpp
+  LABELS  phase4 unit)
+
+# C4.1/C4.2/C4.3/C4.7 + §7 `/metrics`：契约 §2/§3.3/§3.4 在真实端口上的逐条比对
+fss_add_test(test_rest_contract
+  SOURCES conformance/test_rest_contract.cpp
+  LIBS    fss_http_adapter fss_transfer fss_blob_memory fss_location_memory fss_metadata_memory
+          Threads::Threads
+  LABELS  "phase4;conformance")
+
+# C4.11：数据面无整体超时 + 空闲超时断开（把空闲超时压到 2s 以放进日常门槛）
+fss_add_test(test_transfer_timeouts
+  SOURCES integration/test_transfer_timeouts.cpp
+  LIBS    fss_http_adapter fss_transfer fss_blob_memory fss_location_memory fss_metadata_memory
+          Threads::Threads
+  LABELS  "phase4;integration")
+
+# C4.5（HTTP 侧）：三种错误体形态 + 固定消息 + `X-FSS-Error-Kind`
+fss_add_test(test_error_formats
+  SOURCES conformance/test_error_formats.cpp
+  LIBS    fss_http_adapter fss_transfer fss_blob_memory fss_location_memory fss_metadata_memory
+          Threads::Threads
+  LABELS  "phase4;conformance")
+
+# C4.8：端到端垂直切片（上传自签 URL → PUT 真实字节 → 元数据 → 下载 → SHA-256 比对 → 删除）
+fss_add_test(test_upload_flow
+  SOURCES integration/test_upload_flow_posix.cpp
+  LIBS    fss_http_adapter fss_transfer fss_blob_memory fss_location_memory fss_metadata_memory
+          fss_blob_posix fss_location_sqlite
+          Threads::Threads
+  LABELS  "phase4;integration")
+
+# ADR-010：UringIoEngine 探测骨架（不启用，显式拒绝）
+fss_add_test(test_uring_io_engine
+  SOURCES unit/test_uring_io_engine.cpp
+  LIBS    fss_io
+  LABELS  phase3 unit)

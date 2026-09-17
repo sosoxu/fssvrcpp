@@ -1,0 +1,100 @@
+// =============================================================================
+//  LocationIssuer（L4）—— 全项目**唯一**的存储能力分支点（ADR-003 §6.3）
+// =============================================================================
+//  它回答一个问题：给定租户/用户/文件，上传（staging）或下载（persistent）的
+//  地址是什么？两种后端的能力差异只在这里被查询一次：
+//
+//      caps = store->capabilities()
+//        ├─ native_presign == true  → store->presign_put/get(...)   （客户端直连存储）
+//        └─ native_presign == false → ISelfSignedUrlCodec::Encode   （本服务数据面代理）
+//
+//  ★ 为什么必须"只有这一处"
+//    ADR-003 的核心结论是"按能力编程，不按类型分支编程"。若 `if (driver == kPosix)`
+//    扩散到用例/适配层，新增第三种后端就要改业务逻辑。因此：
+//      · 本文件是 `capabilities()` 的**白名单调用点**之一（另一个是
+//        `storage_instruction_service.cpp`），由 `tests/unit/test_capability_guard.cpp`
+//        机械化执行（C2.7）；
+//      · 本文件**不得出现** `StorageDriver::kPosix/kS3` 之类的驱动类型枚举分支
+//        （同一护栏检查），"分支痕迹"不许进入领域结果 —— 结果里的 `driver` 直接取
+//        `capabilities().driver_name`（字符串），而不是由枚举推导。
+//
+//  ★ 位置记录如何携带物理引用
+//    契约要求 `FileLocation` 是"FileSource ↔ 物理位置"的权威映射，但 P2 的领域模型
+//    （`domain/model/types.h`）没有 container/object_key 字段。这里把物理引用写进
+//    `FileLocation.extra`（开放字段，仓储契约要求原样保留），避免为了取 key 而引入
+//    驱动类型分支：
+//        extra["container"]  = 桶/目录
+//        extra["object_key"] = 相对 key
+//        extra["driver_name"] = capabilities().driver_name（"memory" 等无法映射到枚举时也不丢信息）
+//    P3 引入 POSIX/S3 驱动时若把这两列提升为正式字段，只需改这里的两处辅助函数。
+#pragma once
+
+#include "app/services/expiry_policy.h"
+#include "common/ids/id_generator.h"
+#include "common/result/result.h"
+#include "common/time/clock.h"
+#include "domain/model/types.h"
+#include "domain/ports/ports.h"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+
+namespace fss::app {
+
+//  颁发结果（领域层表达，**不含** HTTP 细节；DTO 在 P4 的适配层组装）
+struct LocationResult {
+  std::string file_id;
+  std::string file_source;   // 带前导 '/'，对客户端可见的权威定位符
+  std::string signed_url;
+  std::string driver;        // ★ 来自 capabilities().driver_name（不是 StorageDriver 枚举）
+  domain::StorageZone zone = domain::StorageZone::kStaging;
+  std::int64_t expires_at_epoch_seconds = 0;
+  bool native_presign = false;   // true = 存储原生预签名；false = 本服务自签
+};
+
+class LocationIssuer {
+ public:
+  //  `FileLocation.extra` 里的物理引用键（见文件头说明）
+  static constexpr std::string_view kExtraContainer = "container";
+  static constexpr std::string_view kExtraObjectKey = "object_key";
+  static constexpr std::string_view kExtraDriverName = "driver_name";
+
+  LocationIssuer(domain::IBlobStoreFactory& blobs, domain::IFileLocationRepository& locations,
+                 domain::ISelfSignedUrlCodec& self_signed, const fss::IClock& clock,
+                 const fss::IIdGenerator& ids, std::string self_base_url)
+      : blobs_(blobs),
+        locations_(locations),
+        self_signed_(self_signed),
+        clock_(clock),
+        ids_(ids),
+        self_base_url_(std::move(self_base_url)) {}
+
+  //  上传地址（staging 区）：
+  //    · `requested_file_id` 为空 → 服务端生成（`NewUuidNoDash()`，与契约 §2.1 样例一致）
+  //    · 提供了则必须通过 `^[\w,\s-]+(\.\w+)?$`，且**不得已存在**（契约 §2.2 的 400）
+  Result<LocationResult> IssueUploadLocation(std::string_view partition, std::string_view user_id,
+                                             const std::optional<std::string>& requested_file_id,
+                                             const std::optional<std::string>& expiry_time);
+
+  //  下载地址：位置记录必须已存在（否则 `Not found location for fileID : <id>` → 404）
+  Result<LocationResult> IssueDownloadLocation(std::string_view partition, std::string_view file_id,
+                                               const std::optional<std::string>& expiry_time);
+
+ private:
+  Result<LocationResult> SignAndShape(domain::IBlobStore& store, const domain::ObjectRef& ref,
+                                      const domain::FileLocation& location,
+                                      const domain::BlobCapabilities& caps,
+                                      std::string_view partition, std::int64_t ttl_seconds,
+                                      bool upload);
+
+  domain::IBlobStoreFactory& blobs_;
+  domain::IFileLocationRepository& locations_;
+  domain::ISelfSignedUrlCodec& self_signed_;
+  const fss::IClock& clock_;
+  const fss::IIdGenerator& ids_;
+  std::string self_base_url_;
+};
+
+}  // namespace fss::app

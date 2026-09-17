@@ -1,0 +1,121 @@
+{
+	"id": "string",
+	"kind": "<tenant_name>:wks:dataset--File.Generic:1.0.0",
+	"acl": {
+		"viewers": [
+			"<acl_viewers>@<tenant_name>.<cloud_domain>"
+		],
+		"owners": [
+			"<acl_owners>@<tenant_name>.<cloud_domain>"
+		]
+	},
+	"legal": {
+		"legaltags": [
+			"<legal_tags>"
+		],
+		"otherRelevantDataCountries": [
+			"US"
+		],
+		"status": "compliant"
+	},
+	"data": {
+		"DatasetProperties": {
+            "FileSourceInfo": {
+                "FileSource": "string",
+                "Name": "File"
+            }
+        },
+		"SchemaFormatTypeID": "string",
+		"PreloadFilePath": "string",
+		"FileSource": "string",
+		"FileSize": 0,
+		"Name": "File",
+		"EncodingFormatTypeID": "string",
+		"Endian": "Small",
+		"LossyCompressionIndicator": true,
+		"CompressionMethodTypeID": "string",
+		"CompressionLevel": 0,
+		"Checksum": "string",
+		"VectorHeaderMapping": [
+			{
+				"KeyName": "string",
+				"WordFormat": "string",
+				"WordWidth": 0,
+				"Position": 0,
+				"UoM": "string",
+				"ScalarIndicator": "STANDARD",
+				"ScalarOverride": 0
+			}
+		],
+		"relationships": {
+			"parentEntity": {
+				"confidence": 1,
+				"id": "data_partition:namespace:entity_845934c40e8d922bc57b678990d55722",
+				"name": "Survey ST2016",
+				"version": 0
+			},
+			"relatedItems": {
+				"confidences": [
+					0
+				],
+				"ids": [
+					"string"
+				],
+				"names": [
+					"string"
+				],
+				"versions": [
+					0
+				]
+			}
+		},
+		"ExtensionProperties": {
+			"Classification": "Raw File",
+			"Description": "An text further describing this file example.",
+			"ExternalIds": [
+				"string"
+			],
+			"FileDateCreated": {
+			},
+			"FileDateModified": {
+			},
+			"FileContentsDetails": {
+				"TargetKind": "os:npd:wellbore:1:*.*",
+				"FileType": "csv",
+				"FrameOfReference": [
+					{
+						"kind": "CRS",
+						"name": "[NAD27 * OGP-Usa Conus / North Dakota South [3202115851]ft]",
+						"persistableReference": "scaleOffset:scale:0.3048006096012192offset:0.0symbol:ftUSbaseMeasurement:ancestry:Lengthtype:UMtype:USO}",
+						"propertyNames": [
+							"elevationFromMsl",
+							"totalDepthMdDriller",
+							"wellHeadProjected"
+						],
+						"propertyValues": [
+							"F",
+							"ftUS",
+							"deg"
+						],
+						"uncertainty": 0
+					}
+				],
+				"ExtensionProperties": {
+					"kind": "os:npd:csvFileExtDetails:1.0.0"
+				},
+				"ParentReference": "CSBE0417"
+			}
+		}
+	},
+	"ancestry": {
+		"additionalProp1": [
+			"string"
+		],
+		"additionalProp2": [
+			"string"
+		],
+		"additionalProp3": [
+			"string"
+		]
+	}
+}

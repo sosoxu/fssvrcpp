@@ -1,0 +1,32 @@
+{
+	"id": "string",
+	"kind": "<tenant_name>:wks:dataset--File.Generic:1.0.0",
+	"acl": {
+		"viewers": [
+			"<acl_viewers>@<tenant_name>.<cloud_domain>"
+		],
+		"owners": [
+			"<acl_owners>@<tenant_name>.<cloud_domain>"
+		]
+	},
+	"legal": {
+		"legaltags": [
+			"<legal_tags>"
+		],
+		"otherRelevantDataCountries": [
+			"US"
+		],
+		"status": "compliant"
+	},
+	"ancestry": {
+		"additionalProp1": [
+			"string"
+		],
+		"additionalProp2": [
+			"string"
+		],
+		"additionalProp3": [
+			"string"
+		]
+	}
+}

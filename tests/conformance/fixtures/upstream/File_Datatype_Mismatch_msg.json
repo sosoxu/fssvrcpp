@@ -1,0 +1,13 @@
+{
+    "error": {
+        "code": 400,
+        "message": "Bad Request. Invalid Input.",
+        "errors": [
+            {
+                "domain": "global",
+                "reason": "badRequest",
+                "message": "Bad Request. Invalid Input."
+            }
+        ]
+    }
+}

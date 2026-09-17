@@ -1,0 +1,13 @@
+{
+    "error": {
+        "code": 400,
+        "message": "Validation Error",
+        "errors": [
+            {
+                "domain": "global",
+                "reason": "badRequest",
+                "message": "Record acl.owners cannot be empty"
+            }
+        ]
+    }
+}

@@ -1,0 +1,615 @@
+// =============================================================================
+//  OSDU File Service —— RPC 契约（草案 v0.2）
+// =============================================================================
+//
+//  重要说明（设计前提）
+//  ---------------------------------------------------------------------------
+//  OSDU 官方规范只定义了 REST/HTTP+JSON 接口（OpenAPI），**没有** gRPC/RPC 规范。
+//  证据：osdu/platform/system/file 仓库 master 分支中不存在任何 .proto 文件，
+//  其 API 全部由 Spring `@RestController` 声明。因此本文件是**平台外的扩展契约**
+//  （extension），不是 OSDU 规范的一部分。完整论证见
+//  docs/adr/ADR-001-rpc-as-extension.md。
+//
+//  设计约束（必须遵守，否则会破坏 OSDU 兼容性）
+//  ---------------------------------------------------------------------------
+//  1. 本 proto 的语义与 OSDU REST **一对一同构**：同一请求经 REST 与经 RPC 必须
+//     产生相同的领域结果与相同的错误分类。见 docs/03-api-contract.md 的
+//     "双协议等价性矩阵"。
+//  2. JSON 名称是 OSDU 规范的一部分（例如 data 内字段为 PascalCase：
+//     Name/Description/TotalSize/FileSource；信封字段为 camelCase：id/kind/
+//     acl/legal/data/meta/tags/version）。本 proto 用 `json_name` 精确对齐，
+//     保证 gRPC 客户端启用 proto3-JSON 映射时能直接生产/消费规范 JSON。
+//  3. RPC 独有的能力（流式传输、driver/zone 元信息）只能**新增字段**，
+//     不得改变既有 REST 语义。
+//  4. 本机 protobuf 为 3.12.4，**不支持 proto3 `optional`**（需 3.15+），
+//     因此可选性一律用 message 包裹或"空值即未设置"表达。
+//
+//  端点对照（REST 路径含部署 context path `/api/file`，可由配置覆盖）
+//  ---------------------------------------------------------------------------
+//   RPC 方法                        ←→  REST
+//   GetUploadLocation                   GET  /api/file/v2/files/uploadURL
+//                                            POST /api/file/v2/getLocation   (废弃)
+//   GetFileLocation                     POST /api/file/v2/getFileLocation   (废弃)
+//   GetDownloadLocation                 GET  /api/file/v2/files/{id}/downloadURL
+//   GetFileList                         POST /api/file/v2/getFileList
+//   CreateFileMetadata                  POST /api/file/v2/files/metadata
+//   GetFileMetadata                     GET  /api/file/v2/files/{id}/metadata
+//   DeleteFileMetadata                  DELETE /api/file/v2/files/{id}/metadata
+//   GetStorageInstructions              POST /api/file/v2/files/storageInstructions
+//   GetRetrievalInstructions            POST /api/file/v2/files/retrievalInstructions
+//   CopyFilesToPersistent               POST /api/file/v2/files/copy
+//   GetFileSignedUrl                    POST /api/file/v2/delivery/GetFileSignedUrl
+//   RevokeUrl                           POST /api/file/v2/files/revokeURL
+//   GetInfo                             GET  /api/file/v2/info
+//   Check                               GET  /api/file/v2/liveness_check
+//                                            GET  /api/file/v2/readiness_check
+//   UploadFile / DownloadFile           (无 REST 等价；集中存储的 /v1/transfer 数据面)
+//
+//  分层映射
+//  ---------------------------------------------------------------------------
+//  本文件属于 L5 协议适配层。proto 消息 <-> 领域模型的转换全部发生在
+//  src/adapters/grpc/ 内，领域层与 proto 无关（零 protobuf 依赖，由 CMake 目标
+//  图在编译期强制）。src/adapters/http/ 内做 HTTP DTO <-> 领域模型 转换。
+//  两条链路共享同一应用层用例（L4），因此不会出现业务逻辑分叉。
+//
+// =============================================================================
+
+syntax = "proto3";
+
+package osdu.file.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option cc_enable_arenas = true;
+option java_multiple_files = true;
+option java_package = "org.opengroup.osdu.file.v1";
+
+// =============================================================================
+//  服务定义
+// =============================================================================
+service FileService {
+
+  // ---------------------------------------------------------------------------
+  //  文件位置 / 上传 / 下载
+  // ---------------------------------------------------------------------------
+
+  // 在 landing zone（staging）创建对象并返回上传用的签名 URL。
+  // REST 等价：GET  /api/file/v2/files/uploadURL?expiryTime=5M   (推荐)
+  //          POST /api/file/v2/getLocation                       (已废弃)
+  // 角色：service.file.editors
+  rpc GetUploadLocation(GetUploadLocationRequest) returns (LocationResponse);
+
+  // 查询已登记的 fileID 对应的位置（已废弃端点的 RPC 等价物）。
+  // REST 等价：POST /api/file/v2/getFileLocation
+  // 角色：service.file.editors
+  rpc GetFileLocation(GetFileLocationRequest) returns (GetFileLocationResponse);
+
+  // 为已完成元数据登记的 fileID 生成下载签名 URL。
+  // REST 等价：GET /api/file/v2/files/{id}/downloadURL?expiryTime=5M
+  // 角色：service.file.viewers
+  rpc GetDownloadLocation(GetDownloadLocationRequest) returns (DownloadUrlResponse);
+
+  // 分页查询文件位置记录（Spring Page 语义）。
+  // REST 等价：POST /api/file/v2/getFileList
+  // 角色：service.file.editors
+  rpc GetFileList(GetFileListRequest) returns (FileListResponse);
+
+  // ---------------------------------------------------------------------------
+  //  文件元数据（OSDU Storage 记录语义）
+  // ---------------------------------------------------------------------------
+
+  // 为已上传文件创建元数据记录；成功后文件从 staging 复制到 persistent 区。
+  // REST 等价：POST /api/file/v2/files/metadata  -> 201 {"id": "..."}
+  // 角色：service.file.editors
+  rpc CreateFileMetadata(FileMetadataRecord) returns (CreateFileMetadataResponse);
+
+  // 读取最新版本的元数据记录。
+  // REST 等价：GET /api/file/v2/files/{id}/metadata -> 200 RecordVersion
+  // 角色：service.file.viewers
+  rpc GetFileMetadata(GetFileMetadataRequest) returns (FileMetadataRecord);
+
+  // 删除元数据记录及其关联的 persistent 区文件。
+  // REST 等价：DELETE /api/file/v2/files/{id}/metadata -> 204
+  // 角色：service.file.editors 或 service.file.admin
+  rpc DeleteFileMetadata(DeleteFileMetadataRequest) returns (google.protobuf.Empty);
+
+  // ---------------------------------------------------------------------------
+  //  DMS（Dataset Management Service）接口
+  // ---------------------------------------------------------------------------
+
+  // REST 等价：POST /api/file/v2/files/storageInstructions
+  // 角色：service.dataset.editors
+  rpc GetStorageInstructions(GetStorageInstructionsRequest) returns (StorageInstructionsResponse);
+
+  // REST 等价：POST /api/file/v2/files/retrievalInstructions
+  // 角色：service.dataset.viewers
+  rpc GetRetrievalInstructions(GetRetrievalInstructionsRequest)
+      returns (RetrievalInstructionsResponse);
+
+  // REST 等价：POST /api/file/v2/files/copy
+  // 角色：service.storage.creator 或 service.storage.admin
+  rpc CopyFilesToPersistent(CopyDmsRequest) returns (CopyDmsResponseList);
+
+  // ---------------------------------------------------------------------------
+  //  交付（Delivery）接口
+  // ---------------------------------------------------------------------------
+
+  // 以 SRN 列表为输入批量签发下载地址。
+  // REST 等价：POST /api/file/v2/delivery/GetFileSignedUrl
+  // 角色：service.delivery.viewer
+  rpc GetFileSignedUrl(UrlSigningRequest) returns (UrlSigningResponse);
+
+  // ---------------------------------------------------------------------------
+  //  管理 / 运维
+  // ---------------------------------------------------------------------------
+
+  // REST 等价：POST /api/file/v2/files/revokeURL -> 204
+  // 角色：service.file.admin
+  // 请求体为自由字符串映射；Azure 实现要求 resourceGroup + storageAccount。
+  rpc RevokeUrl(RevokeUrlRequest) returns (google.protobuf.Empty);
+
+  // REST 等价：GET /api/file/v2/info（无需鉴权）
+  rpc GetInfo(google.protobuf.Empty) returns (InfoResponse);
+
+  // REST 等价：GET /api/file/v2/liveness_check（@PermitAll，纯文本）
+  //          GET /api/file/v2/readiness_check（@PermitAll，纯文本）
+  rpc Check(CheckRequest) returns (CheckResponse);
+
+  // ---------------------------------------------------------------------------
+  //  数据面（RPC 扩展能力，OSDU 规范中不存在）
+  // ---------------------------------------------------------------------------
+  //
+  //  背景：OSDU 规范刻意不代理文件字节，而是返回签名 URL 让客户端直连存储。
+  //  对象存储（S3/Azure Blob/GCS）天然支持签名 URL；而"集中存储"（POSIX/NFS
+  //  共享卷）没有原生签名机制，必须由服务自身作为数据面。为使两种存储后端对
+  //  上层完全同构，本服务提供以下方法：
+  //
+  //   - 集中存储模式下，REST 通过 /api/file/v1/transfer/{token} 提供等价字节
+  //     通道，gRPC 通过下面两个流式方法提供。
+  //   - 对象存储模式下，这两个方法退化为"代理转发"（默认仅在显式配置时开启，
+  //     用于内网无直连权限的场景）。
+  //
+  //  REST 与 RPC 的字节通道均为**扩展**，命名空间与 OSDU 规范隔离。
+
+  // 流式上传（客户端流）。首个分片必须携带 UploadFileInfo。
+  rpc UploadFile(stream UploadFileRequest) returns (UploadFileResponse);
+
+  // 流式下载（服务端流），支持 offset/length 区间。
+  rpc DownloadFile(DownloadFileRequest) returns (stream DownloadFileResponse);
+
+  // 服务端复制（staging -> persistent，或反向），供无存储凭证的调用方使用。
+  rpc ServerSideCopy(ServerSideCopyRequest) returns (ServerSideCopyResponse);
+}
+
+// =============================================================================
+//  共享类型
+// =============================================================================
+
+// OSDU 访问控制列表。JSON: {"viewers": [...], "owners": [...]}
+// 校验规则（实测）：两者都非空，且组名匹配
+//   ^data\.[a-zA-Z0-9_+&*-]+(?:\.[a-zA-Z0-9_+&*-]+)*@(?:[a-zA-Z](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$
+message Acl {
+  repeated string viewers = 1;
+  repeated string owners = 2;
+}
+
+// OSDU 法律标签。JSON: {"legaltags": [...], "otherRelevantDataCountries": [...], "status": "..."}
+// 校验规则（实测）：legaltags 与 otherRelevantDataCountries 均非空、元素唯一；
+// status 由服务端设置，取值 compliant / incompliant。
+message Legal {
+  repeated string legaltags = 1;
+  repeated string other_relevant_data_countries = 2
+      [json_name = "otherRelevantDataCountries"];
+  string status = 3;
+}
+
+// OSDU 血缘。JSON: {"parents": [...]}
+message Ancestry {
+  repeated string parents = 1;
+}
+
+// 存储区域。landing/staging 与 persistent 是两个独立容器（每租户各一套）。
+enum StorageZone {
+  STORAGE_ZONE_UNSPECIFIED = 0;
+  STORAGE_ZONE_STAGING = 1;
+  STORAGE_ZONE_PERSISTENT = 2;
+}
+
+// 存储驱动类型。
+//
+// 注意（实测的上游行为）：OSDU 的 Driver 字段来自 os-core-common 的
+// DriverType 枚举，其**唯一取值是 GCS**，且通用 LocationServiceImpl 对
+// 所有云厂商硬编码 DriverType.GCS —— 即 Azure/AWS/IBM 部署下
+// getFileLocation 也会返回 "GCS"。本项目不复刻这个缺陷：Driver 反映真实
+// 驱动，并可通过配置 driver_report_override 强制返回 "GCS" 以兼容依赖该
+// 行为的既有客户端（见 docs/03-api-contract.md §7 兼容性开关）。
+enum StorageDriver {
+  STORAGE_DRIVER_UNSPECIFIED = 0;
+  // 集中存储：POSIX / NFS 共享文件系统，由服务自身提供签名与字节通道。
+  STORAGE_DRIVER_POSIX = 1;
+  // 对象存储：S3 兼容（AWS S3 / MinIO / Ceph RGW / SeaweedFS / 华为 OBS 等）。
+  STORAGE_DRIVER_S3 = 2;
+  // 兼容上报值：等价于上游 DriverType.GCS 的字面量。
+  STORAGE_DRIVER_GCS_COMPAT = 3;
+}
+
+// =============================================================================
+//  File.Generic 元数据记录
+// =============================================================================
+
+// data.DatasetProperties.FileSourceInfo
+// 注意：OSDU schema 中该层字段使用 PascalCase JSON 名称。
+message FileSourceInfo {
+  string file_source = 1 [json_name = "FileSource"];
+  string preload_file_path = 2 [json_name = "PreloadFilePath"];
+  string preload_file_create_user = 3 [json_name = "PreloadFileCreateUser"];
+  string preload_file_create_date = 4 [json_name = "PreloadFileCreateDate"];
+  string preload_file_modify_user = 5 [json_name = "PreloadFileModifyUser"];
+  string preload_file_modify_date = 6 [json_name = "PreloadFileModifyDate"];
+  string name = 7 [json_name = "Name"];
+  string file_size = 8 [json_name = "FileSize"];
+  string encoding_format_type_id = 9 [json_name = "EncodingFormatTypeID"];
+  // 服务端会在复制到 persistent 后覆写这两个字段（上游行为）。
+  string checksum = 10 [json_name = "Checksum"];
+  string checksum_algorithm = 11 [json_name = "ChecksumAlgorithm"];
+}
+
+// data.DatasetProperties
+// 开放部分用 Struct 承载，保证前向兼容（上游新增字段不被丢弃）。
+message DatasetProperties {
+  FileSourceInfo file_source_info = 1 [json_name = "FileSourceInfo"];
+  google.protobuf.Struct additional = 2 [json_name = "Additional"];
+}
+
+// data.ExtensionProperties.FileContentsDetails
+// 注意：上游 data.ExtensionProperties 在 schema 中是自由 object，但 File Service
+// 与文档按 FileContentsDetails 使用。**不存在** `artifact` 字段。
+message FileContentsDetails {
+  string kind = 1 [json_name = "kind"];
+  string target_kind = 2 [json_name = "TargetKind"];
+  // 例如 SEG-Y / LAS / csv。
+  string file_type = 3 [json_name = "FileType"];
+  repeated google.protobuf.Struct frame_of_reference = 4 [json_name = "FrameOfReference"];
+  google.protobuf.Struct extension_properties = 5 [json_name = "ExtensionProperties"];
+  string parent_reference = 6 [json_name = "ParentReference"];
+}
+
+// data —— File.Generic 的主体。字段名 PascalCase 对齐 OSDU schema。
+message FileData {
+  string name = 1 [json_name = "Name"];
+  string description = 2 [json_name = "Description"];
+  string total_size = 3 [json_name = "TotalSize"];
+  string encoding_format_type_id = 4 [json_name = "EncodingFormatTypeID"];
+  string schema_format_type_id = 5 [json_name = "SchemaFormatTypeID"];
+  string resource_home_region_id = 6 [json_name = "ResourceHomeRegionID"];
+  repeated string resource_host_region_ids = 7 [json_name = "ResourceHostRegionIDs"];
+  string resource_curation_status = 8 [json_name = "ResourceCurationStatus"];
+  string resource_lifecycle_status = 9 [json_name = "ResourceLifecycleStatus"];
+  string resource_security_classification = 10
+      [json_name = "ResourceSecurityClassification"];
+  string source = 11 [json_name = "Source"];
+  DatasetProperties dataset_properties = 12 [json_name = "DatasetProperties"];
+  string existence_kind = 13 [json_name = "ExistenceKind"];
+  // "BIG" / "LITTLE"（上游为 Java enum Endian）
+  string endian = 14 [json_name = "Endian"];
+  string checksum = 15 [json_name = "Checksum"];
+  // 自由 object；若承载 FileContentsDetails，用 file_contents_details 表达。
+  google.protobuf.Struct extension_properties = 16 [json_name = "ExtensionProperties"];
+  FileContentsDetails file_contents_details = 17
+      [json_name = "FileContentsDetails"];
+}
+
+// 完整元数据记录（请求与响应共用；响应额外带 version）。
+message FileMetadataRecord {
+  string id = 1;
+  string kind = 2;
+  Acl acl = 3;
+  Legal legal = 4;
+  FileData data = 5;
+  Ancestry ancestry = 6;
+  // meta 在 OSDU 中是 List<Object>，内容不定。
+  repeated google.protobuf.Struct meta = 7;
+  map<string, string> tags = 8;
+  // 仅响应/持久化时填充。
+  int64 version = 9;
+}
+
+message CreateFileMetadataResponse {
+  string id = 1;
+}
+
+message GetFileMetadataRequest {
+  string id = 1;
+}
+
+message DeleteFileMetadataRequest {
+  string id = 1;
+}
+
+// =============================================================================
+//  位置 / 签名 URL
+// =============================================================================
+
+// LocationResponse.Location 的实际结构。
+// 上游把它建模为 Map<String,String>，实测键为 "SignedURL" 与 "FileSource"。
+message LocationBody {
+  string signed_url = 1 [json_name = "SignedURL"];
+  // 形如 /<user>/<epochMillis>-<yyyy-MM-dd-HH-mm-ss-SSS>/<fileID>（含前导斜杠）
+  string file_source = 2 [json_name = "FileSource"];
+}
+
+// 过期时间规格。REST 通过 query 参数 expiryTime 传递，形如 "5M"/"2H"/"1D"。
+// 语义（实测 ExpiryTimeUtil）：缺省 1 小时；超过 7 天**静默截断**为 7 天；
+// 非法格式 -> 400，消息固定为
+//   "expiryTime pattern isn't supported. Value should be one of these regex
+//    patterns ^[0-9]+M$ , ^[0-9]+H$ , ^[0-9]+D$"
+message ExpirySpec {
+  // 原始字符串（如 "5M"）；空字符串表示未提供 -> 使用默认值。
+  string raw = 1;
+  // 规范化后的秒数（由适配层/应用层填充，供 RPC 客户端直接使用）。
+  int64 seconds = 2;
+}
+
+message GetUploadLocationRequest {
+  // 可选（来自 LocationRequest.FileID）。不提供时服务生成 UUID。
+  // 约束：匹配 ^[\w,\s-]+(\.\w+)?$，且长度受限。
+  string file_id = 1 [json_name = "FileID"];
+  ExpirySpec expiry = 2;
+  // 保留：供生成更友好的对象键（REST 端不暴露）。
+  string file_name = 3 [json_name = "fileName"];
+  string content_type = 4 [json_name = "contentType"];
+}
+
+message LocationResponse {
+  string file_id = 1 [json_name = "FileID"];
+  LocationBody location = 2 [json_name = "Location"];
+  // ↓ 以下为 RPC 扩展字段，REST 响应中不存在（见 docs/03-api-contract.md §3.1）
+  StorageDriver driver = 3 [json_name = "Driver"];
+  StorageZone zone = 4 [json_name = "Zone"];
+  // 精确过期时间点，便于客户端规划续传。
+  google.protobuf.Timestamp expires_at = 5 [json_name = "expiresAt"];
+}
+
+message GetFileLocationRequest {
+  // REST 请求体：{"FileID": "..."}
+  string file_id = 1 [json_name = "FileID"];
+  ExpirySpec expiry = 2;
+  // true 时同时返回可用签名 URL（RPC 扩展；REST 的 getFileLocation 不签名）。
+  bool sign = 3 [json_name = "sign"];
+}
+
+// 上游：{"Driver": "GCS", "Location": "https://<account>/<container>/<path>"}
+message GetFileLocationResponse {
+  string driver = 1 [json_name = "Driver"];
+  string location = 2 [json_name = "Location"];
+  // ↓ RPC 扩展字段
+  string file_id = 3 [json_name = "FileID"];
+  string file_source = 4 [json_name = "FileSource"];
+  StorageZone zone = 5 [json_name = "Zone"];
+}
+
+message GetDownloadLocationRequest {
+  string id = 1;
+  ExpirySpec expiry = 2;
+}
+
+// 上游：{"SignedUrl": "https://..."}
+message DownloadUrlResponse {
+  string signed_url = 1 [json_name = "SignedUrl"];
+}
+
+// =============================================================================
+//  文件列表（Spring Page 语义）
+// =============================================================================
+
+// 上游 FileListRequest（os-core-common）
+message FileListRequest {
+  // 形如 "2021-03-01T00:00:00"
+  string time_from = 1 [json_name = "TimeFrom"];
+  string time_to = 2 [json_name = "TimeTo"];
+  int32 page_num = 3 [json_name = "PageNum"];
+  int32 items = 4 [json_name = "Items"];
+  string user_id = 5 [json_name = "UserID"];
+}
+
+// 上游 FileLocation（os-core-common）：FileID / Driver / Location / CreatedAt / CreatedBy
+message FileLocationEntity {
+  string file_id = 1 [json_name = "FileID"];
+  string driver = 2 [json_name = "Driver"];
+  string location = 3 [json_name = "Location"];
+  // 格式 yyyy-MM-dd'T'HH:mm:ss.SSSZ
+  string created_at = 4 [json_name = "CreatedAt"];
+  string created_by = 5 [json_name = "CreatedBy"];
+}
+
+// 上游 FileListResponse —— Spring Data Page 的字段名（非 results/total）
+message FileListResponse {
+  repeated FileLocationEntity content = 1 [json_name = "Content"];
+  int32 number = 2 [json_name = "Number"];
+  int32 number_of_elements = 3 [json_name = "NumberOfElements"];
+  int32 size = 4 [json_name = "Size"];
+}
+
+message GetFileListRequest {
+  FileListRequest request = 1;
+}
+
+// =============================================================================
+//  DMS（上游 os-core-common，package org.opengroup.osdu.core.common.dms.model）
+// =============================================================================
+
+message GetStorageInstructionsRequest {
+  ExpirySpec expiry = 1;
+  // RPC 扩展：按 datasetId 生成指令（REST 的 /v2/files/storageInstructions 不带参数）。
+  string dataset_id = 2 [json_name = "datasetId"];
+}
+
+// 上游：class StorageInstructionsResponse { String providerKey; Map<String,Object> storageLocation; }
+message StorageInstructionsResponse {
+  string provider_key = 1 [json_name = "providerKey"];
+  google.protobuf.Struct storage_location = 2 [json_name = "storageLocation"];
+}
+
+// 上游：class RetrievalInstructionsResponse { List<DatasetRetrievalProperties> datasets; }
+//       class DatasetRetrievalProperties { datasetRegistryId; retrievalProperties; providerKey; }
+message DatasetRetrievalProperties {
+  string dataset_registry_id = 1 [json_name = "datasetRegistryId"];
+  google.protobuf.Struct retrieval_properties = 2 [json_name = "retrievalProperties"];
+  string provider_key = 3 [json_name = "providerKey"];
+}
+
+message RetrievalInstructionsResponse {
+  repeated DatasetRetrievalProperties datasets = 1 [json_name = "datasets"];
+}
+
+message GetRetrievalInstructionsRequest {
+  // REST 请求体：{"datasetRegistryIds": ["..."]}
+  repeated string dataset_registry_ids = 1 [json_name = "datasetRegistryIds"];
+  ExpirySpec expiry = 2;
+}
+
+// 上游：class CopyDmsRequest { List<Record> datasetSources; }
+//       class CopyDmsResponse { boolean success; String datasetBlobStoragePath; }
+message CopyDmsRequest {
+  repeated google.protobuf.Struct dataset_sources = 1 [json_name = "datasetSources"];
+}
+
+message CopyDmsResponse {
+  bool success = 1 [json_name = "success"];
+  string dataset_blob_storage_path = 2 [json_name = "datasetBlobStoragePath"];
+}
+
+message CopyDmsResponseList {
+  repeated CopyDmsResponse results = 1 [json_name = "results"];
+}
+
+// =============================================================================
+//  交付（Delivery）
+// =============================================================================
+
+message UrlSigningRequest {
+  repeated string srns = 1 [json_name = "srns"];
+}
+
+message SrnFileData {
+  string signed_url = 1 [json_name = "signedUrl"];
+  string unsigned_url = 2 [json_name = "unsignedUrl"];
+  string kind = 3 [json_name = "kind"];
+  string connection_string = 4 [json_name = "connectionString"];
+}
+
+message UrlSigningResponse {
+  // 无法处理的 SRN 列表。
+  repeated string unprocessed = 1 [json_name = "unprocessed"];
+  // 已处理的 SRN -> 文件数据。
+  map<string, SrnFileData> processed = 2 [json_name = "processed"];
+}
+
+// =============================================================================
+//  管理 / 运维
+// =============================================================================
+
+// 上游：body 为自由 Map<String,String>；Azure 实现要求 resourceGroup + storageAccount。
+message RevokeUrlRequest {
+  map<string, string> properties = 1;
+}
+
+message InfoResponse {
+  string group_id = 1 [json_name = "groupId"];
+  string artifact_id = 2 [json_name = "artifactId"];
+  string version = 3 [json_name = "version"];
+  string build_time = 4 [json_name = "buildTime"];
+  string branch = 5 [json_name = "branch"];
+  string commit_id = 6 [json_name = "commitId"];
+  string commit_message = 7 [json_name = "commitMessage"];
+  repeated ConnectedService connected_outer_services = 8
+      [json_name = "connectedOuterServices"];
+}
+
+message ConnectedService {
+  string name = 1;
+  string version = 2;
+}
+
+message CheckRequest {
+  enum Probe {
+    PROBE_UNSPECIFIED = 0;
+    PROBE_LIVENESS = 1;
+    PROBE_READINESS = 2;
+  }
+  Probe probe = 1;
+  string service = 2;
+}
+
+message CheckResponse {
+  enum ServingStatus {
+    SERVING_STATUS_UNKNOWN = 0;
+    SERVING_STATUS_SERVING = 1;
+    SERVING_STATUS_NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+  // REST 对等响应是纯文本（"File service is alive" / "File service is ready"），
+  // 此处提供等价文本 + 依赖后端健康明细。
+  string text = 2;
+  map<string, string> details = 3;
+}
+
+// =============================================================================
+//  数据面（扩展）
+// =============================================================================
+
+message UploadFileRequest {
+  oneof payload {
+    // 第一个分片必须携带元信息。
+    UploadFileInfo info = 1;
+    bytes chunk = 2;
+  }
+}
+
+message UploadFileInfo {
+  // 目标位置：由 GetUploadLocation 返回的 fileSource。
+  string file_source = 1 [json_name = "fileSource"];
+  // 或显式指定物理位置。
+  string container = 2 [json_name = "container"];
+  string key = 3 [json_name = "key"];
+  string content_type = 4 [json_name = "contentType"];
+  string expected_checksum = 5 [json_name = "expectedChecksum"];
+  string checksum_algorithm = 6 [json_name = "checksumAlgorithm"];
+  // 上传完成后是否自动登记元数据（等价于随后调用 CreateFileMetadata）。
+  bool register_metadata = 7 [json_name = "registerMetadata"];
+  FileMetadataRecord metadata = 8 [json_name = "metadata"];
+}
+
+message UploadFileResponse {
+  string file_id = 1 [json_name = "fileID"];
+  string file_source = 2 [json_name = "fileSource"];
+  string checksum = 3 [json_name = "checksum"];
+  uint64 bytes_written = 4 [json_name = "bytesWritten"];
+  string metadata_record_id = 5 [json_name = "metadataRecordId"];
+}
+
+message DownloadFileRequest {
+  string file_id = 1 [json_name = "fileID"];
+  string file_source = 2 [json_name = "fileSource"];
+  uint64 offset = 3;
+  uint64 length = 4;
+}
+
+message DownloadFileResponse {
+  bytes chunk = 1;
+  uint64 total_size = 2 [json_name = "totalSize"];
+  string checksum = 3 [json_name = "checksum"];
+}
+
+message ServerSideCopyRequest {
+  string source_file_source = 1 [json_name = "sourceFileSource"];
+  string target_file_source = 2 [json_name = "targetFileSource"];
+  StorageZone target_zone = 3 [json_name = "targetZone"];
+}
+
+message ServerSideCopyResponse {
+  string file_source = 1 [json_name = "fileSource"];
+  uint64 bytes_copied = 2 [json_name = "bytesCopied"];
+}
