@@ -24,6 +24,7 @@
 #include "adapters/http/metrics.h"
 #include "app/usecases/usecases.h"
 #include "common/http/http.h"
+#include "common/metrics/metrics.h"
 #include "common/bytes/bytes.h"
 #include "common/result/result.h"
 
@@ -59,6 +60,9 @@ struct RouteAuth {
 };
 
 struct RouterOptions {
+  //  ★ P9/C9.6：非 HTTP 类指标（存储操作/字节、GC）来自 L1 的注册表；
+  //    为空时 `/metrics` 只渲染 HTTP 自己的指标（测试与嵌入式用法不受影响）
+  fss::metrics::Registry* metrics_registry = nullptr;
   std::string base_path = std::string(kDefaultBasePath);
   ErrorFormat error_format = ErrorFormat::kAppError;
   //  P8 之前 allow-all（启动时必须打印显著告警，契约 §8 的 C8.5）

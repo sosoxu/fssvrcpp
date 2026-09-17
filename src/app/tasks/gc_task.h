@@ -22,6 +22,7 @@
 #pragma once
 
 #include "app/usecases/usecases.h"
+#include "common/metrics/metrics.h"
 #include "common/result/result.h"
 #include "domain/ports/ports.h"
 
@@ -52,14 +53,23 @@ struct GcReport {
   std::int64_t skipped_has_record = 0;    // ★ 有元数据记录 → 永不删
   std::int64_t skipped_no_location = 0;   // 租约指向的位置记录已经没了
   std::int64_t skipped_too_young = 0;     // 还没到 TTL / 宽限期
+  //  ★ C9.25：`.tmp_*` 的清理计数（**绝不**把临时文件当成有效对象）
+  std::int64_t tmp_removed = 0;
+  std::int64_t tmp_skipped_too_young = 0;
+  std::int64_t tmp_skipped_unknown_mtime = 0;  // 取不到 mtime → 保守保护（P9-D04 的邻居）
   std::int64_t errors = 0;
   std::vector<std::string> deleted_file_ids;  // 排障与"不重复删"断言用
 };
 
 class GcTask {
  public:
-  GcTask(UseCasePorts& ports, domain::ILeaseRepository& leases, std::string instance_id)
-      : ports_(ports), leases_(leases), instance_id_(std::move(instance_id)) {}
+  //  `registry` 可选（P9/C9.6）：非空时把 GC 的扫描/删除/跳过计进 `/metrics`
+  GcTask(UseCasePorts& ports, domain::ILeaseRepository& leases, std::string instance_id,
+         fss::metrics::Registry* registry = nullptr)
+      : ports_(ports),
+        leases_(leases),
+        instance_id_(std::move(instance_id)),
+        registry_(registry) {}
 
   //  `partition` 必填：所有仓储访问都必须带 partition（R6/R9 的护栏）。
   Result<GcReport> Run(std::string_view partition, const GcOptions& options = {});
@@ -91,6 +101,7 @@ class GcTask {
   UseCasePorts& ports_;
   domain::ILeaseRepository& leases_;
   std::string instance_id_;
+  fss::metrics::Registry* registry_ = nullptr;
 };
 
 }  // namespace fss::app

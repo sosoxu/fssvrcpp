@@ -300,8 +300,12 @@ class Handler(BaseHTTPRequestHandler):
         if method in ("GET", "HEAD"):
             content_type = config.store.content_types.get((bucket, key), "application/octet-stream")
             etag = hashlib.md5(data).hexdigest()  # noqa: S324
+            #  ★ P9-D08：真实 S3 在 GET/HEAD 上**一定**带 `Last-Modified`（RFC 1123）。
+            #    mock 第一版不返回它 → `S3BlobStore::stat().last_modified_epoch_seconds` 恒为 0，
+            #    而这正是 GC 的 TTL 判据与 fileList 的过滤/排序所依赖的字段。
             headers = {"Content-Type": content_type, "ETag": f'"{etag}"',
-                       "Accept-Ranges": "bytes"}
+                       "Accept-Ranges": "bytes",
+                       "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"}
             range_header = self.headers.get("Range")
             if range_header:
                 matched = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())

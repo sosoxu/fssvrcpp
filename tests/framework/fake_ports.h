@@ -86,6 +86,13 @@ class CapabilityOverrideBlobStore final : public domain::IBlobStore {
     return inner_.list(container, prefix, continuation_token, limit);
   }
 
+  //  C9.25：转发临时文件清理（装饰器不改变语义）
+  fss::Result<domain::TempSweepResult> remove_temp_files(const std::string& container,
+                                                 std::int64_t older_than_epoch_seconds,
+                                                 bool dry_run) override {
+    return inner_.remove_temp_files(container, older_than_epoch_seconds, dry_run);
+  }
+
   //  置位后 presign 直接返回该错误（默认不置位）
   std::optional<fss::Error> presign_error;
   //  置位后 `stat`/`copy` **不报**校验和 —— 模拟"驱动不提供校验和"（逼出流式回算路径，C6.4/C6.9）

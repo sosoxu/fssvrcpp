@@ -219,6 +219,13 @@ class RecordingGetStore final : public fss::domain::IBlobStore {
     return inner_.list(container, prefix, continuation_token, limit);
   }
 
+  //  C9.25：转发
+  fss::Result<fss::domain::TempSweepResult> remove_temp_files(const std::string& container,
+                                                 std::int64_t older_than_epoch_seconds,
+                                                 bool dry_run) override {
+    return inner_.remove_temp_files(container, older_than_epoch_seconds, dry_run);
+  }
+
  private:
   fss::domain::IBlobStore& inner_;
 };

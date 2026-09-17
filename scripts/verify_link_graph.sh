@@ -12,6 +12,9 @@
 #  白名单（docs/02-design.md §4）
 #    fss_domain → fss_result fss_json fss_time fss_bytes fss_ids（+ 系统库）
 #    fss_app    → fss_domain（+ 其传递依赖）
+#  ★ 每新增一个 L1 模块都要在这里登记（`fss_metrics` 是 P9/C9.6 加的）：
+#    白名单是"允许的依赖方向"的**唯一**机械表达，漏登记会让新模块被误判成越层依赖；
+#    而随便加通配（如 `fss_*`）会让这条护栏变成恒真 —— 宁可每次多改一行。
 #
 #  退出码：0 = 通过；1 = 出现白名单外的依赖
 # =============================================================================
@@ -29,7 +32,7 @@ FAILED=0
 
 # 允许出现在各自链接行里的 fss_* 目标
 ALLOWED_DOMAIN="fss_result fss_json fss_time fss_bytes fss_ids fss_crypto"
-ALLOWED_APP="fss_domain fss_result fss_json fss_time fss_bytes fss_ids fss_crypto"
+ALLOWED_APP="fss_domain fss_result fss_json fss_time fss_bytes fss_ids fss_crypto fss_metrics"
 
 #  证据来源的选择（踩过一次坑）
 #    ❌ 静态库的 `link.txt` 只包含 `ar qc libX.a *.o` —— **里没有任何依赖信息**，

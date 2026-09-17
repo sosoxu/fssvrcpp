@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -50,6 +51,22 @@ std::string NormalizeAlgorithm(std::string_view text) {
     out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
   }
   return out;
+}
+
+//  ★ P9-D04：`std::filesystem::last_write_time()` 的时基是 **file_clock**，不是 Unix 纪元。
+//  在 g++ 11 / libstdc++ 上 `time_since_epoch().count() / 1e9` 得到的是 **负数**
+//  （实测某文件 `st_mtime = 1699999995` 时得到 `-4737664005`），
+//  与 `domain::ListEntry::last_modified_epoch_seconds` 声明的"Unix 纪元秒"相差半个世纪。
+//  危害不是"显示不对"而是**判定反了**：`GcTask` 用 `entry.last_modified_epoch_seconds > cutoff`
+//  判断"太新 → 保护"，负值让它**恒假** ⇒ 刚落地的对象被当成过期回收；
+//  `remove_temp_files` 同理会把**在途**上传的临时文件删掉。
+//  正解：与 `stat()` 端口操作同源，用 `::stat().st_mtime`。
+//  失败时返回 `nullopt`（stat 失败意味着这个文件此刻无法访问：竞态删除、EMFILE、EIO…）：
+//  调用方必须按"未知"处理 —— 删除路径一律**不动**，列表路径按"最新"上报（对 GC 而言是保守方向）。
+std::optional<std::int64_t> MtimeEpochSeconds(const std::filesystem::path& path) {
+  struct ::stat info {};
+  if (::stat(path.c_str(), &info) != 0) return std::nullopt;
+  return static_cast<std::int64_t>(info.st_mtime);
 }
 
 bool WriteAll(int fd, const char* data, std::size_t length) {
@@ -485,7 +502,7 @@ fss::Result<domain::ListPage> PosixBlobStore::list(const std::string& container,
     const std::string relative = stdfs::relative(it->path(), dir, ec).generic_string();
     if (ec) break;
     if (IsInternalKey(relative)) continue;
-    found.emplace_back(relative, static_cast<std::int64_t>(it->last_write_time(ec).time_since_epoch().count() / 1000000000LL));
+    found.emplace_back(relative, MtimeEpochSeconds(it->path()).value_or(clock_.NowEpochSeconds()));
   }
   std::sort(found.begin(), found.end(),
             [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -516,6 +533,47 @@ fss::Result<domain::ListPage> PosixBlobStore::list(const std::string& container,
     ++count;
   }
   return page;
+}
+
+
+//  ★ C9.25：清理残留的临时文件（键含 `.tmp.`）。
+//  为什么不能用 `list()`：`list()` 用 `IsInternalKey` **跳过**临时文件与侧车文件 ——
+//  那是"临时文件永远不是对象"的表达。GC 需要一个**专用**入口来清残留。
+//  判据与 staging 的 TTL 扫描同源：mtime 早于 `older_than_epoch_seconds` 才动。
+fss::Result<domain::TempSweepResult> PosixBlobStore::remove_temp_files(
+    const std::string& container, std::int64_t older_than_epoch_seconds, bool dry_run) {
+  FSS_TRY(dir, ContainerDir(container));
+  domain::TempSweepResult result;
+  if (!fs::Exists(dir)) return result;  // 容器不存在 == 没有残留
+
+  namespace stdfs = std::filesystem;
+  std::error_code ec;
+  for (stdfs::recursive_directory_iterator it(dir, ec), end; it != end; it.increment(ec)) {
+    if (ec) break;
+    if (!it->is_regular_file(ec)) continue;
+    const std::string relative = stdfs::relative(it->path(), dir, ec).generic_string();
+    if (ec) break;
+    //  只处理**临时文件**（侧车文件随对象一起删，绝不能在这里删）
+    if (relative.find(kTempMarker) == std::string::npos) continue;
+    const auto mtime = MtimeEpochSeconds(it->path());
+    if (!mtime.has_value()) {
+      ++result.skipped_unknown_mtime;  // 状态未知 → 保护，不动它（删除方向必须保守）
+      continue;
+    }
+    if (*mtime > older_than_epoch_seconds) {
+      ++result.skipped_too_young;  // 太新 → 在途上传，保护
+      continue;
+    }
+    ++result.removed;
+    if (dry_run) continue;
+    std::error_code unlink_error;
+    stdfs::remove(it->path(), unlink_error);
+    if (unlink_error) {
+      return Err(fss::ErrorKind::kUnavailable,
+                 "删除临时文件失败：" + it->path().string() + "：" + unlink_error.message());
+    }
+  }
+  return result;
 }
 
 }  // namespace fss::infra

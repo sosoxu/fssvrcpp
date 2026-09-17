@@ -136,6 +136,7 @@
 │   common/net/       Url 解析/构造、查询字符串编解码、百分号编码                   │
 │   common/bytes/     ByteSource / ByteSink / Range 抽象、缓冲、限流              │
 │   common/sys/       系统能力探测（io_uring 可用性 → 引擎选择依据）              │
+│   common/metrics/   ★ fss_metrics：最小指标注册表（Prometheus 文本；P9/C9.6）  │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -419,6 +420,14 @@ class IBlobStore {
                                  const std::string& prefix,
                                  const std::string& continuation_token,
                                  int limit) = 0;
+
+  //  ★ C9.25（P9）：临时文件**永远不是对象**，所以 `list()` 看不见它们
+  //    （`IsInternalKey` 跳过 `.tmp.` 与侧车）。GC 清残留必须走这个专用入口。
+  //    返回结构而不是一个计数：临时文件对 `list()` 不可见，于是"看到但太新所以保护"
+  //    这件事只有驱动知道 —— 只回删除数会让"在途上传被保护"在 POSIX 路径上不可观测。
+  virtual Result<TempSweepResult> remove_temp_files(const std::string& container,
+                                                   std::int64_t older_than_epoch_seconds,
+                                                   bool dry_run) = 0;
 };
 }
 ```
@@ -866,11 +875,16 @@ GC 是**独立后台任务**（可通过配置关闭），默认**只记录不�
 | staging 超期（无记录） | ✅ `GcTask`：仅当 `gc.require_lease_expiry=false`（**单实例**）时按 TTL 扫描 |
 | persistent 孤儿 | ✅ `GcTask`：无任何位置记录引用 + 超过 `gc.orphan_grace_hours` |
 | 过期 transfer token | ⬜ 未做：自签 token 是**无状态**的（无表可清，靠签名校验拒绝过期）→ P9 复核 |
-| `.tmp_*` 残留 | ⬜ 未做（C9.25，P9）：需要 `IBlobStore` 暴露"列出内部键"；当前 `list` 按契约**跳过**内部键 |
+| `.tmp_*` 残留 | ✅ `GcTask` 第 ④ 步（P9/C9.25）：走 `IBlobStore::remove_temp_files` 专用入口（`list()` 按契约**跳过**内部键，所以不能用它）；判据是 mtime 早于 `gc.staging_ttl_hours` —— 在途上传因此被保护，且**保护数可见**（`TempSweepResult::skipped_too_young` → `fss_gc_skipped_total{reason="tmp_too_young"}`）。反向测试：即使某条位置记录**恰好指向** `.tmp_*` 键也照删（那种键不可能由 `ObjectKeyPolicy` 生成） |
 | 租约过期的 staging 对象 | ✅ `GcTask`：`ClaimExpired` **原子领取** + 领取后**再看一次记录**（有记录永不删） |
 
 实现位置：`src/app/tasks/gc_task.{h,cpp}`；测试：`tests/integration/test_gc_lease.cpp`（C6.12）。
-**未做**（如实登记，属 P9）：调度（`gc.interval_seconds`）、领导者选举、GC 指标的 `/metrics` 暴露、
+GC 指标（P9/C9.6）：`/metrics` 暴露 `fss_gc_runs_total{mode,outcome}`、
+`fss_gc_objects_deleted_total`、`fss_gc_tmp_removed_total`、
+`fss_gc_skipped_total{reason}`（`has_record` / `too_young` / `no_location` / `tmp_too_young`）
+与 `fss_gc_last_run_epoch_seconds`。
+
+**未做**（如实登记，属 P9）：调度（`gc.interval_seconds`）、领导者选举、
 PG 版 `ILeaseRepository`（`InMemoryLeaseRepository` 目前只是测试替身）、
 多实例下 GC 的 TTL 判定应改用数据库时钟（ADR-009 §6.4）。
 
@@ -1061,11 +1075,11 @@ fssvrcpp/
 | 层 | CMake 目标 | 类型 | 链接（只允许这些） |
 | --- | --- | --- | --- |
 | L1 | `fss_common` | INTERFACE | `fss_warnings` |
-| L1 | `fss_http` `fss_crypto` `fss_ids` `fss_time` `fss_fs` `fss_config` `fss_logging` `fss_net` `fss_bytes` `fss_sys` | STATIC | `fss_common` `OpenSSL::Crypto` `Threads` |
+| L1 | `fss_http` `fss_crypto` `fss_ids` `fss_time` `fss_fs` `fss_config` `fss_logging` `fss_net` `fss_bytes` `fss_sys` `fss_metrics` | STATIC | `fss_common` `OpenSSL::Crypto` `Threads` |
 | L3 | `fss_domain` | STATIC | `fss_common` |
 | L4 | `fss_app` | STATIC | `fss_domain` |
 | L5 | `fss_proto` | STATIC | `fss_common` `gRPC++` `protobuf` |
-| L2 | `fss_infra_posix` `fss_infra_s3` `fss_infra_sqlite` `fss_infra_local` | STATIC | `fss_domain` `fss_common` + 对应外部库 |
+| L2 | `fss_infra_posix` `fss_infra_s3` `fss_infra_sqlite` `fss_infra_local` `fss_blob_metered` | STATIC | `fss_domain` `fss_common` + 对应外部库 |
 | L5 | `fss_http_adapter` | STATIC | `fss_app` `fss_http` |
 | L5 | `fss_grpc_adapter` | STATIC | `fss_app` `fss_proto` |
 | — | `fss_server` | EXECUTABLE | 以上全部 |

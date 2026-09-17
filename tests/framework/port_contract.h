@@ -57,6 +57,7 @@
 #include "domain/ports/ports.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -265,6 +266,19 @@ inline void CheckBlobStoreContract(domain::IBlobStore& store,
     REQUIRE(st.exists);
     REQUIRE(st.size == 10);
     REQUIRE(st.content_type == "application/octet-stream");
+    //  ★ P9-D04/P9-D08：`stat()` 的 `last_modified_epoch_seconds` 同样是**Unix 纪元秒**契约。
+    //    这条断言以前不存在，于是两个驱动各自错着：POSIX 这里是对的（`st_mtime`）、
+    //    但 S3 的 `HEAD` 路径解析不到 `Last-Modified`（mock 也没回）→ 恒为 0。
+    //    界与 `list` 段一致：下界挡"时基错误/未初始化"，上界挡"单位错误/未来时间"。
+    {
+      const std::int64_t now_epoch =
+          std::chrono::duration_cast<std::chrono::seconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
+      CAPTURE(st.last_modified_epoch_seconds);
+      REQUIRE(st.last_modified_epoch_seconds >= 1600000000);
+      REQUIRE(st.last_modified_epoch_seconds <= now_epoch + 86400);
+    }
 
     const auto missing = ContractOk(store.stat(MakeRef(container, "stat/nope.bin")),
                                     "stat 缺失对象：Ok + exists=false（不是错误）");
@@ -383,6 +397,22 @@ inline void CheckBlobStoreContract(domain::IBlobStore& store,
     REQUIRE(all.entries.front().key == "p/a");
     REQUIRE(all.entries.back().key == "p/e");
     REQUIRE(all.entries.front().size == 5);  // "v:p/a"
+    //  ★ P9-D04：`last_modified_epoch_seconds` 的契约是**Unix 纪元秒**。
+    //  这条断言以前**不存在**，于是 POSIX 驱动把 `std::filesystem::last_write_time()`
+    //  的 file_clock 时基当成 Unix 秒（得到 -4.7e9 的负数）而无人发现；
+    //  受害的是 GC 的"太新 → 保护"比较（`> cutoff` 恒假 ⇒ 误删在途对象）。
+    //  下界 1600000000（2020-09-13）挡"时基错误/未初始化"，
+    //  上界 = 系统当前时间 + 1 天挡"单位错误（毫秒/纳秒）与未来时间"。
+    //  两个界都不假设具体时钟：契约测试用可注入时钟（ManualClock 默认 1.7e9）。
+    const std::int64_t now_epoch =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    for (const auto& entry : all.entries) {
+      CAPTURE(entry.key, entry.last_modified_epoch_seconds);
+      REQUIRE(entry.last_modified_epoch_seconds >= 1600000000);
+      REQUIRE(entry.last_modified_epoch_seconds <= now_epoch + 86400);
+    }
 
     const auto none = ContractOk(store.list(container, "zzz/", "", 100), "list 无匹配前缀");
     REQUIRE(none.entries.empty());

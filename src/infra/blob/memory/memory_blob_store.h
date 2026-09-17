@@ -87,6 +87,12 @@ class InMemoryBlobStore final : public domain::IBlobStore {
   fss::Result<domain::ListPage> list(const std::string& container, const std::string& prefix,
                                      const std::string& continuation_token, int limit) override;
 
+  //  ★ C9.25：清理**残留的临时文件**（键含 `.tmp.`）。`dry_run` 只统计。
+  fss::Result<domain::TempSweepResult> remove_temp_files(const std::string& container,
+                                                 std::int64_t older_than_epoch_seconds,
+                                                 bool dry_run) override;
+
+
   // ---- 故障注入（仅测试用） ----
   //  ⚠️ 下面这些**不是**线程安全的读（跟其它方法一样不加锁）：只在测试的单线程阶段用。
   void Inject(const FaultPlan& plan) {

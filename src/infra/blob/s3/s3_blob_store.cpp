@@ -151,6 +151,18 @@ std::int64_t ParseHttpDate(const std::string& text) {
   return static_cast<std::int64_t>(::timegm(&tm));
 }
 
+//  ★ P9-D08：对象的"最后修改时间"在 S3 的两个入口里是**两种格式**：
+//    · `ListObjectsV2` 的 `<LastModified>` 是 **ISO-8601**（`2024-01-01T00:00:00.000Z`）；
+//    · `HEAD`/`GET` 的 `Last-Modified` 响应头是 **RFC 1123**（`Mon, 01 Jan 2024 00:00:00 GMT`）。
+//  第一版对两者都套 `ParseHttpDate` → **列表里每个对象的时间恒为 0**。
+//  这与 P9-D04（POSIX 的 `last_write_time` 时基）是同一族缺陷："时间戳语义错误"，
+//  受害的是依赖 `last_modified_epoch_seconds` 的判据（GC 的 TTL、fileList 的过滤/排序），
+//  而且**显示上看不出来**（0 是个合法整数）。所以这里按格式分派，并给 ISO 一个回退。
+std::int64_t ParseObjectTimestamp(const std::string& text) {
+  if (const auto iso = fss::time::ParseIso8601(text); iso.ok()) return iso.value();
+  return ParseHttpDate(text);
+}
+
 //  S3 的 `<Error><Code>` → 我们的 ErrorKind（契约 §5 的映射，C5.7）
 fss::Error MapS3Error(long status, const std::string& body, std::string_view what) {
   const std::string code = FindTag(body, "Code").value_or("");
@@ -727,7 +739,7 @@ fss::Result<domain::ObjectStat> S3BlobStore::stat(const domain::ObjectRef& ref) 
     out.checksum_algorithm = "ETAG";
   }
   if (const auto it = response_headers.find("last-modified"); it != response_headers.end()) {
-    out.last_modified_epoch_seconds = ParseHttpDate(it->second);
+    out.last_modified_epoch_seconds = ParseObjectTimestamp(it->second);
   }
   return out;
 }
@@ -864,11 +876,20 @@ fss::Result<domain::ListPage> S3BlobStore::list(const std::string& container,
       entry.size = std::atoll(size->c_str());
     }
     if (const auto modified = FindTag(block, "LastModified"); modified.has_value()) {
-      entry.last_modified_epoch_seconds = ParseHttpDate(*modified);
+      entry.last_modified_epoch_seconds = ParseObjectTimestamp(*modified);
     }
     page.entries.push_back(std::move(entry));
   }
   return page;
+}
+
+
+//  C9.25：S3 数据面是**原生预签名**（客户端直连存储端点），服务端不落临时文件，
+//  因此这里恒为 0。接口必须实现：契约要求所有驱动提供同一套语义。
+fss::Result<domain::TempSweepResult> S3BlobStore::remove_temp_files(const std::string& /*container*/,
+                                                             std::int64_t /*older_than*/,
+                                                             bool /*dry_run*/) {
+  return domain::TempSweepResult{};
 }
 
 }  // namespace fss::infra

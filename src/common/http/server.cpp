@@ -247,6 +247,7 @@ class BodyPump final : public bytes::ByteSource {
       std::copy(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(n), out);
       buf_.erase(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(n));
       buffered_ -= n;
+      consumed_ += n;  // ★ P9-D07：只有**交给 handler** 的字节才算"被消费"
       cv_space_.notify_all();
       return n;
     }
@@ -273,6 +274,13 @@ class BodyPump final : public bytes::ByteSource {
     std::lock_guard<std::mutex> lock(mu_);
     return pushed_;
   }
+  //  ★ P9-D07：`Read` 交出去的字节总数。用来区分"handler 把请求体读干了"与
+  //    "handler 直接返回、字节被丢进队列后随 `Stop()` 丢弃" —— 后者是**静默截断**，
+  //    而 `Push` 只要队列没满就返回 true，所以 httplib 的 `reader_ok` **看不出来**。
+  std::uint64_t consumed() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return consumed_;
+  }
 
  private:
   std::function<bool(std::function<bool(const char*, std::size_t)>)> pump_;
@@ -284,6 +292,7 @@ class BodyPump final : public bytes::ByteSource {
   std::deque<char> buf_;
   std::size_t buffered_ = 0;
   std::uint64_t pushed_ = 0;
+  std::uint64_t consumed_ = 0;
   bool finished_ = false;
   bool pump_ok_ = true;
   bool stop_ = false;
@@ -924,7 +933,40 @@ struct Server::Impl {
       pump->Stop();
       req.body_stream.reset();
       if (!HandleBodyError(req, route, *counting, reader_ok->load(), &note)) {
-        res = last_body_error;
+        //  ★ P9-D05：**只有**两种情况允许用"读体失败"覆盖 handler 的响应：
+        //    ① handler 报了成功（2xx）：此时"体没读完却回 2xx"是**静默截断**，
+        //       数据面绝不能这么说 —— 必须改成读体错误；
+        //    ② 读体错误本身是**确定性的**（超时/超限/声明长度不符）：那是精确诊断，
+        //       比 handler 的次生错误更接近根因（例如客户端声明 100 只发 50 →
+        //       handler 因为读到半个对象而报 500，我们回 400 + mismatch 更准确）。
+        //    其余情况（handler 已明确报错，且读体失败只是"handler 提前返回、没读干 body"
+        //    的**结果**）必须保留 handler 的响应：否则 401/403/404/5xx 会被统一改写成
+        //    `400 failed to read request body` —— 排障时把调用方引向完全错误的方向
+        //    （实测：数据面 token 解不开时，502/501 变成 400"请求体读失败"）。
+        const bool handler_succeeded =
+            res.status < 0 || (res.status >= 200 && res.status < 300);  // <0 = 交给库定 200/206
+        const bool body_error_is_conclusive =
+            counting->timed_out || counting->exceeded ||
+            (req.content_length >= 0 && counting->read != req.content_length);
+        if (handler_succeeded || body_error_is_conclusive) {
+          res = last_body_error;
+        } else {
+          //  保留 handler 的响应，但把"体也没读完"这件事留在访问日志里（排障时两种事实都要）
+          note = "handler_error_kept_over_body_read_failure";
+        }
+      } else if ((res.status < 0 || (res.status >= 200 && res.status < 300)) &&
+                 pump->consumed() != counting->read) {
+        //  ★ P9-D07：**静默截断**的第二副面孔。`BodyPump::Push` 只要队列没满就返回 true，
+        //    所以"handler 一个字节都没读、字节直接进了队列随后被 `Stop()` 丢弃"这件事
+        //    `reader_ok` **看不出来**（上面那条分支不会触发），而 handler 还报了 2xx ——
+        //    客户端以为存成功了，字节却没了。这是"必须读完才算数"类缺陷（同 P7-D07/P8-D05），
+        //    所以按**服务端缺陷**处理（500），并留下可检索的 note。
+        res = ErrorResponse(options, 500,
+                            "streaming handler returned success without consuming the request "
+                            "body (consumed " +
+                                std::to_string(pump->consumed()) + " of " +
+                                std::to_string(counting->read) + " bytes read)");
+        note = "handler_did_not_consume_body";
       }
     }
 

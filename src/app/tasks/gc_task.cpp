@@ -15,6 +15,18 @@ namespace {
 constexpr std::string_view kExtraContainer = "container";
 constexpr std::string_view kExtraObjectKey = "object_key";
 
+//  POSIX 驱动的临时文件标记（`src/infra/blob/posix/posix_blob_store.h: kTempMarker`）。
+//  ★ 语义：**带这个标记的键永远不可能是一个有效对象** —— 它要么是"正在写"的临时文件，
+//    要么是"写失败后残留"的临时文件。因此 GC 对它：
+//      · 太新 → 跳过（保护在途上传，与 TTL 判据同源）；
+//      · 够旧 → 删除，且**不因为"某条位置记录刚好指向这个键"而放过**
+//        （这样的记录本身就不可能由 `ObjectKeyPolicy` 生成）。
+constexpr std::string_view kTempKeyMarker = ".tmp.";
+
+bool IsTempKey(std::string_view key) {
+  return key.find(kTempKeyMarker) != std::string_view::npos;
+}
+
 std::string PairKey(std::string_view container, std::string_view key) {
   return std::string(container) + "\x1f" + std::string(key);
 }
@@ -133,13 +145,27 @@ void GcTask::CollectExpiredStaging(std::string_view partition, const GcOptions& 
       return;
     }
     for (const auto& entry : page.value().entries) {
+      //  ★ C9.25：临时文件先判定 —— "够旧"是唯一的前置条件（不看位置记录）
+      if (IsTempKey(entry.key)) {
+        if (entry.last_modified_epoch_seconds > cutoff) {
+          ++report.tmp_skipped_too_young;  // 在途上传的临时文件：保护
+          continue;
+        }
+        domain::ObjectRef temp_ref;
+        temp_ref.container = container.value();
+        temp_ref.key = entry.key;
+        ++report.tmp_removed;
+        DeleteCandidate(options, staging, temp_ref, entry.key, /*delete_location=*/false, partition,
+                        report);
+        continue;
+      }
       if (entry.last_modified_epoch_seconds > cutoff) {
         ++report.skipped_too_young;
         continue;
       }
       const auto it = refs.value().find(PairKey(container.value(), entry.key));
       if (it == refs.value().end()) {
-        //  没有任何位置记录引用它 → 直接是残留对象（`.tmp_*` 之类由 P9 C9.25 处理）
+        //  没有任何位置记录引用它 → 残留对象
         domain::ObjectRef ref;
         ref.container = container.value();
         ref.key = entry.key;
@@ -184,6 +210,19 @@ void GcTask::CollectOrphanObjects(std::string_view partition, const GcOptions& o
       return;
     }
     for (const auto& entry : page.value().entries) {
+      if (IsTempKey(entry.key)) {
+        if (entry.last_modified_epoch_seconds > cutoff) {
+          ++report.tmp_skipped_too_young;
+          continue;
+        }
+        domain::ObjectRef temp_ref;
+        temp_ref.container = container.value();
+        temp_ref.key = entry.key;
+        ++report.tmp_removed;
+        DeleteCandidate(options, persistent, temp_ref, entry.key, /*delete_location=*/false,
+                        partition, report);
+        continue;
+      }
       if (refs.value().count(PairKey(container.value(), entry.key)) != 0) continue;  // 有位置记录
       if (entry.last_modified_epoch_seconds > cutoff) {
         ++report.skipped_too_young;
@@ -210,6 +249,18 @@ Result<GcReport> GcTask::Run(std::string_view partition, const GcOptions& option
   }
   GcReport report;
   report.dry_run = options.dry_run;
+  if (registry_ != nullptr) {
+    registry_->Register("fss_gc_runs_total", fss::metrics::Registry::Kind::kCounter,
+                        "GC 运行次数（按是否 dry-run 与结果）");
+    registry_->Register("fss_gc_objects_deleted_total", fss::metrics::Registry::Kind::kCounter,
+                        "GC 删除的对象数（dry-run 下为候选数）");
+    registry_->Register("fss_gc_tmp_removed_total", fss::metrics::Registry::Kind::kCounter,
+                        "GC 清理的 .tmp_* 临时文件数（C9.25）");
+    registry_->Register("fss_gc_skipped_total", fss::metrics::Registry::Kind::kCounter,
+                        "GC 跳过的对象数（按原因）");
+    registry_->Register("fss_gc_last_run_epoch_seconds", fss::metrics::Registry::Kind::kGauge,
+                        "最近一次 GC 运行的时间（epoch 秒）");
+  }
 
   const auto staging = ports_.blobs.ForPartition(partition, domain::StorageZone::kStaging);
   if (!staging.ok()) {
@@ -231,6 +282,77 @@ Result<GcReport> GcTask::Run(std::string_view partition, const GcOptions& option
   }
   //  ③ persistent 孤儿（与租约无关：它没有位置记录、也没有元数据指向它）
   CollectOrphanObjects(partition, options, *persistent.value(), now_seconds, report);
+
+  //  ④ 残留的临时文件（C9.25）：走驱动提供的**专用入口** —— `list()` 看不见它们
+  //     （"临时文件永远不是对象"），所以必须单独清。判据是 mtime 早于 staging TTL：
+  //     在途上传的临时文件因此被保护；够旧的才是残留。
+  //     ★ 与 `require_lease_expiry` 无关：临时文件没有租约，TTL 是唯一可用的判据。
+  {
+    const std::int64_t cutoff = now_seconds - options.staging_ttl_hours * 3600;
+    //  ★ 只扫"存储 × 它自己的容器"这两个组合，**不是**叉乘：
+    //    两种 zone 可以解析到**同一个**物理存储（如单实例的同一个 root，测试与
+    //    `FakeBlobStoreFactory` 的默认装配就是如此）。叉乘会把同一个目录扫两遍 ——
+    //    删除数因为幂等看不出来，但"太新 → 保护"的计数会**翻倍**，
+    //    于是"在途上传有几个"这个数字就失真了（P9-D06）。
+    struct SweepTarget {
+      domain::IBlobStore* store;
+      domain::StorageZone zone;
+    };
+    const SweepTarget targets[] = {{staging.value(), domain::StorageZone::kStaging},
+                                   {persistent.value(), domain::StorageZone::kPersistent}};
+    for (const auto& target : targets) {
+      const auto container = ObjectKeyPolicy::ContainerFor(partition, target.zone);
+      if (!container.ok()) {
+        ++report.errors;
+        continue;
+      }
+      const auto swept =
+          target.store->remove_temp_files(container.value(), cutoff, options.dry_run);
+      if (!swept.ok()) {
+        ++report.errors;
+        continue;
+      }
+      report.tmp_removed += swept.value().removed;
+      //  ★ P9-D04 的连带发现：临时文件对 `list()` 不可见（"它们不是对象"），
+      //    所以"看到但太新 → 保护"这个事实**只有驱动知道**。若只累加删除数，
+      //    POSIX（主部署形态）上"在途上传被保护"就永远不可观测 ——
+      //    `tmp_skipped_too_young` 会恒为 0，而指标里也就少了一条可排障的信号。
+      report.tmp_skipped_too_young += swept.value().skipped_too_young;
+      report.tmp_skipped_unknown_mtime += swept.value().skipped_unknown_mtime;
+    }
+  }
+
+  //  ---- 指标（C9.6）：把本轮结果计进 `/metrics` ----
+  if (registry_ != nullptr) {
+    registry_->Increment("fss_gc_runs_total",
+                         {{"mode", options.dry_run ? "dry_run" : "real"},
+                          {"outcome", report.errors == 0 ? "ok" : "error"}});
+    if (report.deleted_objects > 0) {
+      registry_->Increment("fss_gc_objects_deleted_total", {}, report.deleted_objects);
+    }
+    if (report.tmp_removed > 0) {
+      registry_->Increment("fss_gc_tmp_removed_total", {}, report.tmp_removed);
+    }
+    if (report.skipped_has_record > 0) {
+      registry_->Increment("fss_gc_skipped_total", {{"reason", "has_record"}},
+                           report.skipped_has_record);
+    }
+    if (report.skipped_too_young > 0) {
+      registry_->Increment("fss_gc_skipped_total", {{"reason", "too_young"}},
+                           report.skipped_too_young);
+    }
+    //  ★ 临时文件的"太新 → 保护"单独一个 reason：它与上面那条来自**不同**的扫描路径
+    //    （临时文件对 `list()` 不可见），混在一起会让"在途上传正在被保护"这件事失真。
+    if (report.tmp_skipped_too_young > 0) {
+      registry_->Increment("fss_gc_skipped_total", {{"reason", "tmp_too_young"}},
+                           report.tmp_skipped_too_young);
+    }
+    if (report.skipped_no_location > 0) {
+      registry_->Increment("fss_gc_skipped_total", {{"reason", "no_location"}},
+                           report.skipped_no_location);
+    }
+    registry_->SetGauge("fss_gc_last_run_epoch_seconds", now_seconds);
+  }
 
   return report;
 }

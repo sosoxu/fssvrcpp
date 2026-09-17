@@ -58,6 +58,17 @@ struct PutOptions {
   std::int64_t expected_size = -1;  // -1 = 未知
 };
 
+//  ★ C9.25：`remove_temp_files` 的结果。
+//  为什么不是"只返回删了几个"：临时文件对 `list()` 是**不可见**的（它们不是对象），
+//  所以"看到但太新所以保护"这件事只有驱动自己知道。若只回删除数，POSIX 路径上
+//  "在途上传被正确保护"就**不可观测**（`GcTask` 里等价的 list 分支在这条路径上永不执行），
+//  运维与测试都只能确认"没删"而无法确认"看到了却没删"。
+struct TempSweepResult {
+  std::int64_t removed = 0;             // 已删（dry_run 下 = 将被删）
+  std::int64_t skipped_too_young = 0;   // 看到但太新 → 保护（在途上传）
+  std::int64_t skipped_unknown_mtime = 0;  // 看到但取不到 mtime → 保护（保守方向）
+};
+
 class IBlobStore {
  public:
   virtual ~IBlobStore() = default;
@@ -72,6 +83,18 @@ class IBlobStore {
   virtual Result<ObjectStat> copy(const ObjectRef& from, const ObjectRef& to) = 0;
   virtual Result<ListPage> list(const std::string& container, const std::string& prefix,
                                 const std::string& continuation_token, int limit) = 0;
+
+  //  ★ C9.25：清理**内部临时文件**（键里含 `.tmp.` 的文件）。
+  //    为什么单独一个方法而不是让 `list()` 把它们列出来：
+  //      `list()` 的语义是"列出**对象**"，而临时文件**永远不是**对象（不能下载、不能被
+  //      位置记录引用）。把它们混进 list 会让"对象列举"的判据（getFileList、孤儿扫描）
+  //      都需要额外过滤 —— 那正是"临时文件被当成有效对象"的入口。
+  //    但 GC 又必须能把**残留**的临时文件清掉，所以这里给一个专用入口。
+  //    参数：`older_than_epoch_seconds` 之前的临时文件才处理（保护在途上传）；
+  //          `dry_run=true` 只统计不删除。
+  virtual Result<TempSweepResult> remove_temp_files(const std::string& container,
+                                                    std::int64_t older_than_epoch_seconds,
+                                                    bool dry_run) = 0;
 };
 
 // 按 partition 解析存储实例（多租户的关键接缝）

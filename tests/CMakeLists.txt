@@ -306,6 +306,13 @@ fss_add_test(test_clock_skew_guard
   LIBS    fss_app
   LABELS  "phase8;unit")
 
+# C9.6 + C9.5/C9.25：指标完整性（含"不含 secret"）+ GC 的 .tmp_* 清理
+fss_add_test(test_metrics_and_gc
+  SOURCES hardening/test_metrics_and_gc.cpp
+  LIBS    fss_http_adapter fss_app fss_blob_posix fss_blob_metered fss_metrics
+          fss_location_memory fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase9;hardening")
+
 # C9.2：故障注入 + 恢复时间（存储/DB/磁盘满/远端鉴权 + 非致命依赖）
 fss_add_test(test_fault_injection
   SOURCES hardening/test_fault_injection.cpp
@@ -325,6 +332,15 @@ fss_add_test(test_concurrency
   SOURCES hardening/test_concurrency.cpp
   LIBS    fss_http_adapter fss_app fss_blob_memory fss_blob_posix fss_location_memory
           fss_location_sqlite fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase9;hardening")
+
+# P9-D05：数据面（流式路由）的错误响应语义 —— handler 提前报的错不得被"读体失败 400"覆盖
+#  ★ 必须链真实驱动与真实编解码器：篡改签名要在 handler 里真的失败（内存替身 `Decode` 恒失败，
+#    会让用例无法区分"保留真错误"与"放过所有响应"）。
+fss_add_test(test_transfer_error_semantics
+  SOURCES hardening/test_transfer_error_semantics.cpp
+  LIBS    fss_http_adapter fss_app fss_blob_posix fss_location_sqlite fss_metadata_memory
+          fss_transfer Threads::Threads
   LABELS  "phase9;hardening")
 
 # C8.7：审计覆盖（每个受保护用例的成功/失败两侧 + 字段齐全）

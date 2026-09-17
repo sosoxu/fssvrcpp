@@ -76,6 +76,12 @@ class S3BlobStore final : public domain::IBlobStore {
                                      const std::string& continuation_token,
                                      int limit) override;
 
+  //  ★ C9.25：清理**残留的临时文件**（键含 `.tmp.`）。S3 数据面是原生预签名（没有
+  //  服务端临时文件），因此恒为 0 —— 但接口必须实现（契约要求所有驱动同一套语义）。
+  fss::Result<domain::TempSweepResult> remove_temp_files(const std::string& container,
+                                                 std::int64_t older_than_epoch_seconds,
+                                                 bool dry_run) override;
+
   //  供测试与排障：把 (bucket,key) 拼成 URL（path-style / virtual-host）
   fss::Result<std::string> BuildUrl(const domain::ObjectRef& ref) const;
   const S3Options& options() const { return options_; }

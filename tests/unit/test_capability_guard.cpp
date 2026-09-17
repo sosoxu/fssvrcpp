@@ -44,6 +44,32 @@ bool IsAllowed(const std::string& rel) {
   return std::find(allowed.begin(), allowed.end(), rel) != allowed.end();
 }
 
+//  ★ 装饰器（decorator）：它**必须**实现 `capabilities()`，但只能是"原样转发" ——
+//  那不是"按能力分支"，而是"不改变语义"。为了不因此给护栏开口子，白名单项必须满足
+//  **更强的条件**：该文件里 `capabilities()` 的每一次出现都必须是 `return inner_...` 形态。
+//  这样"把装饰器加进白名单"就等价于"声明它是一个纯转发器"，而不是"这里可以随便分支"。
+const std::vector<std::string>& PassThroughCallSites() {
+  static const std::vector<std::string> allowed = {
+      "infra/blob/metered/metered_blob_store.h",
+  };
+  return allowed;
+}
+
+bool IsPassThrough(const std::string& rel) {
+  const auto& allowed = PassThroughCallSites();
+  return std::find(allowed.begin(), allowed.end(), rel) != allowed.end();
+}
+
+//  取源文件第 `line` 行（1 基；越界返回空串）
+std::string LineOf(const std::string& text, int line) {
+  std::istringstream is(text);
+  std::string current;
+  for (int i = 1; std::getline(is, current); ++i) {
+    if (i == line) return current;
+  }
+  return {};
+}
+
 std::string ReadFile(const fs::path& path) {
   std::ifstream in(path, std::ios::binary);
   std::ostringstream ss;
@@ -188,12 +214,24 @@ TEST_CASE("★ C2.7 capabilities() 的调用点只在白名单里（含非空洞
 
   std::vector<Hit> violations;
   bool allowed_file_actually_calls = false;
+  bool pass_through_actually_forwards = false;
   for (const auto& file : files) {
     const std::string rel = fs::relative(file, src_root).generic_string();
-    const auto hits = ScanText(rel, ReadFile(file));
+    const std::string content = ReadFile(file);
+    const auto hits = ScanText(rel, content);
     if (hits.empty()) continue;
     if (IsAllowed(rel)) {
       allowed_file_actually_calls = true;
+      continue;
+    }
+    if (IsPassThrough(rel)) {
+      for (const auto& hit : hits) {
+        const std::string text = LineOf(content, hit.line);
+        INFO("装饰器白名单项必须原样转发：src/" << rel << ":" << hit.line << "  " << text);
+        REQUIRE(text.find("return inner_") != std::string::npos);
+        REQUIRE(text.find(".capabilities()") != std::string::npos);
+        pass_through_actually_forwards = true;
+      }
       continue;
     }
     for (const auto& hit : hits) violations.push_back(hit);
@@ -202,6 +240,8 @@ TEST_CASE("★ C2.7 capabilities() 的调用点只在白名单里（含非空洞
   //  ★ 非空洞性：如果白名单文件里根本没有调用，这条护栏的"通过"是假象
   //    （与 C2.1 的"静态库 link.txt 是空证据"同类陷阱）
   REQUIRE(allowed_file_actually_calls);
+  //  非空洞性（同一纪律）：装饰器白名单里也必须真的有转发调用，否则多出来的是一条死规则
+  REQUIRE(pass_through_actually_forwards);
 
   std::ostringstream report;
   for (const auto& v : violations) {

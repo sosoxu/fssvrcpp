@@ -49,7 +49,7 @@ add_library(fss_app STATIC
   app/tasks/gc_task.cpp)
 target_include_directories(fss_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # fss_crypto（L1）：CreateFileMetadata 的校验和覆写需要 SHA-256。L4 → L1 允许。
-target_link_libraries(fss_app PUBLIC fss_domain fss_crypto)
+target_link_libraries(fss_app PUBLIC fss_domain fss_crypto fss_metrics)
 
 # -----------------------------------------------------------------------------
 #  L5 适配层：REST。只允许链接 fss_app（+ fss_http 包装层）。
@@ -141,6 +141,12 @@ if(CURL_FOUND)
   target_link_libraries(fss_blob_s3 PUBLIC CURL::libcurl)
   target_compile_definitions(fss_blob_s3 PUBLIC FSS_WITH_LIBCURL=1)
 endif()
+
+# P9：存储指标装饰器（操作数 + 字节数；所有驱动共用一份实现）
+add_library(fss_blob_metered STATIC
+  infra/blob/metered/metered_blob_store.cpp)
+target_include_directories(fss_blob_metered PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fss_blob_metered PUBLIC fss_domain fss_metrics)
 
 add_library(fss_location_memory STATIC
   infra/location/memory/memory_location_repository.cpp)

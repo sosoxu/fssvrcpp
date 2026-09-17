@@ -69,6 +69,12 @@ class PosixBlobStore final : public domain::IBlobStore {
   fss::Result<domain::ListPage> list(const std::string& container, const std::string& prefix,
                                      const std::string& continuation_token, int limit) override;
 
+  //  ★ C9.25：清理**残留的临时文件**（键含 `.tmp.`）。`dry_run` 只统计。
+  fss::Result<domain::TempSweepResult> remove_temp_files(const std::string& container,
+                                                 std::int64_t older_than_epoch_seconds,
+                                                 bool dry_run) override;
+
+
   //  测试可观测性
   const std::string& root() const { return root_; }
   static constexpr std::string_view kSidecarSuffix = ".fssmeta";

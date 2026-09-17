@@ -350,4 +350,37 @@ bool InMemoryBlobStore::HasContainer(const std::string& container) const {
   return containers_.find(container) != containers_.end();
 }
 
+
+//  C9.25：内存实现没有服务端临时文件（`put` 是原子的），因此按**语义**处理：
+//  键里含 `.tmp.` 的条目不算对象，可以清理（测试用它验证 GC 的调用与计数）。
+fss::Result<domain::TempSweepResult> InMemoryBlobStore::remove_temp_files(
+    const std::string& container, std::int64_t older_than_epoch_seconds, bool dry_run) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  FSS_TRY(BeginOp(Op::kList));
+  domain::TempSweepResult result;
+  const auto container_it = containers_.find(container);
+  if (container_it == containers_.end()) return result;
+  std::int64_t removed = 0;
+  auto it = container_it->second.begin();
+  while (it != container_it->second.end()) {
+    if (it->first.find(".tmp.") == std::string::npos) {
+      ++it;
+      continue;
+    }
+    if (it->second.last_modified_epoch_seconds > older_than_epoch_seconds) {
+      ++result.skipped_too_young;  // 在途上传：保护（C9.25）
+      ++it;
+      continue;
+    }
+    ++removed;
+    if (dry_run) {
+      ++it;
+      continue;
+    }
+    it = container_it->second.erase(it);
+  }
+  result.removed = removed;
+  return result;
+}
+
 }  // namespace fss::infra

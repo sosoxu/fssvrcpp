@@ -193,7 +193,11 @@ void Router::Register(fss::http::Server& server) {
     server.Get(options_.metrics_path, MakeRoute("ops.metrics", kSmallBodyLimit),
                [this, &server](fss::http::Request& request) -> fss::http::Response {
                  const auto started = std::chrono::steady_clock::now();
-                 const std::string body = metrics_.RenderPrometheus(server.stats());
+                 //  HTTP 指标 + L1 注册表（存储/GC）拼成同一份抓取文本
+                 std::string body = metrics_.RenderPrometheus(server.stats());
+                 if (options_.metrics_registry != nullptr) {
+                   body += options_.metrics_registry->RenderPrometheus();
+                 }
                  fss::http::Response response;
                  response.status = 200;
                  //  ★ Prometheus 的 Content-Type 必须带 version 参数，抓取器据此选解析器
