@@ -15,6 +15,7 @@
 //    属于**领域规则**，由应用层的 ObjectKeyPolicy 组装，不在 L1 这里。
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -36,15 +37,18 @@ class UuidGenerator final : public IIdGenerator {
 };
 
 // 测试用：确定性、可预期
+//  ★ `next_` 是**原子**的：并发用例（如 P9 的 100 并发 JSON）会在多个服务线程里同时取 id，
+//    普通 `uint64_t` 会让两个请求拿到同一个 id —— 在"按 id 建唯一约束"的仓储上表现为
+//    偶发的唯一键冲突（与 P6 把 `ManualClock` 改成原子同一条理由）。
 class SequentialIdGenerator final : public IIdGenerator {
  public:
   explicit SequentialIdGenerator(std::uint64_t start = 1) : next_(start) {}
   std::string NewUuid() const override;          // 00000000-0000-4000-8000-<12 位递增>
   std::string NewUuidNoDash() const override;    // <32 位递增>
-  void Reset(std::uint64_t start = 1) { next_ = start; }
+  void Reset(std::uint64_t start = 1) { next_.store(start); }
 
  private:
-  mutable std::uint64_t next_;
+  mutable std::atomic<std::uint64_t> next_;
 };
 
 }  // namespace fss

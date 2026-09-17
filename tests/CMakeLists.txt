@@ -306,6 +306,27 @@ fss_add_test(test_clock_skew_guard
   LIBS    fss_app
   LABELS  "phase8;unit")
 
+# C9.2：故障注入 + 恢复时间（存储/DB/磁盘满/远端鉴权 + 非致命依赖）
+fss_add_test(test_fault_injection
+  SOURCES hardening/test_fault_injection.cpp
+  LIBS    fss_http_adapter fss_auth_remote fss_app fss_blob_memory fss_location_memory
+          fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase9;hardening")
+
+# C9.3：6 类资源上限各一个"被拒绝"的测试（真实业务栈）
+fss_add_test(test_resource_limits
+  SOURCES hardening/test_resource_limits.cpp
+  LIBS    fss_http_adapter fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+          fss_transfer Threads::Threads
+  LABELS  "phase9;hardening")
+
+# C9.1：并发硬化（100 并发 JSON 零 5xx；8 并发大文件逐路校验和）
+fss_add_test(test_concurrency
+  SOURCES hardening/test_concurrency.cpp
+  LIBS    fss_http_adapter fss_app fss_blob_memory fss_blob_posix fss_location_memory
+          fss_location_sqlite fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase9;hardening")
+
 # C8.7：审计覆盖（每个受保护用例的成功/失败两侧 + 字段齐全）
 fss_add_test(test_audit_coverage
   SOURCES unit/test_audit_coverage.cpp

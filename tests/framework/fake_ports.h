@@ -144,9 +144,10 @@ class FakeBlobStoreFactory final : public domain::IBlobStoreFactory {
   fss::Result<domain::IBlobStore*> ForPartition(std::string_view partition,
                                                 domain::StorageZone zone) override {
     if (fail) return Err(fss::ErrorKind::kUnavailable, "测试替身：ForPartition 注入失败");
+    const auto it = zone_stores_.find(zone);  // 装配后只读
+    std::lock_guard<std::mutex> lock(mutex_);
     ++calls;
     last_partition = std::string(partition);
-    const auto it = zone_stores_.find(zone);
     return it == zone_stores_.end() ? default_ : it->second;
   }
 
@@ -157,6 +158,9 @@ class FakeBlobStoreFactory final : public domain::IBlobStoreFactory {
  private:
   domain::IBlobStore* default_;
   std::map<domain::StorageZone, domain::IBlobStore*> zone_stores_;
+  //  ★ 并发用例（P9）会在多个服务线程里同时进来：计数器与 `last_partition` 必须加锁，
+  //    否则是数据竞争 + 堆损坏（P9-D01 实测 double free）
+  mutable std::mutex mutex_;
 };
 
 class RecordingSelfSignedCodec final : public domain::ISelfSignedUrlCodec {
@@ -222,9 +226,13 @@ class AllowAllAuthorizer final : public domain::IAuthorizer {
   fss::Result<void> Authorize(std::string_view required_role, std::string_view partition,
                               std::string_view bearer_token) override {
     (void)partition;
-    ++calls;
-    last_role = std::string(required_role);
-    last_roles = {last_role};
+    {
+      //  ★ 并发用例会在多个服务线程里同时调用（P9-D01）：`calls`/`last_role` 必须加锁
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++calls;
+      last_role = std::string(required_role);
+      last_roles = {last_role};
+    }
     if (bearer_token.empty()) {
       return Err(fss::ErrorKind::kUnauthenticated, "Missing authorization token");
     }
@@ -239,19 +247,25 @@ class AllowAllAuthorizer final : public domain::IAuthorizer {
                                  std::string_view partition,
                                  std::string_view bearer_token) override {
     (void)partition;
-    ++calls;
-    last_roles.clear();
-    for (const auto role : required_roles) last_roles.emplace_back(role);
-    last_role = last_roles.empty() ? std::string() : last_roles.front();
+    std::string front;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++calls;
+      last_roles.clear();
+      for (const auto role : required_roles) last_roles.emplace_back(role);
+      last_role = last_roles.empty() ? std::string() : last_roles.front();
+      front = last_role;
+    }
     if (bearer_token.empty()) {
       return Err(fss::ErrorKind::kUnauthenticated, "Missing authorization token");
     }
     if (deny) {
-      return Err(fss::ErrorKind::kPermissionDenied, "角色不足：" + last_role);
+      return Err(fss::ErrorKind::kPermissionDenied, "角色不足：" + front);
     }
     return Ok();
   }
 
+  mutable std::mutex mutex_;
   std::string last_role;
   std::vector<std::string> last_roles;
 };
@@ -297,8 +311,10 @@ class RecordingEventPublisher final : public domain::IEventPublisher {
 
   fss::Result<void> PublishStatusChanged(std::string_view topic,
                                          const domain::StatusChangedEvent& event) override {
+    const bool failing = fail || (!fail_status.empty() && event.status == fail_status);
+    std::lock_guard<std::mutex> lock(mutex_);  // ★ 并发用例（P9-D01）
     ++calls;
-    if (fail || (!fail_status.empty() && event.status == fail_status)) {
+    if (failing) {
       return Err(fss::ErrorKind::kUnavailable, "测试替身：事件发布失败");
     }
     topics.emplace_back(topic);
@@ -312,6 +328,7 @@ class RecordingEventPublisher final : public domain::IEventPublisher {
 
   fss::Result<void> PublishDatasetDetails(std::string_view topic,
                                           const domain::DatasetDetailsEvent& event) override {
+    std::lock_guard<std::mutex> lock(mutex_);  // ★ 并发用例（P9-D01）
     ++details_calls;
     last_details_topic = std::string(topic);
     if (fail_dataset_details) {
@@ -321,6 +338,7 @@ class RecordingEventPublisher final : public domain::IEventPublisher {
     return Ok();
   }
 
+  mutable std::mutex mutex_;
   int calls = 0;
   int details_calls = 0;
   std::string last_details_topic;
@@ -394,12 +412,15 @@ class RecordingAuditLogger final : public domain::IAuditLogger {
   std::vector<domain::AuditEvent> events;
 
   fss::Result<void> Record(const domain::AuditEvent& event) override {
+    //  ★ 审计在每个受保护端点上都会被调用（P8 起是 RAII 守卫）→ 并发下必须加锁（P9-D01）
+    std::lock_guard<std::mutex> lock(mutex_);
     ++calls;
     if (fail) return Err(fss::ErrorKind::kInternal, "测试替身：审计写入失败");
     events.push_back(event);
     return Ok();
   }
 
+  mutable std::mutex mutex_;
   int calls = 0;
 };
 

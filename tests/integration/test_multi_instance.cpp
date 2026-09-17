@@ -107,7 +107,9 @@ struct MultiInstanceFixture {
 
   std::unique_ptr<Instance> MakeWith(IMetadataRepository& repository, unsigned id_seed) {
     auto instance = std::make_unique<Instance>();
-    instance->ids = fss::SequentialIdGenerator{id_seed};
+    //  ★ `SequentialIdGenerator` 的计数器是原子的（并发用例需要）→ 不可赋值；
+    //    用 `Reset()` 设置起点（P9-D01）
+    instance->ids.Reset(id_seed);
     instance->factory = std::make_unique<FakeBlobStoreFactory>(blob);
     instance->issuer = std::make_unique<fss::app::LocationIssuer>(
         *instance->factory, locations, *instance->codec, clock, instance->ids,

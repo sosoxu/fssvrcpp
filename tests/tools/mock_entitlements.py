@@ -20,6 +20,7 @@
     --delay-ms N         响应前睡 N 毫秒（用于触发客户端超时）
     --status N           一律返回该状态码（如 500）
     --malformed          返回非 JSON
+    --fail-file PATH     该文件**存在**时一律返回 500（删掉它 = 故障恢复，用于恢复时间测试）
     --require-partition P  收到的 data-partition-id 与 P 不符 → 400（证明客户端确实带了这个头）
     --require-role R     请求的 roles 里没有 R → 400
 
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,6 +47,7 @@ class Config:
         self.malformed = args.malformed
         self.require_partition = args.require_partition
         self.require_role = args.require_role
+        self.fail_file = args.fail_file
         #  观测：最后一次请求（供测试断言"客户端发了什么"）
         self.last_headers: dict[str, str] = {}
         self.last_roles: list[str] = []
@@ -67,6 +70,10 @@ class Handler(BaseHTTPRequestHandler):
         config: Config = self.server.config  # type: ignore[attr-defined]
         if config.delay_ms > 0:
             time.sleep(config.delay_ms / 1000.0)
+        #  ★ 故障控制文件：存在 = 依赖不可用；删除 = 恢复（测试用它测"解除故障后的恢复时间"）
+        if config.fail_file and os.path.exists(config.fail_file):
+            self._reply(500, b'{"error":"injected failure"}')
+            return
         if config.force_status != 0:
             self._reply(config.force_status, b'{"error":"injected"}')
             return
@@ -119,6 +126,7 @@ def main() -> int:
     parser.add_argument("--malformed", action="store_true")
     parser.add_argument("--require-partition", default="")
     parser.add_argument("--require-role", default="")
+    parser.add_argument("--fail-file", default="", help="该文件存在时一律 500（可删除以恢复）")
     args = parser.parse_args()
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

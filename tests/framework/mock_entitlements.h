@@ -7,6 +7,7 @@
 // =============================================================================
 #pragma once
 
+#include "repo_path.h"
 #include "temp_dir.h"
 
 #include <unistd.h>
@@ -22,10 +23,6 @@
 
 namespace fss::test {
 
-//  ★ 与 `mock_s3.h` 共用同一个 `RepoRelative`（同一命名空间、inline 定义）
-inline std::string RepoRelative(const std::string& relative) {
-  return std::string(FSS_REPO_ROOT) + "/" + relative;
-}
 
 class MockEntitlements {
  public:
@@ -37,6 +34,7 @@ class MockEntitlements {
     bool malformed = false;   // 返回非 JSON
     std::string require_partition;  // 收到的 data-partition-id 不符 → 400
     std::string require_role;       // 请求里没有该角色 → 400
+    std::string fail_file;          // 该文件存在时一律 500（删除即恢复）
   };
 
   MockEntitlements() : MockEntitlements(Options{}) {}
@@ -55,6 +53,7 @@ class MockEntitlements {
       command += " --require-partition " + options_.require_partition;
     }
     if (!options_.require_role.empty()) command += " --require-role " + options_.require_role;
+    if (!options_.fail_file.empty()) command += " --fail-file " + options_.fail_file;
     command += " > " + port_file_ + " 2>/dev/null & echo $!";
 
     std::FILE* pipe = ::popen(command.c_str(), "r");

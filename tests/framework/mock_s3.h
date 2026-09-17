@@ -9,6 +9,8 @@
 //  R9 的教训：固定 sleep 会在慢机器上偶发失败，且失败信息毫无指向）。
 #pragma once
 
+#include "repo_path.h"
+
 #include <catch2/catch.hpp>
 
 #include <cstdio>
@@ -19,10 +21,6 @@
 #include <unistd.h>
 
 namespace fss::test {
-
-inline std::string RepoRelative(const std::string& relative) {
-  return std::string(FSS_REPO_ROOT) + "/" + relative;
-}
 
 class MockS3 {
  public:
