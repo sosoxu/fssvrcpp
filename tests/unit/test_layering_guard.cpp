@@ -49,14 +49,16 @@ std::vector<Rule> BuildRules() {
   return {
       Rule{"L3 领域层不得依赖基础设施",
            {"domain/"},
-           {"<grpc", "<sqlite3.h>", "<curl/", "<openssl/", "httplib", "common/http"},
+           {"<grpc", "<sqlite3.h>", "<curl/", "<openssl/", "httplib", "common/http",
+            "osdu/file/v1", "<google/protobuf"},
            {},
            true,
            "领域层必须能在无 gRPC/DB/HTTP/OpenSSL 的环境下编译与单测（docs/02-design.md §4）"},
 
       Rule{"L4 应用层不得依赖基础设施",
            {"app/"},
-           {"<grpc", "<sqlite3.h>", "<curl/", "<openssl/", "httplib", "common/http"},
+           {"<grpc", "<sqlite3.h>", "<curl/", "<openssl/", "httplib", "common/http",
+            "osdu/file/v1", "<google/protobuf"},
            {},
            true,
            "应用层只依赖领域类型与端口；IO 细节属于 L2/L5"},
@@ -88,6 +90,13 @@ std::vector<Rule> BuildRules() {
            {},
            true,
            "两个协议适配器必须互相独立"},
+
+      Rule{"proto 头只能出现在 gRPC 适配层",
+           {""},                                  // 全树
+           {"osdu/file/v1", "<google/protobuf", "<grpcpp/"},
+           {"adapters/grpc/"},                    // 唯一豁免（契约 §4 的转换层）
+           true,
+           "C7.7：领域/应用/HTTP 适配层都不得出现 protobuf 与 gRPC 头（两条协议互相独立）"},
 
       Rule{"L1 通用库不得反向依赖上层",
            {"common/"},
@@ -196,6 +205,12 @@ TEST_CASE("护栏扫描器本身是有效的（对已知违规必须报错）", 
   REQUIRE(would_flag("app/foo.cpp", "#include \"common/http/server.h\""));
   REQUIRE(would_flag("adapters/http/foo.cpp", "#include \"osdu/file/v1/file_service.pb.h\""));
   REQUIRE(would_flag("adapters/grpc/foo.cpp", "#include <httplib.h>"));
+  //  ★ C7.7：proto 头只能出现在 gRPC 适配层
+  REQUIRE(would_flag("domain/foo.cpp", "#include <osdu/file/v1/file_service.pb.h>"));
+  REQUIRE(would_flag("app/foo.cpp", "#include <google/protobuf/struct.pb.h>"));
+  REQUIRE(would_flag("adapters/http/foo.cpp", "#include <grpcpp/grpcpp.h>"));
+  REQUIRE_FALSE(would_flag("adapters/grpc/dto/grpc_dto.cpp",
+                           "#include <osdu/file/v1/file_service.pb.h>"));
   REQUIRE(would_flag("common/crypto/x.cpp", "#include \"domain/foo.h\""));
   // 符号使用（非 include）
   REQUIRE(would_flag("app/foo.cpp", "httplib::Server s;"));

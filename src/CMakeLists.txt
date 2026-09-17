@@ -27,6 +27,7 @@ add_subdirectory(common)
 # -----------------------------------------------------------------------------
 add_library(fss_domain STATIC
   domain/version.cpp
+  domain/contract/error_table.cpp
   domain/model/file_metadata.cpp)
 target_include_directories(fss_domain PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # 端口签名用到字节流抽象（L1）与 IClock/IIdGenerator（L1）→ 允许且必须（L3 → L1）
@@ -42,6 +43,7 @@ add_library(fss_app STATIC
   app/services/object_key_policy.cpp
   app/services/location_issuer.cpp
   app/usecases/usecases.cpp
+  app/usecases/caller_context.cpp
   app/tasks/gc_task.cpp)
 target_include_directories(fss_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # fss_crypto（L1）：CreateFileMetadata 的校验和覆写需要 SHA-256。L4 → L1 允许。
@@ -57,6 +59,18 @@ add_library(fss_http_adapter STATIC
   adapters/http/router.cpp)
 target_include_directories(fss_http_adapter PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fss_http_adapter PUBLIC fss_app fss_http)
+
+# -----------------------------------------------------------------------------
+#  L5 适配层：gRPC（RPC 是**平台外扩展**，见 ADR-001）。只允许链接 fss_app（+ fss_proto）。
+# -----------------------------------------------------------------------------
+if(FSS_ENABLE_GRPC)
+  add_library(fss_grpc_adapter STATIC
+    adapters/grpc/file_service_adapter.cpp
+    adapters/grpc/grpc_error_mapper.cpp
+    adapters/grpc/dto/grpc_dto.cpp)
+  target_include_directories(fss_grpc_adapter PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(fss_grpc_adapter PUBLIC fss_app fss_proto)
+endif()
 
 # -----------------------------------------------------------------------------
 #  组合根（唯一实例化具体实现的地方；R12）

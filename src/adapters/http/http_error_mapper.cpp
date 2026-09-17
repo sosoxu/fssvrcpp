@@ -2,6 +2,7 @@
 #include "adapters/http/http_error_mapper.h"
 
 #include "common/json/json.h"
+#include "domain/contract/error_table.h"
 
 #include <optional>
 
@@ -24,54 +25,23 @@ std::string_view ErrorFormatName(ErrorFormat format) {
 }
 
 int HttpStatusFor(fss::ErrorKind kind) {
-  switch (kind) {
-    // 400：校验、非法 expiryTime、FileSource 缺失/不存在、kind 非法、fileID 已存在、校验和不符
-    case fss::ErrorKind::kInvalidArgument:
-    case fss::ErrorKind::kFileSourceEmpty:
-    case fss::ErrorKind::kInvalidSourcePath:
-    case fss::ErrorKind::kLocationAlreadyExists:
-    case fss::ErrorKind::kChecksumMismatch:
-      return 400;
-    // 401：缺 token / 缺 partition / token 无效
-    case fss::ErrorKind::kUnauthenticated:
-      return 401;
-    // 403：调用方角色不足 / 存储侧拒绝（两者对客户端都是 403，但错误体里的 kind 不同）
-    case fss::ErrorKind::kPermissionDenied:
-    case fss::ErrorKind::kStorageAccessDenied:
-      return 403;
-    // 404：记录或位置不存在
-    case fss::ErrorKind::kNotFound:
-      return 404;
-    // 501：扩展端点未启用
-    case fss::ErrorKind::kUnimplemented:
-      return 501;
-    // 502：依赖服务异常
-    case fss::ErrorKind::kBadGateway:
-      return 502;
-    // 503：存储后端不可用/过载
-    case fss::ErrorKind::kUnavailable:
-      return 503;
-    // 500：未预期异常（含 kOk 被误当错误使用的情况）
-    case fss::ErrorKind::kInternal:
-    case fss::ErrorKind::kOk:
-      return 500;
-  }
-  return 500;
+  //  ★ 从**共享的契约表**派生（`domain::ErrorContractTable()`）：HTTP 与 gRPC 两条链路
+  //    必须落在同一行，因此映射数据只有一份（见 domain/contract/error_table.h）。
+  //    找不到 = 枚举加了新值却没登记 → 明确报错，而不是猜一个 500（否则契约会静默漂移）。
+  const auto* row = fss::domain::FindErrorContract(kind);
+  if (row == nullptr) return 500;
+  return row->rest_status;
 }
 
 std::string_view ReasonFor(int status) {
+  //  ① 领域错误覆盖的状态码 → 取自**共享契约表**（单一真相，与 gRPC 同行）
+  const auto from_contract = fss::domain::ReasonForStatus(status);
+  if (from_contract != "Unknown") return from_contract;
+  //  ② 协议层自己产生的状态码（不在契约 §5 的错误表里）：HTTP 语义专属
   switch (status) {
-    case 400: return "Bad Request";
-    case 401: return "Unauthorized";
-    case 403: return "Forbidden";
-    case 404: return "Not Found";
     case 409: return "Conflict";
     case 413: return "Payload Too Large";
     case 416: return "Range Not Satisfiable";
-    case 500: return "Internal Server Error";
-    case 501: return "Not Implemented";
-    case 502: return "Bad Gateway";
-    case 503: return "Service Unavailable";
     default: return "Error";
   }
 }

@@ -1,6 +1,7 @@
 // Router 实现。职责与横切入口见头文件。
 #include "adapters/http/router.h"
 
+#include "app/usecases/caller_context.h"
 #include "app/version.h"
 #include "common/json/json.h"
 #include "common/time/time_format.h"
@@ -38,18 +39,11 @@ fss::http::Handler Router::Wrap(Action action) {
     const std::string route = request.route_name;
     const std::string method(fss::http::MethodName(request.method));
 
-    app::CallerContext caller;
-    if (auto value = request.Header("data-partition-id"); value.has_value()) {
-      caller.partition = *value;
-    }
-    if (auto value = request.Header("authorization"); value.has_value()) {
-      caller.bearer_token = *value;
-    }
-    if (auto value = request.Header("x-user-id"); value.has_value()) {
-      caller.user_id = *value;
-    }
-    if (caller.user_id.empty()) caller.user_id = options_.default_user_id;
-    caller.correlation_id = request.correlation_id;
+    //  ★ 与 gRPC 适配层**共用**同一套解析规则（`app::CallerFromHeaders`）：
+    //    两条链路的租户/token/用户/correlation 行为必须完全一致（契约 §4.3）。
+    const auto caller = app::CallerFromHeaders(
+        [&request](std::string_view name) { return request.Header(name); },
+        request.correlation_id, options_.default_user_id);
 
     //  ★ 指标要在**所有**出口上记一次（成功 / 契约错误 / 异常），所以这里用
     //    局部 lambda + 统一 return：三个出口各写一遍必然漏（见 Wrap 的异常分支）

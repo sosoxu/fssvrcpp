@@ -287,6 +287,18 @@ fss_add_test(test_multi_instance
           fss_metadata_sqlite Threads::Threads
   LABELS  "phase6;integration")
 
+# C7.2：契约 §5 的错误码双向映射（REST ↔ gRPC 同行、无空缺）
+fss_add_test(test_error_equivalence
+  SOURCES conformance/test_error_equivalence.cpp
+  LIBS    fss_http_adapter fss_grpc_adapter
+  LABELS  "phase7;conformance")
+
+# C7.1（部分）：真实 gRPC 端口上的运维 RPC + 切片边界
+fss_add_test(test_grpc_basics
+  SOURCES integration/test_grpc_basics.cpp
+  LIBS    fss_app fss_grpc_adapter fss_blob_memory fss_location_memory fss_metadata_memory
+  LABELS  "phase7;integration")
+
 # C6.12：GC 租约（在途不删 / 过期回收 / 原子领取不重复删 / 有记录永不删）
 fss_add_test(test_gc_lease
   SOURCES integration/test_gc_lease.cpp
