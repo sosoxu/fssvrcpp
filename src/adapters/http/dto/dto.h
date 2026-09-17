@@ -89,6 +89,9 @@ struct VersionInfoResponse {
   std::string version;
   std::string build_version;
   std::vector<std::string> connected_outer_services;
+  //  ★ 非 OSDU 规范字段（扩展）：`authMode`。C8.5 要求鉴权模式在 `/v2/info` 可见，
+  //    否则 `auth.mode=disabled` 会变成"静默的无鉴权"。
+  std::string auth_mode;
 };
 
 json::Value ToJson(const VersionInfoResponse& response);

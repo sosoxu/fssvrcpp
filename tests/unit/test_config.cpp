@@ -284,6 +284,69 @@ TEST_CASE("跨字段规则：multi 模式的强制校验（ADR-009 §8.1）", "[
   REQUIRE(r3.ok);
 }
 
+TEST_CASE("★ C8.5 认证配置的强制校验：production 不得 disabled / 不得关验签 / 必须有密钥",
+          "[phase8][config][c8.5]") {
+  fss::test::TempDir tmp("cfg_auth");
+  LoadRequest req;
+  req.schema = fss::config::CoreSchema();
+
+  //  ① production + disabled → 拒绝（这是"忘了开鉴权"的典型形态）
+  req.file_path = WriteFile(tmp.str(), "prod_disabled.json", R"({
+    "deployment": {"environment": "production"},
+    "auth": {"mode": "disabled", "jwt": {"hmac_secret": "s"}}
+  })");
+  auto r1 = fss::config::Load(req);
+  REQUIRE_FALSE(r1.ok);
+  REQUIRE(HasProblem(r1.config.problems(), "auth.mode", "不允许 disabled"));
+
+  //  ② production + 关闭验签 → 拒绝
+  req.file_path = WriteFile(tmp.str(), "prod_noverify.json", R"({
+    "deployment": {"environment": "production"},
+    "auth": {"mode": "jwt", "jwt": {"verify_signature": false, "hmac_secret": "s"}}
+  })");
+  auto r2 = fss::config::Load(req);
+  REQUIRE_FALSE(r2.ok);
+  REQUIRE(HasProblem(r2.config.problems(), "auth.jwt.verify_signature", "必须为 true"));
+
+  //  ③ **production** + jwt 模式 + 开启验签 + 没有密钥 → 拒绝
+  //     （开发环境允许：语义是"本实例拒绝所有 token"+ 启动告警，见 ADR-012 §5.2）
+  req.file_path = WriteFile(tmp.str(), "no_secret.json", R"({
+    "deployment": {"environment": "production"},
+    "auth": {"mode": "jwt", "jwt": {"verify_signature": true}}
+  })");
+  auto r3 = fss::config::Load(req);
+  REQUIRE_FALSE(r3.ok);
+  REQUIRE(HasProblem(r3.config.problems(), "auth.jwt.hmac_secret", "必须配置共享密钥"));
+
+  //  ④ jwks_url 非空 → 拒绝（RS256/JWKS 未实现，ADR-012 §5.3；不能让配置"看起来有鉴权"）
+  req.file_path = WriteFile(tmp.str(), "jwks.json", R"({
+    "auth": {"mode": "jwt", "jwt": {"hmac_secret": "s", "jwks_url": "https://idp/jwks"}}
+  })");
+  auto r4 = fss::config::Load(req);
+  REQUIRE_FALSE(r4.ok);
+  REQUIRE(HasProblem(r4.config.problems(), "auth.jwt.jwks_url", "尚未实现"));
+
+  //  ★ 开发环境 + 空密钥：**允许加载**（运行时拒绝所有 token + 启动告警）
+  req.file_path = WriteFile(tmp.str(), "dev_no_secret.json", R"({
+    "deployment": {"environment": "development"},
+    "auth": {"mode": "jwt", "jwt": {"verify_signature": true}}
+  })");
+  auto dev = fss::config::Load(req);
+  INFO(dev.config.ProblemsToString());
+  REQUIRE(dev.ok);
+
+  //  ★ 正例（R16）：补齐后的生产配置**必须通过** —— 否则无法区分"校验正确"与"校验恒真"
+  req.file_path = WriteFile(tmp.str(), "prod_ok.json", R"({
+    "deployment": {"environment": "production", "mode": "single"},
+    "auth": {"mode": "jwt",
+             "jwt": {"verify_signature": true, "hmac_secret": "a-long-shared-secret",
+                     "partition_claim": "data-partition-id", "require_partition_claim": true}}
+  })");
+  auto r5 = fss::config::Load(req);
+  INFO(r5.config.ProblemsToString());
+  REQUIRE(r5.ok);
+}
+
 TEST_CASE("跨字段规则：租约续租间隔必须小于 TTL、传输内存预算", "[phase1][config]") {
   fss::test::TempDir tmp("cfg_cross2");
   LoadRequest req;

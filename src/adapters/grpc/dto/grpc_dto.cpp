@@ -183,6 +183,8 @@ void FillInfoProto(const fss::app::VersionInfo& info, osdu::file::v1::InfoRespon
   for (const auto& service : info.connected_outer_services) {
     out->add_connected_outer_services()->set_name(service);
   }
+  //  扩展字段：与 REST 的 `authMode` 对齐（C8.5，两条协议同一来源）
+  out->set_auth_mode(info.auth_mode);
 }
 
 void FillMetadataProto(const fss::domain::FileMetadataRecord& record,

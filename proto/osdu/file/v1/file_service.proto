@@ -526,6 +526,9 @@ message InfoResponse {
   string commit_message = 7 [json_name = "commitMessage"];
   repeated ConnectedService connected_outer_services = 8
       [json_name = "connectedOuterServices"];
+  //  ★ 扩展字段（非 OSDU 规范）：当前鉴权模式（C8.5）。缺少它时
+  //    `auth.mode=disabled` 会变成静默的无鉴权状态。
+  string auth_mode = 9 [json_name = "authMode"];
 }
 
 message ConnectedService {
@@ -565,6 +568,12 @@ message UploadFileRequest {
     // 第一个分片必须携带元信息。
     UploadFileInfo info = 1;
     bytes chunk = 2;
+    // ★ **显式结束标记**（扩展）：客户端在最后一个数据分片之后、`WritesDone` 之前发它。
+    //   为什么需要它：gRPC 同步 API 里 `ServerReader::Read()` 返回 false 同时表示
+    //   "客户端正常半关闭"与"流被中断/取消"，二者**无法区分**。当成同一件事处理会
+    //   让"客户端中断"变成"提交一个截断的对象"（静默数据损坏，P7-D07/P8-D05）。
+    //   有了这个标记，服务端可以确定性判定：没有标记就报错，绝不提交。
+    bool end_of_stream = 3;
   }
 }
 

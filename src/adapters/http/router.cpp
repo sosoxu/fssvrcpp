@@ -28,6 +28,47 @@ fss::http::RouteOptions MakeRoute(std::string name, std::int64_t max_body_bytes 
   return options;
 }
 
+//  ---- 每个路由的角色要求（契约 §1.3 的端点表；与用例入口的第二道完全一致）----
+const RouteAuth kEditors{{"service.file.editors"}, true};
+const RouteAuth kViewers{{"service.file.viewers"}, true};
+const RouteAuth kEditorsOrAdmin{{"service.file.editors", "service.file.admin"}, true};
+const RouteAuth kDatasetEditors{{"service.dataset.editors"}, true};
+const RouteAuth kDatasetViewers{{"service.dataset.viewers"}, true};
+const RouteAuth kStorageCreatorOrAdmin{{"service.storage.creator", "service.storage.admin"}, true};
+const RouteAuth kDeliveryViewer{{"service.delivery.viewer"}, true};
+const RouteAuth kAdminNoPartition{{"service.file.admin"}, false};
+
+//  路由名 → 角色要求（契约 §1.3 的**唯一表**；与用例入口的第二道判据一致）
+//  ★ 未登记的路由返回 `nullopt` → 调用方 fail-closed（不是"默认放行"）
+std::optional<RouteAuth> RouteAuthTable(std::string_view route) {
+  static const std::map<std::string_view, RouteAuth> kTable = {
+      //  免鉴权（运维面 + 数据面：数据面用自签 token 自证，不经 JWT）
+      {"ops.liveness", {}},
+      {"ops.readiness", {}},
+      {"ops.info", {}},
+      {"ops.metrics", {}},
+      {"transfer.put", {}},
+      {"transfer.get", {}},
+      //  契约 §1.3 的端点表
+      {"location.upload_url", kEditors},
+      {"location.get_location", kEditors},
+      {"location.get_file_location", kEditors},
+      {"location.download_url", kViewers},
+      {"location.list", kEditors},
+      {"metadata.create", kEditors},
+      {"metadata.get", kViewers},
+      {"metadata.delete", kEditorsOrAdmin},
+      {"dms.storage_instructions", kDatasetEditors},
+      {"dms.retrieval_instructions", kDatasetViewers},
+      {"dms.copy", kStorageCreatorOrAdmin},
+      {"delivery.get_file_signed_url", kDeliveryViewer},
+      {"file.revoke_url", kAdminNoPartition},
+  };
+  const auto it = kTable.find(route);
+  if (it == kTable.end()) return std::nullopt;
+  return it->second;
+}
+
 //  `POST getFileLocation` 空体 / 缺 FileID 时的**固定消息**（契约 §1.6）
 constexpr std::string_view kInvalidFileLocationRequest =
     "ConstraintViolationException: Invalid FileLocationRequest";
@@ -53,6 +94,33 @@ fss::http::Handler Router::Wrap(Action action) {
       metrics_.Observe(route, method, response.status, elapsed.count());
       return response;
     };
+
+    //  ★ 鉴权**先于**任何 DTO 解析（契约 §1.3 末段：未授权者不得靠 400 的差异探测）
+    //    要求按路由名查表；未登记的路由 **fail-closed**（绝不"默认放行"）
+    const auto auth = RouteAuthTable(route);
+    if (!auth.has_value()) {
+      return finish(ErrorToResponse(
+          Err(fss::ErrorKind::kInternal, "路由未登记角色要求：" + route), options_.error_format));
+    }
+    if (!auth->roles.empty()) {
+      //  ★ 顺序必须与用例入口（`AuthorizeCaller`）**逐字一致**：先 partition、后 token。
+      //    两层给出不同的 message 比"顺序本身"更糟 —— 同一个请求会在不同深度
+      //    报出不同的固定文案（phase4 的契约用例已经固化了 partition 优先）。
+      if (auth->require_partition && caller.partition.empty()) {
+        return finish(ErrorToResponse(Err(fss::ErrorKind::kUnauthenticated, "Missing partitionID"),
+                                      options_.error_format));
+      }
+      if (caller.bearer_token.empty()) {
+        return finish(ErrorToResponse(Err(fss::ErrorKind::kUnauthenticated,
+                                         "Missing authorization token"),
+                                      options_.error_format));
+      }
+      if (const auto allowed = ports_.authorizer.AuthorizeAny(auth->roles, caller.partition,
+                                                             caller.bearer_token);
+          !allowed.ok()) {
+        return finish(ErrorToResponse(allowed.error(), options_.error_format));
+      }
+    }
 
     try {
       auto result = action(request, caller);
@@ -104,12 +172,15 @@ void Router::Register(fss::http::Server& server) {
              }));
 
   server.Get(base + "/v2/info", MakeRoute("ops.info", kSmallBodyLimit),
-             Wrap([](fss::http::Request&, const app::CallerContext&) -> fss::Result<fss::http::Response> {
+             Wrap([this](fss::http::Request&, const app::CallerContext&)
+                      -> fss::Result<fss::http::Response> {
                VersionInfoResponse info;
                info.version = "v2";
                info.build_version = fss::app::BuildVersion();
                //  内置 SQLite 时记录不进 Storage Service，因此这里如实声明只有 storage
                info.connected_outer_services = {"storage"};
+               //  ★ C8.5：与 gRPC 的 `GetInfo` 读**同一个**来源（`UseCasePorts.auth_mode`）
+               info.auth_mode = ports_.auth_mode;
                return fss::http::Response::Json(200, fss::json::Dump(ToJson(info)));
              }));
 

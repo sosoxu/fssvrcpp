@@ -49,6 +49,9 @@ Schema CoreSchema() {
   Schema s;
 
   // ---------------- deployment ----------------
+  s.Add(FieldSpec{"deployment.environment"}
+            .Str("development=开发/测试；production=生产（触发更严格的强制校验）")
+            .Enum({"development", "production"}).Default("development"));
   s.Add(FieldSpec{"deployment.mode"}.Str("single=单实例；multi=多实例")
           .Enum({"single", "multi"}).Default("single"));
   s.Add(FieldSpec{"deployment.instance_id"}.Str("空则自动生成；K8s 下建议注入 POD_NAME").Default(""));
@@ -193,6 +196,15 @@ Schema CoreSchema() {
   s.Add(FieldSpec{"auth.jwt.verify_signature"}.Bool().Default("true"));
   s.Add(FieldSpec{"auth.jwt.roles_claim"}.Str().Default("roles"));
   s.Add(FieldSpec{"auth.jwt.user_id_claim"}.Str().Default("email"));
+  //  HS256 共享密钥（ADR-012 §5.1）。verify_signature=true 时为空 → 实例**拒绝所有 token**
+  s.Add(FieldSpec{"auth.jwt.hmac_secret"}
+            .Str("HS256 共享密钥；为空且开启验签时本实例拒绝一切 token（fail-closed）")
+            .Default(""));
+  //  租户绑定：token 里必须带这个 claim，且与请求头 `data-partition-id` 一致（ADR-012 §3）
+  s.Add(FieldSpec{"auth.jwt.partition_claim"}.Str("租户 claim 名").Default("data-partition-id"));
+  s.Add(FieldSpec{"auth.jwt.require_partition_claim"}
+            .Bool("必须 true：否则 A 租户的 token 可以配 B 的请求头读 B 的数据")
+            .Default("true"));
   s.Add(FieldSpec{"auth.remote_entitlements.base_url"}.Str().Default(""));
   s.Add(FieldSpec{"auth.remote_entitlements.timeout_ms"}.Int(1, 600000).Default("3000"));
   s.Add(FieldSpec{"auth.remote_entitlements.fail_closed"}
@@ -248,6 +260,35 @@ Schema CoreSchema() {
           if (StrOr(c, "storage.posix.shared_mount_required", "false") != "true")
             problems.emplace_back("storage.posix.shared_mount_required", "multi 时必须为 true");
         }
+        // ---- 认证（ADR-012 / C8.5）----
+        const std::string environment = StrOr(c, "deployment.environment", "development");
+        const std::string auth_mode = StrOr(c, "auth.mode", "jwt");
+        const std::string verify_signature = StrOr(c, "auth.jwt.verify_signature", "true");
+        const std::string hmac_secret = StrOr(c, "auth.jwt.hmac_secret", "");
+        const std::string jwks_url = StrOr(c, "auth.jwt.jwks_url", "");
+        if (environment == "production" && auth_mode == "disabled") {
+          problems.emplace_back("auth.mode",
+                                "production 环境不允许 disabled（那等于没有鉴权）");
+        }
+        if (environment == "production" && verify_signature != "true") {
+          problems.emplace_back("auth.jwt.verify_signature",
+                                "production 环境必须为 true（不接受不验签的 token）");
+        }
+        //  ★ 只在 production 强制"必须有密钥"：空密钥在开发环境是**允许**的
+        //    （语义是"本实例拒绝所有 token" + 启动显著告警），否则 schema 的默认值
+        //    会与自己的校验冲突 —— Load({}) 直接失败，默认配置根本起不来。
+        if (environment == "production" && auth_mode == "jwt" && verify_signature == "true" &&
+            hmac_secret.empty()) {
+          problems.emplace_back("auth.jwt.hmac_secret",
+                                "production 环境必须配置共享密钥"
+                                "（否则本实例会拒绝所有 token）");
+        }
+        if (!jwks_url.empty()) {
+          problems.emplace_back("auth.jwt.jwks_url",
+                                "RS256/JWKS 尚未实现（ADR-012 §5.3）：配置它会让服务"
+                                "「看起来配了鉴权」，因此这里直接拒绝启动");
+        }
+
         // 传输内存预算：并发 × 缓冲 ≤ 预算
         const auto buf = GetOr(c, "server.http.transfer_buffer_bytes", "262144");
         const auto budget = GetOr(c, "server.http.transfer_memory_budget_bytes", "268435456");

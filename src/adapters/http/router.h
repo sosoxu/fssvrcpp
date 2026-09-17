@@ -6,10 +6,14 @@
 //    · **不含业务判断**（不重算有效期、不拼路径、不判 kind）；
 //    · **不含直接 IO**（除了把请求体交给 `TransferEndpoint` 的流式转发）。
 //
-//  `Wrap()` 是唯一的横切入口：构造 `CallerContext` → 执行 → 把 `Error` 经
-//  `ErrorToResponse` 映射成三种错误体之一 → 兜住异常并映射为 500。
-//  授权本身在**用例入口**做（缺 token/缺 partition/角色不足都在那里报错），
-//  适配层只负责把请求头翻译成上下文 —— 这样"谁有权做什么"只有一处判据。
+//  `Wrap()` 是唯一的横切入口：构造 `CallerContext` → **鉴权预检** → 执行 →
+//  把 `Error` 经 `ErrorToResponse` 映射成三种错误体之一 → 兜住异常并映射为 500。
+//
+//  ★ 为什么适配层也要判一次角色（P8，契约 §1.3 末段）
+//    上游的鉴权在 Spring Security 过滤器里，**先于** controller 的参数绑定。
+//    若本实现只在用例入口判，那么"形状非法的请求体"会先被 DTO 解析成 400 ——
+//    未授权调用者就能靠 400/403 的差异做探测。因此 `Wrap` 先按路由声明的角色
+//    拦截（401/403），用例入口的授权保留为**第二道**（纵深防御，且 gRPC 面只有它）。
 //
 //  ⚠️ P8 之前的 `user_id`：没有 JWT 解析器，因此先用可注入的 `x-user-id`
 //     头（缺省值见 `RouterOptions`）。这是**显式占位**，P8 会替换成 token 里的 claim。
@@ -27,6 +31,8 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace fss::adapters::http {
 
@@ -45,6 +51,12 @@ struct TransferCallbacks {
 //  REST base path（契约 §2）。**唯一来源**：自签 URL 的 `<base>` 必须包含它，
 //  否则发出去的上传/下载地址会指向 404（P4-D04）。
 inline constexpr std::string_view kDefaultBasePath = "/api/file";
+
+//  路由的角色要求（契约 §1.3 的手抄表；空 `roles` = 免鉴权路由，如 /v2/info 与数据面）
+struct RouteAuth {
+  std::vector<std::string_view> roles;  // "任一即通过"
+  bool require_partition = true;        // `revokeURL` 为 false（契约 §1.2）
+};
 
 struct RouterOptions {
   std::string base_path = std::string(kDefaultBasePath);
@@ -80,7 +92,9 @@ class Router {
   using Action =
       std::function<fss::Result<fss::http::Response>(fss::http::Request&, const app::CallerContext&)>;
 
-  //  横切：上下文构造 + 错误映射 + 异常兜底 + 指标计数
+  //  横切：上下文构造 + 鉴权预检 + 错误映射 + 异常兜底 + 指标计数
+  //  ★ 鉴权要求按 `RouteOptions.name` 在 `RouteAuthTable()` 里查（单一表；
+  //    未登记的路由 **fail-closed**，见 router.cpp）。
   fss::http::Handler Wrap(Action action);
 
   //  数据面 token 被拒的计数（只算"凭证类"错误：签名错/过期 → 401；用途/租户不符 → 403；

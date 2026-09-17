@@ -25,7 +25,7 @@ JOBS="${JOBS:-$(nproc)}"
 cd "${REPO_ROOT}"
 
 # 已实现阶段的前缀（新增阶段时把编号加进来；未列入的会被跳过并提示）
-IMPLEMENTED_PHASES=(0 1 2 3 4 5 6 7)
+IMPLEMENTED_PHASES=(0 1 2 3 4 5 6 7 8)
 
 WANT=("$@")
 

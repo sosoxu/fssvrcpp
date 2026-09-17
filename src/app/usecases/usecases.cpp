@@ -775,6 +775,7 @@ fss::Result<VersionInfo> GetInfo::Execute() {
   info.build_version = "unknown";
 #endif
   info.connected_outer_services = {"storage"};
+  info.auth_mode = ports_.auth_mode;  // C8.5：鉴权模式必须在 `/v2/info` 可见
   return info;
 }
 

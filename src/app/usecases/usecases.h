@@ -73,6 +73,9 @@ struct UseCasePorts {
   LocationIssuer& issuer;
   const fss::IClock& clock;
   const fss::IIdGenerator& ids;
+  //  运维响应需要的**只读**运行时配置（`/v2/info` 的 `authMode`，C8.5）。
+  //  放在端口集合里而不是各适配层，是为了让 REST 与 gRPC 返回**同一个**值。
+  std::string auth_mode = "disabled";
 };
 
 // =============================================================================
@@ -147,6 +150,8 @@ struct VersionInfo {
   std::string version;
   std::string build_version;
   std::vector<std::string> connected_outer_services;
+  //  ★ C8.5：`auth.mode` 必须**可见** —— "忘了开鉴权"不能是静默状态
+  std::string auth_mode;  // "jwt" / "remote-entitlements" / "disabled"
 };
 
 // =============================================================================

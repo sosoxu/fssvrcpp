@@ -25,6 +25,8 @@
 // =============================================================================
 {
   "deployment": {
+    //  development=开发/测试；production=生产（禁止 auth.mode=disabled 与关闭验签）
+    "environment": "development",
     // single = 单实例（可用本地 SQLite）；multi = 多实例（状态必须外置到 PostgreSQL）
     // ★ multi 会强制校验 5 条，任一条不满足 → 拒绝启动（ADR-009 §8.1）
     "mode": "single",
@@ -228,12 +230,19 @@
   "auth": {
     "mode": "jwt",
     "jwt": {
+      //  RS256/JWKS **尚未实现**（ADR-012 §5.3）：保持为空；配了会被配置校验拒绝启动
       "jwks_url": "",
       "issuer": "",
       "audience": "",
       "verify_signature": true,
       "roles_claim": "roles",
-      "user_id_claim": "email"
+      "user_id_claim": "email",
+      //  HS256 共享密钥（可用 ${ENV:FSS_JWT_HMAC_SECRET} 引用环境变量）。
+      //  ★ 为空且开启验签时，实例会**拒绝所有 token**（fail-closed），启动横幅会警告
+      "hmac_secret": "${ENV:FSS_JWT_HMAC_SECRET}",
+      //  租户绑定（ADR-012 §3）：token 必须带这个 claim，且与请求头 data-partition-id 一致
+      "partition_claim": "data-partition-id",
+      "require_partition_claim": true
     },
     "local_roles": {
       "admin@example.com": ["service.file.admin", "service.file.editors", "service.file.viewers",

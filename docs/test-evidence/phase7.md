@@ -5,18 +5,18 @@
 | 阶段 | P7（gRPC 适配层 + 双协议等价性；RPC 是**平台外扩展**，见 ADR-001） |
 | 状态 | ✅ **已完成并通过门槛 —— C7.1~C7.10 全部满足**（3 个切片全部收口） |
 | 门槛命令 | `ctest -L phase7` |
-| 退出码 | `0`（**6 测试 / 5354 断言**） |
+| 退出码 | `0`（**6 测试 / 5378 断言**） |
 
 测试明细：
 
 | 测试 | 用例 | 断言 | 覆盖 |
 | --- | --- | --- | --- |
 | `test_error_equivalence`（conformance） | 3 | 188 | C7.2 |
-| `test_grpc_basics`（integration） | 4 | 33 | C7.1（运维 RPC + 错误语义 + 不再 UNIMPLEMENTED） |
+| `test_grpc_basics`（integration） | 4 | 34 | C7.1（运维 RPC + 错误语义 + 不再 UNIMPLEMENTED） |
 | `test_protocol_equivalence`（conformance） | 3 | 222 | C7.3（矩阵 12 行）+ C7.4 |
 | `test_proto_json_mapping`（unit） | 2 | 43 | C7.5 |
-| `test_grpc_streaming`（integration） | 8 | 4795 | C7.1 / C7.6 / C7.10 |
-| `test_dual_protocol_concurrency`（integration） | 1 | 73 | C7.8（**真实二进制**） |
+| `test_grpc_streaming`（integration） | 9 | 4812 | C7.1 / C7.6 / C7.10 |
+| `test_dual_protocol_concurrency`（integration） | 1 | 79 | C7.8（**真实二进制**） |
 
 ---
 
@@ -115,7 +115,7 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `ctest --test-dir build -L phase7 --output-on-failure` | ✅ **6 测试 / 5354 断言** 全通过（明细见开头表） |
+| `ctest --test-dir build -L phase7 --output-on-failure` | ✅ **6 测试 / 5378 断言** 全通过（明细见开头表） |
 | `./scripts/check_docs.sh` | ✅ D1~D5 全通过（链接、ADR 索引、阶段表与 `IMPLEMENTED_PHASES` 一致） |
 | `./scripts/run_all_gates.sh` | ✅ **phase0~7 全部通过**，`失败: 无`（C7.9 回归；完整日志 `build/gates-slice3.log`）——其中 phase1 的**护栏自证** ①~⑤ 全绿、phase2 的链接图/能力护栏自证全绿、phase5 驱动切换全绿 |
 | sanitizer（`run_all_gates.sh` 内嵌，`build-asan`） | ✅ ASan + UBSan + LSan 全绿，**含 `ctest -L phase7` 的 6 个测试**（其中 `test_dual_protocol_concurrency` 会在 sanitizer 构建下拉起 `build-asan/bin/fss_server`）。规模注释：sanitizer 下用 `FSS_TEST_BIG_BYTES=64MiB` / `FSS_TEST_RSS_LIMIT_KIB=512MiB` 缩小，**紧的上限在普通构建的门槛里跑** |

@@ -89,6 +89,10 @@ UploadOutcome RpcUploadPattern(PosixDualProtocolFixture& fx, const std::string& 
     chunk.set_chunk(buffer.data(), read.value());
     if (!writer->Write(chunk)) return out;
   }
+  //  ★ 协议要求：数据分片之后必须发显式结束标记，否则服务端视为"流不完整"（P8-D05）
+  osdu::file::v1::UploadFileRequest end;
+  end.set_end_of_stream(true);
+  if (!writer->Write(end)) return out;
   writer->WritesDone();
   const auto status = writer->Finish();
   out.ok = status.ok();
@@ -116,6 +120,9 @@ UploadOutcome RpcUploadPayload(PosixDualProtocolFixture& fx, const std::string& 
     chunk.set_chunk(payload);
     if (!writer->Write(chunk)) return out;
   }
+  osdu::file::v1::UploadFileRequest end;
+  end.set_end_of_stream(true);
+  if (!writer->Write(end)) return out;
   writer->WritesDone();
   const auto status = writer->Finish();
   out.ok = status.ok();
@@ -346,8 +353,9 @@ TEST_CASE("★ C7.6 上传中途取消：无 .tmp. 残留、fd 不增长、对�
     for (int i = 0; i < 16; ++i) {
       REQUIRE(writer->Write(chunk));  // 4 MiB 之后取消
     }
+    //  ★ 取消之后**不要**再 `WritesDone()`：半关闭会被服务端看成"正常结束"，
+    //    这正是"截断对象被提交"的另一种形态（真实中断 = 直接放弃流）。
     context->TryCancel();
-    (void)writer->WritesDone();
     const auto status = writer->Finish();
     INFO("取消后的状态：" << status.error_code() << " " << status.error_message());
     REQUIRE_FALSE(status.ok());
@@ -619,6 +627,9 @@ TEST_CASE("★ C7.6 慢客户端（分片间停顿）上传仍然成功", "[phas
     REQUIRE(writer->Write(chunk));
     ::usleep(25 * 1000);  // 慢客户端：让服务端在两次读之间空闲
   }
+  osdu::file::v1::UploadFileRequest end;
+  end.set_end_of_stream(true);
+  REQUIRE(writer->Write(end));
   writer->WritesDone();
   const auto status = writer->Finish();
   INFO("慢客户端上传 → " << status.error_code() << " " << status.error_message());
@@ -633,4 +644,47 @@ TEST_CASE("★ C7.6 慢客户端（分片间停顿）上传仍然成功", "[phas
   const auto downloaded = RpcDownload(fx, issued.file_id);
   REQUIRE(downloaded.ok);
   REQUIRE(downloaded.checksum == fss::crypto::Sha256Hex(expected));
+}
+
+// =============================================================================
+//  P8-D05：**没有结束标记的流**必须被拒绝，且对象不能被"截断提交"
+// =============================================================================
+//  这是 P7-D07 的确定性版本：不依赖"取消与 EOF 的竞态"，而是直接违反协议 ——
+//  客户端发完数据分片就 `WritesDone`（不发 `end_of_stream`）。
+//  在 ASan 构建下，"取消当 EOF"的竞态曾让 512 KiB 的截断对象被 commit（P8-D05）；
+//  有了显式结束标记，这个场景变成**确定性**拒绝。
+TEST_CASE("★ P8-D05 缺 end_of_stream 的上传流：报错且对象保持为空",
+          "[phase7][integration][c7.6]") {
+  PosixDualProtocolFixture fx;
+  const auto issued = RpcIssueUpload(fx);
+
+  auto context = fx.Context();
+  osdu::file::v1::UploadFileResponse response;
+  auto writer = fx.stub->UploadFile(context.get(), &response);
+  osdu::file::v1::UploadFileRequest info;
+  info.mutable_info()->set_file_source(issued.file_source);
+  REQUIRE(writer->Write(info));
+  osdu::file::v1::UploadFileRequest chunk;
+  chunk.set_chunk(std::string(256 * 1024, 'x'));
+  REQUIRE(writer->Write(chunk));
+  REQUIRE(writer->Write(chunk));
+  writer->WritesDone();  // ★ 故意不发 end_of_stream
+  const auto status = writer->Finish();
+  INFO("缺结束标记 → " << status.error_code() << " " << status.error_message());
+  REQUIRE_FALSE(status.ok());
+
+  //  对象必须仍是签发时的 0 字节空对象（**不是**被提交的 512 KiB）
+  const auto downloaded = RpcDownload(fx, issued.file_id);
+  REQUIRE(downloaded.ok);
+  REQUIRE(downloaded.bytes == 0);
+  REQUIRE(downloaded.total_size == 0);
+
+  //  失败路径同样不能留下临时文件
+  std::vector<std::string> residue;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    residue = TempResidue(fx.blob_root());
+    if (residue.empty()) break;
+    ::usleep(50 * 1000);
+  }
+  REQUIRE(residue.empty());
 }

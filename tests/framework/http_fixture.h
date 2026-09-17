@@ -144,6 +144,20 @@ struct HttpFixture {
     router_options = options;
     WireRouterAndServer(*this, std::move(options), server_options);
   }
+  //  用**外部提供的授权器**装配（P8 的角色矩阵：注入真实的 `LocalJwtAuthorizer`）。
+  //  ★ `authorizer` 必须比 fixture 活得久（`UseCasePorts` 持有它的引用）。
+  explicit HttpFixture(fss::domain::IAuthorizer& authorizer_override,
+                       fss::adapters::http::RouterOptions options = {},
+                       fss::http::ServerOptions server_options = {}) {
+    issuer = std::make_unique<fss::app::LocationIssuer>(
+        factory, locations, codec, clock, ids,
+        "http://127.0.0.1" + std::string(fss::adapters::http::kDefaultBasePath));
+    ports = std::make_unique<fss::app::UseCasePorts>(fss::app::UseCasePorts{
+        factory, locations, metadata, authorizer_override, events, audit, partitions, legal,
+        schema, *issuer, clock, ids});
+    router_options = options;
+    WireRouterAndServer(*this, std::move(options), server_options);
+  }
   ~HttpFixture() {
     if (server) server->Stop();
   }

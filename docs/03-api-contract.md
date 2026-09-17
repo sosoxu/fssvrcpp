@@ -23,7 +23,7 @@
 | 上游部署 context path | **`/api/file/`**（`server.servlet.contextPath`） |
 | 本服务默认 base path | `/api/file`（**可配置**：`server.http.base_path`） |
 | API 版本段 | `/v2`（唯一的现行版本；`/v1` 已于上游 v0.7.0 起移除，本项目不实现） |
-| 端口 | HTTP `8080`（可配）；gRPC `50051`（可配，独立端口） |
+| 端口 | HTTP `8080`（可配）；gRPC **默认关闭**（`FSS_GRPC_PORT`，`-1` = 系统分配，独立端口） |
 | 内容类型 | 请求/响应 `application/json`（`/v2/info` 等纯文本端点除外） |
 
 > 为便于测试与灰度，本服务在**同时**暴露"带 base path"的路径。
@@ -74,8 +74,17 @@
 | `/v2/info`、`/v2/liveness_check`、`/v2/readiness_check` | — | 不需要角色 |
 
 **授权发生在输入校验之前**（Spring Security 过滤器先于 controller）：未授权调用者拿到 `403`，
-不能靠 `400` 的差异探测数据是否存在。本实现由 `AuthorizeCaller`/`AuthorizeCallerAny` 在每个用例
-**入口第一步**完成，并由 `tests/unit/test_roles.cpp` 机械断言（含"上一句"这条安全属性）。
+不能靠 `400` 的差异探测数据是否存在。
+
+本实现在**两处**判同一张表（P8）：
+
+| 位置 | 作用 | 证据 |
+| --- | --- | --- |
+| HTTP 适配层 `Router::Wrap` 的**路由级预检**（`RouteAuthTable()`，按 `RouteOptions.name` 查表） | 在**任何 DTO 解析之前**给出 `401`/`403`，与上游"过滤器先于 controller"一致；未登记的路由 **fail-closed** | `tests/integration/test_auth_matrix.cpp`（含"畸形请求体也是 401/403"） |
+| 用例入口 `AuthorizeCaller`/`AuthorizeCallerAny`（**第一步**） | 纵深防御；gRPC 面**只有**这一道 | `tests/unit/test_roles.cpp`（含"授权先于校验"与"403 先于 400"） |
+
+`/v1/transfer/{token}` 数据面**不走 JWT**：它用自签 token 自证（绑定 `op`/`partition`/`exp`，
+见威胁模型 T3/T4），因此不在上表的角色矩阵里。
 
 ### 1.4 `expiryTime` 语义（唯一 query 参数）
 
@@ -551,6 +560,11 @@ checksum = storageUtil.getChecksum(persistentLocation)
 > ★ **纯文本**，不是 JSON。这是最常见的重写错误之一，契约测试专门断言 `Content-Type: text/plain`
 > 与响应体逐字节相等。
 
+**`/v2/info` 的扩展字段 `authMode`**（非 OSDU 规范，C8.5）：取值 `jwt` / `remote-entitlements`
+/ `disabled`，与 gRPC 的 `InfoResponse.auth_mode` 同源。**为什么必须暴露它**：
+`auth.mode=disabled` 的实例与正常实例在行为上只差"是否校验 token"，运维与自动化必须能
+**看到**这个状态，否则"忘了开鉴权"就是静默的。
+
 ---
 
 ## 3. 元数据契约（`dataset--File.Generic`）
@@ -722,7 +736,7 @@ checksum = storageUtil.getChecksum(persistentLocation)
 
 | RPC | 授权角色 | 语义 | 副作用 |
 | --- | --- | --- | --- |
-| `UploadFile`（客户端流） | `users.datalake.editors`（同 `GetUploadLocation`） | 首片必须是 `info`（带 `file_source`）；其后全是 `chunk`。**只允许写到已签发的位置记录**：`info.container`/`key` 非空时只能与记录**一致**（不一致 → `PERMISSION_DENIED`，不接受坐标覆盖，与 `/v1/transfer` 内核同一条防线）。`registerMetadata=true` 时上传完成后复用 `CreateFileMetadata` 的 **12 步**用例（`metadata.data.FileSource` 必须等于上传目标） | 覆盖 staging 对象字节；`registerMetadata=true` 时额外：staging→persistent 复制、写元数据 v1、位置记录迁到 persistent |
+| `UploadFile`（客户端流） | `users.datalake.editors`（同 `GetUploadLocation`） | 首片必须是 `info`（带 `file_source`）；其后是 `chunk`；**最后一个数据分片之后必须发 `end_of_stream = true`**（显式结束标记），再 `WritesDone`。**只允许写到已签发的位置记录**：`info.container`/`key` 非空时只能与记录**一致**（不一致 → `PERMISSION_DENIED`，不接受坐标覆盖，与 `/v1/transfer` 内核同一条防线）。`registerMetadata=true` 时上传完成后复用 `CreateFileMetadata` 的 **12 步**用例（`metadata.data.FileSource` 必须等于上传目标） | 覆盖 staging 对象字节；`registerMetadata=true` 时额外：staging→persistent 复制、写元数据 v1、位置记录迁到 persistent |
 | `DownloadFile`（服务端流） | `users.datalake.viewers`（同 `GetDownloadLocation`） | `file_id` 优先，否则用 `file_source`；`offset`/`length` 语义 = HTTP `Range`（`length == 0` = 从 `offset` 到末尾；`offset` 越界 → `INVALID_ARGUMENT`）。数据分片 ≤ 64 KiB，**最后一个分片的 `chunk` 为空**，携带 `totalSize` 与 `checksum` | 无 |
 | `ServerSideCopy`（一元） | `service.storage.creator` / `service.storage.admin`（同 `/v2/files/copy`） | 把 `source_file_source` 的对象复制到 `target_file_source` 在 `target_zone`（`UNSPECIFIED` 按 **persistent** 处理）下的对象键；**纯字节原语，不改动任何位置/元数据记录**；目标已存在则覆盖（幂等） | 写入目标对象 |
 
@@ -730,9 +744,16 @@ checksum = storageUtil.getChecksum(persistentLocation)
 "取消算不算成功""`length=0` 是什么意思""复制是否要动记录"就只能靠读代码 ——
 而双协议等价性（§6）恰恰要求这些语义**可复述、可测试**。
 
-**取消语义（`UploadFile`）**：客户端中途取消时，服务端必须把**不完整的字节流**
+**取消 / 中断语义（`UploadFile`）**：客户端中途取消或断开时，服务端必须把**不完整的字节流**
 当作失败（`UNAVAILABLE`），**不能**当成"正常读完" —— 后者会把截断的对象
 rename 成正式对象（静默数据损坏，P7-D07）。失败路径必须清掉 `.tmp.*` 临时文件。
+
+**为什么需要 `end_of_stream` 这个显式标记**：gRPC 同步 API 里 `ServerReader::Read()`
+返回 `false` 同时表示"客户端正常半关闭"与"流被中断/取消"，**二者无法区分**；而
+`ServerContext::IsCancelled()` 的置位时机比 `Read()` 的失败**更晚**（实测：ASan 构建下
+取消时 `Read()==false` 而 `IsCancelled()==false`，于是 512 KiB 的截断对象被 commit ——
+P8-D05，普通构建碰不到）。显式标记把这个判定变成**确定性**的：没有标记就报错、绝不提交。
+`end_of_stream` 之后不允许再出现数据分片，否则 `INVALID_ARGUMENT`。
 
 ### 4.2 消息 ↔ JSON 字段映射（关键项）
 

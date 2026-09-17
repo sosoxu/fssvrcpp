@@ -55,6 +55,7 @@ json::Value ToJson(const VersionInfoResponse& response) {
   body["version"] = response.version;
   body["buildVersion"] = response.build_version;
   body["connectedOuterServices"] = response.connected_outer_services;
+  if (!response.auth_mode.empty()) body["authMode"] = response.auth_mode;
   return body;
 }
 

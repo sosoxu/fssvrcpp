@@ -11,9 +11,10 @@
 //    C7.6 要求 1 GiB 上传/下载的 RSS 峰值 < 64 MiB。任何"先攒起来"的实现都会立刻
 //    变成 1 GiB 常驻（P6-D13 同类教训：把流式路径换成整块读回，RSS 直接抬到对象大小）。
 //
-//  协议约束（proto）：UploadFile 的**首个分片必须携带 `info`**；后续分片只能是
-//  `chunk`。这里对"重复 info""空分片""未设置 payload"都明确报错，而不是静默跳过——
-//  静默跳过会让"客户端发错协议"表现为"上传了一个截断的对象"。
+//  协议约束（proto）：UploadFile 的**首个分片必须携带 `info`**；后续分片是 `chunk`；
+//  **最后一个数据分片之后必须有 `end_of_stream = true`**。这里对"重复 info"
+//  "未设置 payload""流没有结束标记就断了"都明确报错，而不是静默跳过——
+//  静默跳过会让"客户端中断"表现为"上传了一个截断的对象"（P7-D07/P8-D05）。
 // =============================================================================
 #pragma once
 
@@ -48,6 +49,7 @@ class GrpcUploadSource final : public fss::bytes::ByteSource {
   std::string buffer_;          // 当前分片剩余未消费的字节
   std::size_t cursor_ = 0;
   std::uint64_t chunks_ = 0;
+  bool saw_end_of_stream_ = false;  // 客户端发过 `end_of_stream` 标记
 };
 
 class GrpcDownloadSink final : public fss::bytes::ByteSink {

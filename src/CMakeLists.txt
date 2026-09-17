@@ -76,13 +76,22 @@ if(FSS_ENABLE_GRPC)
 endif()
 
 # -----------------------------------------------------------------------------
+#  L2 认证（P8）：本地 JWT 校验（ADR-012）
+#    只依赖 fss_domain（端口）+ fss_crypto/json/time（L1）
+# -----------------------------------------------------------------------------
+add_library(fss_auth_local STATIC
+  infra/auth/local/local_jwt_authorizer.cpp)
+target_include_directories(fss_auth_local PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fss_auth_local PUBLIC fss_domain fss_crypto fss_json fss_time)
+
+# -----------------------------------------------------------------------------
 #  组合根（唯一实例化具体实现的地方；R12）
 # -----------------------------------------------------------------------------
 add_executable(fss_server
   main/server_main.cpp)
 target_link_libraries(fss_server PRIVATE
-  fss_http_adapter fss_grpc_adapter fss_blob_posix fss_blob_s3 fss_location_sqlite fss_transfer
-  fss_metadata_memory fss_logging Threads::Threads)
+  fss_http_adapter fss_grpc_adapter fss_auth_local fss_blob_posix fss_blob_s3
+  fss_location_sqlite fss_transfer fss_metadata_memory fss_logging Threads::Threads)
 
 # -----------------------------------------------------------------------------
 #  L2 基础设施适配层：每个端口实现一个独立目标（依赖倒置：L2 → L3 端口）

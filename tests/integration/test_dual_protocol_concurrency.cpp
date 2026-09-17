@@ -126,6 +126,10 @@ TEST_CASE("★ C7.8 真实二进制：REST 与 gRPC 两个端口同时服务、�
       osdu::file::v1::UploadFileRequest chunk;
       chunk.set_chunk(payload);
       REQUIRE(writer->Write(chunk));
+      //  协议要求：数据分片后必须有显式结束标记（P8-D05）
+      osdu::file::v1::UploadFileRequest end;
+      end.set_end_of_stream(true);
+      REQUIRE(writer->Write(end));
       writer->WritesDone();
       const auto status = writer->Finish();
       INFO("UploadFile #" << i << " → " << status.error_code() << " " << status.error_message());

@@ -287,6 +287,19 @@ fss_add_test(test_multi_instance
           fss_metadata_sqlite Threads::Threads
   LABELS  "phase6;integration")
 
+# C8.3 + 租户绑定 + fail-closed：本地 JWT 授权器（P8 切片 1）
+fss_add_test(test_jwt_authorizer
+  SOURCES unit/test_jwt_authorizer.cpp
+  LIBS    fss_auth_local
+  LABELS  "phase8;unit")
+
+# C8.1：19 个端点 × 角色的 401/403/200 矩阵（真实 HTTP + 真实 HS256 token）
+fss_add_test(test_auth_matrix
+  SOURCES integration/test_auth_matrix.cpp
+  LIBS    fss_http_adapter fss_auth_local fss_blob_memory fss_location_memory
+          fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase8;integration")
+
 # C7.2：契约 §5 的错误码双向映射（REST ↔ gRPC 同行、无空缺）
 fss_add_test(test_error_equivalence
   SOURCES conformance/test_error_equivalence.cpp

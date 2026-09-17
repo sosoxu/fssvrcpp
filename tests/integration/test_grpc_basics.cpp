@@ -1,12 +1,11 @@
 // =============================================================================
 //  test_grpc_basics.cpp —— C7.1（部分）：真实 gRPC 端口上的运维 RPC + 切片边界
 // =============================================================================
-//  本切片（P7 切片 1）实现 `GetInfo` 与 `Check`；其余 15 个 RPC 明确回
-//  `UNIMPLEMENTED`。这个文件证明：
-//    · 真实端口 + 真实 channel 能调通已实现的 RPC（含免鉴权语义）；
+//  这个文件证明（P7 已收口：17/17 RPC 都有实现）：
+//    · 真实端口 + 真实 channel 能调通运维 RPC（含免鉴权语义）；
 //    · 调用元数据（契约 §4.3）被正确解析（correlation-id 透传到领域事件）；
-//    · 未实现的 RPC **明确**回 UNIMPLEMENTED（而不是静默成功或 INTERNAL）——
-//      切片 2/3 会把它们逐个实现，届时本用例的断言随之收紧。
+//    · **扩展 RPC 不再回 UNIMPLEMENTED**（用非法输入触发各自的错误路径来钉边界）；
+//    · `/v2/info` 的 `authMode` 与 gRPC 的 `auth_mode` **同源**（C8.5 的双协议一致性）。
 // =============================================================================
 #include <catch2/catch.hpp>
 
@@ -32,6 +31,8 @@ TEST_CASE("★ C7.1 GetInfo：真实端口可调用、免鉴权、返回版本�
   //  `ConnectedService{name, version}`
   REQUIRE(response.connected_outer_services_size() >= 1);
   REQUIRE(response.connected_outer_services(0).name() == "storage");
+  //  ★ C8.5：鉴权模式必须**可见**，且两条协议读的是同一个来源（`UseCasePorts.auth_mode`）
+  REQUIRE(response.auth_mode() == "disabled");
 }
 
 TEST_CASE("★ C7.1 Check：liveness/readiness 的文本与 REST 逐字一致；非法 probe → INVALID_ARGUMENT",

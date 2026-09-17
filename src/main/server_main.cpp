@@ -24,6 +24,7 @@
 #include "common/result/result.h"
 #include "common/time/clock.h"
 #include "domain/ports/ports.h"
+#include "infra/auth/local/local_jwt_authorizer.h"
 #include "infra/blob/posix/posix_blob_store.h"
 #include "infra/blob/s3/s3_blob_store.h"
 #include "infra/location/sqlite/sqlite_location_repository.h"
@@ -216,9 +217,6 @@ int main(int /*argc*/, char** /*argv*/) {
   //  ---- 组合根：唯一实例化具体实现的位置（R12）----
   SystemClock clock;
   logging::StreamLogger logger(logging::LogOptions{}, clock);
-  logging::Warn(logger, "auth.mode=disabled（allow-all）：仅用于开发/测试，禁止用于生产",
-                {{"component", "server_main"}});
-
   UuidGenerator ids;
   //  ★ 两种驱动都只在**组合根**创建（R12）。上层只看到 `IBlobStore` 与能力声明，
   //    因此"换驱动"对用例/适配层完全透明（C5.9 要证明的正是这一点）。
@@ -257,7 +255,44 @@ int main(int /*argc*/, char** /*argv*/) {
   InMemoryMetadataRepository metadata_repository(clock);  // P6 换成 SQLite
   HmacTransferTokenCodec token_codec(transfer_secret, clock);
 
-  AllowAllAuthorizer authorizer;
+  //  ---- 认证（P8 / ADR-012）----
+  //  `jwt` = 本地 HS256 校验（默认生产形态）；`disabled` = allow-all（仅开发）。
+  //  ★ `remote-entitlements` **尚未实现**：明确拒绝启动，绝不静默降级为放行。
+  const std::string auth_mode = Env("FSS_AUTH_MODE", "disabled");
+  AllowAllAuthorizer allow_all_authorizer;
+  std::unique_ptr<infra::LocalJwtAuthorizer> jwt_authorizer;
+  domain::IAuthorizer* authorizer = &allow_all_authorizer;
+  if (auth_mode == "jwt") {
+    infra::LocalJwtOptions jwt_options;
+    jwt_options.hmac_secret = Env("FSS_JWT_HMAC_SECRET", "");
+    jwt_options.issuer = Env("FSS_JWT_ISSUER", "");
+    jwt_options.audience = Env("FSS_JWT_AUDIENCE", "");
+    jwt_options.verify_signature = Env("FSS_JWT_VERIFY_SIGNATURE", "true") != "false";
+    jwt_options.user_id_claim = Env("FSS_JWT_USER_ID_CLAIM", "email");
+    jwt_options.partition_claim = Env("FSS_JWT_PARTITION_CLAIM", "data-partition-id");
+    jwt_options.require_partition_claim =
+        Env("FSS_JWT_REQUIRE_PARTITION_CLAIM", "true") != "false";
+    jwt_authorizer = std::make_unique<infra::LocalJwtAuthorizer>(jwt_options, clock);
+    authorizer = jwt_authorizer.get();
+    //  ★ 升级为显式拒绝启动（而不是"起来但拒绝所有 token"）：空密钥 100% 是配置错误，
+    //    让它以 401 的形式暴露给调用方只会制造误导性的排障路径。
+    if (!jwt_authorizer->Ready()) {
+      std::cerr << "拒绝启动：" << jwt_authorizer->NotReadyReason() << "\n";
+      return 1;
+    }
+  } else if (auth_mode == "remote-entitlements") {
+    std::cerr << "拒绝启动：auth.mode=remote-entitlements 尚未实现（ADR-012 §5.3）——"
+                 "绝不降级为放行\n";
+    return 1;
+  } else if (auth_mode != "disabled") {
+    std::cerr << "未知的 auth.mode: " << auth_mode << "（可选：jwt | remote-entitlements | disabled）\n";
+    return 1;
+  } else {
+    logging::Warn(logger,
+                  "auth.mode=disabled（allow-all）：仅用于开发/测试，禁止用于生产",
+                  {{"component", "server_main"}});
+  }
+
   LogEventPublisher events(logger);
   LogAuditLogger audit(logger);
 
@@ -275,9 +310,10 @@ int main(int /*argc*/, char** /*argv*/) {
                              self_base_url);
 
   app::UseCasePorts ports{blob_factory,      *location_repository.value(), metadata_repository,
-                          authorizer,        events,                         audit,
+                          *authorizer,       events,                         audit,
                           partitions,        legal,                          schema,
                           issuer,            clock,                          ids};
+  ports.auth_mode = auth_mode;  // C8.5：让 `/v2/info` 与 gRPC 的 `GetInfo` 都能看到
 
   //  ---- 路由 ----
   adapters::http::RouterOptions router_options;
@@ -360,7 +396,13 @@ int main(int /*argc*/, char** /*argv*/) {
             << "  sqlite path    : " << sqlite_path << "\n"
             << "  error format   : " << adapters::http::ErrorFormatName(router_options.error_format)
             << "\n"
-            << "  auth           : disabled（allow-all，仅开发/测试）\n";
+            << "  auth           : "
+            << (auth_mode == "jwt"
+                    ? "jwt（HS256 本地校验" +
+                          std::string(Env("FSS_JWT_HMAC_SECRET", "").empty() ? "，未验签！" : "") +
+                          "）"
+                    : "disabled（allow-all，仅开发/测试）")
+            << "\n";
   std::cout.flush();
 
   server.Listen();

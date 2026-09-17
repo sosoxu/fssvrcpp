@@ -224,6 +224,7 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | [ADR-009](adr/ADR-009-multi-instance-consistency.md) | 多实例：**PG 强一致 + 租约 + 领导者选举** | 已采纳（5 个竞态已实测复现并验证修复） |
 | [ADR-010](adr/ADR-010-io-engine-choice.md) | I/O 引擎：**阻塞线程池为默认**，io_uring 为可选加速引擎（默认容器 seccomp 阻断，实测 EPERM） | 已采纳 |
 | [ADR-011](adr/ADR-011-logging-library.md) | 日志：**保留自研最小实现**（spdlog 只覆盖约 3% 的耗时与 0% 的核心需求），并把热路径优化到实测地板的同一量级 | 已采纳（附 4 条重开触发条件） |
+| [ADR-012](adr/ADR-012-auth-and-tenant-binding.md) | 认证与租户绑定：**本地 JWT 校验（HS256）+ `partition` claim 绑定 + fail-closed**；不假设"前面一定有可信网关"；远端 Entitlements / RS256-JWKS 登记为未实现（`remote-entitlements` 模式**拒绝启动**而不是静默放行） | 已采纳（P8；证据 `docs/test-evidence/phase8.md`） |
 
 ---
 
@@ -307,7 +308,7 @@ P3 集中存储驱动 + 位置仓储 + 数据面        ✅ 已完成（9 测试
 P4 REST 适配层 + 端到端垂直切片（POSIX）   ✅ 已完成（8 测试 / 1058 断言）← 此阶段服务可被 OSDU 客户端真实使用
 P5 对象存储驱动（S3 SigV4 + mock-S3 独立验签） ✅ 已完成（6 测试 / 1737 断言）
 P6 元数据记录语义完整化（12 步序列 + 回滚 + 版本链 + DMS + Delivery） ✅ 已完成（9 测试 / 2578 断言；C6.1~C6.13）
-P7 gRPC 适配层 + 双协议等价性            ✅ 已完成（C7.1~C7.10；17/17 RPC + 契约 §6 矩阵 + 流式 + 双协议并发；6 测试 / 5354 断言）← 此阶段"双协议"达成
+P7 gRPC 适配层 + 双协议等价性            ✅ 已完成（C7.1~C7.10；17/17 RPC + 契约 §6 矩阵 + 流式 + 双协议并发；6 测试 / 5378 断言）← 此阶段"双协议"达成
 P8 认证授权与多租户
 P9 硬化与交付（容量基线 / 故障注入 / GC / 打包 / 定稿 ADR-006）
 ```

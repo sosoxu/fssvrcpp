@@ -1162,8 +1162,8 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 | T3 | 自签传输 URL 伪造/篡改 | HMAC-SHA256 + 常量时间比较；载荷含 `op`+`ref`+`exp`+`partition`+`nonce` | 单元测试：篡改任一字段必须失败 |
 | T4 | 自签 URL 重放（跨操作/跨租户/过期） | 载荷绑定 `op` 与 `partition`；强制 `exp` 校验；`nonce` 支持一次性使用（可选，默认关闭以支持大文件续传） | 集成测试：GET token 用于 PUT、越租户、过期后使用 → 全部拒绝 |
 | T5 | 密钥泄漏（S3 secret / 签名密钥） | 配置支持 `${ENV:VAR}` 引用；日志脱敏（`access_key`/`secret_key`/`token`/`sig` 一律打码）；`/v2/info` 不输出密钥 | 单元测试：日志与 info 输出中不出现密钥明文 |
-| T6 | 越权访问他人记录 | 所有仓储方法强制 `partition_id`；元数据读取时用 ACL + `IAuthorizer` 校验 | 集成测试：跨租户读取 → 401/403 |
-| T7 | 认证绕过 | `auth.mode` 在 production 模板强制为 `jwt`；启动时校验；`disabled` 打印显著告警 | 配置校验测试 + 集成测试 |
+| T6 | 越权访问他人记录 | 所有仓储方法强制 `partition_id`；路由级鉴权预检 + 用例入口 `IAuthorizer`；**租户绑定**：token 的 `data-partition-id` claim 必须等于请求头（ADR-012 §3） | `test_jwt_authorizer`（A 的 token + B 的头 → 403）+ `test_auth_matrix`（端点 × 角色矩阵）+ P3/P6 的分区隔离契约 |
+| T7 | 认证绕过 | ADR-012：默认 `auth.mode=jwt`（HS256 本地校验）；`alg` 白名单（拒绝 `none`）；`exp` 必需；密钥/claim 缺失一律拒绝（fail-closed）；production 禁止 `disabled`/关验签/无密钥；`disabled` 打印显著告警且 `/v2/info` 暴露 `authMode`；`remote-entitlements`/JWKS 未实现时**拒绝启动** | `test_unit/test_jwt_authorizer`（9 类越权/畸形 token 全 401）+ `test_config`（production 三条拒绝 + 一条正例）+ `test_auth_matrix` |
 | T8 | HTTP 解析歧义/走私 | 拒绝优先的解析规则（见 §7.1），`Content-Length` 与 `chunked` 互斥 | 单元测试（畸形样例 ≥15 例） |
 | T9 | 资源耗尽（大文件/大量连接） | 硬上限 + 配额 + 磁盘水位检查（低于阈值时 readiness 失败） | 压力/边界测试 |
 | T10 | 校验和绕过（数据损坏） | 若请求提供 `expected_checksum`，服务端在写入过程中增量计算并比对，不符则删除对象并返回 400 | 集成测试：故意给错校验和 |
@@ -1213,6 +1213,7 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 | [ADR-009](adr/ADR-009-multi-instance-consistency.md) | 多实例一致性与共享状态设计：强一致控制面（PG）+ 租约 + 领导者选举 | 已采纳（5 个竞态已实测复现并验证修复） |
 | [ADR-010](adr/ADR-010-io-engine-choice.md) | I/O 引擎：阻塞线程池为默认；io_uring 为可选引擎（默认容器 seccomp 阻断） | 已采纳 |
 | [ADR-011](adr/ADR-011-logging-library.md) | 日志实现：自研最小实现（spdlog 评估后不采用，附重开触发条件） | 已采纳 |
+| [ADR-012](adr/ADR-012-auth-and-tenant-binding.md) | 认证与租户绑定：本地 JWT（HS256）+ `partition` claim 绑定 + fail-closed；远端 Entitlements 与 RS256/JWKS 登记为未实现 | 已采纳（P8 切片 1；未实现项见其 §5.3） |
 
 ---
 
