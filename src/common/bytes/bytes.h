@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -152,6 +153,30 @@ class StringSink final : public ByteSink {
 };
 
 // 丢弃全部数据但计数（用于"只测吞吐/长度"的场景）
+//  写进调用方提供的**固定缓冲**（L1 通用件）。
+//  ★ 用途：把 `IBlobStore` 的"推式"读取包成"拉式"字节源（一次只取一块），
+//    这样复制/校验和都是 O(1) 内存（C6.9）。此前该逻辑在 `BlobByteSource` 里是一份私有副本。
+class BufferSink final : public ByteSink {
+ public:
+  BufferSink(char* out, std::size_t capacity) : out_(out), capacity_(capacity) {}
+
+  fss::Result<void> Write(std::string_view data) override {
+    if (written_ + data.size() > capacity_) {
+      return Err(fss::ErrorKind::kInternal, "BufferSink 缓冲溢出");
+    }
+    std::memcpy(out_ + written_, data.data(), data.size());
+    written_ += data.size();
+    return Ok();
+  }
+
+  std::size_t written() const { return written_; }
+
+ private:
+  char* out_;
+  std::size_t capacity_;
+  std::size_t written_ = 0;
+};
+
 class CountingSink final : public ByteSink {
  public:
   Result<void> Write(std::string_view data) override;

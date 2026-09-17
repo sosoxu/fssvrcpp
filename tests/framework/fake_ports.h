@@ -58,12 +58,26 @@ class CapabilityOverrideBlobStore final : public domain::IBlobStore {
     return inner_.get(ref, sink, range);
   }
   fss::Result<domain::ObjectStat> stat(const domain::ObjectRef& ref) override {
-    return inner_.stat(ref);
+    FSS_TRY(out, inner_.stat(ref));
+    if (hide_checksum) {
+      out.checksum.clear();
+      out.checksum_algorithm.clear();
+    }
+    return out;
   }
   fss::Result<void> remove(const domain::ObjectRef& ref) override { return inner_.remove(ref); }
   fss::Result<domain::ObjectStat> copy(const domain::ObjectRef& from,
                                        const domain::ObjectRef& to) override {
-    return inner_.copy(from, to);
+    FSS_TRY(out, inner_.copy(from, to));
+    if (hide_checksum) {
+      out.checksum.clear();
+      out.checksum_algorithm.clear();
+    }
+    if (copy_checksum_override.has_value()) {
+      out.checksum = copy_checksum_override.value();
+      out.checksum_algorithm = copy_checksum_algorithm.value_or("");
+    }
+    return out;
   }
   fss::Result<domain::ListPage> list(const std::string& container, const std::string& prefix,
                                      const std::string& continuation_token,
@@ -73,6 +87,12 @@ class CapabilityOverrideBlobStore final : public domain::IBlobStore {
 
   //  置位后 presign 直接返回该错误（默认不置位）
   std::optional<fss::Error> presign_error;
+  //  置位后 `stat`/`copy` **不报**校验和 —— 模拟"驱动不提供校验和"（逼出流式回算路径，C6.4/C6.9）
+  bool hide_checksum = false;
+  //  非空时 `copy` 返回该**原生**校验和（配 `copy_checksum_algorithm`）——
+  //  模拟 Azure 那样的驱动（`getChecksum` 给的是 MD5，调研 §2.1 第 7 条）
+  std::optional<std::string> copy_checksum_override;
+  std::optional<std::string> copy_checksum_algorithm;
 
   int presign_put_calls() const { return presign_put_calls_; }
   int presign_get_calls() const { return presign_get_calls_; }

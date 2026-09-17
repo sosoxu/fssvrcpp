@@ -280,6 +280,19 @@ fss_add_test(test_sqlite_metadata_repository
   LIBS    fss_metadata_sqlite fss_metadata_memory
   LABELS  "phase6;integration")
 
+# C6.4：校验和的 L1 基座（算法解析 / 规范名 / hex 结构 / 增量摘要公开向量）
+fss_add_test(test_checksum
+  SOURCES unit/test_checksum.cpp
+  LIBS    fss_crypto
+  LABELS  "phase6;unit")
+
+# C6.4：校验和（服务端计算 / 客户端比对 / 回滚删除 / 流式 RSS）
+fss_add_test(test_metadata_lifecycle
+  SOURCES integration/test_metadata_lifecycle.cpp
+  LIBS    fss_app fss_blob_memory fss_blob_posix fss_location_memory fss_metadata_memory
+          fss_crypto fss_io
+  LABELS  "phase6;integration")
+
 # -----------------------------------------------------------------------------
 #  阶段 5：对象存储驱动（S3 SigV4）
 # -----------------------------------------------------------------------------

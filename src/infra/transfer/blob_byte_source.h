@@ -31,7 +31,7 @@ class BlobByteSource final : public bytes::ByteSource {
     if (out == nullptr || capacity == 0 || offset_ >= static_cast<std::uint64_t>(size_)) {
       return std::size_t{0};
     }
-    BufferSink sink(out, capacity);
+    bytes::BufferSink sink(out, capacity);
     FSS_TRY(store_.get(ref_, sink, domain::ByteRange{offset_, capacity}));
     offset_ += sink.written();
     return sink.written();
@@ -49,25 +49,6 @@ class BlobByteSource final : public bytes::ByteSource {
   }
 
  private:
-  class BufferSink final : public bytes::ByteSink {
-   public:
-    BufferSink(char* out, std::size_t capacity) : out_(out), capacity_(capacity) {}
-    fss::Result<void> Write(std::string_view data) override {
-      if (written_ + data.size() > capacity_) {
-        return Err(fss::ErrorKind::kInternal, "blob source 缓冲溢出");
-      }
-      std::memcpy(out_ + written_, data.data(), data.size());
-      written_ += data.size();
-      return Ok();
-    }
-    std::size_t written() const { return written_; }
-
-   private:
-    char* out_;
-    std::size_t capacity_;
-    std::size_t written_ = 0;
-  };
-
   domain::IBlobStore& store_;
   domain::ObjectRef ref_;
   std::int64_t size_ = 0;

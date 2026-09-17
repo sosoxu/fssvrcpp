@@ -66,6 +66,63 @@ void PublishStatus(UseCasePorts& ports, const CallerContext& caller, std::string
 
 //  跨 zone 复制：同一 store 用服务端 copy；不同 store（由不同后端承载 zone）走 get→put 兜底。
 //  ⚠️ 兜底会把对象整体放进内存（P2 够用）；P3 用真正的流式管道替换（大文件门槛 C1.3）。
+//  把 `IBlobStore` 的对象包成**可定位读**的 `ByteSource`：一次只读一块，
+//  因此"跨 store 复制"与"算校验和"都不会把整个对象读进内存（C6.9）。
+//  ★ 这里刻意不依赖 L2 的 `BlobByteSource`：那是给数据面用的实现，L4 只依赖端口。
+class StoreByteSource final : public bytes::ByteSource {
+ public:
+  StoreByteSource(domain::IBlobStore& store, domain::ObjectRef ref, std::int64_t size)
+      : store_(store), ref_(std::move(ref)), size_(size) {}
+
+  fss::Result<std::size_t> Read(char* out, std::size_t capacity) override {
+    if (out == nullptr || capacity == 0 || offset_ >= static_cast<std::uint64_t>(size_)) {
+      return std::size_t{0};
+    }
+    //  ★ 每次只请求一段：固定缓冲，RSS 与对象大小无关
+    const std::uint64_t want = std::min<std::uint64_t>(capacity,
+                                                      static_cast<std::uint64_t>(size_) - offset_);
+    bytes::BufferSink sink(out, static_cast<std::size_t>(want));
+    FSS_TRY(store_.get(ref_, sink, domain::ByteRange{offset_, want}));
+    offset_ += sink.written();
+    return sink.written();
+  }
+
+  std::optional<std::int64_t> Size() const override { return size_; }
+
+ private:
+  domain::IBlobStore& store_;
+  domain::ObjectRef ref_;
+  std::int64_t size_ = 0;
+  std::uint64_t offset_ = 0;
+};
+
+//  边收字节边算校验和的 sink（复制/回读两条路径共用）
+class HashingSink final : public bytes::ByteSink {
+ public:
+  explicit HashingSink(crypto::Hasher& hasher) : hasher_(hasher) {}
+  fss::Result<void> Write(std::string_view data) override {
+    hasher_.Update(data);
+    ++chunks_;
+    return Ok();
+  }
+
+ private:
+  crypto::Hasher& hasher_;
+  std::size_t chunks_ = 0;
+};
+
+//  流式计算某个对象的校验和（**不把对象读进内存**；C6.9 的 RSS 要求）
+fss::Result<std::string> ComputeChecksumStreaming(UseCasePorts& ports, std::string_view partition,
+                                                 const domain::ObjectRef& ref,
+                                                 domain::StorageZone zone,
+                                                 crypto::ChecksumAlgorithm algorithm) {
+  FSS_TRY(store, ports.blobs.ForPartition(partition, zone));
+  crypto::Hasher hasher(algorithm);
+  HashingSink sink(hasher);
+  FSS_TRY(store->get(ref, sink, domain::ByteRange{}));
+  return hasher.HexDigest();
+}
+
 fss::Result<domain::ObjectStat> CopyBetweenZones(UseCasePorts& ports, std::string_view partition,
                                                  const domain::ObjectRef& from,
                                                  const domain::ObjectRef& to,
@@ -78,21 +135,15 @@ fss::Result<domain::ObjectStat> CopyBetweenZones(UseCasePorts& ports, std::strin
   if (from_store == to_store) {
     return to_store->copy(from, to);
   }
-  bytes::StringSink sink;
-  FSS_TRY(from_store->get(from, sink, domain::ByteRange{}));
-  bytes::StringSource source(sink.str());
+  //  ★ 跨 store 复制必须**流式**：曾经把整个对象读进 `StringSink` 再交给 `put`，
+  //    1 GiB 对象的 RSS 会直接抬高 1 GiB（C6.9）。现在用可定位读的 ByteSource 边读边写。
+  FSS_TRY(stat, from_store->stat(from));
+  StoreByteSource source(*from_store, from, stat.size);
   FSS_TRY(to_store->put(to, source, domain::PutOptions{}));
   return to_store->stat(to);
 }
 
 //  读取对象内容（用于计算校验和；仅在存储没有给出校验和时调用）
-fss::Result<std::string> ReadObject(UseCasePorts& ports, std::string_view partition,
-                                    const domain::ObjectRef& ref, domain::StorageZone zone) {
-  FSS_TRY(store, ports.blobs.ForPartition(partition, zone));
-  bytes::StringSink sink;
-  FSS_TRY(store->get(ref, sink, domain::ByteRange{}));
-  return sink.str();
-}
 
 bool LooksLikeFileSource(std::string_view value) {
   return !value.empty() && value.front() == '/' && value.find("..") == std::string_view::npos;
@@ -296,23 +347,43 @@ fss::Result<std::string> CreateFileMetadata::Execute(
                "复制到 persistent 失败：" + copied.error().message());
   }
 
-  // 7. 校验和：优先用存储侧给出的；没有则读回计算。**覆写** FileSourceInfo
+  // 7. 校验和：`checksum = storageUtil.getChecksum(persistentLocation)`，非空则**回写覆盖**
+  //    `FileSourceInfo.Checksum` + `ChecksumAlgorithm`（调研 §2.1 第 7 条 / §2.3）。
+  //
+  //  ★★ 客户端传入的 `Checksum`/`ChecksumAlgorithm` 是**被覆写的输入**，不是"待校验的断言"：
+  //     上游证据 ①：`docs/01-osdu-research.md` §2.3「校验和：**服务端覆写**客户端传入的
+  //     `Checksum`/`ChecksumAlgorithm`（至少 Azure 实现如此）」；
+  //     上游证据 ②：vendored 样例 `File_CorrectPayload.json` 里客户端给的是
+  //     `MD5("") = d41d8cd9…` 却声明 `ChecksumAlgorithm = "SHA-256"`，而它的期望响应是 **201** ——
+  //     任何"比对不符就拒绝"的实现在这条权威样例上都会 **400**。
+  //     （本项目计划里曾写过"提供但不符 → 400 + 删除对象"，那是**没有上游依据的臆断**，
+  //       已在 `docs/00-final-design.md` §5 记录为被推翻的结论。）
+  auto& source_info = out.data.dataset_properties.file_source_info;
+
+  //  ★ 优先用复制返回的**原生**校验和（零额外读盘）；只有在"原生缺失/算法不认识/不是合法 hex"
+  //    时才**流式回算**。`ETAG` 这类非 hex 摘要绝不能当校验和写进记录（那是"看起来有值"的假象）。
   std::string checksum = copied.value().checksum;
   std::string algorithm = copied.value().checksum_algorithm;
-  if (checksum.empty()) {
-    const auto payload = ReadObject(ports_, caller.partition, to_ref,
-                                    domain::StorageZone::kPersistent);
-    if (payload.ok()) {
-      checksum = crypto::Sha256Hex(payload.value());
-      algorithm = "SHA256";
-    }
+  const auto native_algorithm = crypto::ParseChecksumAlgorithm(algorithm);
+  const bool native_usable =
+      native_algorithm.has_value() && crypto::IsHexDigestOf(checksum, *native_algorithm);
+  if (native_usable) {
+    //  规范名（`SHA256`/`SHA1`/`MD5`）：驱动回什么写法都不影响记录里的一致性
+    algorithm = std::string(crypto::CanonicalChecksumName(*native_algorithm));
+  } else {
+    //  默认算法是 SHA-256（上游 Azure 驱动给的是 MD5，故算法必须跟着驱动走 —— C6.4 的"算法覆盖"）
+    FSS_TRY(computed, ComputeChecksumStreaming(ports_, caller.partition, to_ref,
+                                               domain::StorageZone::kPersistent,
+                                               crypto::ChecksumAlgorithm::kSha256));
+    checksum = std::move(computed);
+    algorithm = std::string(crypto::CanonicalChecksumName(crypto::ChecksumAlgorithm::kSha256));
   }
+
   if (!checksum.empty()) {
-    auto& info = out.data.dataset_properties.file_source_info;
-    info.checksum = checksum;
-    info.checksum_algorithm = algorithm.empty() ? "SHA256" : algorithm;
+    source_info.checksum = checksum;
+    source_info.checksum_algorithm = algorithm.empty() ? "SHA256" : algorithm;
     out.data.checksum = checksum;
-    out.data.checksum_algorithm = info.checksum_algorithm;
+    out.data.checksum_algorithm = source_info.checksum_algorithm;
   }
 
   // 8/9. 写元数据记录（幂等键 = partition + FileSource）

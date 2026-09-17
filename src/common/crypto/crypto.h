@@ -124,4 +124,55 @@ std::vector<std::uint8_t> RandomBytes(std::size_t n);
 // 十六进制随机串（便于放进 URL / 日志）
 std::string RandomHex(std::size_t bytes);
 
+// =============================================================================
+//  校验和算法（C6.4）：SHA-256 / SHA-1 / MD5 的**流式**计算
+// =============================================================================
+//  为什么需要多算法：契约 §3.2/§3.4 允许客户端在 `FileSourceInfo.ChecksumAlgorithm` 里
+//  点名算法（上游样例里有 `SHA-256`、也有历史数据用 MD5）。服务端必须能用**同一种算法**
+//  复算才能比对 —— 拿 SHA-256 去比客户端给的 MD5 只会得到一个恒假的判断。
+//
+//  ⚠️ MD5 与 SHA-1 **不用于安全场景**，只用于与历史数据/客户端提供的校验和比对。
+//     新写入的记录默认仍然是 SHA-256。
+enum class ChecksumAlgorithm {
+  kSha256,
+  kSha1,
+  kMd5,
+};
+
+//  名字归一化：接受 `SHA-256` / `SHA256` / `sha_256` / `SHA-1` / `SHA1` / `MD5`（大小写不敏感）
+//  无法识别 → nullopt（调用方必须报 400，**不要**静默回退成 SHA-256）
+std::optional<ChecksumAlgorithm> ParseChecksumAlgorithm(std::string_view name);
+//  规范名（我们写回记录用）：`SHA256` / `SHA1` / `MD5`
+std::string_view CanonicalChecksumName(ChecksumAlgorithm algorithm);
+//  hex 摘要长度（64 / 40 / 32）——用于长度校验
+std::size_t ChecksumHexLength(ChecksumAlgorithm algorithm);
+//  是否是**该算法**的合法 hex 摘要（长度 + 仅 [0-9a-fA-F]）。
+//  ★ 用途：把"结构非法"与"值不符"分开报错 —— 客户端给了 32 个字符却声明 SHA-256 时，
+//    正确的诊断是 400 "长度不符"，而不是一句含糊的"校验和不符"。
+bool IsHexDigestOf(std::string_view text, ChecksumAlgorithm algorithm);
+
+//  增量哈希（用法与 `Sha256Hasher` 相同，但算法可变）。
+//  ★ 必须是**增量**的：大对象只能边读边算，不能"先读进内存再算"（C6.9：RSS 与对象大小无关）
+class Hasher {
+ public:
+  explicit Hasher(ChecksumAlgorithm algorithm);
+  ~Hasher();
+  Hasher(const Hasher&) = delete;
+  Hasher& operator=(const Hasher&) = delete;
+  Hasher(Hasher&& other) noexcept;
+  Hasher& operator=(Hasher&& other) noexcept;
+
+  void Update(std::string_view data);
+  void Update(std::span<const std::uint8_t> data);
+  //  取出 hex 摘要并**重置**（可复用同一对象算下一段）
+  std::string HexDigest();
+  void Reset();
+
+  ChecksumAlgorithm algorithm() const { return algorithm_; }
+
+ private:
+  void* ctx_ = nullptr;  // EVP_MD_CTX*（不把 OpenSSL 类型带进头文件）
+  ChecksumAlgorithm algorithm_;
+};
+
 }  // namespace fss::crypto

@@ -247,6 +247,14 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 
 ---
 
+### 5.y 本轮更正的既有结论（P6 元数据语义）
+
+| # | 旧结论（记录于） | 现状（依据） | 影响 |
+| --- | --- | --- | --- |
+| 1 | 「客户端提供了 `Checksum` 但不符 → `400` + **删除**已搬迁的 persistent 对象」（`docs/04-implementation-plan.md` C6.4） | **推翻（P6-D05）**：上游第 7 步是 `checksum = storageUtil.getChecksum(persistentLocation)`，非空则**无条件覆写** `FileSourceInfo.Checksum` + `ChecksumAlgorithm`，失败语义为 `—`（非致命）—— `docs/01-osdu-research.md` §2.1/§2.3。**权威样例** `tests/conformance/fixtures/upstream/File_CorrectPayload.json` 客户端给的正是 `MD5("") = d41d8cd9…` 却声明 `ChecksumAlgorithm: "SHA-256"`，期望 **`201`**；按旧结论实现会把这条样例判成 `400`，并让 phase4 已收口的 C4.2/C4.3 两条用例失败（实测） | 实现改为"覆写 + 不比对 + 不回滚"；C6.4 判据更正为「未提供 → 服务端计算并写入；提供 → **被覆写**；算法覆盖 SHA-256/MD5/SHA-1 **跟随驱动**」。**G1（OSDU 兼容）优先于自造约束** |
+
+---
+
 ### 5.x 本轮更正的既有结论（HTTP 传输层）
 
 | # | 旧结论（记录于） | 现状（实测） | 影响 |

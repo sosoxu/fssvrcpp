@@ -16,7 +16,7 @@
 | **P3** | 集中存储驱动 + 位置仓储 + 数据面 | `PosixBlobStore`、`SqliteLocationRepository`、自签传输 token 与 `/v1/transfer` 内核 | `ctest -L phase3` | ✅ **已完成**（C3.1~C3.12；9 测试 / 580 断言；见 `docs/test-evidence/phase3.md`） |
 | **P4** | REST 适配层 + 端到端垂直切片（POSIX） | OSDU 全部端点、错误映射、DTO、三大错误体、`fss_server` 可启动 | `ctest -L phase4` | ✅ **已完成：19/19 路由 + `/metrics` + 上游样例逐字对齐（C4.3）+ 护栏 + 超时语义；C4.1~C4.11 全部满足** |
 | **P5** | 对象存储驱动（S3 SigV4） | `S3BlobStore`、SigV4 签名/验签、mock-S3、同一套契约测试跑 S3 | `ctest -L phase5` | ✅ **已完成：C5.1~C5.10 全部满足**（AWS 官方向量 5 条逐字节匹配、独立验签 mock、同一套契约跑第三遍、分页、错误映射、S3 端到端、按配置切驱动、ADR-005） |
-| **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | 🚧 **进行中（切片 1/6：`SqliteMetadataRepository` + 元数据契约跑第二遍；C2.10 元数据侧与 C6.5 已满足）** |
+| **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | 🚧 **进行中（切片 2/6：`SqliteMetadataRepository` + 元数据契约跑第二遍；校验和 C6.4 已满足）** |
 | **P7** | gRPC 适配层 + 双协议等价性 | `FileServiceAdapter`、流式数据面、错误等价、URL 结构等价 | `ctest -L phase7` | ⬜ |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ⬜ |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ⬜ |
@@ -432,11 +432,17 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase5 --output-on
 
 ### 阶段 6：元数据记录语义完整化  🚧 进行中
 
-> **当前进度（切片 1/6）**：`src/infra/metadata/sqlite/sqlite_metadata_repository.{h,cpp}`
+> **当前进度（切片 2/6）**：
+> ① `src/infra/metadata/sqlite/sqlite_metadata_repository.{h,cpp}`
 > （版本链 + `is_latest` 部分唯一索引 + partition 隔离）+ 元数据契约在 SQLite 上跑第二遍
-> （闭合 C2.10 的**元数据侧**）。C6.5 已满足；C6.1 部分（仓储侧无损，REST 侧见 C4.2）。
-> **剩余**：校验和（C6.4）、12 步序列故障注入（C6.3）、`getFileList`（C6.6）、角色常量（C6.8）、
-> GC 租约/幂等并发/tmp 名（C6.11~C6.13）、DMS/Delivery（C6.7）、大文件搬迁 RSS（C6.9）、远端仓储。
+> （闭合 C2.10 的**元数据侧**）→ C6.5 已满足；C6.1 部分（仓储侧无损，REST 侧见 C4.2）。
+> ② **校验和（C6.4）**：增量 `crypto::Hasher`（SHA-256/SHA-1/MD5，已用 RFC/FIPS 公开向量兜底）
+> + 算法规范化 + `IsHexDigestOf` 结构校验；第 7 步按上游语义**无条件覆写**客户端传入的两处
+> （"原生可用则采用、不可用则**流式回算** SHA-256"）。
+> 并证 64 MiB 跨 store 搬迁 + 回算的 RSS 增长 **80 KiB**（同测试内"整块读回"对照 65664 KiB）。
+> ⚠️ 本切片推翻了计划里"客户端提供但不符 → `400` + 删除对象"那句臆断（**P6-D05**，见 §5）。
+> **剩余**：12 步序列故障注入（C6.3）、`getFileList`（C6.6）、角色常量（C6.8）、
+> GC 租约/幂等并发/tmp 名（C6.11~C6.13）、DMS/Delivery（C6.7）、**1 GiB** 搬迁 RSS 绝对上限（C6.9）、远端仓储。
 
 **目标**：把 `File.Generic` 记录语义、版本链、staging→persistent 搬迁与回滚、列表/DMS/Delivery 做完整。
 
@@ -478,7 +484,7 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase6 --output-on
 | C6.1 | 契约 §3.3 黄金样例经 REST 与（内存）仓储往返后**字段级完全一致**（含 `meta` 数组、`tags` 字典、未知字段） |
 | C6.2 | 契约 §3.4 全部负向样例通过；三种 kind 消息逐字节匹配 |
 | C6.3 | 12 步序列：正常路径 + **6 个故障注入点**各有测试。特别是：第 9 步失败 → persistent 对象被**回滚删除**；第 11 步失败 → 响应**仍为 201**（不是 500） |
-| C6.4 | 校验和：客户端未提供 → 服务端计算并写入；提供但**不符** → `400` + 对象被删除；算法覆盖 SHA-256 / MD5 / SHA-1 |
+| C6.4 | 校验和：客户端未提供 → 服务端计算并写入；~~提供但**不符** → `400` + 对象被删除~~（**已推翻：与上游冲突，见 `00-final-design.md` §5 与 P6-D05** → 客户端提供的一律**被覆写**，不比对、不回滚）；算法覆盖 SHA-256 / MD5 / SHA-1（**跟随驱动**；驱动原生值不可用时流式回算 SHA-256） |
 | C6.5 | 版本链：同 `id` 两次写入 → `version` 1、2，`GET` 返回 2，历史可查 |
 | C6.6 | `getFileList`：分页字段名精确；`PageNum=0` 与 `PageNum=1` 结果不重叠；时间区间过滤正确；无记录 → `400` |
 | C6.7 | DMS 6 端点 + Delivery：状态码、角色、响应键集合全部断言通过 |

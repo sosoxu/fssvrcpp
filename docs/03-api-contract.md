@@ -333,6 +333,35 @@ accept 队列只有 5 个位置，多余的 SYN 被内核丢弃，客户端按 1
 12. 任一步 6/7/9 失败 → remove(persistent) 回滚 + publish status(FAILED) → 重抛
 ```
 
+**第 7 步的校验和语义（C6.4）**
+
+```
+checksum = storageUtil.getChecksum(persistentLocation)
+非空 → 覆写 FileSourceInfo.Checksum + FileSourceInfo.ChecksumAlgorithm
+        （并同步 data.Checksum / data.ChecksumAlgorithm）
+失败语义：**无**（这一步不产生 4xx/5xx）
+```
+
+> **客户端传入的 `Checksum`/`ChecksumAlgorithm` 是"会被覆写的输入"，不是"待校验的断言"。**
+> 上游证据：① `docs/01-osdu-research.md` §2.3「校验和：**服务端覆写**客户端传入的
+> `Checksum`/`ChecksumAlgorithm`（至少 Azure 实现如此）」，第 7 条失败语义为 `—`；
+> ② 权威样例 `File_CorrectPayload.json` 客户端给的是 `MD5("") = d41d8cd9…` 却声明
+> `ChecksumAlgorithm: "SHA-256"`，**期望响应 `201`**。
+> （本项目计划曾写"提供但不符 → `400` + 删除对象"，**没有上游依据**，已在
+> `docs/00-final-design.md` §5 登记为被推翻的结论。）
+
+| 情形 | 服务端行为 | 响应 |
+| --- | --- | --- |
+| 客户端给了 `Checksum`/`ChecksumAlgorithm`（任意值：错值、长度不符、不认识的算法、为空） | **忽略并覆写**（不比对、不拒绝、不回滚） | `201` |
+| 驱动给出了**合法**的原生校验和（hex 且长度与该算法匹配） | 直接采用（零额外读盘），算法名写**规范名**：`SHA256` / `SHA1` / `MD5`（Azure 的 `getChecksum` 给 MD5） | `201` |
+| 驱动**没给**、算法不认识、或值不是该算法的合法 hex（如 `ETAG`） | **流式回算 SHA-256**；**不得**把 `ETAG` 之类当校验和写进记录 | `201` |
+
+三条实现约束（C6.4 / C6.9）：
+
+1. 校验和必须**流式**计算 —— 对象不得整体驻留内存（含跨 store 复制的兜底路径）。
+2. 覆写必须同时落到**两处**（`data.*` 与 `FileSourceInfo.*`），且两处一致。
+3. 算法必须**跟随驱动**：记录里写的是"值实际所用的算法"的规范名，不能把 MD5 的值标成 `SHA256`。
+
 **请求样例（权威黄金样例，实测自 `input_payloads/File_CorrectPayload.json`）**
 见 §3.3。
 
@@ -625,7 +654,7 @@ accept 队列只有 5 个位置，多余的 SYN 被内核丢弃，客户端按 1
 | `kPermissionDenied` | `403 Forbidden` | `PERMISSION_DENIED` | **调用方**角色不足（本服务拒绝该用户） |
 | `kStorageAccessDenied` | `403 Forbidden` | `PERMISSION_DENIED` | **存储侧**拒绝本服务（凭证错/桶策略不允许；如 S3 `AccessDenied`/`SignatureDoesNotMatch`）—— 对客户端是依赖故障，不是"你没权限" |
 | `kNotFound` | `404 Not Found` | `NOT_FOUND` | 记录/位置不存在 |
-| `kChecksumMismatch` | `400 Bad Request` | `INVALID_ARGUMENT` | `details` 携带期望/实际 |
+| `kChecksumMismatch` | `400 Bad Request` | `INVALID_ARGUMENT` | 校验和不符（存储 `put` 的 `expected_checksum`、数据面校验）；`details` 携带期望/实际。**注意**：这不是"客户端在 metadata 里填了错校验和"——那是被**覆写**的（§2.6 第 7 步） |
 | `kUnimplemented` | `501 Not Implemented` | `UNIMPLEMENTED` | 扩展端点未启用时 |
 | `kInternal` | `500 Internal Server Error` | `INTERNAL` | — |
 | `kBadGateway` | `502 Bad Gateway` | `UNAVAILABLE` | 依赖服务异常 |

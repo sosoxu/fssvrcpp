@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -261,5 +262,116 @@ std::vector<std::uint8_t> RandomBytes(std::size_t n) {
 }
 
 std::string RandomHex(std::size_t bytes) { return ToHex(RandomBytes(bytes)); }
+
+
+// =============================================================================
+//  校验和算法（C6.4）：SHA-256 / SHA-1 / MD5 的流式计算
+// =============================================================================
+namespace {
+
+const EVP_MD* MdFor(ChecksumAlgorithm algorithm) {
+  switch (algorithm) {
+    case ChecksumAlgorithm::kSha256: return EVP_sha256();
+    case ChecksumAlgorithm::kSha1: return EVP_sha1();
+    case ChecksumAlgorithm::kMd5: return EVP_md5();
+  }
+  return EVP_sha256();
+}
+
+std::string NormalizeAlgorithmName(std::string_view name) {
+  std::string out;
+  out.reserve(name.size());
+  for (const char c : name) {
+    if (c == '-' || c == '_' || c == ' ') continue;   // 丢掉分隔符：SHA-256 → SHA256
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return out;
+}
+
+}  // namespace
+
+std::optional<ChecksumAlgorithm> ParseChecksumAlgorithm(std::string_view name) {
+  const std::string normalized = NormalizeAlgorithmName(name);
+  if (normalized == "sha256") return ChecksumAlgorithm::kSha256;
+  if (normalized == "sha1") return ChecksumAlgorithm::kSha1;
+  if (normalized == "md5") return ChecksumAlgorithm::kMd5;
+  return std::nullopt;
+}
+
+std::string_view CanonicalChecksumName(ChecksumAlgorithm algorithm) {
+  switch (algorithm) {
+    case ChecksumAlgorithm::kSha256: return "SHA256";
+    case ChecksumAlgorithm::kSha1: return "SHA1";
+    case ChecksumAlgorithm::kMd5: return "MD5";
+  }
+  return "SHA256";
+}
+
+std::size_t ChecksumHexLength(ChecksumAlgorithm algorithm) {
+  switch (algorithm) {
+    case ChecksumAlgorithm::kSha256: return 64;
+    case ChecksumAlgorithm::kSha1: return 40;
+    case ChecksumAlgorithm::kMd5: return 32;
+  }
+  return 64;
+}
+
+bool IsHexDigestOf(std::string_view text, ChecksumAlgorithm algorithm) {
+  if (text.size() != ChecksumHexLength(algorithm)) return false;
+  for (const char c : text) {
+    const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!hex) return false;
+  }
+  return true;
+}
+
+Hasher::Hasher(ChecksumAlgorithm algorithm) : algorithm_(algorithm) {
+  ctx_ = EVP_MD_CTX_new();
+  if (ctx_ != nullptr) EVP_DigestInit_ex(static_cast<EVP_MD_CTX*>(ctx_), MdFor(algorithm), nullptr);
+}
+
+Hasher::~Hasher() {
+  if (ctx_ != nullptr) EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(ctx_));
+}
+
+Hasher::Hasher(Hasher&& other) noexcept : ctx_(other.ctx_), algorithm_(other.algorithm_) {
+  other.ctx_ = nullptr;
+}
+
+Hasher& Hasher::operator=(Hasher&& other) noexcept {
+  if (this != &other) {
+    if (ctx_ != nullptr) EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(ctx_));
+    ctx_ = other.ctx_;
+    algorithm_ = other.algorithm_;
+    other.ctx_ = nullptr;
+  }
+  return *this;
+}
+
+void Hasher::Update(std::string_view data) {
+  Update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data.data()),
+                                       data.size()));
+}
+
+void Hasher::Update(std::span<const std::uint8_t> data) {
+  if (ctx_ == nullptr) return;
+  if (!data.empty()) {
+    EVP_DigestUpdate(static_cast<EVP_MD_CTX*>(ctx_), data.data(), data.size());
+  }
+}
+
+std::string Hasher::HexDigest() {
+  if (ctx_ == nullptr) return {};
+  std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+  unsigned int length = 0;
+  EVP_DigestFinal_ex(static_cast<EVP_MD_CTX*>(ctx_), digest.data(), &length);
+  //  取完即重置：同一对象可以继续算下一段（与 Sha256Hasher 的语义一致）
+  EVP_DigestInit_ex(static_cast<EVP_MD_CTX*>(ctx_), MdFor(algorithm_), nullptr);
+  return ToHex(std::span<const std::uint8_t>(digest.data(), length));
+}
+
+void Hasher::Reset() {
+  if (ctx_ != nullptr) EVP_DigestInit_ex(static_cast<EVP_MD_CTX*>(ctx_), MdFor(algorithm_), nullptr);
+}
 
 }  // namespace fss::crypto

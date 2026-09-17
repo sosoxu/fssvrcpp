@@ -32,7 +32,7 @@ enum class ErrorKind {
   kFileSourceEmpty,       // 消息固定为 "FileSource can not be empty"
   kInvalidSourcePath,     // 消息固定为 "Invalid source file path to copy from <path>"
   kLocationAlreadyExists, // ★ 上游映射到 400（不是 409）
-  kChecksumMismatch,      // 客户端提供的校验和与实际不符
+  kChecksumMismatch,      // 校验和不符（存储 put 的 expected_checksum / 数据面校验）
 
   // 401 / 403
   kUnauthenticated,       // 缺 token / 缺 partition → "Missing authorization token" / "Missing partitionID"
