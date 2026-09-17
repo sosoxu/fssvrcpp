@@ -287,6 +287,12 @@ fss_add_test(test_multi_instance
           fss_metadata_sqlite Threads::Threads
   LABELS  "phase6;integration")
 
+# C6.12：GC 租约（在途不删 / 过期回收 / 原子领取不重复删 / 有记录永不删）
+fss_add_test(test_gc_lease
+  SOURCES integration/test_gc_lease.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory Threads::Threads
+  LABELS  "phase6;integration")
+
 # C6.13：临时文件名唯一性（含"朴素临时名必错乱"的对照）
 fss_add_test(test_posix_tmp_names
   SOURCES integration/test_posix_tmp_names.cpp

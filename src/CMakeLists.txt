@@ -41,7 +41,8 @@ add_library(fss_app STATIC
   app/services/kind_validator.cpp
   app/services/object_key_policy.cpp
   app/services/location_issuer.cpp
-  app/usecases/usecases.cpp)
+  app/usecases/usecases.cpp
+  app/tasks/gc_task.cpp)
 target_include_directories(fss_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # fss_crypto（L1）：CreateFileMetadata 的校验和覆写需要 SHA-256。L4 → L1 允许。
 target_link_libraries(fss_app PUBLIC fss_domain fss_crypto)

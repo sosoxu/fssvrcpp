@@ -16,7 +16,7 @@
 | **P3** | 集中存储驱动 + 位置仓储 + 数据面 | `PosixBlobStore`、`SqliteLocationRepository`、自签传输 token 与 `/v1/transfer` 内核 | `ctest -L phase3` | ✅ **已完成**（C3.1~C3.12；9 测试 / 580 断言；见 `docs/test-evidence/phase3.md`） |
 | **P4** | REST 适配层 + 端到端垂直切片（POSIX） | OSDU 全部端点、错误映射、DTO、三大错误体、`fss_server` 可启动 | `ctest -L phase4` | ✅ **已完成：19/19 路由 + `/metrics` + 上游样例逐字对齐（C4.3）+ 护栏 + 超时语义；C4.1~C4.11 全部满足** |
 | **P5** | 对象存储驱动（S3 SigV4） | `S3BlobStore`、SigV4 签名/验签、mock-S3、同一套契约测试跑 S3 | `ctest -L phase5` | ✅ **已完成：C5.1~C5.10 全部满足**（AWS 官方向量 5 条逐字节匹配、独立验签 mock、同一套契约跑第三遍、分页、错误映射、S3 端到端、按配置切驱动、ADR-005） |
-| **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | 🚧 **进行中（切片 6/7：C6.3~C6.9、C6.11、C6.13 已满足；剩 C6.12 GC 租约与 C6.10 回归）** |
+| **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | ✅ **已完成（C6.1~C6.13；9 测试 / 2578 断言）** |
 | **P7** | gRPC 适配层 + 双协议等价性 | `FileServiceAdapter`、流式数据面、错误等价、URL 结构等价 | `ctest -L phase7` | ⬜ |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ⬜ |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ⬜ |
@@ -430,9 +430,17 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase5 --output-on
 
 ---
 
-### 阶段 6：元数据记录语义完整化  🚧 进行中
+### 阶段 6：元数据记录语义完整化  ✅ 已完成（C6.1~C6.13）
 
-> **当前进度（切片 6/7）**：
+> **✅ 已收口（7 个切片）**：退出条件"C6.1–C6.10 满足"已达成，C6.11~C6.13 亦完成。
+> 证据：`docs/test-evidence/phase6.md`；门槛：`ctest -L phase6`（9 测试 / 2578 断言）+ `./scripts/run_all_gates.sh`。
+> **切片 7 追加**：`src/app/tasks/gc_task.{h,cpp}`（GC 租约：原子领取 + 按 TTL/宽限期 + dry-run 默认）
+> 与 `tests/integration/test_gc_lease.cpp`（6 用例 / 131 断言，含 5 条反向/正例对照）。
+> **未做（已登记）**：`.tmp_*` 残留清理与 transfer token 清理（P9 C9.25）、GC 调度/领导者选举/指标（P9）、
+> PG 版 `ILeaseRepository`、远端 Storage Service 仓储（ADR-004 **可选**）、组合根改接 SQLite 元数据仓储、
+> GC 的 TTL 判定改用数据库时钟（P6-D18）。
+>
+> **进度明细（切片 1~7）**：
 > ① `src/infra/metadata/sqlite/sqlite_metadata_repository.{h,cpp}`
 > （版本链 + `is_latest` 部分唯一索引 + partition 隔离）+ 元数据契约在 SQLite 上跑第二遍
 > （闭合 C2.10 的**元数据侧**）→ C6.5 已满足；C6.1 部分（仓储侧无损，REST 侧见 C4.2）。
@@ -504,11 +512,11 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase6 --output-on
 | C6.8 | 角色常量逐字节断言：`service.file.viewers/editors/admin`、`service.dataset.viewers/editors`、`service.storage.viewer/creator/admin`、`service.delivery.viewer` |
 | C6.9 | 大文件搬迁：≥ 1 GiB staging→persistent 复制的 RSS 峰值增长 < 64 MiB |
 | **C6.11** | **幂等性（复现 M2）**：2 实例并发提交同一 `fileSource` → 只产生 1 条记录、只发生 1 次复制。对照测试：去掉唯一约束时**必须**出现重复（自证） |
-| **C6.12** | **GC 租约（复现 M3）**：在途对象在租约有效期内不被删；租约过期且无记录时被回收；两个 GC 并发时靠原子领取不重复删 |
+| **C6.12** | **GC 租约（复现 M3）**：在途对象在租约有效期内不被删；租约过期且无记录时被回收；两个 GC 并发时靠原子领取不重复删 —— ✅ 切片 7（`test_gc_lease` 6 用例 / 131 断言，含"无租约不许删"与"有记录永不删"两条反向测试） |
 | **C6.13** | **tmp 名唯一性（复现 M1）**：2 实例并发写同一业务序号 → 无内容错乱。对照测试：用不含实例标识的 tmp 名时**必须**能复现错乱（自证） |
 | C6.10 | 回归：P0–P5 全绿 |
 
-**退出条件**：C6.1–C6.10 满足，证据写入 `docs/test-evidence/phase6.md`。
+**退出条件**：C6.1–C6.10 满足，证据写入 `docs/test-evidence/phase6.md`。→ ✅ **已满足（C6.11~C6.13 亦完成）**。
 
 ---
 

@@ -272,7 +272,47 @@ All tests passed (1040 assertions in 1 test case)
 
 ---
 
-## 7. 门槛命令与输出（累计）
+## 7. 切片 7：GC 租约（C6.12）+ C6.10 回归 —— **P6 收口**
+
+### 交付物
+
+| 路径 | 内容 |
+| --- | --- |
+| `src/app/tasks/gc_task.{h,cpp}` | L4 的 GC 任务：过期租约（**原子领取**）→ 位置记录 → 对象；单实例降级的 staging TTL 扫描；persistent 孤儿（宽限期）；`dry_run` 默认只报告 |
+| `tests/integration/test_gc_lease.cpp` | 6 用例 / 131 断言：dry-run、在途不删、过期回收、**无租约不许删**（含单实例正例对照）、**有记录永不删**、**两个 GC 并发不重复删** |
+
+### C6.12 判定表（每条都配了反向/正例对照）
+
+| 情形 | 期望 | 断言点 |
+| --- | --- | --- |
+| `dry_run=true`（默认） | 报告候选（`deleted_objects==1`）但**一个都不删** | 对象 + 位置记录 + 租约都还在 |
+| 在途租约**未过期**（且已续租） | **不删**（哪怕 staging TTL 早过、`dry_run=false`） | `expired_leases_claimed==0`、对象仍在 |
+| 租约**过期且无记录** | 回收：对象 + 位置记录都删，报告列出 file_id | 再跑一轮 → `claimed==0 / deleted==0`（幂等） |
+| `require_lease_expiry=true` 且**完全没有租约** | **不许删**（这就是 M3 的护栏） | 对象仍在；**正例对照**：显式切成单实例（`require_lease_expiry=false`）后同一对象**必须**被 TTL 回收 |
+| 有**元数据记录**的对象（哪怕过期租约指着它） | `skipped_has_record==1`、**永不删** | 对象 + 位置记录 + 元数据记录都在 |
+| **两个 GC 并发**（不同 instance id） | 每个对象**恰好删一次** | 两侧 `claimed` 之和 == 对象数、`deleted` 之和 == 对象数、两份 `deleted_file_ids` **交集为空** |
+
+**自证对照（R1）**：把"有记录永不删"的守卫与租约的"原子领取"（只扫描、不迁移 owner）拆掉后重跑，
+6 个用例里 **3 个失败**（实测）；恢复后 131 断言全绿。
+
+> ⚠️ **未做（如实登记）**：`.tmp_*` 残留清理（C9.25，需要 `IBlobStore` 暴露内部键）、
+> 过期 transfer token 清理（自签 token 无状态、无表）、调度/领导者选举/GC 指标（P9）、
+> PG 版 `ILeaseRepository`（目前只有测试替身）、**多实例下 GC 的 TTL 判定应改用数据库时钟**
+> （ADR-009 §6.4；见缺陷表 P6-D18）。
+
+### C6.10 回归（P0–P5 全绿）
+
+```console
+$ ctest --test-dir build -L "phase0|phase1|phase2|phase3|phase4|phase5"
+100% tests passed, 0 tests failed out of 48
+Total Test time (real) = 31.39 sec
+$ ./scripts/run_all_gates.sh          # 含 ASan/UBSan/LSan 与 5 个自证脚本
+✅ 全部已启用阶段门槛通过。
+```
+
+---
+
+## 8. 门槛命令与输出（累计）
 
 ```console
 $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failure
@@ -284,7 +324,8 @@ $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failur
     Start 39: test_dms_delivery ....................   Passed    0.03 sec
     Start 40: test_multi_instance ..................   Passed    0.05 sec
     Start 41: test_posix_tmp_names .................   Passed    0.09 sec
-100% tests passed, 0 tests failed out of 8
+    Start 42: test_gc_lease ........................   Passed    0.06 sec
+100% tests passed, 0 tests failed out of 9
 
 逐测试断言数：
   test_sqlite_metadata_repository   122 assertions in 2 test cases
@@ -303,8 +344,10 @@ $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failur
                                     ← C6.11（内存 + SQLite 两连接 + 朴素主键对照）
   test_posix_tmp_names               63 assertions in 2 test cases
                                     ← C6.13（临时名唯一性 + 朴素临时名必错乱对照）
+  test_gc_lease                     131 assertions in 6 test cases
+                                    ← C6.12（dry-run / 在途不删 / 过期回收 / 并发不重复删）
   ─────────────────────────────────────────────
-  合计 2447 个断言 / 44 个测试用例 / 8 个测试
+  合计 2578 个断言 / 50 个测试用例 / 9 个测试
 ```
 
 相关护栏（改动仓储 SQL 后必跑）：
@@ -316,13 +359,14 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 
 ---
 
-## 8. 判据进展
+## 9. 判据进展
 
 | 判据 | 状态 | 证据 |
 | --- | --- | --- |
 | **C2.10（元数据侧）** 同一套契约跑第二遍 | ✅ | `test_sqlite_metadata_repository` 复用 `CheckMetadataRepositoryContract`（与内存实现逐条相同） |
 | **C6.5** 版本链 | ✅ | 契约的版本用例 + 切片 1 的"数据库真实形态"用例（3 版共存、1 个 latest、部分唯一索引自证） |
-| C6.1（黄金样例字段级往返） | 🚧 部分 | 仓储侧已无损（`data` 列存整条 JSON）；REST 侧的全字段比对已在 P4 的 C4.2 覆盖，尚缺"经 SQLite 仓储往返"的组合用例 |
+| **C6.1** 黄金样例字段级往返 | ✅ | 仓储侧：`data` 列存整条 JSON → SQLite 仓储无损（`test_sqlite_metadata_repository` 与内存实现跑同一份契约）；REST 侧的全字段逐字段比对见 P4 的 C4.2（`test_rest_contract` 的"只允许 3 处服务端改写"用例） |
+| **C6.2** §3.4 全部负向样例 + kind 消息逐字节 | ✅ | P4 的 C4.3：vendored 上游 10 条在跑样例 + 2 条上游自己注释掉的行，逐字比对期望消息（`File_*_msg.json`） |
 | **C6.4** 校验和（服务端计算并**覆写** / 算法跟随驱动 / 大对象流式） | ✅ | 切片 2：判定表 5 行全部有断言（未提供 / 客户端值被覆写 / 客户端点名别的算法 / 原生 MD5 / 原生不可用回退）+ L1 公开向量与算法解析两向断言。**旧表述**"客户端提供但不符 → 400 + 删除对象"已推翻（P6-D05） |
 | **C6.3** 12 步序列 + 故障注入 | ✅ | 切片 3：正常路径的顺序/副作用 + **7 个注入点**（计划要求 6 个，追加 `datasetDetails` 非致命点）；第 9/11 步的顺序用"staging 是否还在"证明；自证对照两处 | 
 | **C6.6** `getFileList` 语义 | ✅ | 切片 4：字段名集合相等、`CreatedAt` 格式、分页不重叠、闭区间时间过滤、用户过滤、上游三条 fixture 逐字 400、非法参数正反例 |
@@ -331,11 +375,13 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | **C6.9** 大文件搬迁 RSS | ✅ | 切片 6：**1 GiB** staging→persistent + 流式回算，RSS 增长 **3432 KiB < 64 MiB**；另有 64 MiB 那一例带"整块读回"对照（65664 KiB）|
 | **C6.11** 幂等并发 | ✅ | 切片 6：内存装配 + **SQLite 两个连接**（同 id / 不同 id 两种冲突路径）都"恰 1 条记录、1 份对象"；对照（朴素主键 check-then-insert）**必现重复** |
 | **C6.13** tmp 名唯一性 | ✅ | 切片 6：同 `instance_id` 的两个 store 并发写同一 key × 12 轮无错乱（进程级序号）；对照证明朴素临时名会产出"大小正常、内容混装"的对象 |
+| **C6.12** GC 租约 | ✅ | 切片 7：dry-run 不删 / 在途不删 / 过期且无记录才回收 / **无租约不许删**（含单实例正例对照）/ **有记录永不删** / **两个 GC 并发每对象恰好删一次** |
+| **C6.10** 回归（P0–P5） | ✅ | 切片 7：`ctest -L "phase0|...|phase5"` **48 测试全绿** + `run_all_gates.sh`（含 sanitizer 与 5 个自证脚本）全绿 |
 | C6.2 / C6.3 / C6.6 / C6.7 / C6.8 / C6.11 / C6.12 / C6.13 | ⬜ 未开始 | 见开头"剩余" |
 
 ---
 
-## 9. 本阶段发现并修复的缺陷
+## 10. 本阶段发现并修复的缺陷
 
 | 编号 | 症状 / 根因 | 复现方式 | 修复 |
 | --- | --- | --- | --- |
@@ -350,13 +396,14 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | **P6-D09** | **`getFileList` 的三处上游不兼容**：① `FileListRequest.items` 缺省 `10` → 上游 `{}`（缺 `Items`）必须 `400`，我们返回 `200`；② `Driver` 返回**大写** provider key，与 §2.2/§2.3（小写）及契约 §2.5 样例不一致；③ 无记录消息是自造的 `No record found`，上游 provider 是 `Nothing found for such filter and page(num: N, size: M).`。三处都被"发 `{}` 期望 200"的旧用例挡住（那条期望本身就是错的） | 切片 4 的 `test_file_list`（三条上游 fixture 逐字驱动）；`test_ops_endpoints` 修正后立即暴露 | `items` 缺省改 `0`；`Driver` 统一小写；消息对齐上游；同时纠正 `test_ops_endpoints` 的错误期望并登记 |
 | **P6-D10** | **ISO-8601 解析静默归一化越界时间**：`ParseIso8601` 直接交给 `timegm`，后者把 `2020-13-45T99:99:99Z` **归一化**成一个"看似合理"的错误时刻（月份 13 → 次年、小时 99 → +4 天）。用它当 `TimeFrom`/`TimeTo` 边界会**静默筛错数据**；`2020-1-01T...` 这类位数不符也被接受 | 切片 4 的 `TimeFrom: "2020-13-45T99:99:99Z"` 分支（旧实现返回 200） | 解析前补**形状**（`consumed == 19`）与**字段范围**（月/日/时/分/秒、含闰年 `DaysInMonth`、时区偏移）校验；`test_time.cpp` 增 11 条越界/形状用例 + 闰日正例对照（phase1 断言数 4970 → **4984**） |
 | **P6-D12** | **SQLite 并发写入不是幂等的**：两个实例（两个连接）同时 `Create` 同一个 file_source 时，输家的 `INSERT` 撞唯一索引 → 直接把 `UNIQUE constraint failed` 映射成 **500**；另一条路径（两个实例生成**同一个 id**）在"同 id 已存在"预检处就报 `同 id 已存在且 file_source 不同`（其实 source 相同）。客户端重试/并发提交拿到 500 而不是既有记录 | 切片 6 的 SQLite 两连接用例（同 id 与不同 id 两种组合；修复前 2 条 `REQUIRE(...ok())` 失败） | 两条路径都补"按幂等键**回读既有记录**"：预检命中时回读；`(rc & 0xFF) == SQLITE_CONSTRAINT` 时回读（扩展码必须按主码比较，P3-D03） |
+| **P6-D18**（**未修复，登记 P9**） | **多实例下 GC 的时间判定用了服务时钟**：ADR-009 §6.4 要求"租约/过期判定一律用数据库 `now()`"（实例时钟偏移会误判），GC 的租约到期由 `ClaimExpired` 走数据库侧 ✓，但 staging TTL / orphan 宽限期的比较用的是 `ports.clock` | 切片 7 写用例时暴露：租约替身的时钟与服务时钟是**两个**时钟，必须显式同步（`SetNowMillis`）才让"过期"生效 | 登记到 P9：在端口上暴露数据库时间（或让 GC 走仓储查询），使 TTL 判定也来自数据库时钟。**当前未修复**，因此多实例下应把 `staging_ttl_hours` / `orphan_grace_hours` 留足余量 |
 | **P6-D13** | **12 步序列在"重试/并发"下会删掉活对象**（三种形态）：① 位置记录的 `zone` 被上一次成功的请求改成 persistent，第二个请求据此把 **persistent 对象当 staging 清理**；② 复制失败时的回滚会删掉**并发赢家**刚写好的对象；③ staging 已被赢家清理 → 输家复制失败直接 502（而不是幂等成功） | 切片 6 的并发用例（修复前：`stat(persistent).exists == false`、`zone == kStaging`、`复制源不存在`） | ① `source_is_staging` 守卫复制与第 11 步清理；② `RollbackCreatedObject` 加"已有记录指向该对象则不动"的守卫；③ 第 4b 步加**幂等快路径**（同 fileSource 已有记录 → 直接返回），复制失败时也回读一次 |
 | **P6-D14** | **`InMemoryBlobStore` 不是线程安全的**：组合根 `single` 模式用它，并发请求同时改 `std::map` → **静默堆损坏**（实测 `double free or corruption` / `free(): invalid next size`），而不是给出错误 | 切片 6 的并发用例（两线程共享同一个 store） | 内部加一把互斥量（与 `InMemoryMetadataRepository` 的既有做法对齐），头文件写明线程安全 |
 | **P6-D15** | **`InMemoryLocationRepository` 不是线程安全的**，而且加锁后 **`FindByFileSource` 自死锁**（持锁后又调用同样加锁的 `Find()`） | 并发用例**挂死**；gdb 回溯：`FindByFileSource` → `Find` 等在同一个非递归互斥量上 | 加锁 + 内部查询内联成不加锁实现。★ 教训：给类加锁后要**逐个审"公开方法之间的调用"** |
 | **P6-D16** | **`InMemoryMetadataRepository` 不是线程安全的**，且 **`GetLatestByFileSource` 自死锁**（持锁后调 `GetById`） | 同上（gdb 回溯到 `GetById` 的 `lock_guard`） | 同上：加锁 + 用不加锁的 `FindChain` 实现查询；`ManualClock` 的读数改成原子 |
 | **P6-D17** | **POSIX 临时文件序号是"每个 store 各自从 0 开始"**：同一进程里两个 store（同 `instance_id`）会算出同一个临时路径 → 后者 `O_EXCL` 失败（极端情况下互相覆盖） | 切片 6 的 tmp 名用例（修复前两个 put 有一个失败） | 改成**进程级**静态序号（`instance_id` + `pid` + 进程级序号三者合一）；自证：去掉序号后用例必失败 |
 
-## 10. 结论
+## 11. 结论
 
 | 项 | 结论 |
 | --- | --- |
@@ -365,6 +412,8 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | 切片 3 门槛（12 步序列 C6.3） | ✅ 正常路径的顺序/副作用 + 7 个故障注入点 + 端到端 `x-correlation-id` 透传 |
 | 切片 4 门槛（`getFileList` C6.6 + 角色 C6.8） | ✅ 上游三条 fixture 逐字 400 + 分页/时间/用户过滤 + 9 个角色常量与端点映射（顺带：phase1 因时间解析修复 4970 → 4984） |
 | 切片 5 门槛（DMS/Delivery C6.7） | ✅ 6 端点 + delivery 的键集合逐键断言 + 上游 DMS 端到端 |
-| 切片 6 门槛（C6.9 + C6.11 + C6.13） | ✅ 1 GiB 搬迁 RSS 3.4 MiB（< 64 MiB）；并发幂等在内存与 SQLite 两连接上都"恰 1 条"；tmp 名唯一性（含对照）；`ctest -L phase6` **8 测试 / 2447 断言** |
-| 已满足判据 | **C2.10（元数据侧）、C6.3、C6.4、C6.5、C6.6、C6.7、C6.8、C6.9、C6.11、C6.13** |
-| P6 是否收口 | ❌ 未收口 |
+| 切片 6 门槛（C6.9 + C6.11 + C6.13） | ✅ 1 GiB 搬迁 RSS 3.4 MiB（< 64 MiB）；并发幂等在内存与 SQLite 两连接上都"恰 1 条"；tmp 名唯一性（含对照） |
+| 切片 7 门槛（C6.12 + C6.10） | ✅ GC 租约 6 用例（含 5 条反向/对照断言）+ P0–P5 回归 48 测试全绿；`ctest -L phase6` **9 测试 / 2578 断言** |
+| 已满足判据 | **C2.10（元数据侧）+ C6.1~C6.13 全部满足**（逐条证据见 §9 判据进展） |
+| P6 是否收口 | ✅ **收口**（退出条件"C6.1–C6.10 满足"已达成；C6.11~C6.13 亦完成） |
+| 未做但已登记（不阻塞判据） | `.tmp_*` 残留清理与 transfer token 清理（P9 C9.25）、GC 调度/领导者选举/指标（P9）、PG 版 `ILeaseRepository`、远端 Storage Service 仓储（ADR-004 列为**可选**）、组合根改接 SQLite 元数据仓储、GC 的数据库时钟（P6-D18） |

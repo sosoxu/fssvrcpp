@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -404,12 +405,15 @@ class RecordingAuditLogger final : public domain::IAuditLogger {
 
 // =============================================================================
 //  租约（ADR-009）——内存实现，供 GC/多实例用例的单元测试
+//  ★ 线程安全（内部一把互斥量）：C6.12 的"两个 GC 并发"用例会在两个线程里同时
+//    `ClaimExpired` —— 没有锁时那既是数据竞争，也会让"原子领取"失去意义。
 // =============================================================================
 class InMemoryLeaseRepository final : public domain::ILeaseRepository {
  public:
   fss::Result<Lease> Acquire(std::string_view partition, std::string_view file_id,
                              std::string_view owner_instance_id,
                              std::int64_t ttl_millis) override {
+    std::lock_guard<std::mutex> guard(mutex_);
     const std::string key = std::string(partition) + "\x1f" + std::string(file_id);
     const auto it = leases_.find(key);
     if (it != leases_.end() && it->second.expires_at_epoch_millis > now_millis_) {
@@ -425,6 +429,7 @@ class InMemoryLeaseRepository final : public domain::ILeaseRepository {
 
   fss::Result<void> Renew(std::string_view partition, std::string_view file_id,
                           std::string_view owner_instance_id, std::int64_t ttl_millis) override {
+    std::lock_guard<std::mutex> guard(mutex_);
     const std::string key = std::string(partition) + "\x1f" + std::string(file_id);
     const auto it = leases_.find(key);
     if (it == leases_.end() || it->second.owner_instance_id != owner_instance_id) {
@@ -436,6 +441,7 @@ class InMemoryLeaseRepository final : public domain::ILeaseRepository {
 
   fss::Result<void> Release(std::string_view partition, std::string_view file_id,
                             std::string_view owner_instance_id) override {
+    std::lock_guard<std::mutex> guard(mutex_);
     const std::string key = std::string(partition) + "\x1f" + std::string(file_id);
     const auto it = leases_.find(key);
     if (it == leases_.end()) return Err(fss::ErrorKind::kNotFound, "租约不存在");
@@ -449,6 +455,7 @@ class InMemoryLeaseRepository final : public domain::ILeaseRepository {
   //  ★ 原子领取：一次调用内"挑选 + 迁移 owner"，并发下同一条只会被一个实例领走
   fss::Result<std::vector<Lease>> ClaimExpired(std::string_view partition, int limit,
                                                std::string_view claimant_instance_id) override {
+    std::lock_guard<std::mutex> guard(mutex_);
     std::vector<Lease> claimed;
     const std::string prefix = std::string(partition) + "\x1f";
     for (auto& [key, lease] : leases_) {
@@ -462,9 +469,13 @@ class InMemoryLeaseRepository final : public domain::ILeaseRepository {
     return claimed;
   }
 
-  void SetNowMillis(std::int64_t now) { now_millis_ = now; }
+  void SetNowMillis(std::int64_t now) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    now_millis_ = now;
+  }
 
  private:
+  std::mutex mutex_;
   std::map<std::string, Lease> leases_;
   std::int64_t now_millis_ = 1700000000000;
 };
