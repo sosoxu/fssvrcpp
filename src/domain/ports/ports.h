@@ -238,11 +238,33 @@ struct StatusChangedEvent {
   json::Value extra = json::Value::object();
 };
 
+//  契约 §2.6 第 10 步的**第二个**事件。上游形状（一手依据：
+//  `/home/ll/osdu-file-upstream/.../status/FileDatasetDetailsPublisher.java`）：
+//    kind = "datasetDetails"，body 是**长度为 1 的数组**，元素 properties 含
+//    `correlationId` / `datasetId`（= 记录 id）/ `datasetType` = `FILE` /
+//    `datasetVersionId`（= 记录版本）/ `recordCount` = 1 / `timestamp`（毫秒）。
+//  ★ 与 status 事件一样是**非致命**的：上游只 `log.warning("Failed to publish dataset details")`。
+struct DatasetDetailsEvent {
+  static constexpr std::string_view kKind = "datasetDetails";
+  static constexpr std::string_view kDatasetTypeFile = "FILE";
+
+  std::string partition;
+  std::string correlation_id;    // 来自 `correlation-id` 头（缺失时为空）
+  std::string dataset_id;        // 记录 id
+  std::string dataset_version_id;  // 记录版本（字符串形态，与上游一致）
+  std::string dataset_type = std::string(kDatasetTypeFile);
+  int record_count = 1;
+  std::int64_t timestamp_millis = 0;
+};
+
 class IEventPublisher {
  public:
   virtual ~IEventPublisher() = default;
   virtual Result<void> PublishStatusChanged(std::string_view topic,
                                             const StatusChangedEvent& event) = 0;
+  //  `datasetDetails`（索引服务据此更新数据集清单）
+  virtual Result<void> PublishDatasetDetails(std::string_view topic,
+                                             const DatasetDetailsEvent& event) = 0;
 };
 
 struct AuditEvent {

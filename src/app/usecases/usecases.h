@@ -46,6 +46,9 @@ struct CallerContext {
   std::string partition;      // data-partition-id（revokeURL 不要求）
   std::string user_id;        // 用于 FileSource 与 getFileList 的 UserID 过滤
   std::string bearer_token;   // "Bearer xxx" 或裸 token（由适配层归一化）
+  //  请求的 `correlation-id`（适配层填充）—— 上游把它放进 `datasetDetails` 事件的
+  //  `properties.correlationId`，用于跨服务追踪。非 HTTP 入口（gRPC/测试）可以留空。
+  std::string correlation_id;
 };
 
 //  角色名（契约 §1.3；viewers/editors 也在 domain::ports 里）

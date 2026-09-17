@@ -49,6 +49,7 @@ fss::http::Handler Router::Wrap(Action action) {
       caller.user_id = *value;
     }
     if (caller.user_id.empty()) caller.user_id = options_.default_user_id;
+    caller.correlation_id = request.correlation_id;
 
     //  ★ 指标要在**所有**出口上记一次（成功 / 契约错误 / 异常），所以这里用
     //    局部 lambda + 统一 return：三个出口各写一遍必然漏（见 Wrap 的异常分支）

@@ -329,8 +329,9 @@ accept 队列只有 5 个位置，多余的 SYN 被内核丢弃，客户端按 1
 8.  record = 组装(id, acl, legal, kind, ancestry, data, meta, tags)
 9.  metadataRepo.Save(record, version=1)                            [失败 → 回滚删除 persistent, 500]
 10. publish status(SUCCESS) + datasetDetails                        [非致命]
-11. remove(staging)                                                 [失败 → 忽略 + 审计告警, 不影响响应]
-12. 任一步 6/7/9 失败 → remove(persistent) 回滚 + publish status(FAILED) → 重抛
+11. remove(staging)                                                 [失败 → 忽略 + 审计告警 `createMetadataStagingCleanupFailure`, 不影响响应]
+12. 任一步 6/7/9 失败 → remove(persistent) 回滚 + publish status(FAILED)
+                       + 审计 `createMetadataFailure` → 重抛
 ```
 
 **第 7 步的校验和语义（C6.4）**
@@ -361,6 +362,21 @@ checksum = storageUtil.getChecksum(persistentLocation)
 1. 校验和必须**流式**计算 —— 对象不得整体驻留内存（含跨 store 复制的兜底路径）。
 2. 覆写必须同时落到**两处**（`data.*` 与 `FileSourceInfo.*`），且两处一致。
 3. 算法必须**跟随驱动**：记录里写的是"值实际所用的算法"的规范名，不能把 MD5 的值标成 `SHA256`。
+
+**第 10 步的两个事件（都**非致命**：发布失败只告警，不影响 `201`）**
+
+| 事件 | topic | 载荷 |
+| --- | --- | --- |
+| `status`（第 1/10/12 步共用） | `status-changed` | `{partition, status ∈ {IN_PROGRESS, SUCCESS, FAILED}, dataset_sync: "DATASET_SYNC", version}` |
+| `datasetDetails`（第 10 步第二个） | `datasetDetails` | `kind: "datasetDetails"` + `properties: {correlationId, datasetId(= 记录 id), datasetType: "FILE", datasetVersionId(= 版本字符串), recordCount: 1, timestamp(毫秒)}`；body 是**长度为 1 的数组**（与上游一致） |
+
+> 上游依据（一手，vendored 到 `/home/ll/osdu-file-upstream`）：
+> `file-core/src/main/java/org/opengroup/osdu/file/service/status/FileDatasetDetailsPublisher.java`
+> 定义 `KIND = "datasetDetails"`、`DATASET_TYPE = FILE`、`recordCount = 1`、
+> `timestamp = System.currentTimeMillis()`，并在失败时只 `log.warning("Failed to publish dataset details")`；
+> `FileMetadataService` 在 `publishSuccessStatus(recordIds.get(0), recordIdVersions.get(0))` **之后立刻**
+> 调用 `publishDatasetDetails(...)`（即"先 status、再 datasetDetails"的顺序）。
+> `properties.correlationId` 取自请求头 `x-correlation-id`（本实现由适配层填入 `CallerContext`）。
 
 **请求样例（权威黄金样例，实测自 `input_payloads/File_CorrectPayload.json`）**
 见 §3.3。

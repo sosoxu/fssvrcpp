@@ -51,6 +51,14 @@ struct AppFixture {
         *issuer, clock, ids});
   }
 
+  //  用替代的元数据仓储**重建**端口集合（故障注入替身用）。
+  //  ⚠️ 必须在构造之后、任何用例调用之前调用；重建后 `ports` 指向新的仓储引用。
+  void UseMetadata(domain::IMetadataRepository& repository) {
+    ports = std::make_unique<fss::app::UseCasePorts>(fss::app::UseCasePorts{
+        factory, locations, repository, authorizer, events, audit, partitions, legal, schema,
+        *issuer, clock, ids});
+  }
+
   //  构造一条合法的 `dataset--File.Generic` 记录（只填必需字段）
   //  ★ ACL 主体必须满足契约 §1.5 的 `^data\.[...]@<域名>$`，legal 必须带
   //    `otherRelevantDataCountries` —— 这两条以前没被任何测试碰到，因为

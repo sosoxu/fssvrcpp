@@ -290,7 +290,7 @@ fss_add_test(test_checksum
 fss_add_test(test_metadata_lifecycle
   SOURCES integration/test_metadata_lifecycle.cpp
   LIBS    fss_app fss_blob_memory fss_blob_posix fss_location_memory fss_metadata_memory
-          fss_crypto fss_io
+          fss_crypto fss_io fss_http_adapter fss_transfer Threads::Threads
   LABELS  "phase6;integration")
 
 # -----------------------------------------------------------------------------

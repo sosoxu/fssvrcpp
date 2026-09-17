@@ -134,6 +134,20 @@ class LogEventPublisher final : public fss::domain::IEventPublisher {
     return fss::Ok();
   }
 
+  //  `datasetDetails`（契约 §2.6 第 10 步）：默认实现只写日志（与 status 事件同一策略）
+  fss::Result<void> PublishDatasetDetails(
+      std::string_view topic, const fss::domain::DatasetDetailsEvent& event) override {
+    fss::logging::Info(logger_, "datasetDetails",
+                       {{"topic", std::string(topic)},
+                        {"partition", event.partition},
+                        {"correlationId", event.correlation_id},
+                        {"datasetId", event.dataset_id},
+                        {"datasetType", event.dataset_type},
+                        {"datasetVersionId", event.dataset_version_id},
+                        {"recordCount", std::to_string(event.record_count)}});
+    return fss::Ok();
+  }
+
  private:
   const fss::logging::ILogger& logger_;
 };

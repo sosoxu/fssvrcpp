@@ -23,6 +23,7 @@
 #include <catch2/catch.hpp>
 
 #include "app_fixture.h"
+#include "http_fixture.h"   // HttpFixture / HttpDo / Authed（端到端 correlation-id 用例）
 #include "raw_http.h"
 #include "temp_dir.h"
 
@@ -411,4 +412,321 @@ TEST_CASE("★ C6.4/C6.9 校验和**流式**回算：64 MiB 对象 + RSS 上限 
       control_after > control_baseline ? control_after - control_baseline : 0;
   INFO("对照（整块读回）RSS 增长 " << control_growth << " KiB");
   REQUIRE(control_growth >= 32 * 1024);  // 证明该测量确实能发现整块驻留
+}
+
+// =============================================================================
+//  C6.3：契约 §2.6 的 12 步序列 + **6 个故障注入点**
+// =============================================================================
+//  分工（故障点 ↔ 期望）：
+//    ① 第 1 步 `IN_PROGRESS` 事件失败 → **非致命**，流程继续（仍是 201）
+//    ② 第 6 步 复制失败            → `502` + FAILED 事件 + 审计失败 + 无记录 + 无 persistent 对象
+//    ③ 第 7 步 校验和回算失败      → **回滚删除 persistent** + FAILED + 502 + 无记录
+//    ④ 第 9 步 写记录失败          → **回滚删除 persistent** + FAILED + 500；staging 仍然保留
+//    ⑤ 第 10 步 `SUCCESS` 事件失败 → **非致命**，仍是 201 且记录已落地
+//    ⑥ 第 11 步 删 staging 失败    → 仍是 **201**（上游 issue #76）+ 审计告警 `createMetadataStagingCleanupFailure`
+//
+//  ★ 顺序断言用的是**可观测副作用**（事件序列 / 审计 / 对象是否存在 / 仓储计数），而不是
+//    "读一遍代码觉得顺序对"：例如"第 6 步失败时记录数为 0"证明复制发生在写记录**之前**；
+//    "第 9 步失败时 staging 仍在"证明 staging 清理发生在写记录**之后**。
+namespace {
+
+bool HasAudit(const fss::test::RecordingAuditLogger& audit, std::string_view operation,
+              std::string_view result) {
+  for (const auto& event : audit.events) {
+    if (event.operation == operation && event.result == result) return true;
+  }
+  return false;
+}
+
+std::size_t CountAudit(const fss::test::RecordingAuditLogger& audit, std::string_view operation) {
+  std::size_t n = 0;
+  for (const auto& event : audit.events) {
+    if (event.operation == operation) ++n;
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("★ C6.3 12 步序列：正常路径的顺序与副作用", "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  fx.caller.correlation_id = "corr-c6.3";  // 适配层会从 `correlation-id` 头填这个字段
+  const std::string payload = "sequence-happy";
+  const auto uploaded = UploadWithContent(fx, payload);
+  const ObjectRef persistent = PersistentRef(fx, uploaded.staging_ref);
+
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "happy.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto id = create.Execute(fx.caller, record);
+  INFO("create 失败：" << (id.ok() ? std::string() : id.error().ToString()));
+  REQUIRE(id.ok());
+
+  // 第 1/10 步：IN_PROGRESS 在前、SUCCESS 在后（各自恰好一次）
+  const auto statuses = fx.events.statuses();
+  REQUIRE(statuses == std::vector<std::string>{"IN_PROGRESS", "SUCCESS"});
+  REQUIRE(fx.events.events[1].version == 1);   // SUCCESS 带 version
+  REQUIRE(fx.events.events[0].dataset_sync == "DATASET_SYNC");
+
+  // 第 6 步：persistent 对象存在（且内容正确）
+  const auto stat = fx.blob.stat(persistent);
+  REQUIRE(stat.ok());
+  REQUIRE(stat.value().exists);
+
+  // 第 7 步：校验和已写回（记录里的值 == 真实字节的 SHA-256）
+  const auto stored = Fetch(fx, id.value());
+  REQUIRE(stored.ok());
+  REQUIRE(*stored.value().data.checksum == fss::crypto::Sha256Hex(payload));
+
+  // 第 11 步：staging 对象**已被清理**（这是"顺序在写记录之后"的可观测证据）
+  const auto staging_after = fx.blob.stat(uploaded.staging_ref);
+  REQUIRE(staging_after.ok());
+  REQUIRE_FALSE(staging_after.value().exists);
+
+  // 第 10 步的**第二个**事件：datasetDetails（上游 `FileDatasetDetailsPublisher` 的形状）
+  REQUIRE(fx.events.details.size() == 1);
+  const auto& details = fx.events.details.front();
+  REQUIRE(fx.events.last_details_topic == "datasetDetails");
+  REQUIRE(details.dataset_id == id.value());
+  REQUIRE(details.dataset_version_id == "1");
+  REQUIRE(details.dataset_type == "FILE");
+  REQUIRE(details.record_count == 1);
+  REQUIRE(std::string(fss::domain::DatasetDetailsEvent::kKind) == "datasetDetails");
+  //  correlation-id 由适配层填进 CallerContext（这里显式设置，证明它被透传）
+  REQUIRE(details.correlation_id == "corr-c6.3");
+  REQUIRE(details.timestamp_millis == fx.clock.NowEpochMillis());
+
+  // 第 9/11 步之后的审计：成功事件必须存在，且**没有**失败记录
+  REQUIRE(HasAudit(fx.audit, "createMetadataSuccess", "success"));
+  REQUIRE_FALSE(HasAudit(fx.audit, "createMetadataFailure", "failure"));
+  REQUIRE_FALSE(HasAudit(fx.audit, "createMetadataStagingCleanupFailure", "failure"));
+
+  // 位置记录已迁到 persistent 并记下上传者（getFileList 的 UserID 过滤依赖它）
+  const auto location = fx.locations.FindByFileSource(fx.caller.partition, uploaded.file_source);
+  REQUIRE(location.ok());
+  REQUIRE(location.value().zone == StorageZone::kPersistent);
+  REQUIRE(location.value().user_id == fx.caller.user_id);
+}
+
+TEST_CASE("★ C6.3 故障①：第 1 步 IN_PROGRESS 事件失败 → 非致命，仍 201",
+          "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  const std::string payload = "fault-step1";
+  const auto uploaded = UploadWithContent(fx, payload);
+
+  //  ★ 只让 IN_PROGRESS 失败：SUCCESS 仍必须发出去（否则区分不了"第 1 步非致命"与"事件全挂"）
+  fx.events.fail_status = "IN_PROGRESS";
+
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "step1.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto id = create.Execute(fx.caller, record);
+  INFO("create 失败：" << (id.ok() ? std::string() : id.error().ToString()));
+  REQUIRE(id.ok());
+  REQUIRE(fx.events.statuses() == std::vector<std::string>{"SUCCESS"});
+  REQUIRE(HasAudit(fx.audit, "createMetadataSuccess", "success"));
+}
+
+TEST_CASE("★ C6.3 故障②：第 6 步复制失败 → 502 + FAILED + 无记录 + 无持久对象",
+          "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  const auto uploaded = UploadWithContent(fx, "fault-step6");
+  const ObjectRef persistent = PersistentRef(fx, uploaded.staging_ref);
+
+  fx.blob.Inject({fss::infra::InMemoryBlobStore::Op::kCopy, 1, fss::ErrorKind::kUnavailable,
+                  "injected copy failure"});
+
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "step6.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto result = create.Execute(fx.caller, record);
+  REQUIRE_FALSE(result.ok());
+  REQUIRE(result.error().kind() == fss::ErrorKind::kBadGateway);  // → 502
+  REQUIRE(result.error().message().find("复制到 persistent 失败") != std::string::npos);
+
+  // 事件：IN_PROGRESS → FAILED（顺序断言）；审计：失败
+  REQUIRE(fx.events.statuses() == std::vector<std::string>{"IN_PROGRESS", "FAILED"});
+  REQUIRE(HasAudit(fx.audit, "createMetadataFailure", "failure"));
+
+  // ★ 复制发生在写记录之前：一条记录都不能有
+  fss::domain::MetadataQuery query;
+  const auto page = fx.metadata.List(fx.caller.partition, query);
+  REQUIRE(page.ok());
+  REQUIRE(page.value().total == 0);
+
+  // 持久区不留对象；staging 必须**保留**（第 11 步还没到，客户端可以重试）
+  REQUIRE_FALSE(fx.blob.stat(persistent).value().exists);
+  REQUIRE(fx.blob.stat(uploaded.staging_ref).value().exists);
+}
+
+TEST_CASE("★ C6.3 故障③：第 7 步校验和回算失败 → **回滚删除** persistent",
+          "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  const auto uploaded = UploadWithContent(fx, "fault-step7");
+  const ObjectRef persistent = PersistentRef(fx, uploaded.staging_ref);
+
+  // 驱动不报校验和 → 第 7 步必须回算；此时对 `get` 注入故障 = 第 7 步失败。
+  //  ⚠️ 装饰器必须**就地**构造：`factory` 存的是指针，按值返回会立刻变成悬空引用。
+  fss::test::CapabilityOverrideBlobStore store(fx.blob, fx.blob.capabilities(),
+                                               "https://self.invalid");
+  store.hide_checksum = true;
+  fx.factory.SetZoneStore(StorageZone::kStaging, store);
+  fx.factory.SetZoneStore(StorageZone::kPersistent, store);
+  fx.blob.Inject({fss::infra::InMemoryBlobStore::Op::kGet, 1, fss::ErrorKind::kUnavailable,
+                  "injected read failure"});
+
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "step7.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto result = create.Execute(fx.caller, record);
+  REQUIRE_FALSE(result.ok());
+  REQUIRE(result.error().kind() == fss::ErrorKind::kBadGateway);
+  REQUIRE(result.error().message().find("计算校验和失败") != std::string::npos);
+
+  REQUIRE(fx.events.statuses() == std::vector<std::string>{"IN_PROGRESS", "FAILED"});
+  REQUIRE(HasAudit(fx.audit, "createMetadataFailure", "failure"));
+
+  // ★ 第 12 步：已搬迁的 persistent 对象必须被**回滚删除**（此前这里是 `FSS_TRY`，漏了回滚）
+  REQUIRE_FALSE(fx.blob.stat(persistent).value().exists);
+  // staging 仍在（第 11 步未执行）
+  REQUIRE(fx.blob.stat(uploaded.staging_ref).value().exists);
+
+  fss::domain::MetadataQuery query;
+  REQUIRE(fx.metadata.List(fx.caller.partition, query).value().total == 0);
+}
+
+TEST_CASE("★ C6.3 故障④：第 9 步写记录失败 → 回滚删除 persistent + 500",
+          "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  const auto uploaded = UploadWithContent(fx, "fault-step9");
+  const ObjectRef persistent = PersistentRef(fx, uploaded.staging_ref);
+
+  fss::test::FaultyMetadataRepository failing{fx.metadata};
+  failing.fail_create = true;
+  fx.UseMetadata(failing);
+
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "step9.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto result = create.Execute(fx.caller, record);
+  REQUIRE_FALSE(result.ok());
+  REQUIRE(result.error().kind() == fss::ErrorKind::kInternal);  // → 500
+  REQUIRE(result.error().message().find("写入元数据记录失败") != std::string::npos);
+  REQUIRE(failing.create_calls == 1);
+
+  REQUIRE(fx.events.statuses() == std::vector<std::string>{"IN_PROGRESS", "FAILED"});
+  REQUIRE(HasAudit(fx.audit, "createMetadataFailure", "failure"));
+
+  // ★ 回滚：刚复制过去的 persistent 对象必须被删掉（否则留下无主副本）
+  REQUIRE_FALSE(fx.blob.stat(persistent).value().exists);
+  // ★ staging 仍在 → 证明第 11 步的清理确实发生在第 9 步**之后**
+  REQUIRE(fx.blob.stat(uploaded.staging_ref).value().exists);
+}
+
+TEST_CASE("★ C6.3 故障⑤：第 10 步 SUCCESS 事件失败 → 非致命，仍 201",
+          "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  const auto uploaded = UploadWithContent(fx, "fault-step10");
+  const ObjectRef persistent = PersistentRef(fx, uploaded.staging_ref);
+
+  fx.events.fail_status = "SUCCESS";
+
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "step10.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto id = create.Execute(fx.caller, record);
+  INFO("create 失败：" << (id.ok() ? std::string() : id.error().ToString()));
+  REQUIRE(id.ok());
+
+  // 记录已落地、persistent 在、staging 已清理 —— 事件失败不影响任何一步
+  const auto stored = Fetch(fx, id.value());
+  REQUIRE(stored.ok());
+  REQUIRE(fx.blob.stat(persistent).value().exists);
+  REQUIRE_FALSE(fx.blob.stat(uploaded.staging_ref).value().exists);
+  REQUIRE(fx.events.statuses() == std::vector<std::string>{"IN_PROGRESS"});
+  REQUIRE(HasAudit(fx.audit, "createMetadataSuccess", "success"));
+}
+
+TEST_CASE("★ C6.3 故障⑥：第 11 步删 staging 失败 → 仍 201 + 审计告警",
+          "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  const auto uploaded = UploadWithContent(fx, "fault-step11");
+  const ObjectRef persistent = PersistentRef(fx, uploaded.staging_ref);
+
+  // 第 11 步的 remove 是本次流程里唯一一次 remove（6/7/9 都没失败）
+  fx.blob.Inject({fss::infra::InMemoryBlobStore::Op::kRemove, 1, fss::ErrorKind::kUnavailable,
+                  "injected remove failure"});
+
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "step11.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto id = create.Execute(fx.caller, record);
+  INFO("create 失败：" << (id.ok() ? std::string() : id.error().ToString()));
+  // ★ 上游 issue #76：清理失败**不得**让已成功的登记变失败
+  REQUIRE(id.ok());
+
+  const auto stored = Fetch(fx, id.value());
+  REQUIRE(stored.ok());
+  REQUIRE(fx.blob.stat(persistent).value().exists);
+  // staging 没删掉（故障注入生效）→ 必须留下审计告警，而不是静默
+  REQUIRE(fx.blob.stat(uploaded.staging_ref).value().exists);
+  REQUIRE(HasAudit(fx.audit, "createMetadataStagingCleanupFailure", "failure"));
+  REQUIRE(CountAudit(fx.audit, "createMetadataStagingCleanupFailure") == 1);
+  REQUIRE(HasAudit(fx.audit, "createMetadataSuccess", "success"));
+  // 事件序列不受影响（第 10 步已经成功）
+  REQUIRE(fx.events.statuses() == std::vector<std::string>{"IN_PROGRESS", "SUCCESS"});
+}
+
+TEST_CASE("★ C6.3 故障⑦（追加）：第 10 步 datasetDetails 发布失败 → 非致命，仍 201",
+          "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  const auto uploaded = UploadWithContent(fx, "fault-dataset-details");
+  fx.events.fail_dataset_details = true;
+
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "details.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto id = create.Execute(fx.caller, record);
+  INFO("create 失败：" << (id.ok() ? std::string() : id.error().ToString()));
+  //  ★ 上游只 `log.warning("Failed to publish dataset details")` —— 不得影响 201
+  REQUIRE(id.ok());
+  REQUIRE(fx.events.details_calls == 1);   // 真的尝试发布过
+  REQUIRE(fx.events.details.empty());      // 但失败了
+  REQUIRE(fx.events.statuses() == std::vector<std::string>{"IN_PROGRESS", "SUCCESS"});
+  REQUIRE(HasAudit(fx.audit, "createMetadataSuccess", "success"));
+}
+
+// -----------------------------------------------------------------------------
+//  C6.3 第 10 步的"真的把 correlation-id 透传下去了吗"—— 端到端（真实端口）
+// -----------------------------------------------------------------------------
+//  ★ R15：`CallerContext.correlation_id` 这条约定如果只有单元断言，就无法证明**适配层**
+//    真的从 `x-correlation-id` 头填了它。这里走完整 HTTP 路径（uploadURL → PUT → POST metadata）。
+TEST_CASE("★ C6.3 端到端：`x-correlation-id` 头 → datasetDetails 事件",
+          "[phase6][integration][c6.3]") {
+  fss::test::HttpFixture fx;
+  const int port = fx.port();
+
+  auto headers = fss::test::Authed();
+  headers.push_back("x-correlation-id: corr-e2e-c6.3");
+
+  const auto upload = fss::test::HttpDo(port, "GET", "/api/file/v2/files/uploadURL", headers);
+  REQUIRE(upload.status == 200);
+  const auto upload_json = fss::json::ParseObject(upload.body);
+  REQUIRE(upload_json.ok());
+  const std::string file_source =
+      upload_json.value()["Location"]["FileSource"].get<std::string>();
+
+  const auto put = fss::test::HttpDo(
+      port, "PUT", fss::test::TargetOf(upload_json.value()["Location"]["SignedURL"].get<std::string>()),
+      headers, "correlation-body");
+  REQUIRE(put.status == 200);
+
+  auto record = AppFixture::MakeRecord(file_source, "corr.bin");
+  const auto created = fss::test::HttpDo(port, "POST", "/api/file/v2/files/metadata", headers,
+                                        fss::json::Dump(fss::domain::ToJson(record)));
+  INFO("POST metadata → " << created.status << " " << created.body);
+  REQUIRE(created.status == 201);
+
+  REQUIRE(fx.events.statuses() == std::vector<std::string>{"IN_PROGRESS", "SUCCESS"});
+  REQUIRE(fx.events.details.size() == 1);
+  const auto& details = fx.events.details.front();
+  REQUIRE(details.correlation_id == "corr-e2e-c6.3");
+  REQUIRE(details.partition == "opendes");
+  REQUIRE(details.dataset_id ==
+          fss::json::ParseObject(created.body).value()["id"].get<std::string>());
+  REQUIRE(details.dataset_version_id == "1");
+  REQUIRE(details.dataset_type == "FILE");
+  REQUIRE(details.record_count == 1);
 }

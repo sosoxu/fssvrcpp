@@ -88,7 +88,7 @@ File Service 的定位（引自官方文档 [File Service](https://osdu.pages.op
 | 7 | `checksum = storageUtilService.getChecksum(persistentLocation)`，非空则**回写覆盖** `FileSourceInfo.Checksum` + `ChecksumAlgorithm`（Azure 用 MD5） | — |
 | 8 | `fileMetadataRecordMapper.fileMetadataToRecord(fileMetadata)`（id/acl/legal/kind/ancestry/data-as-map/meta/tags） | — |
 | 9 | `dataLakeStorage.upsertRecord(record)` → **Storage Service** 的 `PUT {storage.api}/records` | `StorageException` |
-| 10 | `publishSuccessStatus(recordId, version)` + `publishDatasetDetails(recordId, version)` | 非致命 |
+| 10 | `publishSuccessStatus(recordId, version)` + `publishDatasetDetails(recordId, version)`（**两个**事件；`datasetDetails` 的 `kind = "datasetDetails"`、`properties = {correlationId, datasetId, datasetType: FILE, datasetVersionId, recordCount: 1, timestamp}`，见 `status/FileDatasetDetailsPublisher.java`） | 非致命 |
 | 11 | `cleanupStagingLocation(...)`：重新读取记录确认存在后删除 staging 对象；**删除失败被捕获并忽略**（上游 issue #76），**不得导致请求失败** | 忽略 |
 | 12 | 出错时（`StorageException` 或一般异常）：`deleteFile(persistentLocation)` **回滚已复制的副本** + `publishFailureStatus`，然后重新抛出 | — |
 
@@ -110,7 +110,8 @@ getMetadataById(id)                                   —— 不存在 → 404 "
 | Legal 校验 | File Service **不直接调用 Legal Service**；legal tag 的合规性由 **Storage Service 的 `PUT /records`** 内部校验 |
 | ACL 校验 | 本地做**结构**校验（非空 + 邮箱式组名正则），组成员是否存在由 Entitlements/Storage 负责 |
 | 校验和 | **服务端覆写**客户端传入的 `Checksum`/`ChecksumAlgorithm`（至少 Azure 实现如此） |
-| staging 清理 | 失败**静默忽略**（有意的：不能因为清理失败而让成功的元数据登记变失败） |
+| staging 清理 | 失败**静默忽略**（有意的：不能因为清理失败而让成功的元数据登记变失败）；我们额外落一条审计告警（`createMetadataStagingCleanupFailure`），否则"staging 里堆孤儿"会无人察觉 |
+| 事件 | 第 10 步发**两个**：`status`（`status-changed`）+ `datasetDetails`；**两者失败都只告警**（上游 `log.warning("Failed to publish dataset details")`），不得影响 `201` |
 
 ---
 

@@ -268,19 +268,103 @@ class NoopSchemaValidator final : public domain::ISchemaValidator {
 class RecordingEventPublisher final : public domain::IEventPublisher {
  public:
   bool fail = false;
+  //  ★ 只让**指定 status** 的发布失败（`"IN_PROGRESS"` / `"SUCCESS"`）——
+  //    否则无法区分第 1 步与第 10 步的"非致命"（两者都必须不影响响应）。
+  std::string fail_status;
   std::vector<std::string> topics;
   std::vector<domain::StatusChangedEvent> events;
 
   fss::Result<void> PublishStatusChanged(std::string_view topic,
                                          const domain::StatusChangedEvent& event) override {
     ++calls;
-    if (fail) return Err(fss::ErrorKind::kUnavailable, "测试替身：事件发布失败");
+    if (fail || (!fail_status.empty() && event.status == fail_status)) {
+      return Err(fss::ErrorKind::kUnavailable, "测试替身：事件发布失败");
+    }
     topics.emplace_back(topic);
     events.push_back(event);
     return Ok();
   }
 
+  //  `datasetDetails`（契约 §2.6 第 10 步）
+  bool fail_dataset_details = false;
+  std::vector<domain::DatasetDetailsEvent> details;
+
+  fss::Result<void> PublishDatasetDetails(std::string_view topic,
+                                          const domain::DatasetDetailsEvent& event) override {
+    ++details_calls;
+    last_details_topic = std::string(topic);
+    if (fail_dataset_details) {
+      return Err(fss::ErrorKind::kUnavailable, "测试替身：datasetDetails 发布失败");
+    }
+    details.push_back(event);
+    return Ok();
+  }
+
   int calls = 0;
+  int details_calls = 0;
+  std::string last_details_topic;
+
+  //  发布**成功**的 status 序列（排障与顺序断言用）
+  std::vector<std::string> statuses() const {
+    std::vector<std::string> out;
+    out.reserve(events.size());
+    for (const auto& event : events) out.push_back(event.status);
+    return out;
+  }
+
+  int CountStatus(std::string_view status) const {
+    int n = 0;
+    for (const auto& event : events) {
+      if (event.status == status) ++n;
+    }
+    return n;
+  }
+};
+
+// =============================================================================
+//  仓储替身：可注入失败的元数据仓储（C6.3 的第 9 步故障注入）
+// =============================================================================
+//  为什么用**装饰器**而不是给 `InMemoryMetadataRepository` 加开关：
+//    内存仓储是要跟 SQLite / 远端仓储共用同一份契约测试的"准产品实现"，
+//    故障注入属于测试替身的职责（与 `FakeBlobStoreFactory` 同类）。
+class FaultyMetadataRepository final : public domain::IMetadataRepository {
+ public:
+  explicit FaultyMetadataRepository(domain::IMetadataRepository& inner) : inner_(inner) {}
+
+  bool fail_create = false;
+  fss::ErrorKind create_error = fss::ErrorKind::kInternal;
+  int create_calls = 0;
+
+  fss::Result<domain::FileMetadataRecord> Create(std::string_view partition,
+                                                const domain::FileMetadataRecord& record) override {
+    ++create_calls;
+    if (fail_create) {
+      return Err(create_error, "测试替身：写入元数据记录失败");
+    }
+    return inner_.Create(partition, record);
+  }
+  fss::Result<domain::FileMetadataRecord> GetById(std::string_view partition,
+                                                 std::string_view record_id) override {
+    return inner_.GetById(partition, record_id);
+  }
+  fss::Result<domain::FileMetadataRecord> GetLatestByFileSource(
+      std::string_view partition, std::string_view file_source) override {
+    return inner_.GetLatestByFileSource(partition, file_source);
+  }
+  fss::Result<domain::FileMetadataRecord> Update(std::string_view partition,
+                                                const domain::FileMetadataRecord& record) override {
+    return inner_.Update(partition, record);
+  }
+  fss::Result<void> Delete(std::string_view partition, std::string_view record_id) override {
+    return inner_.Delete(partition, record_id);
+  }
+  fss::Result<domain::MetadataPage> List(std::string_view partition,
+                                         const domain::MetadataQuery& query) override {
+    return inner_.List(partition, query);
+  }
+
+ private:
+  domain::IMetadataRepository& inner_;
 };
 
 class RecordingAuditLogger final : public domain::IAuditLogger {

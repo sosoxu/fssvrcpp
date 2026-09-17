@@ -64,6 +64,20 @@ void PublishStatus(UseCasePorts& ports, const CallerContext& caller, std::string
   (void)ports.events.PublishStatusChanged("status-changed", event);
 }
 
+//  `datasetDetails` 事件（契约 §2.6 第 10 步）—— **非致命**，与 `status` 事件同策略。
+//  上游依据：`FileDatasetDetailsPublisher.publishDatasetDetails(datasetId, datasetVersionId)`
+//  （`FileMetadataService` 在 `publishSuccessStatus` 之后立刻调用它）。
+void PublishDatasetDetails(UseCasePorts& ports, const CallerContext& caller,
+                           std::string_view record_id, std::int64_t version) {
+  domain::DatasetDetailsEvent event;
+  event.partition = caller.partition;
+  event.correlation_id = caller.correlation_id;
+  event.dataset_id = std::string(record_id);
+  event.dataset_version_id = std::to_string(version);
+  event.timestamp_millis = ports.clock.NowEpochMillis();
+  (void)ports.events.PublishDatasetDetails("datasetDetails", event);
+}
+
 //  跨 zone 复制：同一 store 用服务端 copy；不同 store（由不同后端承载 zone）走 get→put 兜底。
 //  ⚠️ 兜底会把对象整体放进内存（P2 够用）；P3 用真正的流式管道替换（大文件门槛 C1.3）。
 //  把 `IBlobStore` 的对象包成**可定位读**的 `ByteSource`：一次只读一块，
@@ -141,6 +155,19 @@ fss::Result<domain::ObjectStat> CopyBetweenZones(UseCasePorts& ports, std::strin
   StoreByteSource source(*from_store, from, stat.size);
   FSS_TRY(to_store->put(to, source, domain::PutOptions{}));
   return to_store->stat(to);
+}
+
+//  第 12 步：任一步 6/7/9 失败 → **回滚删除**已搬迁的 persistent 对象 + publish FAILED + 审计。
+//  ★ 三处必须**完全一致**：只报错不删会留下"元数据没有、对象却在"的孤儿（会被 GC 当成在途对象）；
+//    不回滚就会在客户端重试时留下一堆无主副本。
+void RollbackCreatedObject(UseCasePorts& ports, const CallerContext& caller,
+                           const domain::ObjectRef& to_ref, std::string_view record_id) {
+  if (auto to_store = ports.blobs.ForPartition(caller.partition, domain::StorageZone::kPersistent);
+      to_store.ok()) {
+    (void)to_store.value()->remove(to_ref);
+  }
+  PublishStatus(ports, caller, "FAILED", 0);
+  RecordAudit(ports, "createMetadataFailure", caller, record_id, false);
 }
 
 //  读取对象内容（用于计算校验和；仅在存储没有给出校验和时调用）
@@ -340,8 +367,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   const auto copied = CopyBetweenZones(ports_, caller.partition, from_ref, to_ref, location.zone,
                                        domain::StorageZone::kPersistent);
   if (!copied.ok()) {
-    PublishStatus(ports_, caller, "FAILED", 0);
-    RecordAudit(ports_, "createMetadataFailure", caller, out.id, false);
+    RollbackCreatedObject(ports_, caller, to_ref, out.id);
     //  依赖服务（存储）异常 → 502（契约 §2.6：失败 → 502/500）
     return Err(fss::ErrorKind::kBadGateway,
                "复制到 persistent 失败：" + copied.error().message());
@@ -372,10 +398,17 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     algorithm = std::string(crypto::CanonicalChecksumName(*native_algorithm));
   } else {
     //  默认算法是 SHA-256（上游 Azure 驱动给的是 MD5，故算法必须跟着驱动走 —— C6.4 的"算法覆盖"）
-    FSS_TRY(computed, ComputeChecksumStreaming(ports_, caller.partition, to_ref,
-                                               domain::StorageZone::kPersistent,
-                                               crypto::ChecksumAlgorithm::kSha256));
-    checksum = std::move(computed);
+    const auto computed = ComputeChecksumStreaming(ports_, caller.partition, to_ref,
+                                                   domain::StorageZone::kPersistent,
+                                                   crypto::ChecksumAlgorithm::kSha256);
+    if (!computed.ok()) {
+      //  ★ 第 7 步失败也属于第 12 步的"任一步 6/7/9 失败"：必须**回滚删除**已搬迁的对象。
+      //    此前这里是 `FSS_TRY`，直接 return 就漏掉了回滚（C6.3 的故障注入点③抓到）。
+      RollbackCreatedObject(ports_, caller, to_ref, out.id);
+      return Err(fss::ErrorKind::kBadGateway,
+                 "计算校验和失败：" + computed.error().message());
+    }
+    checksum = computed.value();
     algorithm = std::string(crypto::CanonicalChecksumName(crypto::ChecksumAlgorithm::kSha256));
   }
 
@@ -389,18 +422,13 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   // 8/9. 写元数据记录（幂等键 = partition + FileSource）
   const auto created = ports_.metadata.Create(caller.partition, out);
   if (!created.ok()) {
-    // 回滚：删掉刚复制的 persistent 对象
-    if (auto to_store = ports_.blobs.ForPartition(caller.partition, domain::StorageZone::kPersistent);
-        to_store.ok()) {
-      (void)to_store.value()->remove(to_ref);
-    }
-    PublishStatus(ports_, caller, "FAILED", 0);
-    RecordAudit(ports_, "createMetadataFailure", caller, out.id, false);
+    RollbackCreatedObject(ports_, caller, to_ref, out.id);
     return Err(fss::ErrorKind::kInternal, "写入元数据记录失败：" + created.error().message());
   }
 
-  // 10. 成功事件（非致命）
+  // 10. 成功事件（非致命）：**两个**事件，顺序与上游一致（先 status，再 datasetDetails）
   PublishStatus(ports_, caller, "SUCCESS", created.value().version);
+  PublishDatasetDetails(ports_, caller, created.value().id, created.value().version);
 
   // 位置记录迁到 persistent（zone 更新）并记上传者（getFileList 的 UserID 过滤）
   domain::FileLocation persistent_location = location;
@@ -413,11 +441,18 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   persistent_location.updated_at_epoch_seconds = ports_.clock.NowEpochSeconds();
   (void)ports_.locations.Save(caller.partition, persistent_location);
 
-  // 11. 删除 staging 对象（失败忽略 + 审计）
+  // 11. 删除 staging 对象：**失败被忽略**（上游 issue #76：清理失败不得让已成功的登记变失败），
+  //     但必须留下审计告警（契约 §2.6 第 11 步），否则"staging 里堆着孤儿"会无人察觉。
+  bool staging_removed = true;
   if (auto staging_store = ports_.blobs.ForPartition(caller.partition, domain::StorageZone::kStaging);
       staging_store.ok()) {
-    (void)staging_store.value()->remove(from_ref);
+    const auto removal = staging_store.value()->remove(from_ref);
+    staging_removed = removal.ok();
+    if (!staging_removed) {
+      RecordAudit(ports_, "createMetadataStagingCleanupFailure", caller, created.value().id, false);
+    }
   }
+  (void)staging_removed;
   RecordAudit(ports_, "createMetadataSuccess", caller, created.value().id, true);
   return created.value().id;
 }

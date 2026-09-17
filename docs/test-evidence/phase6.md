@@ -3,11 +3,11 @@
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P6（元数据记录语义完整化） |
-| 状态 | 🚧 **进行中 —— 切片 2/6 完成**（切片 1：`SqliteMetadataRepository`；切片 2：校验和 C6.4） |
+| 状态 | 🚧 **进行中 —— 切片 3/6 完成**（1：`SqliteMetadataRepository`；2：校验和 C6.4；3：12 步序列与故障注入 C6.3） |
 | 门槛命令 | `ctest -L phase6` |
-| 退出码 | `0`（3 测试 / 458 断言） |
+| 退出码 | `0`（3 测试 / 610 断言） |
 
-> 剩余：12 步序列的 6 个故障注入点（C6.3）、`getFileList` 语义（C6.6）、角色常量（C6.8）、
+> 剩余：`getFileList` 语义（C6.6）、角色常量（C6.8）、
 > GC 租约与幂等并发与 tmp 名唯一性（C6.11/C6.12/C6.13）、DMS/Delivery 语义收口（C6.7）、
 > **1 GiB** 大文件搬迁 RSS（C6.9；64 MiB 流式已证，绝对上限 < 64 MiB 尚未测）、
 > 远端 Storage Service 仓储、组合根改接 `SqliteMetadataRepository`。
@@ -100,7 +100,50 @@ RSS 增长必然 ≈ 对象大小 —— 那是**适配器**的固有开销，�
 
 ---
 
-## 3. 门槛命令与输出（累计）
+## 3. 切片 3：12 步序列与故障注入（C6.3）
+
+契约依据：`docs/03-api-contract.md` §2.6 的 12 步序列 + 第 10/11/12 步的事件与回滚语义。
+上游依据：`docs/01-osdu-research.md` §2.1 逐步表（含第 11 步的上游 issue #76）与
+`status/FileDatasetDetailsPublisher.java`（第 10 步的第二个事件）。
+
+### 交付物
+
+| 路径 | 变化 |
+| --- | --- |
+| `src/app/usecases/usecases.cpp` | ① 新增统一的第 12 步回滚 `RollbackCreatedObject`（删 persistent + `FAILED` 事件 + 审计），**第 6/7/9 步共用**；② **第 7 步失败此前漏掉回滚**（`FSS_TRY` 直接 return）→ 已修；③ 第 10 步补发 `datasetDetails`；④ 第 11 步清理失败补审计告警 |
+| `src/domain/ports/ports.h` | `DatasetDetailsEvent`（`kind`/`properties` 形状对齐上游）+ `IEventPublisher::PublishDatasetDetails` |
+| `src/app/usecases/usecases.h`、`src/adapters/http/router.cpp` | `CallerContext.correlation_id`，由 `x-correlation-id` 头填（上游 `properties.correlationId`） |
+| `src/main/server_main.cpp` | `LogEventPublisher::PublishDatasetDetails`（默认写日志） |
+| `tests/framework/fake_ports.h`、`app_fixture.h` | `RecordingEventPublisher`：按 status 选择性失败 + `datasetDetails` 记录/注入失败；`FaultyMetadataRepository`（可注入 `Create` 失败）；`AppFixture::UseMetadata()`（换仓储重建端口集合） |
+| `tests/integration/test_metadata_lifecycle.cpp` | 追加 9 个用例：正常路径顺序 + **7 个故障注入点** + 端到端 `x-correlation-id` 透传 |
+
+### 故障注入矩阵（每一行都有断言，且都配"顺序/副作用"观测）
+
+| # | 注入点 | 期望 | 顺序/副作用证据 |
+| --- | --- | --- | --- |
+| ① | 第 1 步 `IN_PROGRESS` 事件失败 | **非致命**（`SUCCESS` 仍发出） | `statuses == {SUCCESS}` |
+| ② | 第 6 步 复制失败 | `502` `kBadGateway` + `FAILED` + 审计失败 | 记录数 `0`（证明复制在写记录**之前**）；persistent 不存在；staging 保留 |
+| ③ | 第 7 步 校验和回算失败 | `502` + **回滚删除 persistent** + `FAILED` | persistent 不存在、staging 保留、无记录 |
+| ④ | 第 9 步 写记录失败 | `500` `kInternal` + **回滚删除 persistent** | staging **仍存在**（证明第 11 步在第 9 步之后） |
+| ⑤ | 第 10 步 `SUCCESS` 事件失败 | **非致命**，仍 `201` | 记录已落地、staging 已清理 |
+| ⑥ | 第 11 步 删 staging 失败 | 仍 `201`（上游 issue #76）+ 审计告警 `createMetadataStagingCleanupFailure` | staging 对象仍在（注入生效），审计计数恰为 1 |
+| ⑦ | 第 10 步 `datasetDetails` 失败（**追加点**） | **非致命**，仍 `201` | `details_calls == 1` 但 `details` 为空 |
+
+> **自证对照（R1）**：把"第 7 步失败时回滚"和"第 11 步失败记审计"两处代码临时拆掉后重跑，
+> 对应用例**必须失败**（实测分别命中 `statuses == {IN_PROGRESS, FAILED}` 与
+> `HasAudit(createMetadataStagingCleanupFailure)` 两条断言）；恢复后全绿。
+
+### 第 10 步的第二个事件（此前**根本没有实现**）
+
+`datasetDetails` 是上游在 `publishSuccessStatus` 之后立刻发的第二个事件。本仓库 4 份文档都写着它，
+但代码里只有 `status` —— 属于 R15 说的"只有描述、没有实现"的约定。现已实现并断言：
+`kind == "datasetDetails"`、`datasetId == 记录 id`、`datasetVersionId == 版本`、
+`datasetType == "FILE"`、`recordCount == 1`、`correlationId` 来自 `x-correlation-id` 头
+（端到端用例走真实端口验证）。
+
+---
+
+## 4. 门槛命令与输出（累计）
 
 ```console
 $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failure
@@ -112,12 +155,12 @@ $ cmake --build build -j8 && ctest --test-dir build -L phase6 --output-on-failur
 逐测试断言数：
   test_sqlite_metadata_repository   122 assertions in 2 test cases
                                     ← C2.10（元数据侧契约）+ C6.5（版本链 + 唯一索引自证）
-  test_metadata_lifecycle           230 assertions in 6 test cases
-                                    ← C6.4（覆写语义判定表 + 流式 RSS + 自证对照）
+  test_metadata_lifecycle           382 assertions in 15 test cases
+                                    ← C6.4（覆写语义 + 流式 RSS）+ C6.3（12 步序列 + 7 个故障注入点）
   test_checksum                     106 assertions in 6 test cases
                                     ← C6.4 的 L1 基座（算法解析 / hex 结构 / 公开向量）
   ─────────────────────────────────────────────
-  合计 458 个断言 / 14 个测试用例 / 3 个测试
+  合计 610 个断言 / 23 个测试用例 / 3 个测试
 ```
 
 相关护栏（改动仓储 SQL 后必跑）：
@@ -129,7 +172,7 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 
 ---
 
-## 4. 判据进展
+## 5. 判据进展
 
 | 判据 | 状态 | 证据 |
 | --- | --- | --- |
@@ -137,12 +180,13 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | **C6.5** 版本链 | ✅ | 契约的版本用例 + 切片 1 的"数据库真实形态"用例（3 版共存、1 个 latest、部分唯一索引自证） |
 | C6.1（黄金样例字段级往返） | 🚧 部分 | 仓储侧已无损（`data` 列存整条 JSON）；REST 侧的全字段比对已在 P4 的 C4.2 覆盖，尚缺"经 SQLite 仓储往返"的组合用例 |
 | **C6.4** 校验和（服务端计算并**覆写** / 算法跟随驱动 / 大对象流式） | ✅ | 切片 2：判定表 5 行全部有断言（未提供 / 客户端值被覆写 / 客户端点名别的算法 / 原生 MD5 / 原生不可用回退）+ L1 公开向量与算法解析两向断言。**旧表述**"客户端提供但不符 → 400 + 删除对象"已推翻（P6-D05） |
+| **C6.3** 12 步序列 + 故障注入 | ✅ | 切片 3：正常路径的顺序/副作用 + **7 个注入点**（计划要求 6 个，追加 `datasetDetails` 非致命点）；第 9/11 步的顺序用"staging 是否还在"证明；自证对照两处 | 
 | C6.9 大文件搬迁 RSS | 🚧 部分 | 切片 2 已证 **64 MiB** 对象跨 store 搬迁 + 校验和回算的 RSS 增长 80 KiB，且有整块读回对照（65664 KiB）；**≥1 GiB + 绝对上限 < 64 MiB** 尚未测 |
 | C6.2 / C6.3 / C6.6 / C6.7 / C6.8 / C6.11 / C6.12 / C6.13 | ⬜ 未开始 | 见开头"剩余" |
 
 ---
 
-## 5. 本阶段发现并修复的缺陷
+## 6. 本阶段发现并修复的缺陷
 
 | 编号 | 症状 / 根因 | 复现方式 | 修复 |
 | --- | --- | --- | --- |
@@ -150,12 +194,16 @@ $ ./build/bin/test_layering_guard         → 20 assertions in 3 test cases（L2
 | **P6-D03** | **跨 store 复制把整个对象读进内存**：`ReadObject` → `StringSink` → `put`，1 GiB 对象会让 RSS 抬高 1 GiB —— 直接顶穿 C6.9 的红线 | 切片 2 的流式用例（跨 store + 64 MiB）；同一测试内"整块读回"对照给出 65664 KiB 增长，证明该测量确实能抓到整块驻留 | `StoreByteSource`（`BufferSink` + 分段 `get`）+ 边读边写；校验和走 `HashingSink` 增量计算 |
 | **P6-D04** | **门槛可能在"被拆掉防线"的源码树上运行**：`scripts/verify_http_hardening.sh` 等自证脚本临时改源码、靠 `trap` 恢复；脚本被 **SIGKILL** 强杀时 trap 不执行 → H-2 的两道防护补丁残留在 `src/common/http/server.cpp`，下一次门槛的基线直接失败（假警报）；反过来若残留的是"让测试更容易通过"的注入，就会**静默**削弱门槛 | 复现：强杀 `run_all_gates.sh`（本轮真实发生）→ `git diff src/common/http/server.cpp` 里能看到 `自证注入` | ① `git checkout -- src` 恢复；② `scripts/run_all_gates.sh` 增加**前置机械检查**：`src/` 下不得存在 `_*selftest*`/`*_injected*` 文件，且 `git diff -- src` 不得含注入标记，命中即拒绝开跑并给出修复指令。**两向自证**：造一个残留文件/一行标记 → 前置检查必须退出 1；清理后必须通过 |
 | **P6-D05** | **计划里的一条判据没有上游依据**：C6.4 写的「客户端提供 `Checksum` 但不符 → `400` + 删除已搬迁对象」与上游冲突。按它实现后，**phase4 的 C4.2/C4.3 两条已收口用例立刻失败**（`test_rest_contract`：golden 样例与 `File_Calculate_Checksum` 都期望 `201`，实测得到 `400`） | 先按旧判据实现 → `ctest -R test_rest_contract` 两条 `REQUIRE(status == 201)` 失败；证据见 `docs/01-osdu-research.md` §2.3 与 `File_CorrectPayload.json` | 实现改为"**无条件覆写 + 不校验 + 不回滚**"；契约 §2.6 第 7 步改写；计划 C6.4 更正并在 `docs/00-final-design.md` §5 登记为**被推翻的结论**（不静默改）。这条差异属于"能测出来的差异"，不是"看起来更好" |
+| **P6-D06** | **第 7 步失败漏掉回滚**：第 12 步要求"任一步 6/7/9 失败 → remove(persistent) 回滚"，但第 7 步用的是 `FSS_TRY(...)`，失败时**直接 return** —— 已搬迁的 persistent 对象被留下成为无主副本（GC 会把它当成在途对象，或永久占空间） | 切片 3 的故障注入点③（对 `get` 注入故障）→ 旧实现下 `REQUIRE_FALSE(stat(persistent).exists)` 失败 | 抽出统一的 `RollbackCreatedObject`（删 persistent + `FAILED` + 审计），第 6/7/9 步共用；自证：拆掉回滚后用例必失败 |
+| **P6-D07** | **第 10 步只发了一个事件**：4 份文档（调研 §2.1/§2.3、设计 §2.6、契约 §2.6、计划任务 6）都写着"`status` + `datasetDetails`"，代码里**只有** `status` —— 典型的"只有描述没有实现"（R15） | 切片 3 的正常路径用例断言 `events.details.size() == 1` → 旧实现下为 0 | 新增 `DatasetDetailsEvent` + 端口方法 + 组合根实现 + 用例调用；`correlationId` 由 `x-correlation-id` 头透传（端到端用例证明） |
+| **P6-D08** | **第 11 步清理失败静默**：契约要求"忽略 + **审计告警**"，实现里只有 `(void)store->remove(...)` —— staging 里堆孤儿无人察觉 | 切片 3 的故障注入点⑥ | 记 `createMetadataStagingCleanupFailure`（result=failure），响应仍 `201`；自证：拆掉审计后用例必失败 |
 
-## 6. 结论
+## 7. 结论
 
 | 项 | 结论 |
 | --- | --- |
 | 切片 1 门槛（SQLite 元数据仓储 + 元数据契约） | ✅ 契约在 SQLite 上跑第二遍；两个护栏全绿 |
-| 切片 2 门槛（校验和 C6.4） | ✅ `ctest -L phase6` 3 测试 / 458 断言；覆写语义 + 算法跟随驱动 + 流式 + 公开向量都有断言 |
-| 已满足判据 | **C2.10（元数据侧）、C6.4、C6.5** |
+| 切片 2 门槛（校验和 C6.4） | ✅ 覆写语义 + 算法跟随驱动 + 流式回算 + L1 公开向量都有断言 |
+| 切片 3 门槛（12 步序列 C6.3） | ✅ 正常路径的顺序/副作用 + 7 个故障注入点 + 端到端 `x-correlation-id` 透传；`ctest -L phase6` **3 测试 / 610 断言** |
+| 已满足判据 | **C2.10（元数据侧）、C6.3、C6.4、C6.5** |
 | P6 是否收口 | ❌ 未收口 |
