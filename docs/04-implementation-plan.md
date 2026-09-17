@@ -18,7 +18,7 @@
 | **P5** | 对象存储驱动（S3 SigV4） | `S3BlobStore`、SigV4 签名/验签、mock-S3、同一套契约测试跑 S3 | `ctest -L phase5` | ✅ **已完成：C5.1~C5.10 全部满足**（AWS 官方向量 5 条逐字节匹配、独立验签 mock、同一套契约跑第三遍、分页、错误映射、S3 端到端、按配置切驱动、ADR-005） |
 | **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | ✅ **已完成（C6.1~C6.13；9 测试 / 2578 断言）** |
 | **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | ✅ **已完成（C7.1~C7.10 全部满足；17/17 RPC；6 测试 / 5378 断言）** |
-| **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | 🚧 **进行中（切片 1/3：本地 JWT + 路由级预检 + 配置强校验；C8.1/C8.3/C8.5 部分满足）** |
+| **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | 🚧 **进行中（切片 2/3：本地 JWT + 路由级预检 + 跨租户隔离 + 远端 Entitlements fail-closed；C8.1~C8.5 满足）** |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ⬜ |
 
 **全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P9 并全绿。
@@ -596,7 +596,19 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase7 --output-on
 
 ### 阶段 8：认证授权与多租户  🚧 进行中
 
-> **当前进度（切片 1/3）**：本地 JWT 授权器落地（ADR-012）+ 路由级鉴权预检 + 配置强校验。
+> **当前进度（切片 2/3）**：在切片 1 之上补齐**跨租户隔离**与**远端 Entitlements**。
+> ⑤ **C8.2 跨租户隔离**（`test_tenant_isolation`，2 用例 / 107 断言）：两个租户 + 真实 HTTP
+> + 真实 JWT；A 的 token 配 B 的头 → **403**（鉴权层拦，不去 B 的分区查）；B 读/删 A 的记录
+> → **404** 且响应里没有 A 的任何数据；B 的列表看不到 A 的记录（A 自己能列到 → 正例）；
+> 签名 URL 三道：跨租户头 → 403、篡改 token/sig → 401、改路径形状 → 404（如实区分）。
+> ⑥ **C8.4 远端 Entitlements**（`src/infra/auth/remote/`，L2；`test_remote_entitlements_authorizer`
+> 3 用例 / 62 断言）：`authorizeAny` 语义；超时 / 5xx / 坏 JSON / 缺 `allowed` / 连不上 /
+> 未配地址 → **一律 503（fail-closed）**，`fail_closed=false` 被配置校验拒绝；故障形态由
+> `tests/tools/mock_entitlements.py` **独立进程**注入（含超时）。
+> ⑦ 组合根：`FSS_AUTH_MODE=remote-entitlements` 现在走真实实现（未配地址则拒绝启动）。
+> `ctest -L phase8` **4 测试 / 954 断言**。
+>
+> **切片 1（已收口）**：本地 JWT 授权器落地（ADR-012）+ 路由级鉴权预检 + 配置强校验。
 > ① `src/infra/auth/local/local_jwt_authorizer.{h,cpp}`（L2）：HS256 验签 + `exp`/`nbf`/`iss`/`aud`
 > + 角色 claim ∪ 静态角色表 + **租户绑定**（token 的 `data-partition-id` claim 必须等于请求头）；
 > 一律 fail-closed（密钥缺失/算法非 HS256/无 `exp`/畸形 → 401）。`ctest -L phase8` **单元 6 用例 / 68 断言**。
@@ -606,8 +618,8 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase7 --output-on
 > ③ 配置：`deployment.environment` + `auth.jwt.{hmac_secret,partition_claim,require_partition_claim}`，
 > production 禁止 `disabled`/关验签/无密钥，`jwks_url` 非空直接拒绝（未实现不许"看起来配了"）。
 > ④ `/v2/info` 的 `authMode`（REST + gRPC 同源）。
-> **剩余**：切片 2 = 跨租户隔离（C8.2）+ `remote-entitlements` 的 fail-closed（C8.4）；
-> 切片 3 = 事件/审计（C8.6/C8.7）+ multi 模式启动校验（C8.9）+ 时钟偏移（C8.10）。
+> **剩余**：切片 3 = 事件（C8.6）/审计（C8.7）+ `deployment.mode=multi` 的 5 条启动校验
+> （C8.9）+ 时钟偏移（C8.10）。
 
 **目标**：从"allow-all"切换到真实鉴权，并证明租户隔离不可绕过。
 

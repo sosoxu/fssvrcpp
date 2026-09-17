@@ -25,6 +25,7 @@
 #include "common/time/clock.h"
 #include "domain/ports/ports.h"
 #include "infra/auth/local/local_jwt_authorizer.h"
+#include "infra/auth/remote/remote_entitlements_authorizer.h"
 #include "infra/blob/posix/posix_blob_store.h"
 #include "infra/blob/s3/s3_blob_store.h"
 #include "infra/location/sqlite/sqlite_location_repository.h"
@@ -261,6 +262,7 @@ int main(int /*argc*/, char** /*argv*/) {
   const std::string auth_mode = Env("FSS_AUTH_MODE", "disabled");
   AllowAllAuthorizer allow_all_authorizer;
   std::unique_ptr<infra::LocalJwtAuthorizer> jwt_authorizer;
+  std::unique_ptr<infra::RemoteEntitlementsAuthorizer> remote_entitlements;
   domain::IAuthorizer* authorizer = &allow_all_authorizer;
   if (auth_mode == "jwt") {
     infra::LocalJwtOptions jwt_options;
@@ -281,9 +283,24 @@ int main(int /*argc*/, char** /*argv*/) {
       return 1;
     }
   } else if (auth_mode == "remote-entitlements") {
-    std::cerr << "拒绝启动：auth.mode=remote-entitlements 尚未实现（ADR-012 §5.3）——"
-                 "绝不降级为放行\n";
-    return 1;
+    infra::RemoteEntitlementsOptions remote_options;
+    remote_options.base_url = Env("FSS_ENTITLEMENTS_URL", "");
+    remote_options.authorize_path =
+        Env("FSS_ENTITLEMENTS_AUTHORIZE_PATH", remote_options.authorize_path);
+    if (const char* timeout = std::getenv("FSS_ENTITLEMENTS_TIMEOUT_MS");
+        timeout != nullptr && *timeout != '\0') {
+      remote_options.timeout_ms = std::atoi(timeout);
+    }
+    remote_entitlements = std::make_unique<infra::RemoteEntitlementsAuthorizer>(remote_options);
+    authorizer = remote_entitlements.get();
+    //  ★ 没配地址就**拒绝启动**：起来之后"拒绝一切"只会制造误导性的排障路径
+    if (!remote_entitlements->Ready()) {
+      std::cerr << "拒绝启动：" << remote_entitlements->NotReadyReason() << "\n";
+      return 1;
+    }
+    logging::Warn(logger,
+                  "auth.mode=remote-entitlements：依赖不可用时 fail-closed（503），绝不放行",
+                  {{"component", "server_main"}});
   } else if (auth_mode != "disabled") {
     std::cerr << "未知的 auth.mode: " << auth_mode << "（可选：jwt | remote-entitlements | disabled）\n";
     return 1;
@@ -398,10 +415,11 @@ int main(int /*argc*/, char** /*argv*/) {
             << "\n"
             << "  auth           : "
             << (auth_mode == "jwt"
-                    ? "jwt（HS256 本地校验" +
-                          std::string(Env("FSS_JWT_HMAC_SECRET", "").empty() ? "，未验签！" : "") +
-                          "）"
-                    : "disabled（allow-all，仅开发/测试）")
+                    ? "jwt（HS256 本地校验）"
+                    : (auth_mode == "remote-entitlements"
+                           ? "remote-entitlements（fail-closed，地址 " +
+                                 Env("FSS_ENTITLEMENTS_URL", "") + "）"
+                           : "disabled（allow-all，仅开发/测试）"))
             << "\n";
   std::cout.flush();
 

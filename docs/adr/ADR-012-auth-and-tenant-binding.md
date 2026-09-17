@@ -27,6 +27,7 @@ IAuthorizer（L3 端口）
    否则"用 A 租户的合法 token + 把请求头改成 B"就能读到 B 的数据（§3）。
 3. **依赖不可用不得降级为放行**：验签密钥缺失、算法不认识、claim 缺失、远端超时 →
    一律拒绝（`401`/`403`/`503`），**绝无**"跳过校验"的分支。
+   远端模式（`auth.mode=remote-entitlements`）的实现与故障注入测试见 P8 切片 2。
 
 ---
 
@@ -103,7 +104,7 @@ OSDU 的 `data-partition-id` 头是**客户端可写**的（网关模式下网�
 
 | 项 | 现状 | 触发条件 |
 | --- | --- | --- |
-| `auth.mode=remote-entitlements` | **拒绝启动**（明确报错，不是"静默 allow"） | 需要真实验证 Entitlements 语义时 |
+| `auth.mode=remote-entitlements` | ✅ **已实现**（L2 `RemoteEntitlementsAuthorizer`：超时/连不上/非 200/坏 JSON/缺 `allowed` → **一律 503**，`fail_closed=false` 被配置校验拒绝；接口见契约 §4.5）。**未与真实 Entitlements 联调**（本机网络不可达），故障形态由 `tests/tools/mock_entitlements.py` 注入验证 | 拿到可达的真实 Entitlements → 跑一遍联调并记录 |
 | RS256 / JWKS（`auth.jwt.jwks_url`） | 配置非空 → **拒绝启动** | 对接真实 IdP 时 |
 | 多密钥轮换（密钥版本化） | 只支持单一 `hmac_secret` | 需要无缝轮换时（§8 待办） |
 | ACL 级鉴权（记录级 `acl.viewers`） | 目前是角色级 + 租户级；记录 ACL 未参与判定 | 需要"同一租户内再分权"时 |

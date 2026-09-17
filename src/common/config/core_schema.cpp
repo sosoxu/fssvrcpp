@@ -206,6 +206,10 @@ Schema CoreSchema() {
             .Bool("必须 true：否则 A 租户的 token 可以配 B 的请求头读 B 的数据")
             .Default("true"));
   s.Add(FieldSpec{"auth.remote_entitlements.base_url"}.Str().Default(""));
+  //  与 Entitlements 约定的路径（契约 §4.5）；可配置以便适配真实服务
+  s.Add(FieldSpec{"auth.remote_entitlements.authorize_path"}
+            .Str("authorizeAny 的路径").Default("/api/entitlements/v2/authorizeAny"));
+  s.Add(FieldSpec{"auth.remote_entitlements.connect_timeout_ms"}.Int(1, 600000).Default("1000"));
   s.Add(FieldSpec{"auth.remote_entitlements.timeout_ms"}.Int(1, 600000).Default("3000"));
   s.Add(FieldSpec{"auth.remote_entitlements.fail_closed"}
           .Bool("必须 true：依赖不可用不可降级为放行").Default("true"));
@@ -282,6 +286,21 @@ Schema CoreSchema() {
           problems.emplace_back("auth.jwt.hmac_secret",
                                 "production 环境必须配置共享密钥"
                                 "（否则本实例会拒绝所有 token）");
+        }
+        const std::string remote_base = StrOr(c, "auth.remote_entitlements.base_url", "");
+        const std::string remote_fail_closed =
+            StrOr(c, "auth.remote_entitlements.fail_closed", "true");
+        if (auth_mode == "remote-entitlements") {
+          //  ★ 本地实现与配置必须一致：远端模式要求①有地址②fail_closed=true ——
+          //    "依赖坏了就放行"不是可配置项，是本项目明确拒绝的语义（ADR-012 §5.1）
+          if (remote_base.empty()) {
+            problems.emplace_back("auth.remote_entitlements.base_url",
+                                  "auth.mode=remote-entitlements 时必须配置 Entitlements 地址");
+          }
+          if (remote_fail_closed != "true") {
+            problems.emplace_back("auth.remote_entitlements.fail_closed",
+                                  "必须为 true：依赖不可用不可降级为放行");
+          }
         }
         if (!jwks_url.empty()) {
           problems.emplace_back("auth.jwt.jwks_url",

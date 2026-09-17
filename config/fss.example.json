@@ -253,8 +253,11 @@
       "viewer@example.com": ["service.file.viewers"]
     },
     "remote_entitlements": {
+      //  auth.mode=remote-entitlements 时必须非空（否则组合根拒绝启动）
       "base_url": "",
+      "authorize_path": "/api/entitlements/v2/authorizeAny",
       "timeout_ms": 3000,
+      "connect_timeout_ms": 1000,
       // 必须为 true：Entitlements 不可用时**不可**降级为放行
       "fail_closed": true
     }

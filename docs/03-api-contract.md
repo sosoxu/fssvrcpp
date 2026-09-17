@@ -86,6 +86,10 @@
 `/v1/transfer/{token}` 数据面**不走 JWT**：它用自签 token 自证（绑定 `op`/`partition`/`exp`，
 见威胁模型 T3/T4），因此不在上表的角色矩阵里。
 
+角色来源有两种**可配置**的形态（ADR-012）：`auth.mode=jwt` = 本地从 token 的 `roles` claim
+（∪ 静态角色表）取；`auth.mode=remote-entitlements` = 每个请求向 Entitlements 问一次
+（接口见 §4.5，**依赖不可用一律 503、绝不放行**）。`auth.mode=disabled` 仅开发可用。
+
 ### 1.4 `expiryTime` 语义（唯一 query 参数）
 
 ```
@@ -769,6 +773,32 @@ P8-D05，普通构建碰不到）。显式标记把这个判定变成**确定性
 | `FileSourceInfo.file_source` | `FileSource` | ✅ |
 | `StorageInstructionsResponse.provider_key` / `.storage_location` | `providerKey` / `storageLocation` | ✅ |
 | `StorageZone` / `StorageDriver` / 各扩展 RPC | — | ❌ **扩展** |
+
+### 4.5 与 Entitlements 的接口（`auth.mode=remote-entitlements`）
+
+本项目对 Entitlements 的**要求**（实现见 `src/infra/auth/remote/remote_entitlements_authorizer.cpp`；
+mock 见 `tests/tools/mock_entitlements.py`）：
+
+```
+POST {auth.remote_entitlements.base_url}{auth.remote_entitlements.authorize_path}
+headers: Authorization: <bearer 原样透传>
+         data-partition-id: <请求的 partition>
+         content-type: application/json
+body:    {"roles": ["service.file.editors", ...]}          // 任一命中即可
+200 + {"allowed": true,  "grantedRoles": [...]}            → 放行
+200 + {"allowed": false}                                   → 403
+401                                                        → 401（凭证不行）
+其它状态码 / 超时 / 连不上 / 响应不是 JSON / 缺布尔 allowed → 503（**fail-closed**）
+```
+
+**为什么把这条也写进合同**：它是本项目与外部依赖的**接口约定**，不是实现细节。
+`authorize_path` 可配置，便于适配真实的 Entitlements 服务；但无论路径如何，
+"读不懂或够不着依赖 → 不放行"这一条**不可配置**（`fail_closed=false` 会被配置校验拒绝）。
+
+⚠️ **未与真实 OSDU Entitlements 联调**（本机网络不可达）：响应形状是本项目的约定，
+已登记在 `docs/adr/ADR-012-auth-and-tenant-binding.md` §5.3 与 `docs/test-evidence/phase8.md`。
+
+---
 
 ### 4.3 gRPC 调用元数据（metadata）
 

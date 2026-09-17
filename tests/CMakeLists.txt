@@ -293,6 +293,19 @@ fss_add_test(test_jwt_authorizer
   LIBS    fss_auth_local
   LABELS  "phase8;unit")
 
+# C8.2：跨租户隔离（两个租户 + 真实 HTTP + 真实 JWT + 签名 URL 绑对象）
+fss_add_test(test_tenant_isolation
+  SOURCES integration/test_tenant_isolation.cpp
+  LIBS    fss_http_adapter fss_auth_local fss_blob_memory fss_location_memory
+          fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase8;integration")
+
+# C8.4：远端 Entitlements 的 fail-closed（超时 / 5xx / 坏 JSON / 未配置 → 一律 503）
+fss_add_test(test_remote_entitlements_authorizer
+  SOURCES unit/test_remote_entitlements_authorizer.cpp
+  LIBS    fss_auth_remote
+  LABELS  "phase8;unit")
+
 # C8.1：19 个端点 × 角色的 401/403/200 矩阵（真实 HTTP + 真实 HS256 token）
 fss_add_test(test_auth_matrix
   SOURCES integration/test_auth_matrix.cpp

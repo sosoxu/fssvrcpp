@@ -326,6 +326,38 @@ TEST_CASE("★ C8.5 认证配置的强制校验：production 不得 disabled / �
   REQUIRE_FALSE(r4.ok);
   REQUIRE(HasProblem(r4.config.problems(), "auth.jwt.jwks_url", "尚未实现"));
 
+  //  ⑤ remote-entitlements：缺地址 / fail_closed=false → 拒绝；
+  //     补齐后必须通过（★ 正例：区分"校验正确"与"校验恒真"）
+  req.file_path = WriteFile(tmp.str(), "remote_no_url.json", R"({
+    "auth": {"mode": "remote-entitlements",
+             "remote_entitlements": {"base_url": "", "fail_closed": true}}
+  })");
+  auto r6 = fss::config::Load(req);
+  REQUIRE_FALSE(r6.ok);
+  REQUIRE(HasProblem(r6.config.problems(), "auth.remote_entitlements.base_url",
+                     "必须配置 Entitlements 地址"));
+
+  req.file_path = WriteFile(tmp.str(), "remote_open.json", R"({
+    "auth": {"mode": "remote-entitlements",
+             "remote_entitlements": {"base_url": "http://entitlements:8080",
+                                     "fail_closed": false}}
+  })");
+  auto r7 = fss::config::Load(req);
+  REQUIRE_FALSE(r7.ok);
+  REQUIRE(HasProblem(r7.config.problems(), "auth.remote_entitlements.fail_closed",
+                     "必须为 true"));
+
+  req.file_path = WriteFile(tmp.str(), "remote_ok.json", R"({
+    "auth": {"mode": "remote-entitlements",
+             "remote_entitlements": {"base_url": "http://entitlements:8080",
+                                     "authorize_path": "/api/entitlements/v2/authorizeAny",
+                                     "fail_closed": true, "timeout_ms": 3000,
+                                     "connect_timeout_ms": 1000}}
+  })");
+  auto r8 = fss::config::Load(req);
+  INFO(r8.config.ProblemsToString());
+  REQUIRE(r8.ok);
+
   //  ★ 开发环境 + 空密钥：**允许加载**（运行时拒绝所有 token + 启动告警）
   req.file_path = WriteFile(tmp.str(), "dev_no_secret.json", R"({
     "deployment": {"environment": "development"},
