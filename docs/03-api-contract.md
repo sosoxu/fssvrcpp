@@ -712,6 +712,9 @@ checksum = storageUtil.getChecksum(persistentLocation)
 | `Check` | `GET /v2/{liveness,readiness}_check` | 否 |
 | `UploadFile` / `DownloadFile` / `ServerSideCopy` | — | ✅ **扩展** |
 
+> **实现状态（P7 切片 2/3）**：上表**前 14 行（一元 RPC）已实现**并跑在真实 gRPC 端口上；
+> 最后一行 3 个扩展 RPC 目前明确返回 `UNIMPLEMENTED`（切片 3 交付字节通道）。
+
 ### 4.2 消息 ↔ JSON 字段映射（关键项）
 
 | proto 字段 | `json_name` | REST 对应 |
@@ -784,17 +787,34 @@ checksum = storageUtil.getChecksum(persistentLocation)
 | `RevokeUrl` | 无（204） | ✅ | 无 | 不变 | 不变 |
 
 **关于签名 URL 的等价性判定（重要）**：
-REST 与 RPC 两次调用会生成**不同的**签名 URL（含不同时间戳/nonce），因此"等价"的判据是
-结构等价而非字面相等：
+REST 与 RPC 两次调用会生成**不同的**签名 URL（含不同时间戳/nonce；自签形态的
+`/v1/transfer/<token>` 路径里内嵌的是**密文**，逐字节必然不同），因此"等价"的判据是
+**语义等价而非字面相等**。按签名所在位置分两种形态：
 
 ```
-等价 ⟺  scheme 相同 ∧ host 相同 ∧ path 相同 ∧
-        {query 参数名集合} 相同 ∧
-        过期时间相差 ≤ 5 秒
+① 通用形态（签名在 query 里，如 S3 预签名）：
+   等价 ⟺  scheme 相同 ∧ host 相同 ∧ path 相同 ∧
+           {query 参数名集合} 相同 ∧
+           过期时间相差 ≤ 5 秒
+
+② 自签传输形态（path 形如 /v1/transfer/<token>?exp=…&sig=…）：
+   等价 ⟺  scheme 相同 ∧ host 相同 ∧
+           path 的 `/v1/transfer/` 前缀相同 ∧
+           {query 参数名集合} 相同 ∧
+           过期时间相差 ≤ 5 秒 ∧
+           两侧 token 都能用同一密钥**验签并解码** ∧
+           解码后的声明逐项相等：
+             partition ∧ file_id ∧ container ∧ object_key ∧ zone ∧ op
 ```
+
+② 之所以不是"path 相同"，是因为自签 token 每次签发都带新 nonce，
+字面相等**永远不可能成立**——用字面比较会把"实现正确"判成失败。
+但也不能退化成只比"都返回 200"：必须解码到**同一条位置记录**（`object_key` + `zone` + `op`）
+才算等价。
 
 该判据由 `tests/conformance/test_protocol_equivalence.cpp` 中的
-`SignedUrlEquivalent(a, b)` 实现，并有**反向测试**（故意改一个 query 参数名 → 判定必须为不等）。
+`SignedUrlEquivalent(a, b)` 实现，并有**反向测试**（故意改一个 query 参数名、
+或换一条位置记录 → 判定必须为不等）。
 
 ---
 

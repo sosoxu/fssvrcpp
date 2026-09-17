@@ -76,6 +76,10 @@ class FileServiceAdapter final : public osdu::file::v1::FileService::Service {
                             ::grpc::ServerWriter<osdu::file::v1::DownloadFileResponse>*) override;
 
  private:
+  //  调用元数据（契约 §4.3：`authorization` / `data-partition-id` / `correlation-id`）→
+  //  与 REST **共用**同一套解析规则（`app::CallerFromHeaders`）
+  fss::app::CallerContext CallerFrom(::grpc::ServerContext* context) const;
+
   fss::app::UseCasePorts& ports_;
   std::string default_user_id_;
 };

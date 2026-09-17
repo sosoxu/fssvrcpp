@@ -2,6 +2,7 @@
 #include "adapters/http/router.h"
 
 #include "app/usecases/caller_context.h"
+#include "app/usecases/wire_shapes.h"
 #include "app/version.h"
 #include "common/json/json.h"
 #include "common/time/time_format.h"
@@ -371,28 +372,9 @@ void Router::Register(fss::http::Server& server) {
     }
     std::vector<app::CopyFileSource> sources;
     for (const auto& item : *it) {
-      //  元素是记录（契约 §2.9：`{"datasetSources": [ ...records... ]}`）；也接受
-      //  直接给路径字符串（部分客户端这样调）。取不到 FileSource 时**传空串**，
-      //  让用例给出契约 §5 的固定消息，而不是在这里静默跳过。
-      std::string file_source;
-      if (item.is_string()) {
-        file_source = item.get<std::string>();
-      } else if (item.is_object()) {
-        if (const auto top = item.find("FileSource");
-            top != item.end() && top->is_string()) {
-          file_source = top->get<std::string>();
-        } else if (const auto data = item.find("data"); data != item.end()) {
-          if (const auto props = data->find("DatasetProperties"); props != data->end()) {
-            if (const auto info = props->find("FileSourceInfo"); info != props->end()) {
-              if (const auto src = info->find("FileSource");
-                  src != info->end() && src->is_string()) {
-                file_source = src->get<std::string>();
-              }
-            }
-          }
-        }
-      }
-      sources.push_back(app::CopyFileSource{std::move(file_source)});
+      //  取值规则与 gRPC 侧共用（`app::FileSourceFromRecordNode`）：同一份输入在两条
+      //  协议上必须得到同一个 FileSource（C7.3）。取不到时传空串，让用例给出固定消息。
+      sources.push_back(app::CopyFileSource{app::FileSourceFromRecordNode(item)});
     }
     app::CopyFiles usecase(ports_);
     FSS_TRY(outcomes, usecase.Execute(caller, sources));

@@ -293,6 +293,19 @@ fss_add_test(test_error_equivalence
   LIBS    fss_http_adapter fss_grpc_adapter
   LABELS  "phase7;conformance")
 
+# C7.5：proto 的 json_name 与 OSDU JSON 逐字段对齐（用黄金样例做参照实现）
+fss_add_test(test_proto_json_mapping
+  SOURCES unit/test_proto_json_mapping.cpp
+  LIBS    fss_grpc_adapter fss_domain
+  LABELS  "phase7;unit")
+
+# C7.3 + C7.4：契约 §6 的 12 行等价性矩阵 + 签名 URL 结构等价（含反向测试）
+fss_add_test(test_protocol_equivalence
+  SOURCES conformance/test_protocol_equivalence.cpp
+  LIBS    fss_app fss_grpc_adapter fss_http_adapter fss_blob_memory fss_location_memory
+          fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase7;conformance")
+
 # C7.1（部分）：真实 gRPC 端口上的运维 RPC + 切片边界
 fss_add_test(test_grpc_basics
   SOURCES integration/test_grpc_basics.cpp

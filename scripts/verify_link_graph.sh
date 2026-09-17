@@ -40,7 +40,12 @@ ALLOWED_APP="fss_domain fss_result fss_json fss_time fss_bytes fss_ids fss_crypt
 declared_deps() {
   local target="$1"
   local info
-  info="$(find "${BUILD_DIR}" -name DependInfo.cmake -path "*${target}.dir*" | head -1)"
+  #  ★ 不要用 `| head -1`：`head` 提前退出会给上游 `find` 发 SIGPIPE，
+  #    在 `set -euo pipefail` 下整条管道返回 141 → 门槛**误报失败**（P7-D06）。
+  #    取"第一行"用 `sed -n 1p`（读完全部输入，不提前关闭管道）。
+  local candidates
+  candidates="$(find "${BUILD_DIR}" -name DependInfo.cmake -path "*${target}.dir*" 2>/dev/null || true)"
+  info="$(printf '%s\n' "${candidates}" | sed -n '1p')"
   [[ -f "${info}" ]] || return 1
   grep -oE 'fss_[a-z_]+' "${info}" | sort -u | grep -v "^${target}$" || true
 }
@@ -65,23 +70,40 @@ check_target() {
   done
 }
 
-#  传递闭包佐证：任一个"链接了 fss_domain 的可执行文件"都不得把传输层/基础设施拉进来
+#  传递闭包佐证：**所有"不含传输适配器"的可执行文件**都不得把传输层/基础设施拉进来。
+#
+#  ★ 不要退化成"随便挑一个链接了 fss_domain 的可执行文件"：phase4 起的端到端测试
+#    本来就链接 fss_http_adapter，一旦被挑中就会误报"依赖链被污染"。
+#    判据必须**排除**合法链接适配器的二进制，再要求剩下的"纯分层"二进制干净。
 closure_evidence() {
-  local exe_link
-  exe_link="$(find "${BUILD_DIR}/tests" -name link.txt 2>/dev/null | head -50 |               xargs grep -l "libfss_domain\.a" 2>/dev/null | head -1)"
-  if [[ -z "${exe_link}" ]]; then
-    info "（未找到链接 fss_domain 的可执行文件，跳过传递闭包佐证）"
+  local entry libs checked=0 violations=0 sample=""
+  local -a links=()
+  #  ★ 不用 `| head`：`head` 提前退出会给上游发 SIGPIPE → pipefail 下 141（P7-D06）
+  mapfile -t links < <(find "${BUILD_DIR}/tests" -name link.txt -print 2>/dev/null | sort)
+  for entry in "${links[@]}"; do
+    libs="$(grep -oE 'libfss_[a-z_]+\.a' "${entry}" | sort -u | sed 's/^lib//; s/\.a$//' || true)"
+    #  只看"确实链接了 L3/L4 且没有链接任一传输适配器"的可执行文件
+    grep -qE '^(fss_domain|fss_app)$' <<<"${libs}" || continue
+    grep -qE '^(fss_http_adapter|fss_grpc_adapter)$' <<<"${libs}" && continue
+    checked=$((checked + 1))
+    [[ -n "${sample}" ]] || sample="$(basename "$(dirname "${entry}")")"
+    for forbidden in fss_http fss_proto; do
+      if grep -qx "${forbidden}" <<<"${libs}"; then
+        no "纯分层测试 ${sample} 链接了 ${forbidden} —— 说明 L3/L4 的依赖链被污染"
+        violations=$((violations + 1))
+      fi
+    done
+  done
+  if [[ ${checked} -eq 0 ]]; then
+    info "（未找到「纯分层」的可执行文件，跳过传递闭包佐证）"
     return
   fi
-  local libs
-  libs="$(grep -oE 'libfss_[a-z_]+\.a' "${exe_link}" | sort -u | sed 's/^lib//; s/\.a$//')"
-  info "传递闭包（$(basename "$(dirname "${exe_link}")")）： $(echo ${libs} | tr '\n' ' ')"
-  for forbidden in fss_http fss_proto; do
-    if echo "${libs}" | grep -qx "${forbidden}"; then
-      no "传递闭包出现了 ${forbidden} —— 说明 L3 的依赖链被污染"
-      FAILED=1
-    fi
-  done
+  if [[ ${violations} -eq 0 ]]; then
+    info "传递闭包佐证：检查了 ${checked} 个纯分层可执行文件（如 ${sample}），均不含 fss_http/fss_proto"
+  else
+    info "传递闭包佐证：检查了 ${checked} 个纯分层可执行文件（如 ${sample}），其中 ${violations} 个被污染"
+    FAILED=1
+  fi
 }
 
 echo "分层链接图校验（C2.1，build=${BUILD_DIR}）"

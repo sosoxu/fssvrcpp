@@ -13,6 +13,7 @@
 #pragma once
 
 #include "app_fixture.h"
+#include "http_fixture.h"  // HttpFixture / HttpDo / Authed / TargetOf（DualProtocolFixture 复用 REST 栈）
 
 #include "adapters/grpc/file_service_adapter.h"
 
@@ -54,6 +55,50 @@ struct GrpcFixture {
   std::unique_ptr<::grpc::ClientContext> Context(
       const std::string& token = "Bearer test-token", const std::string& partition = "opendes",
       const std::string& correlation_id = "corr-grpc-e2e") const {
+    auto context = std::make_unique<::grpc::ClientContext>();
+    context->AddMetadata("authorization", token);
+    context->AddMetadata("data-partition-id", partition);
+    context->AddMetadata("correlation-id", correlation_id);
+    return context;
+  }
+};
+
+// -----------------------------------------------------------------------------
+//  DualProtocolFixture —— **同一份状态**同时挂在 REST 与 gRPC 两条协议上
+// -----------------------------------------------------------------------------
+//  C7.3 的等价性矩阵要求"同一份输入分别经 REST 与 gRPC 调用"后逐项相等；
+//  C7.8 还要求两条链路**同时运行、互不干扰**。两者都要求两条协议指向**同一批端口**
+//  （同一个 metadata/location/repository 实例），因此这里用组合而不是各起一套。
+struct DualProtocolFixture {
+  fss::test::HttpFixture http;  // REST 栈（内存适配器 + 自签 codec + 真实回环端口）
+  std::unique_ptr<fss::adapters::grpc::FileServiceAdapter> service;
+  std::unique_ptr<::grpc::Server> grpc_server;
+  std::unique_ptr<osdu::file::v1::FileService::Stub> stub;
+  int grpc_port = 0;
+
+  DualProtocolFixture() {
+    service = std::make_unique<fss::adapters::grpc::FileServiceAdapter>(*http.ports, "osdu-user");
+    ::grpc::ServerBuilder builder;
+    builder.AddListeningPort("127.0.0.1:0", ::grpc::InsecureServerCredentials(), &grpc_port);
+    builder.RegisterService(service.get());
+    grpc_server = builder.BuildAndStart();
+    REQUIRE(grpc_server != nullptr);
+    REQUIRE(grpc_port != 0);
+    stub = osdu::file::v1::FileService::NewStub(
+        ::grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                              ::grpc::InsecureChannelCredentials()));
+  }
+  ~DualProtocolFixture() {
+    if (grpc_server) grpc_server->Shutdown();
+  }
+  DualProtocolFixture(const DualProtocolFixture&) = delete;
+  DualProtocolFixture& operator=(const DualProtocolFixture&) = delete;
+
+  int http_port() const { return http.port(); }
+
+  std::unique_ptr<::grpc::ClientContext> Context(
+      const std::string& token = "Bearer test-token", const std::string& partition = "opendes",
+      const std::string& correlation_id = "corr-equivalence") const {
     auto context = std::make_unique<::grpc::ClientContext>();
     context->AddMetadata("authorization", token);
     context->AddMetadata("data-partition-id", partition);

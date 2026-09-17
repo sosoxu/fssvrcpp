@@ -103,7 +103,8 @@ if grep -qE '201 == 400|400 \(0x190\) == 413|201 == 413' <<<"${OUTPUT}"; then
   ok "③ 失败症状与 H-2 特征一致（超限却 201 / 413 退化），不是无关的偶发失败"
 else
   no "③ 测试虽然失败，但症状与 H-2 无关 —— 请检查失败原因："
-  grep -E "FAILED|with expansion:" -A 2 <<<"${OUTPUT}" | head -20
+  #  ★ 同上：`head` 会 SIGPIPE 上游；用 sed 读满 20 行（P7-D06）
+  grep -E "FAILED|with expansion:" -A 2 <<<"${OUTPUT}" | sed -n "1,20p"
   exit 1
 fi
 

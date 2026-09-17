@@ -661,21 +661,33 @@ class FileServiceAdapter final : public osdu::file::v1::FileService::Service {
 
 ### 8.3 错误映射（双向一致）
 
+**唯一权威表在契约 §5，数据在 `src/domain/contract/error_table.cpp`（L3，无协议类型）**；
+HTTP 与 gRPC 两个适配器都从**同一张表**派生（`HttpStatusFor` / `GrpcStatusFor`），
+`test_error_equivalence`（C7.2）用手抄的契约期望值同时钉住两边。
+
 | 领域 `ErrorKind` | REST | gRPC |
 | --- | --- | --- |
+| `kOk`（不是错误；误当错误用 → 实现 bug） | `500` | `INTERNAL` |
 | `kInvalidArgument` | `400` | `INVALID_ARGUMENT` |
+| `kFileSourceEmpty` | `400` | `INVALID_ARGUMENT` |
+| `kInvalidSourcePath` | `400` | `INVALID_ARGUMENT` |
+| `kLocationAlreadyExists` | `400`（对齐上游 `LocationAlreadyExistsException` → 400） | `ALREADY_EXISTS` |
+| `kChecksumMismatch` | `400` | `INVALID_ARGUMENT`（尾随元数据 `fss-error-details` 携带期望/实际） |
 | `kUnauthenticated` | `401` | `UNAUTHENTICATED` |
 | `kPermissionDenied` | `403` | `PERMISSION_DENIED` |
+| `kStorageAccessDenied` | `403` | `PERMISSION_DENIED`（存储侧拒绝本服务，对客户端是依赖故障） |
 | `kNotFound` | `404` | `NOT_FOUND` |
-| `kAlreadyExists` | `400`（对齐上游 `LocationAlreadyExistsException` → 400） | `ALREADY_EXISTS` |
-| `kFailedPrecondition` | `400` | `FAILED_PRECONDITION` |
-| `kResourceExhausted` | `503` | `RESOURCE_EXHAUSTED` |
 | `kUnimplemented` | `501` | `UNIMPLEMENTED` |
 | `kInternal` | `500` | `INTERNAL` |
+| `kBadGateway` | `502` | `UNAVAILABLE` |
 | `kUnavailable` | `503` | `UNAVAILABLE` |
-| `kChecksumMismatch` | `400` | `INVALID_ARGUMENT`（`details` 携带期望/实际） |
 
-> 注意 `kAlreadyExists → 400` 而非 409：这是**实测的上游行为**（`LocationAlreadyExistsException` 在
+> 上表**不允许**在本节独立演化：新增 `ErrorKind` 必须改 `error_table.cpp` + 契约 §5 表，
+> 否则 `test_error_equivalence`（"无空缺"判据）直接失败。
+> 本节的旧版本曾列出 `kAlreadyExists` / `kFailedPrecondition` / `kResourceExhausted`
+> 三个**实现中并不存在**的枚举值，已按真实枚举更正（P7 切片 2）。
+>
+> 注意 `kLocationAlreadyExists → 400` 而非 409：这是**实测的上游行为**（`LocationAlreadyExistsException` 在
 > `RestExceptionHandler` 中被归入 `handleBadRequest` → `HttpStatus.BAD_REQUEST`）。契约测试会固化这一点。
 
 ---

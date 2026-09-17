@@ -20,6 +20,18 @@ namespace {
 
 }  // namespace
 
+::fss::app::CallerContext FileServiceAdapter::CallerFrom(::grpc::ServerContext* context) const {
+  const auto& metadata = context->client_metadata();
+  const auto lookup = [&metadata](std::string_view name) -> std::optional<std::string> {
+    const auto it = metadata.find(::grpc::string_ref(name.data(), name.size()));
+    if (it == metadata.end()) return std::nullopt;
+    return std::string(it->second.data(), it->second.size());
+  };
+  std::string correlation_id;
+  if (const auto value = lookup("correlation-id"); value.has_value()) correlation_id = *value;
+  return fss::app::CallerFromHeaders(lookup, correlation_id, default_user_id_);
+}
+
 ::grpc::Status FileServiceAdapter::GetInfo(::grpc::ServerContext* /*context*/,
                                          const google::protobuf::Empty* /*request*/,
                                          osdu::file::v1::InfoResponse* response) {
@@ -65,69 +77,194 @@ namespace {
   }
 }
 
+::grpc::Status FileServiceAdapter::GetUploadLocation(
+    ::grpc::ServerContext* context, const osdu::file::v1::GetUploadLocationRequest* request,
+    osdu::file::v1::LocationResponse* response) {
+  const auto caller = CallerFrom(context);
+  fss::app::GetUploadLocation usecase(ports_);
+  const std::optional<std::string> file_id =
+      request->file_id().empty() ? std::nullopt
+                                 : std::optional<std::string>(request->file_id());
+  const auto result = usecase.Execute(caller, file_id, ExpiryFromProto(request->expiry()));
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  FillLocationProto(result.value(), response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::GetFileLocation(
+    ::grpc::ServerContext* context, const osdu::file::v1::GetFileLocationRequest* request,
+    osdu::file::v1::GetFileLocationResponse* response) {
+  const auto caller = CallerFrom(context);
+  fss::app::GetFileLocation usecase(ports_);
+  const auto view = usecase.Execute(caller, request->file_id());
+  if (!view.ok()) {
+    AttachErrorMetadata(*context, view.error());
+    return ToGrpcStatus(view.error());
+  }
+  FillFileLocationProto(view.value(), response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::GetDownloadLocation(
+    ::grpc::ServerContext* context, const osdu::file::v1::GetDownloadLocationRequest* request,
+    osdu::file::v1::DownloadUrlResponse* response) {
+  const auto caller = CallerFrom(context);
+  fss::app::GetDownloadLocation usecase(ports_);
+  const auto result = usecase.Execute(caller, request->id(), ExpiryFromProto(request->expiry()));
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  FillDownloadUrlProto(result.value(), response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::GetFileList(::grpc::ServerContext* context,
+                                                 const osdu::file::v1::GetFileListRequest* request,
+                                                 osdu::file::v1::FileListResponse* response) {
+  const auto caller = CallerFrom(context);
+  const auto list_request = FileListRequestFromProto(request->request());
+  if (!list_request.ok()) {
+    AttachErrorMetadata(*context, list_request.error());
+    return ToGrpcStatus(list_request.error());
+  }
+  fss::app::GetFileList usecase(ports_);
+  const auto page = usecase.Execute(caller, list_request.value());
+  if (!page.ok()) {
+    AttachErrorMetadata(*context, page.error());
+    return ToGrpcStatus(page.error());
+  }
+  FillFileListProto(page.value(), response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::CreateFileMetadata(
+    ::grpc::ServerContext* context, const osdu::file::v1::FileMetadataRecord* request,
+    osdu::file::v1::CreateFileMetadataResponse* response) {
+  const auto caller = CallerFrom(context);
+  const auto record = MetadataFromProto(*request);
+  if (!record.ok()) {
+    AttachErrorMetadata(*context, record.error());
+    return ToGrpcStatus(record.error());
+  }
+  fss::app::CreateFileMetadata usecase(ports_);
+  const auto id = usecase.Execute(caller, record.value());
+  if (!id.ok()) {
+    AttachErrorMetadata(*context, id.error());
+    return ToGrpcStatus(id.error());
+  }
+  response->set_id(id.value());
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::GetFileMetadata(
+    ::grpc::ServerContext* context, const osdu::file::v1::GetFileMetadataRequest* request,
+    osdu::file::v1::FileMetadataRecord* response) {
+  const auto caller = CallerFrom(context);
+  fss::app::GetFileMetadata usecase(ports_);
+  const auto record = usecase.Execute(caller, request->id());
+  if (!record.ok()) {
+    AttachErrorMetadata(*context, record.error());
+    return ToGrpcStatus(record.error());
+  }
+  FillMetadataProto(record.value(), response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::DeleteFileMetadata(
+    ::grpc::ServerContext* context, const osdu::file::v1::DeleteFileMetadataRequest* request,
+    google::protobuf::Empty* /*response*/) {
+  const auto caller = CallerFrom(context);
+  fss::app::DeleteFileMetadata usecase(ports_);
+  const auto result = usecase.Execute(caller, request->id());
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::GetStorageInstructions(
+    ::grpc::ServerContext* context, const osdu::file::v1::GetStorageInstructionsRequest* request,
+    osdu::file::v1::StorageInstructionsResponse* response) {
+  const auto caller = CallerFrom(context);
+  fss::app::GetStorageInstructions usecase(ports_);
+  const auto result = usecase.Execute(caller, ExpiryFromProto(request->expiry()));
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  //  ★ 集合版的键集合由调用方的 RPC 决定（proto 没有这个区分，因为它们是两条 REST 路径）。
+  //    gRPC 侧用**单文件版**键集合（与 `/v2/files/storageInstructions` 等价）。
+  FillStorageInstructionsProto(result.value(), /*collection=*/false, response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::GetRetrievalInstructions(
+    ::grpc::ServerContext* context, const osdu::file::v1::GetRetrievalInstructionsRequest* request,
+    osdu::file::v1::RetrievalInstructionsResponse* response) {
+  const auto caller = CallerFrom(context);
+  std::vector<std::string> registry_ids(request->dataset_registry_ids().begin(),
+                                        request->dataset_registry_ids().end());
+  fss::app::GetRetrievalInstructions usecase(ports_);
+  const auto result =
+      usecase.Execute(caller, registry_ids, ExpiryFromProto(request->expiry()));
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  FillRetrievalInstructionsProto(result.value(), /*collection=*/false, response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::CopyFilesToPersistent(
+    ::grpc::ServerContext* context, const osdu::file::v1::CopyDmsRequest* request,
+    osdu::file::v1::CopyDmsResponseList* response) {
+  const auto caller = CallerFrom(context);
+  fss::app::CopyFiles usecase(ports_);
+  const auto outcomes = usecase.Execute(caller, CopySourcesFromProto(*request));
+  if (!outcomes.ok()) {
+    AttachErrorMetadata(*context, outcomes.error());
+    return ToGrpcStatus(outcomes.error());
+  }
+  FillCopyDmsProto(outcomes.value(), response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::GetFileSignedUrl(
+    ::grpc::ServerContext* context, const osdu::file::v1::UrlSigningRequest* request,
+    osdu::file::v1::UrlSigningResponse* response) {
+  const auto caller = CallerFrom(context);
+  std::vector<std::string> srns(request->srns().begin(), request->srns().end());
+  fss::app::GetFileSignedUrl usecase(ports_);
+  const auto result = usecase.Execute(caller, srns, std::nullopt);
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  FillUrlSigningProto(result.value(), response);
+  return ::grpc::Status::OK;
+}
+
+::grpc::Status FileServiceAdapter::RevokeUrl(::grpc::ServerContext* context,
+                                           const osdu::file::v1::RevokeUrlRequest* /*request*/,
+                                           google::protobuf::Empty* /*response*/) {
+  const auto caller = CallerFrom(context);
+  fss::app::RevokeUrl usecase(ports_);
+  const auto result = usecase.Execute(caller);
+  if (!result.ok()) {
+    AttachErrorMetadata(*context, result.error());
+    return ToGrpcStatus(result.error());
+  }
+  return ::grpc::Status::OK;
+}
+
 // ---------------------------------------------------------------------------
 //  切片 2 / 3 的实现位置（保留签名以免"忘了实现"变成编译错误而不是运行错误）
 // ---------------------------------------------------------------------------
-::grpc::Status FileServiceAdapter::GetUploadLocation(::grpc::ServerContext*,
-                                                   const osdu::file::v1::GetUploadLocationRequest*,
-                                                   osdu::file::v1::LocationResponse*) {
-  return NotYet("GetUploadLocation");
-}
-::grpc::Status FileServiceAdapter::GetFileLocation(::grpc::ServerContext*,
-                                                 const osdu::file::v1::GetFileLocationRequest*,
-                                                 osdu::file::v1::GetFileLocationResponse*) {
-  return NotYet("GetFileLocation");
-}
-::grpc::Status FileServiceAdapter::GetDownloadLocation(
-    ::grpc::ServerContext*, const osdu::file::v1::GetDownloadLocationRequest*,
-    osdu::file::v1::DownloadUrlResponse*) {
-  return NotYet("GetDownloadLocation");
-}
-::grpc::Status FileServiceAdapter::GetFileList(::grpc::ServerContext*,
-                                             const osdu::file::v1::GetFileListRequest*,
-                                             osdu::file::v1::FileListResponse*) {
-  return NotYet("GetFileList");
-}
-::grpc::Status FileServiceAdapter::CreateFileMetadata(
-    ::grpc::ServerContext*, const osdu::file::v1::FileMetadataRecord*,
-    osdu::file::v1::CreateFileMetadataResponse*) {
-  return NotYet("CreateFileMetadata");
-}
-::grpc::Status FileServiceAdapter::GetFileMetadata(
-    ::grpc::ServerContext*, const osdu::file::v1::GetFileMetadataRequest*,
-    osdu::file::v1::FileMetadataRecord*) {
-  return NotYet("GetFileMetadata");
-}
-::grpc::Status FileServiceAdapter::DeleteFileMetadata(
-    ::grpc::ServerContext*, const osdu::file::v1::DeleteFileMetadataRequest*,
-    google::protobuf::Empty*) {
-  return NotYet("DeleteFileMetadata");
-}
-::grpc::Status FileServiceAdapter::GetStorageInstructions(
-    ::grpc::ServerContext*, const osdu::file::v1::GetStorageInstructionsRequest*,
-    osdu::file::v1::StorageInstructionsResponse*) {
-  return NotYet("GetStorageInstructions");
-}
-::grpc::Status FileServiceAdapter::GetRetrievalInstructions(
-    ::grpc::ServerContext*, const osdu::file::v1::GetRetrievalInstructionsRequest*,
-    osdu::file::v1::RetrievalInstructionsResponse*) {
-  return NotYet("GetRetrievalInstructions");
-}
-::grpc::Status FileServiceAdapter::CopyFilesToPersistent(::grpc::ServerContext*,
-                                                       const osdu::file::v1::CopyDmsRequest*,
-                                                       osdu::file::v1::CopyDmsResponseList*) {
-  return NotYet("CopyFilesToPersistent");
-}
-::grpc::Status FileServiceAdapter::GetFileSignedUrl(::grpc::ServerContext*,
-                                                  const osdu::file::v1::UrlSigningRequest*,
-                                                  osdu::file::v1::UrlSigningResponse*) {
-  return NotYet("GetFileSignedUrl");
-}
-::grpc::Status FileServiceAdapter::RevokeUrl(::grpc::ServerContext*,
-                                           const osdu::file::v1::RevokeUrlRequest*,
-                                           google::protobuf::Empty*) {
-  return NotYet("RevokeUrl");
-}
 ::grpc::Status FileServiceAdapter::ServerSideCopy(::grpc::ServerContext*,
                                                 const osdu::file::v1::ServerSideCopyRequest*,
                                                 osdu::file::v1::ServerSideCopyResponse*) {

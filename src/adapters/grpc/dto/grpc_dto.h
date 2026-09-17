@@ -24,6 +24,9 @@
 
 #include <osdu/file/v1/file_service.pb.h>
 
+#include <optional>
+#include <vector>
+
 namespace fss::adapters::grpc {
 
 //  `InfoResponse`（运维端点，无错误路径）
@@ -35,5 +38,36 @@ void FillMetadataProto(const fss::domain::FileMetadataRecord& record,
 //  proto → 领域。结构性错误（缺必需段等）交给领域校验（`ValidateMetadataRecord`）报 400。
 fss::Result<fss::domain::FileMetadataRecord> MetadataFromProto(
     const osdu::file::v1::FileMetadataRecord& proto);
+
+//  ---- 位置 / 列表 / DMS / 交付 的响应填充（与 REST 的 DTO 一一对应）----
+void FillLocationProto(const fss::app::LocationResult& result,
+                       osdu::file::v1::LocationResponse* out);
+void FillFileLocationProto(const fss::app::FileLocationView& view,
+                           osdu::file::v1::GetFileLocationResponse* out);
+void FillDownloadUrlProto(const fss::app::DownloadLocationResult& result,
+                          osdu::file::v1::DownloadUrlResponse* out);
+void FillFileListProto(const fss::app::FileListResult& result,
+                       osdu::file::v1::FileListResponse* out);
+//  `collection = true` 时用集合版的键集合（`fileCollectionSource` + `fileCount`/`fileNames`）
+void FillStorageInstructionsProto(const fss::app::StorageInstructions& instructions,
+                                  bool collection,
+                                  osdu::file::v1::StorageInstructionsResponse* out);
+void FillRetrievalInstructionsProto(
+    const std::vector<fss::app::RetrievalInstruction>& instructions, bool collection,
+    osdu::file::v1::RetrievalInstructionsResponse* out);
+void FillCopyDmsProto(const std::vector<fss::app::CopyFileOutcome>& outcomes,
+                      osdu::file::v1::CopyDmsResponseList* out);
+void FillUrlSigningProto(const fss::app::SignedUrlResult& result,
+                         osdu::file::v1::UrlSigningResponse* out);
+
+//  ---- 请求侧（proto → 领域输入）----
+//  `ExpirySpec.raw` → 用例的 `expiryTime`（空串 = 未提供，走缺省 1H / 上限 7D）
+std::optional<std::string> ExpiryFromProto(const osdu::file::v1::ExpirySpec& spec);
+//  `FileListRequest` → 领域请求（时间用与 REST 相同的 `ParseIso8601`）
+fss::Result<fss::app::FileListRequest> FileListRequestFromProto(
+    const osdu::file::v1::FileListRequest& proto);
+//  `CopyDmsRequest.datasetSources`（Struct 列表，元素是记录或路径字符串）
+std::vector<fss::app::CopyFileSource> CopySourcesFromProto(
+    const osdu::file::v1::CopyDmsRequest& proto);
 
 }  // namespace fss::adapters::grpc

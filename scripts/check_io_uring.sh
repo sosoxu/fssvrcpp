@@ -106,8 +106,9 @@ else
   elif ! docker info >/dev/null 2>&1; then
     warn "docker daemon 不可用，跳过容器探测"
   else
-    IMAGE="${IMAGE:-$(docker images --format '{{.Repository}}:{{.Tag}}' \
-             | grep -v '^<none>' | head -1)}"
+    #  ★ `| head -1` 会让 `docker images` 收到 SIGPIPE → pipefail 下整条管道 141（P7-D06）
+    IMAGE="${IMAGE:-$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+             | grep -v '^<none>' | sed -n '1p')}"
     if [[ -z "${IMAGE}" ]]; then
       warn "本地无可用镜像且不可联网拉取，跳过容器探测"
     else

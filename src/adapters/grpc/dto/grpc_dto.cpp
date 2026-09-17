@@ -1,7 +1,9 @@
 // grpc_dto 实现。字段映射与 proto 的 `json_name` 一一对应（契约 §4.2）。
 #include "adapters/grpc/dto/grpc_dto.h"
 
+#include "app/usecases/wire_shapes.h"
 #include "common/json/json.h"
+#include "common/time/time_format.h"
 
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
@@ -234,6 +236,154 @@ fss::Result<fss::domain::FileMetadataRecord> MetadataFromProto(
     record.tags[key] = value;
   }
   return record;
+}
+
+}  // namespace fss::adapters::grpc
+
+// =============================================================================
+//  位置 / 列表 / DMS / 交付 的转换（与 REST DTO 的输出逐字段对齐）
+// =============================================================================
+namespace fss::adapters::grpc {
+
+namespace {
+
+osdu::file::v1::StorageDriver DriverEnumFromName(std::string_view name) {
+  //  领域里 driver 是**小写字符串**（真实驱动名）；proto 是枚举（扩展字段）
+  if (name == "posix") return osdu::file::v1::STORAGE_DRIVER_POSIX;
+  if (name == "s3") return osdu::file::v1::STORAGE_DRIVER_S3;
+  if (name == "gcs") return osdu::file::v1::STORAGE_DRIVER_GCS_COMPAT;
+  return osdu::file::v1::STORAGE_DRIVER_UNSPECIFIED;
+}
+osdu::file::v1::StorageZone ZoneEnumFromDomain(fss::domain::StorageZone zone) {
+  return zone == fss::domain::StorageZone::kPersistent
+             ? osdu::file::v1::STORAGE_ZONE_PERSISTENT
+             : osdu::file::v1::STORAGE_ZONE_STAGING;
+}
+void SetExpiryTimestamp(std::int64_t epoch_seconds, google::protobuf::Timestamp* out) {
+  out->set_seconds(epoch_seconds);
+  out->set_nanos(0);
+}
+
+}  // namespace
+
+void FillLocationProto(const fss::app::LocationResult& result,
+                       osdu::file::v1::LocationResponse* out) {
+  out->set_file_id(result.file_id);
+  out->mutable_location()->set_signed_url(result.signed_url);
+  out->mutable_location()->set_file_source(result.file_source);
+  out->set_driver(DriverEnumFromName(result.driver));
+  out->set_zone(ZoneEnumFromDomain(result.zone));
+  SetExpiryTimestamp(result.expires_at_epoch_seconds, out->mutable_expires_at());
+}
+
+void FillFileLocationProto(const fss::app::FileLocationView& view,
+                           osdu::file::v1::GetFileLocationResponse* out) {
+  out->set_driver(view.driver);
+  out->set_location(view.location);
+  out->set_file_source(view.file_source);
+}
+
+void FillDownloadUrlProto(const fss::app::DownloadLocationResult& result,
+                          osdu::file::v1::DownloadUrlResponse* out) {
+  out->set_signed_url(result.signed_url);
+}
+
+void FillFileListProto(const fss::app::FileListResult& result,
+                       osdu::file::v1::FileListResponse* out) {
+  out->set_number(result.number);
+  out->set_size(result.size);
+  out->set_number_of_elements(result.number_of_elements);
+  for (const auto& entry : result.content) {
+    auto* item = out->add_content();
+    item->set_file_id(entry.file_id);
+    item->set_driver(entry.driver);
+    item->set_location(entry.location);
+    item->set_created_at(fss::time::ToOsduTimestamp(entry.created_at_epoch_seconds, 0));
+    item->set_created_by(entry.created_by);
+  }
+}
+
+void FillStorageInstructionsProto(const fss::app::StorageInstructions& instructions,
+                                  bool collection,
+                                  osdu::file::v1::StorageInstructionsResponse* out) {
+  out->set_provider_key(instructions.provider_key);
+  //  ★ 位置对象是两条协议**共用**的 JSON 形状（`app::DmsLocationJson`）：
+  //    REST 直接写进响应体，gRPC 装进 `Struct` —— 键集合不可能漂移。
+  JsonToStruct(fss::app::DmsLocationJson(instructions.signed_url, instructions.file_source,
+                                         instructions.created_by,
+                                         instructions.expires_at_epoch_seconds, collection, 0, {}),
+               out->mutable_storage_location());
+}
+
+void FillRetrievalInstructionsProto(
+    const std::vector<fss::app::RetrievalInstruction>& instructions, bool collection,
+    osdu::file::v1::RetrievalInstructionsResponse* out) {
+  for (const auto& instruction : instructions) {
+    auto* item = out->add_datasets();
+    item->set_dataset_registry_id(instruction.dataset_registry_id);
+    item->set_provider_key(instruction.provider_key);
+    JsonToStruct(fss::app::DmsLocationJson(instruction.signed_url, instruction.file_source,
+                                           instruction.created_by,
+                                           instruction.expires_at_epoch_seconds, collection, 0, {}),
+                 item->mutable_retrieval_properties());
+  }
+}
+
+void FillCopyDmsProto(const std::vector<fss::app::CopyFileOutcome>& outcomes,
+                      osdu::file::v1::CopyDmsResponseList* out) {
+  for (const auto& outcome : outcomes) {
+    auto* item = out->add_results();
+    item->set_success(outcome.success);
+    item->set_dataset_blob_storage_path(outcome.dataset_blob_storage_path);
+  }
+}
+
+void FillUrlSigningProto(const fss::app::SignedUrlResult& result,
+                         osdu::file::v1::UrlSigningResponse* out) {
+  for (const auto& srn : result.unprocessed) out->add_unprocessed(srn);
+  for (const auto& [srn, entry] : result.processed) {
+    auto& slot = (*out->mutable_processed())[srn];
+    slot.set_signed_url(entry.signed_url);
+    slot.set_unsigned_url(entry.unsigned_url);
+    slot.set_kind(entry.kind);
+    //  ★ `connectionString` 必须**存在**（proto3 里 string 字段的空值不会出现在 JSON 里，
+    //    因此这里留空；REST 侧显式输出 `null`。两边的"字段存在性"语义见契约 §2.10）
+    slot.set_connection_string("");
+  }
+}
+
+std::optional<std::string> ExpiryFromProto(const osdu::file::v1::ExpirySpec& spec) {
+  if (spec.raw().empty()) return std::nullopt;
+  return spec.raw();
+}
+
+fss::Result<fss::app::FileListRequest> FileListRequestFromProto(
+    const osdu::file::v1::FileListRequest& proto) {
+  fss::app::FileListRequest request;
+  request.page_num = proto.page_num();
+  request.items = proto.items();
+  request.user_id = proto.user_id();
+  //  ★ 时间解析与 REST 用**同一个** `ParseIso8601`（错误分类因此天然一致）
+  if (!proto.time_from().empty()) {
+    FSS_TRY(from, fss::time::ParseIso8601(proto.time_from()));
+    request.time_from_epoch_seconds = from;
+  }
+  if (!proto.time_to().empty()) {
+    FSS_TRY(to, fss::time::ParseIso8601(proto.time_to()));
+    request.time_to_epoch_seconds = to;
+  }
+  return request;
+}
+
+std::vector<fss::app::CopyFileSource> CopySourcesFromProto(
+    const osdu::file::v1::CopyDmsRequest& proto) {
+  std::vector<fss::app::CopyFileSource> sources;
+  for (const auto& node : proto.dataset_sources()) {
+    //  ★ 与 REST 共用同一套"取值规则"（`app::FileSourceFromRecordNode`）
+    sources.push_back(fss::app::CopyFileSource{
+        fss::app::FileSourceFromRecordNode(StructToJson(node))});
+  }
+  return sources;
 }
 
 }  // namespace fss::adapters::grpc
