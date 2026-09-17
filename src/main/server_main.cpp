@@ -256,6 +256,17 @@ int main(int /*argc*/, char** /*argv*/) {
   InMemoryMetadataRepository metadata_repository(clock);  // P6 换成 SQLite
   HmacTransferTokenCodec token_codec(transfer_secret, clock);
 
+  //  ---- 部署形态（ADR-009）----
+  //  `deployment.mode=multi` 的 5 条配置校验已经在 schema 里（C8.9），但**运行形态**还依赖
+  //  PG 版仓储、PG 租约与数据库时钟（ADR-009；计划 P9）——本版本没有交付。
+  //  ★ 明确拒绝启动，而不是"以单实例状态跑在多实例里"（那会让各实例状态发散）。
+  const std::string deployment_mode = Env("FSS_DEPLOYMENT_MODE", "single");
+  if (deployment_mode == "multi") {
+    std::cerr << "拒绝启动：deployment.mode=multi 需要 PG 仓储 + PG 租约 + 数据库时钟"
+                 "（ADR-009），本版本尚未交付（计划 P9）。\n";
+    return 1;
+  }
+
   //  ---- 认证（P8 / ADR-012）----
   //  `jwt` = 本地 HS256 校验（默认生产形态）；`disabled` = allow-all（仅开发）。
   //  ★ `remote-entitlements` **尚未实现**：明确拒绝启动，绝不静默降级为放行。
@@ -274,6 +285,11 @@ int main(int /*argc*/, char** /*argv*/) {
     jwt_options.partition_claim = Env("FSS_JWT_PARTITION_CLAIM", "data-partition-id");
     jwt_options.require_partition_claim =
         Env("FSS_JWT_REQUIRE_PARTITION_CLAIM", "true") != "false";
+    //  C8.10：容忍范围与 `deployment.max_clock_skew_seconds` 同源（默认 5 秒）
+    if (const char* skew = std::getenv("FSS_MAX_CLOCK_SKEW_SECONDS");
+        skew != nullptr && *skew != '\0') {
+      jwt_options.clock_skew_seconds = std::atoll(skew);
+    }
     jwt_authorizer = std::make_unique<infra::LocalJwtAuthorizer>(jwt_options, clock);
     authorizer = jwt_authorizer.get();
     //  ★ 升级为显式拒绝启动（而不是"起来但拒绝所有 token"）：空密钥 100% 是配置错误，

@@ -41,6 +41,7 @@ add_library(fss_app STATIC
   app/services/expiry_policy.cpp
   app/services/kind_validator.cpp
   app/services/object_key_policy.cpp
+  app/services/clock_skew_guard.cpp
   app/services/location_issuer.cpp
   app/usecases/usecases.cpp
   app/usecases/caller_context.cpp

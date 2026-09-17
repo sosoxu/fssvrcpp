@@ -159,6 +159,24 @@
 
 ---
 
+### 1.6b 多实例（`deployment.mode=multi`）的强制启动校验（C8.9）
+
+`multi` 模式下配置校验**必须**拒绝以下任一情况（每条都有"拒绝启动"的测试，且五条全满足
+时**必须通过** —— 正例断言防"校验恒真"）：
+
+| # | 配置项 | 要求 | 理由 |
+| --- | --- | --- | --- |
+| 1 | `metadata.repository` / `location.repository` | `postgres` | 各实例共享 SQLite 会让状态发散 |
+| 2 | `leases.enabled` / `leader_election.enabled` | `true` | 租约与领导者选举是多实例一致性的前提（ADR-009） |
+| 3 | `gc.require_lease_expiry` | `true` | 否则 GC 会把**在途上传**当孤儿删（实测 20/20 误删） |
+| 4 | `storage.posix.shared_mount_required` | `true` | 存储根必须在共享挂载上 |
+| 5 | `deployment.max_clock_skew_seconds` | `0 < 值 ≤ 60` | 时钟偏差过大会让租约/过期误判（C8.10） |
+
+**运行形态**：PG 版仓储 + PG 租约 + 数据库时钟（ADR-009）尚未交付（计划 P9），因此
+组合根对 `FSS_DEPLOYMENT_MODE=multi` **拒绝启动**（明确报错），而不是以单实例状态跑在多实例里。
+
+---
+
 ### 1.7 HTTP 层硬上限与拒绝语义
 
 由 `fss_http` 包装层（`src/common/http/`）强制，**不依赖第三方库的默认行为**。
@@ -773,6 +791,37 @@ P8-D05，普通构建碰不到）。显式标记把这个判定变成**确定性
 | `FileSourceInfo.file_source` | `FileSource` | ✅ |
 | `StorageInstructionsResponse.provider_key` / `.storage_location` | `providerKey` / `storageLocation` | ✅ |
 | `StorageZone` / `StorageDriver` / 各扩展 RPC | — | ❌ **扩展** |
+
+### 4.6 审计与事件的操作名（C8.6/C8.7）
+
+审计事件（`IAuditLogger`）与状态事件（`IEventPublisher`）的操作名/状态由下表钉住，
+测试逐条比对（`tests/unit/test_audit_coverage.cpp`、`tests/integration/test_metadata_lifecycle.cpp`）。
+
+| 用例 | 审计操作（`operation`） | 状态事件（`status`） |
+| --- | --- | --- |
+| `GetUploadLocation` | `createLocationSuccess` / `createLocationFailure` | — |
+| `GetFileLocation` | `readFileLocationSuccess` / `readFileLocationFailure` | — |
+| `GetDownloadLocation` | `createDownloadLocationSuccess` / `…Failure` | — |
+| `GetFileList` | `getFileListSuccess` / `…Failure` | — |
+| `CreateFileMetadata` | `createMetadataSuccess` / `createMetadataFailure`（另有 `createMetadataStagingCleanupFailure` 诊断项） | **`IN_PROGRESS` → `SUCCESS`**（成功）/ **`IN_PROGRESS` → `FAILED`**（失败） |
+| `GetFileMetadata` | `readMetadataSuccess` / `readMetadataFailure` | — |
+| `DeleteFileMetadata` | `deleteMetadataSuccess` / `deleteMetadataFailure` | — |
+| `GetStorageInstructions` | `getStorageInstructionsSuccess` / `…Failure` | — |
+| `GetRetrievalInstructions` | `getRetrievalInstructionsSuccess` / `…Failure` | — |
+| `CopyFiles` | `copyFilesSuccess` / `copyFilesFailure` | — |
+| `GetFileSignedUrl` | `getFileSignedUrlSuccess` / `…Failure` | — |
+| `RevokeUrl` | `revokeUrlSuccess` / `revokeUrlFailure` | — |
+| `UploadFile` / `DownloadFile` / `ServerSideCopy`（扩展 RPC） | `uploadFileSuccess` / `downloadFileSuccess` / `serverSideCopySuccess`（及各自 `…Failure`） | 上传 + `registerMetadata=true` 时由 `CreateFileMetadata` 发事件 |
+
+**每个审计事件必须含**：`user`（actor）、`partition`、`object_id`（受影响对象，未知时为空）、
+`result`（`success`/`failure`）、`epoch_millis`、**`correlation_id`**（跨服务追踪）。
+实现上由 `AuditGuard`（RAII）保证"任何提前 return 都会记账"——手写调用会漏掉失败出口，
+而**漏审计是静默的**。
+
+`createLocationSuccess` / `readFileLocationSuccess` 是**上游实测**的操作名；其余按同一命名
+约定（`<动作><对象><Success|Failure>`）扩展，属于本项目的补充（已在证据文件登记）。
+
+---
 
 ### 4.5 与 Entitlements 的接口（`auth.mode=remote-entitlements`）
 

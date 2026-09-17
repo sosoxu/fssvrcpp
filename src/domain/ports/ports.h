@@ -297,11 +297,13 @@ class IEventPublisher {
 
 struct AuditEvent {
   std::string operation;   // 对齐上游 `AuditOperation`（createLocationSuccess 等）
-  std::string user;
+  std::string user;        // actor（来自 `x-user-id` 或 JWT 的 email/sub）
   std::string partition;
-  std::string object_id;
+  std::string object_id;   // 受影响的对象（记录 id / file id；未知时为空）
   std::string result;      // success / failure
   std::int64_t epoch_millis = 0;
+  //  ★ C8.7 要求审计含 correlation-id：跨服务追踪的关联键（缺失时为空串）
+  std::string correlation_id;
   json::Value extra = json::Value::object();
 };
 

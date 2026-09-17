@@ -18,7 +18,7 @@
 | **P5** | 对象存储驱动（S3 SigV4） | `S3BlobStore`、SigV4 签名/验签、mock-S3、同一套契约测试跑 S3 | `ctest -L phase5` | ✅ **已完成：C5.1~C5.10 全部满足**（AWS 官方向量 5 条逐字节匹配、独立验签 mock、同一套契约跑第三遍、分页、错误映射、S3 端到端、按配置切驱动、ADR-005） |
 | **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | ✅ **已完成（C6.1~C6.13；9 测试 / 2578 断言）** |
 | **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | ✅ **已完成（C7.1~C7.10 全部满足；17/17 RPC；6 测试 / 5378 断言）** |
-| **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | 🚧 **进行中（切片 2/3：本地 JWT + 路由级预检 + 跨租户隔离 + 远端 Entitlements fail-closed；C8.1~C8.5 满足）** |
+| **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ✅ **已完成（C8.1~C8.8 全部满足；C8.9 配置级 + C8.10 机制级完成；6 测试 / 1323 断言）** |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ⬜ |
 
 **全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P9 并全绿。
@@ -594,9 +594,24 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase7 --output-on
 
 ---
 
-### 阶段 8：认证授权与多租户  🚧 进行中
+### 阶段 8：认证授权与多租户  ✅ 已完成
 
-> **当前进度（切片 2/3）**：在切片 1 之上补齐**跨租户隔离**与**远端 Entitlements**。
+> **收口（切片 3/3）**：`ctest -L phase8` **6 测试 / 1323 断言**；**C8.1~C8.8 全部满足**
+> （退出条件达成），C8.9/C8.10 的**配置/机制**部分完成、端到端形态依赖 PG（P9）。
+> ⑧ **C8.7 审计覆盖**（`test_audit_coverage`，2 用例 / 355 断言）：15 个受保护用例**逐个**在
+> 成功侧与失败侧（授权失败 + 领域失败）都留下审计，字段含 actor / partition / object_id /
+> result / epoch_millis / **correlation_id**；实现上统一为 RAII 守卫（`AuditGuard`），
+> "任何提前 return 都会记账"（手写调用漏掉失败出口是**静默**的）。
+> ⑨ **C8.6 事件**：由 P6 的既有用例机械覆盖（`IN_PROGRESS→SUCCESS` 各恰好一次 + 
+> `datasetDetails` 含 record id/version/correlationId/timestamp；失败路径 `IN_PROGRESS→FAILED`），
+> 本次把操作名表写进契约 §4.6 并逐条对照。
+> ⑩ **C8.9 multi 5 条启动校验**：仓储必须 PG / 租约与选举开启 / GC 必须要求租约到期 /
+> 存储根共享挂载 / 时钟偏差容忍范围（0 < 值 ≤ 60）—— 五条各有一条"拒绝"测试 + 一条
+> "全满足必须通过"的正例；组合根对 `FSS_DEPLOYMENT_MODE=multi` **拒绝启动**（PG 运行形态属 P9）。
+> ⑪ **C8.10 时钟偏移**：`app::ClockSkewGuard`（参考时钟是 TTL/过期判定的**唯一**时间源；
+> 快钟/慢钟超容忍 → fail-closed）+ JWT `exp` 的 ±skew 边界用例。
+>
+> **切片 2（已收口）**：跨租户隔离与远端 Entitlements。
 > ⑤ **C8.2 跨租户隔离**（`test_tenant_isolation`，2 用例 / 107 断言）：两个租户 + 真实 HTTP
 > + 真实 JWT；A 的 token 配 B 的头 → **403**（鉴权层拦，不去 B 的分区查）；B 读/删 A 的记录
 > → **404** 且响应里没有 A 的任何数据；B 的列表看不到 A 的记录（A 自己能列到 → 正例）；
@@ -667,7 +682,9 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase8 --output-on
 | **C8.9** | `deployment.mode=multi` 的 **5 条强制启动校验**各有一个"拒绝启动"的测试：仓储必须为 PG、租约与选举必须开启、GC 必须要求租约到期、存储根必须在共享挂载上、时钟偏移在容忍范围内 |
 | **C8.10** | 时钟偏移：模拟快钟/慢钟实例 → 租约与 token 过期**不误判**（租约判定一律用 PG 的 `now()`） |
 
-**退出条件**：C8.1–C8.8 满足，证据写入 `docs/test-evidence/phase8.md`。
+**退出条件**：C8.1–C8.8 满足，证据写入 `docs/test-evidence/phase8.md`。✅ **已达成**
+（2026-09；C8.9/C8.10 为表中**加粗**的追加判据：配置级与机制级已完成并测试，
+端到端形态依赖 PG 版仓储/租约/数据库时钟 —— 属 P9，见其"未做"清单）。
 
 ---
 

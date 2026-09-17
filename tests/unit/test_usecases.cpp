@@ -76,6 +76,13 @@ TEST_CASE("①~③ GetUploadLocation / GetFileLocation / GetDownloadLocation",
   //  审计真的被写过（"用例走了这条路"的证据）
   REQUIRE(fx.audit.events.size() == 1);
   REQUIRE(fx.audit.events[0].operation == "createLocationSuccess");
+  //  ★ C8.7：审计必须带 actor / 对象 / 结果 / 时间 / correlation-id
+  REQUIRE(fx.audit.events[0].user == fx.caller.user_id);
+  REQUIRE(fx.audit.events[0].partition == fx.caller.partition);
+  REQUIRE(fx.audit.events[0].object_id == up.value().file_id);
+  REQUIRE(fx.audit.events[0].result == "success");
+  REQUIRE(fx.audit.events[0].epoch_millis > 0);
+  REQUIRE(fx.audit.events[0].correlation_id == fx.caller.correlation_id);
 
   //  上传时按契约 §2.1 在 staging 建立了空对象
   const auto location = fx.locations.Find(fx.caller.partition, up.value().file_id);
@@ -334,7 +341,7 @@ TEST_CASE("⑫⑬ RevokeUrl（不要求 partition） / GetInfo（无鉴权）", 
   RevokeUrl revoke(*fx.ports);
   CallerContext no_partition{"", "osdu-user", "Bearer token"};
   REQUIRE(revoke.Execute(no_partition).ok());        // 契约 §2.11：不需要 data-partition-id
-  REQUIRE(fx.audit.events.back().operation == "revokeUrl");
+  REQUIRE(fx.audit.events.back().operation == "revokeUrlSuccess");
 
   GetInfo info(*fx.ports);
   const auto version = info.Execute();

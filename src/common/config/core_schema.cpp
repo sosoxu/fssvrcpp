@@ -52,6 +52,10 @@ Schema CoreSchema() {
   s.Add(FieldSpec{"deployment.environment"}
             .Str("development=开发/测试；production=生产（触发更严格的强制校验）")
             .Enum({"development", "production"}).Default("development"));
+  //  时钟偏差容忍范围（秒）：本地钟与参考钟（多实例下 = 数据库 now()）的允许偏差。
+  //  ★ TTL/租约/过期判定一律用参考钟；本值只决定"偏差多大时拒绝服务"（C8.10）
+  s.Add(FieldSpec{"deployment.max_clock_skew_seconds"}
+            .Int(0, 300, "多实例下不得超过 60（容忍范围过大等于放任误判）").Default("5"));
   s.Add(FieldSpec{"deployment.mode"}.Str("single=单实例；multi=多实例")
           .Enum({"single", "multi"}).Default("single"));
   s.Add(FieldSpec{"deployment.instance_id"}.Str("空则自动生成；K8s 下建议注入 POD_NAME").Default(""));
@@ -263,6 +267,16 @@ Schema CoreSchema() {
             problems.emplace_back("leader_election.enabled", "multi 时必须开启（GC 必须单例运行）");
           if (StrOr(c, "storage.posix.shared_mount_required", "false") != "true")
             problems.emplace_back("storage.posix.shared_mount_required", "multi 时必须为 true");
+          //  ★ GC 必须要求"租约到期"（ADR-009：无元数据记录即在途，不能当孤儿删）
+          if (StrOr(c, "gc.require_lease_expiry", "true") != "true")
+            problems.emplace_back("gc.require_lease_expiry",
+                                  "multi 时必须为 true（否则 GC 会误删在途上传）");
+          //  ★ 时钟偏差容忍范围必须存在且足够小（C8.10）：过大等于放任误判
+          const auto skew = GetOr(c, "deployment.max_clock_skew_seconds", "5");
+          if (skew.is_number_integer() && (skew.get<long>() <= 0 || skew.get<long>() > 60)) {
+            problems.emplace_back("deployment.max_clock_skew_seconds",
+                                  "multi 时必须 > 0 且 <= 60 秒（时钟偏差过大会让租约/过期误判）");
+          }
         }
         // ---- 认证（ADR-012 / C8.5）----
         const std::string environment = StrOr(c, "deployment.environment", "development");

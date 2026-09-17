@@ -27,6 +27,8 @@
   "deployment": {
     //  development=开发/测试；production=生产（禁止 auth.mode=disabled 与关闭验签）
     "environment": "development",
+    //  本地钟与参考钟（multi 下 = 数据库 now()）的允许偏差；multi 时要求 0 < 值 <= 60
+    "max_clock_skew_seconds": 5,
     // single = 单实例（可用本地 SQLite）；multi = 多实例（状态必须外置到 PostgreSQL）
     // ★ multi 会强制校验 5 条，任一条不满足 → 拒绝启动（ADR-009 §8.1）
     "mode": "single",

@@ -300,6 +300,18 @@ fss_add_test(test_tenant_isolation
           fss_metadata_memory fss_transfer Threads::Threads
   LABELS  "phase8;integration")
 
+# C8.10：时钟偏移护栏（快钟/慢钟 + 参考时钟是唯一时间源）
+fss_add_test(test_clock_skew_guard
+  SOURCES unit/test_clock_skew_guard.cpp
+  LIBS    fss_app
+  LABELS  "phase8;unit")
+
+# C8.7：审计覆盖（每个受保护用例的成功/失败两侧 + 字段齐全）
+fss_add_test(test_audit_coverage
+  SOURCES unit/test_audit_coverage.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+  LABELS  "phase8;unit")
+
 # C8.4：远端 Entitlements 的 fail-closed（超时 / 5xx / 坏 JSON / 未配置 → 一律 503）
 fss_add_test(test_remote_entitlements_authorizer
   SOURCES unit/test_remote_entitlements_authorizer.cpp

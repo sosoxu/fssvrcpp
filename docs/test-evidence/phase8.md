@@ -1,15 +1,16 @@
-# 阶段 8 测试证据（🚧 进行中）
+# 阶段 8 测试证据（✅ 已完成）
 
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P8（认证授权与多租户） |
-| 状态 | 🚧 **进行中 —— 切片 2/3 完成**（+ 跨租户隔离 + 远端 Entitlements fail-closed） |
+| 状态 | ✅ **已完成并通过门槛 —— C8.1~C8.8 全部满足**（3 个切片全部收口） |
 | 门槛命令 | `ctest -L phase8` |
-| 退出码 | `0`（**4 测试 / 954 断言**：`test_jwt_authorizer` 68、`test_auth_matrix` 717、`test_remote_entitlements_authorizer` 62、`test_tenant_isolation` 107；另在 phase7 标签下有"缺结束标记"的确定性用例，`test_grpc_streaming` 9 用例） |
+| 退出码 | `0`（**6 测试 / 1323 断言**）：`test_jwt_authorizer` 68、`test_auth_matrix` 717、`test_remote_entitlements_authorizer` 62、`test_tenant_isolation` 107、`test_audit_coverage` 355、`test_clock_skew_guard` 14；另在 phase7 标签下有"缺结束标记"的确定性用例（`test_grpc_streaming` 9 用例） |
 | 决策记录 | `docs/adr/ADR-012-auth-and-tenant-binding.md`（已采纳） |
 
-> **剩余**：切片 3 = 事件（C8.6）+ 审计（C8.7）+ `deployment.mode=multi` 的 5 条启动校验
-> （C8.9）+ 时钟偏移（C8.10）。
+> **收口**：C8.1~C8.8 全部满足（退出条件达成）；C8.9（配置级）与 C8.10（机制级）也已完成。
+> **依赖 PG 的端到端形态（PG 仓储/租约/数据库时钟、`deployment.mode=multi` 运行形态）登记给 P9**：
+> 组合根当前对 `FSS_DEPLOYMENT_MODE=multi` **拒绝启动**（明确报错，而不是以单实例状态跑多实例）。
 
 ---
 
@@ -38,6 +39,20 @@
 | `src/main/server_main.cpp` | `FSS_AUTH_MODE=remote-entitlements` 走真实实现；未配 `FSS_ENTITLEMENTS_URL` → **拒绝启动** |
 | `src/common/config/core_schema.cpp` + `config/fss.example.json` | `auth.remote_entitlements.{authorize_path,connect_timeout_ms}`；远端模式强制"有地址 + fail_closed=true" |
 
+## 1.2 切片 3 交付物
+
+| 路径 | 内容 |
+| --- | --- |
+| `src/app/usecases/usecases.cpp`（`AuditGuard`） | **审计守卫（RAII）**：15 个受保护用例逐个接线；操作名按上游约定自动加 `Success`/`Failure` 后缀；任何 `FSS_TRY` 提前返回都会记账（手写调用漏掉失败出口是**静默**的） |
+| `src/domain/ports/ports.h`（`AuditEvent`） | 审计事件新增 `correlation_id`（C8.7 要求含 correlation-id）；`RecordAudit` 从 `CallerContext` 填充 |
+| `tests/unit/test_audit_coverage.cpp` | C8.7：15 个用例的**成功侧**（表驱动）+ **失败侧**（授权失败 15 条 + 领域失败 `kNotFound`），逐条断言 5 个字段 |
+| `src/app/services/clock_skew_guard.{h,cpp}` | C8.10：参考时钟是 TTL/过期判定的**唯一**时间源；快/慢钟超容忍 → `kUnavailable`（fail-closed） |
+| `tests/unit/test_clock_skew_guard.cpp` | C8.10：快钟/慢钟/边界/放宽容忍范围 + "判定时间跟参考钟走" |
+| `src/common/config/core_schema.cpp` + `config/fss.example.json` | C8.9：`deployment.max_clock_skew_seconds` + multi 模式新增两条强制校验（GC 必须要求租约到期、时钟偏差 `0 < 值 ≤ 60`） |
+| `tests/unit/test_config.cpp` | C8.9：五条强制校验各一条"拒绝"断言 + **全满足必须通过**（正例）+ 单实例不误伤 |
+| `src/main/server_main.cpp` | `FSS_MAX_CLOCK_SKEW_SECONDS` → JWT 容忍范围；`FSS_DEPLOYMENT_MODE=multi` → **拒绝启动**（PG 运行形态属 P9） |
+| `docs/03-api-contract.md` §4.6/§1.6b | 审计与事件操作名表 + multi 五条校验 |
+
 ## 2. 判据进展
 
 | 判据 | 状态 | 证据 |
@@ -47,9 +62,11 @@
 | **C8.3** JWT 边界 | ✅ | `test_jwt_authorizer`：过期、无 `exp`、`nbf` 未到、`iss`/`aud` 错（含 `aud` 数组形态）、错密钥签名、`alg=none`、`alg=RS256`、7 种畸形串、**载荷/签名混拼**（提权）→ 全部 401；`exp` 边界含 ±skew（C8.10 的机制基础） |
 | **C8.4** 远端不可达 fail-closed | ✅ | `test_remote_entitlements_authorizer`（3 用例 / 62 断言）：**超时注入**（mock 睡 800 ms / 客户端 150 ms）、5xx、坏 JSON、缺 `allowed`、连不上、未配地址 → 全部 `kUnavailable`（503），**没有**任何一条走成放行；401 → kUnauthenticated、allowed=false → kPermissionDenied；配置校验拒绝 `fail_closed=false`；**注入 fail-open 后本用例必须失败**（见 §4） |
 | **C8.5** `disabled` 告警 + `/v2/info` 标记 + production 校验 | ✅ | 组合根告警 + `authMode` 字段（REST 与 gRPC 同源）+ `test_config` 的三条拒绝 + 一条正例；`test_auth_matrix` 断言 `/v2/info` 的 `authMode == "disabled"`（fixture 未设模式时） |
-| **C8.6** 事件 / **C8.7** 审计 | ⬜ 未开始（切片 3；P6 已实现事件与审计的**注入点**，这里补"真实鉴权下的完整覆盖"） | — |
+| **C8.6** 事件（`IN_PROGRESS`→`SUCCESS` / `FAILED`） | ✅ | P6 的既有用例机械覆盖：`test_metadata_lifecycle` 断言成功路径 `statuses == {IN_PROGRESS, SUCCESS}`（各恰好一次）、`datasetDetails` 含 `dataset_id`/`dataset_version_id`/`correlationId`/`timestamp`；失败路径 `statuses == {IN_PROGRESS, FAILED}`。本次把操作名/状态表写进契约 §4.6 并逐条对照（§2.1 的"记录在先、实现在后"） |
+| **C8.7** 审计（成功+失败两侧、字段齐全） | ✅ | `test_audit_coverage`（2 用例 / 355 断言）：**15 个受保护用例**逐个在成功侧（表驱动）与失败侧（授权失败 15 条 + 领域失败 `kNotFound`）都断言 `operation`（含 Success/Failure 后缀）、`user`、`partition`、`object_id`、`result`、`epoch_millis`、`correlation_id`。实现改为 RAII 守卫，失败出口不再可能被漏记 |
 | **C8.8** 回归（P0–P7 全绿） | ✅ | `ctest --test-dir build`：**65/65 通过**（含 phase4 的 401/403 契约用例；`HttpFixture`/`PosixStackFixture` 继续**显式注入** `AllowAllAuthorizer`，不依赖配置默认值） |
-| **C8.9** multi 启动校验 / **C8.10** 时钟偏移 | ⬜ 未开始（切片 3） | 机制已就位：授权器的 `clock_skew_seconds` 与 `IClock` 注入 |
+| **C8.9** multi 的 5 条强制启动校验 | ✅ **配置级**（运行形态属 P9） | `test_config`：仓储必须 PG、租约+选举开启、GC 必须 `require_lease_expiry`、存储根共享挂载、`max_clock_skew_seconds ∈ (0,60]` —— 每条都有"拒绝"断言，且五条全满足时**必须通过**（正例）+ 单实例不受影响。组合根对 `FSS_DEPLOYMENT_MODE=multi` 拒绝启动（PG 运行形态未交付） |
+| **C8.10** 时钟偏移不误判 | ✅ **机制级**（端到端需 PG 时钟，属 P9） | `test_clock_skew_guard`：参考时钟是判定用的**唯一**时间源（本地钟只用来比对）、快/慢钟超容忍 → `kUnavailable`、边界与放宽容忍范围各一条；token `exp` 的 ±skew 边界在 `test_jwt_authorizer`（快/慢 3 秒接受、10 秒拒绝） |
 
 ## 3. 两条"看起来等价、实际不同"的判定（本切片的关键设计）
 
@@ -83,19 +100,22 @@
 
 | **P8-D06** | 远端鉴权用例第一次跑：期望"未授予 → 403"却拿到 503 | mock 同时开了 `--require-role service.file.editors`：任何"请求别的角色"的探测都被 mock 判成 **400**（协议错误）→ 我们 fail-closed 成 503，把"未授予"的语义盖掉了 | 一个 mock 开关只表达**一件事**：`require_partition` 用于证明"客户端确实带了租户头"；"客户端是否如实转发 roles"改由**授权结果**反向证明（请求未授予的角色必须被拒）—— 若客户端偷懒总问一个已授予的角色，那条断言会失败 |
 
-## 6. 收工验证（切片 1 + 切片 2）
+| **P8-D07** | 加审计覆盖时发现：`GetFileLocation` / `GetFileList` / `GetFileMetadata` / `GetStorageInstructions` / `GetRetrievalInstructions` / `GetFileSignedUrl` / `DownloadFile` 等**端点在失败侧（甚至成功侧）根本没有审计记录**；即使有记录的端点也只记了成功侧 | 审计是在每个 `Execute` 里**手写**的 `RecordAudit` 调用。一个 `Execute` 有 4~8 个失败出口（授权/解析/仓储/存储/事件），手写必然漏；而"漏审计"不会让任何测试失败 —— 它是**静默**的 | 统一为 RAII 守卫 `AuditGuard`（析构时按 `Success()` 是否被调用记账），15 个用例逐个接线；操作名由"业务动作"自动派生 `Success`/`Failure`；并新增表驱动的 `test_audit_coverage` 逐个钉住两侧 |
+
+## 6. 收工验证（切片 1 + 2 + 3）
 
 | 命令 | 结果 |
 | --- | --- |
-| `ctest --test-dir build -L phase8 --output-on-failure` | ✅ **4 测试 / 954 断言**（`test_jwt_authorizer` 68 + `test_auth_matrix` 717 + `test_remote_entitlements_authorizer` 62 + `test_tenant_isolation` 107） |
-| `ctest --test-dir build`（全量回归，C8.8） | ✅ **67/67 通过**（含 phase4 的 401/403 契约用例与 phase7 的双协议用例） |
+| `ctest --test-dir build -L phase8 --output-on-failure` | ✅ **6 测试 / 1323 断言**（jwt 68 + auth_matrix 717 + remote_entitlements 62 + tenant_isolation 107 + audit_coverage 355 + clock_skew_guard 14） |
+| `ctest --test-dir build`（全量回归，C8.8） | ✅ **69/69 通过**（含 phase4 的 401/403 契约用例与 phase7 的双协议用例） |
 | `./scripts/check_docs.sh` | ✅ D1~D5（新增 ADR-012 后 ADR 索引仍完整：11 个文件 / 12 个编号） |
-| `./scripts/run_all_gates.sh` | ✅ **phase0~8 全部通过**，`失败: 无`（切片 1 日志 `build/gates-p8s1b.log`，切片 2 日志 `build/gates-p8s2.log`）；phase8 已在 `IMPLEMENTED_PHASES` 中 |
+| `./scripts/run_all_gates.sh` | ✅ **phase0~8 全部通过**，`失败: 无`（切片 3 日志 `build/gates-p8s3.log`；phase8 已在 `IMPLEMENTED_PHASES` 中） |
 | sanitizer（`run_all_gates.sh` 内嵌，`build-asan`） | ✅ ASan + UBSan + LSan 全绿，**含 phase8 与 phase7**；"缺结束标记/取消"的用例在 ASan 下连跑 3 次全绿（P8-D05 的原始症状正是在这里暴露的） |
 
-**结论**：切片 1+2 完成 —— REST 面的端点 × 角色矩阵、JWT 边界、租户绑定、跨租户隔离、
-两种角色来源（本地 claim / 远端 Entitlements）的 fail-closed、配置强校验、`authMode`
-可见性均已落地并有机械证据。**剩余切片 3** 见开头"剩余"。
+**结论**：**P8 收口** —— C8.1~C8.8 全部满足：端点×角色矩阵、JWT 边界、租户绑定与跨租户隔离、
+两种角色来源的 fail-closed、审计（成功+失败两侧、字段齐全）、事件序列、回归全绿；
+另完成 C8.9（配置级五条校验）与 C8.10（时钟偏移机制）。**依赖 PG 的端到端形态（PG 仓储/
+租约/数据库时钟与 multi 运行形态）登记给 P9**，组合根当前对该模式**拒绝启动**。
 
 ## 7. 未验证 / 已知限制（如实登记）
 

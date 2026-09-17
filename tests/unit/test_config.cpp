@@ -379,6 +379,81 @@ TEST_CASE("★ C8.5 认证配置的强制校验：production 不得 disabled / �
   REQUIRE(r5.ok);
 }
 
+TEST_CASE("★ C8.9 multi 模式的 5 条强制启动校验：逐条拒绝 + 补齐后必须通过",
+          "[phase8][config][c8.9]") {
+  fss::test::TempDir tmp("cfg_multi_c89");
+  LoadRequest req;
+  req.schema = fss::config::CoreSchema();
+
+  //  ① 仓储必须为 PG（缺一条 → 拒绝，并给出该字段）
+  req.file_path = WriteFile(tmp.str(), "m1.json", R"({"deployment": {"mode": "multi"}})");
+  auto r1 = fss::config::Load(req);
+  REQUIRE_FALSE(r1.ok);
+  REQUIRE(HasProblem(r1.config.problems(), "metadata.repository", "必须是 postgres"));
+  REQUIRE(HasProblem(r1.config.problems(), "location.repository", "必须是 postgres"));
+  REQUIRE(HasProblem(r1.config.problems(), "leases.enabled", "必须开启"));
+  REQUIRE(HasProblem(r1.config.problems(), "leader_election.enabled", "必须开启"));
+  REQUIRE(HasProblem(r1.config.problems(), "storage.posix.shared_mount_required", "必须为 true"));
+
+  //  ② GC 必须要求租约到期
+  req.file_path = WriteFile(tmp.str(), "m2.json", R"({
+    "deployment": {"mode": "multi", "max_clock_skew_seconds": 5},
+    "metadata": {"repository": "postgres"}, "location": {"repository": "postgres"},
+    "leases": {"enabled": true}, "leader_election": {"enabled": true},
+    "storage": {"posix": {"shared_mount_required": true}},
+    "gc": {"require_lease_expiry": false}
+  })");
+  auto r2 = fss::config::Load(req);
+  REQUIRE_FALSE(r2.ok);
+  REQUIRE(HasProblem(r2.config.problems(), "gc.require_lease_expiry", "multi 时必须为 true"));
+
+  //  ③ 时钟偏差容忍范围必须 0 < 值 <= 60
+  //     （字段级范围是 0..300；>60 由跨字段规则拒绝，>300 连字段级都过不了）
+  req.file_path = WriteFile(tmp.str(), "m3.json", R"({
+    "deployment": {"mode": "multi", "max_clock_skew_seconds": 120},
+    "metadata": {"repository": "postgres"}, "location": {"repository": "postgres"},
+    "leases": {"enabled": true}, "leader_election": {"enabled": true},
+    "storage": {"posix": {"shared_mount_required": true}},
+    "gc": {"require_lease_expiry": true}
+  })");
+  auto r3 = fss::config::Load(req);
+  REQUIRE_FALSE(r3.ok);
+  REQUIRE(HasProblem(r3.config.problems(), "deployment.max_clock_skew_seconds", "<= 60"));
+
+  //  ③b 超出字段范围（0..300）的值：字段级校验就拒绝（两道防线都要有）
+  req.file_path = WriteFile(tmp.str(), "m3b.json", R"({
+    "deployment": {"mode": "multi", "max_clock_skew_seconds": 3600},
+    "metadata": {"repository": "postgres"}, "location": {"repository": "postgres"},
+    "leases": {"enabled": true}, "leader_election": {"enabled": true},
+    "storage": {"posix": {"shared_mount_required": true}},
+    "gc": {"require_lease_expiry": true}
+  })");
+  auto r3b = fss::config::Load(req);
+  REQUIRE_FALSE(r3b.ok);
+  REQUIRE(HasProblem(r3b.config.problems(), "deployment.max_clock_skew_seconds", ""));
+
+  //  ★ 正例（R16）：五条全部满足 → **必须通过**（否则无法区分"校验正确"与"校验恒真"）
+  req.file_path = WriteFile(tmp.str(), "m_ok.json", R"({
+    "deployment": {"mode": "multi", "max_clock_skew_seconds": 5},
+    "metadata": {"repository": "postgres"}, "location": {"repository": "postgres"},
+    "leases": {"enabled": true}, "leader_election": {"enabled": true},
+    "storage": {"posix": {"shared_mount_required": true}},
+    "gc": {"require_lease_expiry": true}
+  })");
+  auto ok = fss::config::Load(req);
+  INFO(ok.config.ProblemsToString());
+  REQUIRE(ok.ok);
+
+  //  单实例：同样的 GC/时钟设置**不受** multi 约束（不误伤）
+  req.file_path = WriteFile(tmp.str(), "single.json", R"({
+    "deployment": {"mode": "single", "max_clock_skew_seconds": 5},
+    "gc": {"require_lease_expiry": false}
+  })");
+  auto single = fss::config::Load(req);
+  INFO(single.config.ProblemsToString());
+  REQUIRE(single.ok);
+}
+
 TEST_CASE("跨字段规则：租约续租间隔必须小于 TTL、传输内存预算", "[phase1][config]") {
   fss::test::TempDir tmp("cfg_cross2");
   LoadRequest req;

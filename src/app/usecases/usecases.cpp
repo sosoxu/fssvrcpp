@@ -69,8 +69,43 @@ void RecordAudit(UseCasePorts& ports, std::string_view operation, const CallerCo
   event.object_id = std::string(object_id);
   event.result = success ? "success" : "failure";
   event.epoch_millis = ports.clock.NowEpochMillis();
+  event.correlation_id = caller.correlation_id;
   (void)ports.audit.Record(event);
 }
+
+//  审计守卫（C8.7）：**每个受保护端点在成功与失败两侧都要有审计记录**。
+//  为什么用 RAII 而不是在每个 return 前手写一次：一次 Execute 里有 4~8 个失败出口
+//  （授权、解析、仓储、存储、事件…），手写必然漏掉某一条 —— 而"漏审计"是**静默**的。
+//  守卫在析构时按 `Success()` 是否被调用决定 success/failure，任何 `FSS_TRY` 提前返回
+//  都会走到它。`SetObjectId` 用于"对象 id 在过程中才知道"的用例（如创建类端点）。
+class AuditGuard {
+ public:
+  AuditGuard(UseCasePorts& ports, const CallerContext& caller, std::string_view operation,
+             std::string object_id = {})
+      : ports_(ports),
+        caller_(caller),
+        operation_(operation),
+        object_id_(std::move(object_id)) {}
+  //  ★ 操作名按上游 `AuditOperation` 的约定带结果后缀（createLocationSuccess / Failure）：
+  //    调用点只写"业务动作"，避免每个 endpoint 各写两遍名字（写错一个就少一条审计）
+  ~AuditGuard() {
+    RecordAudit(ports_, operation_ + (success_ ? "Success" : "Failure"), caller_, object_id_,
+                success_);
+  }
+
+  void SetObjectId(std::string object_id) { object_id_ = std::move(object_id); }
+  void Success() { success_ = true; }
+
+  AuditGuard(const AuditGuard&) = delete;
+  AuditGuard& operator=(const AuditGuard&) = delete;
+
+ private:
+  UseCasePorts& ports_;
+  const CallerContext& caller_;
+  std::string operation_;
+  std::string object_id_;
+  bool success_ = false;
+};
 
 //  状态变更事件（契约 §2.6 的第 1/10/12 步）：**非致命**
 void PublishStatus(UseCasePorts& ports, const CallerContext& caller, std::string_view status,
@@ -270,15 +305,16 @@ std::string ProviderKeyOf(const domain::FileLocation& location) {
 fss::Result<LocationResult> GetUploadLocation::Execute(
     const CallerContext& caller, const std::optional<std::string>& requested_file_id,
     const std::optional<std::string>& expiry_time) {
+  AuditGuard audit(ports_, caller, "createLocation", requested_file_id.value_or(""));
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleEditors, /*require_partition=*/true));
 
   auto result = ports_.issuer.IssueUploadLocation(caller.partition, caller.user_id,
                                                   requested_file_id, expiry_time);
   if (!result.ok()) {
-    RecordAudit(ports_, "createLocationFailure", caller, "", false);
-    return result.error();
+    return result.error();  // 失败路径由守卫记 `createLocationFailure`
   }
-  RecordAudit(ports_, "createLocationSuccess", caller, result.value().file_id, true);
+  audit.SetObjectId(result.value().file_id);
+  audit.Success();
   return result;
 }
 
@@ -287,6 +323,7 @@ fss::Result<LocationResult> GetUploadLocation::Execute(
 // =============================================================================
 fss::Result<FileLocationView> GetFileLocation::Execute(const CallerContext& caller,
                                                        std::string_view file_id) {
+  AuditGuard audit(ports_, caller, "readFileLocation", std::string(file_id));
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleEditors, true));
   FSS_TRY(location, ports_.locations.Find(caller.partition, file_id));
 
@@ -297,6 +334,7 @@ fss::Result<FileLocationView> GetFileLocation::Execute(const CallerContext& call
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   view.location = PhysicalLocationOf(location);
   view.file_source = location.file_source;
+  audit.Success();
   return view;
 }
 
@@ -306,6 +344,7 @@ fss::Result<FileLocationView> GetFileLocation::Execute(const CallerContext& call
 fss::Result<DownloadLocationResult> GetDownloadLocation::Execute(
     const CallerContext& caller, std::string_view file_id,
     const std::optional<std::string>& expiry_time) {
+  AuditGuard audit(ports_, caller, "createDownloadLocation", std::string(file_id));
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleViewers, true));
   FSS_TRY(result, ports_.issuer.IssueDownloadLocation(caller.partition, file_id, expiry_time));
 
@@ -315,7 +354,7 @@ fss::Result<DownloadLocationResult> GetDownloadLocation::Execute(
   out.driver = result.driver;
   out.expires_at_epoch_seconds = result.expires_at_epoch_seconds;
   out.native_presign = result.native_presign;
-  RecordAudit(ports_, "getDownloadLocationSuccess", caller, file_id, true);
+  audit.Success();
   return out;
 }
 
@@ -324,6 +363,7 @@ fss::Result<DownloadLocationResult> GetDownloadLocation::Execute(
 // =============================================================================
 fss::Result<FileListResult> GetFileList::Execute(const CallerContext& caller,
                                                  const FileListRequest& request) {
+  AuditGuard audit(ports_, caller, "getFileList");
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleEditors, true));
   if (request.items <= 0) return Invalid("Items 必须 > 0");
   if (request.page_num < 0) return Invalid("PageNum 必须 >= 0");
@@ -369,6 +409,7 @@ fss::Result<FileListResult> GetFileList::Execute(const CallerContext& caller,
     out.content.push_back(std::move(entry));
   }
   out.number_of_elements = static_cast<int>(out.content.size());
+  audit.Success();
   return out;
 }
 
@@ -377,6 +418,9 @@ fss::Result<FileListResult> GetFileList::Execute(const CallerContext& caller,
 // =============================================================================
 fss::Result<std::string> CreateFileMetadata::Execute(
     const CallerContext& caller, const domain::FileMetadataRecord& record) {
+  //  对象 id 在序列进行到第 9 步才知道 → 用 `SetObjectId` 补上（失败时至少带上 FileSource）
+  AuditGuard audit(ports_, caller, "createMetadata",
+                   record.data.dataset_properties.file_source_info.file_source);
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleEditors, true));
 
   // 1. 状态事件 IN_PROGRESS（非致命）
@@ -573,7 +617,8 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     }
   }
   (void)staging_removed;
-  RecordAudit(ports_, "createMetadataSuccess", caller, created.value().id, true);
+  audit.SetObjectId(created.value().id);
+  audit.Success();
   return created.value().id;
 }
 
@@ -582,8 +627,11 @@ fss::Result<std::string> CreateFileMetadata::Execute(
 // =============================================================================
 fss::Result<domain::FileMetadataRecord> GetFileMetadata::Execute(
     const CallerContext& caller, std::string_view record_id) {
+  AuditGuard audit(ports_, caller, "readMetadata", std::string(record_id));
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleViewers, true));
-  return ports_.metadata.GetById(caller.partition, record_id);
+  FSS_TRY(record, ports_.metadata.GetById(caller.partition, record_id));
+  audit.Success();
+  return record;
 }
 
 // =============================================================================
@@ -591,6 +639,7 @@ fss::Result<domain::FileMetadataRecord> GetFileMetadata::Execute(
 // =============================================================================
 fss::Result<void> DeleteFileMetadata::Execute(const CallerContext& caller,
                                               std::string_view record_id) {
+  AuditGuard audit(ports_, caller, "deleteMetadata", std::string(record_id));
   //  上游 `FileMetadataApi`：`hasPermission(FILE_EDITORS, FILE_ADMIN)` —— 任一即可
   static constexpr std::string_view kRoles[] = {domain::kRoleFileEditors,
                                                 domain::kRoleFileAdmin};
@@ -615,7 +664,7 @@ fss::Result<void> DeleteFileMetadata::Execute(const CallerContext& caller,
       (void)ports_.locations.Delete(caller.partition, location.value().file_id);
     }
   }
-  RecordAudit(ports_, "deleteMetadataSuccess", caller, record_id, true);
+  audit.Success();
   return Ok();
 }
 
@@ -624,6 +673,7 @@ fss::Result<void> DeleteFileMetadata::Execute(const CallerContext& caller,
 // =============================================================================
 fss::Result<StorageInstructions> GetStorageInstructions::Execute(
     const CallerContext& caller, const std::optional<std::string>& expiry_time) {
+  AuditGuard audit(ports_, caller, "getStorageInstructions");
   FSS_TRY(AuthorizeCaller(ports_, caller, kRoleDatasetEditors, true));
   FSS_TRY(location, ports_.issuer.IssueUploadLocation(caller.partition, caller.user_id,
                                                       std::nullopt, expiry_time));
@@ -634,6 +684,8 @@ fss::Result<StorageInstructions> GetStorageInstructions::Execute(
   out.file_source = location.file_source;
   out.created_by = caller.user_id;
   out.expires_at_epoch_seconds = location.expires_at_epoch_seconds;
+  audit.SetObjectId(location.file_id);
+  audit.Success();
   return out;
 }
 
@@ -643,6 +695,7 @@ fss::Result<StorageInstructions> GetStorageInstructions::Execute(
 fss::Result<std::vector<RetrievalInstruction>> GetRetrievalInstructions::Execute(
     const CallerContext& caller, const std::vector<std::string>& dataset_registry_ids,
     const std::optional<std::string>& expiry_time) {
+  AuditGuard audit(ports_, caller, "getRetrievalInstructions");
   FSS_TRY(AuthorizeCaller(ports_, caller, kRoleDatasetViewers, true));
 
   std::vector<RetrievalInstruction> out;
@@ -668,6 +721,7 @@ fss::Result<std::vector<RetrievalInstruction>> GetRetrievalInstructions::Execute
     instruction.expires_at_epoch_seconds = signed_url.value().expires_at_epoch_seconds;
     out.push_back(std::move(instruction));
   }
+  audit.Success();
   return out;
 }
 
@@ -676,6 +730,7 @@ fss::Result<std::vector<RetrievalInstruction>> GetRetrievalInstructions::Execute
 // =============================================================================
 fss::Result<std::vector<CopyFileOutcome>> CopyFiles::Execute(
     const CallerContext& caller, const std::vector<CopyFileSource>& sources) {
+  AuditGuard audit(ports_, caller, "copyFiles");
   //  上游 `FileDmsApi`/`FileCollectionDmsApi`：`hasPermission(STORAGE_CREATOR, STORAGE_ADMIN)`
   static constexpr std::string_view kRoles[] = {domain::kRoleStorageCreator,
                                                 domain::kRoleStorageAdmin};
@@ -712,7 +767,7 @@ fss::Result<std::vector<CopyFileOutcome>> CopyFiles::Execute(
     outcome.dataset_blob_storage_path = to_ref.container + "/" + to_ref.key;
     out.push_back(std::move(outcome));
   }
-  RecordAudit(ports_, "copyFiles", caller, "", true);
+  audit.Success();
   return out;
 }
 
@@ -722,6 +777,7 @@ fss::Result<std::vector<CopyFileOutcome>> CopyFiles::Execute(
 fss::Result<SignedUrlResult> GetFileSignedUrl::Execute(
     const CallerContext& caller, const std::vector<std::string>& srns,
     const std::optional<std::string>& expiry_time) {
+  AuditGuard audit(ports_, caller, "getFileSignedUrl");
   FSS_TRY(AuthorizeCaller(ports_, caller, kRoleDeliveryViewer, true));
 
   SignedUrlResult out;
@@ -751,6 +807,7 @@ fss::Result<SignedUrlResult> GetFileSignedUrl::Execute(
     if (record.ok()) entry.kind = record.value().kind;
     out.processed.emplace(srn, std::move(entry));
   }
+  audit.Success();
   return out;
 }
 
@@ -758,8 +815,9 @@ fss::Result<SignedUrlResult> GetFileSignedUrl::Execute(
 //  ⑫ RevokeUrl（不要求 partition；恒定成功语义）
 // =============================================================================
 fss::Result<void> RevokeUrl::Execute(const CallerContext& caller) {
+  AuditGuard audit(ports_, caller, "revokeUrl");
   FSS_TRY(AuthorizeCaller(ports_, caller, kRoleAdmin, /*require_partition=*/false));
-  RecordAudit(ports_, "revokeUrl", caller, "", true);
+  audit.Success();
   return Ok();
 }
 
@@ -789,24 +847,22 @@ fss::Result<VersionInfo> GetInfo::Execute() {
 fss::Result<UploadStreamResult> UploadFile::Execute(const CallerContext& caller,
                                                     const UploadStreamRequest& request,
                                                     bytes::ByteSource& body) {
+  AuditGuard audit(ports_, caller, "uploadFile", request.file_source);
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleEditors, /*require_partition=*/true));
   if (request.file_source.empty()) {
     return Invalid("UploadFile 要求 file_source（先调用 GetUploadLocation 取得）");
   }
   const auto location = ports_.locations.FindByFileSource(caller.partition, request.file_source);
   if (!location.ok()) {
-    RecordAudit(ports_, "uploadFileFailure", caller, "", false);
     return Err(fss::ErrorKind::kNotFound,
                "没有 FileSource = " + request.file_source + " 的位置记录（请先调用 GetUploadLocation）");
   }
   FSS_TRY(ref, ObjectRefFromLocation(location.value()));
   if (request.container.has_value() && *request.container != ref.container) {
-    RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
     return Err(fss::ErrorKind::kPermissionDenied,
                "container 与已签发的位置记录不一致（不接受坐标覆盖）");
   }
   if (request.key.has_value() && *request.key != ref.key) {
-    RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
     return Err(fss::ErrorKind::kPermissionDenied,
                "key 与已签发的位置记录不一致（不接受坐标覆盖）");
   }
@@ -821,7 +877,6 @@ fss::Result<UploadStreamResult> UploadFile::Execute(const CallerContext& caller,
   options.checksum_algorithm = request.checksum_algorithm;
   const auto put = store->put(ref, body, options);
   if (!put.ok()) {
-    RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
     return put.error();
   }
 
@@ -844,24 +899,22 @@ fss::Result<UploadStreamResult> UploadFile::Execute(const CallerContext& caller,
   //  `register_metadata=true` 时复用**同一个** 12 步用例（不另写一条注册路径）
   if (request.register_metadata) {
     if (!request.metadata.has_value()) {
-      RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
       return Invalid("register_metadata=true 时必须提供 metadata");
     }
     const auto& declared =
         request.metadata->data.dataset_properties.file_source_info.file_source;
     if (declared != request.file_source) {
-      RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
       return Invalid("metadata 的 data.FileSource 与上传目标不一致");
     }
     CreateFileMetadata create(ports_);
     const auto created = create.Execute(caller, *request.metadata);
     if (!created.ok()) {
-      RecordAudit(ports_, "uploadFileFailure", caller, location.value().file_id, false);
       return created.error();
     }
     out.metadata_record_id = created.value();
   }
-  RecordAudit(ports_, "uploadFileSuccess", caller, location.value().file_id, true);
+  audit.SetObjectId(location.value().file_id);
+  audit.Success();
   return out;
 }
 
@@ -876,6 +929,8 @@ fss::Result<DownloadStreamResult> DownloadFile::Execute(const CallerContext& cal
                                                         std::uint64_t offset,
                                                         std::uint64_t length,
                                                         bytes::ByteSink& sink) {
+  AuditGuard audit(ports_, caller, "downloadFile",
+                   file_id.empty() ? std::string(file_source) : std::string(file_id));
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleViewers, /*require_partition=*/true));
   if (file_id.empty() && file_source.empty()) {
     return Invalid("DownloadFile 要求 file_id 或 file_source");
@@ -902,6 +957,7 @@ fss::Result<DownloadStreamResult> DownloadFile::Execute(const CallerContext& cal
   out.checksum = stat.checksum;
   out.checksum_algorithm = stat.checksum_algorithm;
   out.bytes_written = static_cast<std::uint64_t>(counter.bytes_written());
+  audit.Success();
   return out;
 }
 
@@ -914,6 +970,7 @@ fss::Result<DownloadStreamResult> DownloadFile::Execute(const CallerContext& cal
 fss::Result<ServerSideCopyResult> ServerSideCopy::Execute(
     const CallerContext& caller, std::string_view source_file_source,
     std::string_view target_file_source, domain::StorageZone target_zone) {
+  AuditGuard audit(ports_, caller, "serverSideCopy", std::string(source_file_source));
   static constexpr std::string_view kRoles[] = {domain::kRoleStorageCreator,
                                                 domain::kRoleStorageAdmin};
   FSS_TRY(AuthorizeCallerAny(ports_, caller, kRoles, /*require_partition=*/true));
@@ -940,7 +997,8 @@ fss::Result<ServerSideCopyResult> ServerSideCopy::Execute(
   ServerSideCopyResult out;
   out.file_source = std::string(target_file_source);
   out.bytes_copied = stat.size > 0 ? static_cast<std::uint64_t>(stat.size) : 0;
-  RecordAudit(ports_, "serverSideCopySuccess", caller, source_location.file_id, true);
+  audit.SetObjectId(source_location.file_id);
+  audit.Success();
   return out;
 }
 
