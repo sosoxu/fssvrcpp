@@ -44,6 +44,7 @@ const InMemoryMetadataRepository::Chain* InMemoryMetadataRepository::FindChain(
 
 fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::Create(
     std::string_view partition, const domain::FileMetadataRecord& record) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(ValidatePartitionAndId(partition, record));
 
   const std::string part(partition);
@@ -77,6 +78,7 @@ fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::Create(
 
 fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::GetById(
     std::string_view partition, std::string_view record_id) {
+  std::lock_guard<std::mutex> guard(mutex_);
   const Chain* chain = FindChain(partition, record_id);
   if (chain == nullptr || chain->empty()) {
     return NotFound("Record Not Found");
@@ -86,16 +88,24 @@ fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::GetById(
 
 fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::GetLatestByFileSource(
     std::string_view partition, std::string_view file_source) {
+  std::lock_guard<std::mutex> guard(mutex_);
   const auto owner =
       source_index_.find(SourceKey{std::string(partition), std::string(file_source)});
   if (owner == source_index_.end()) {
     return NotFound("Record Not Found");
   }
-  return GetById(partition, owner->second);
+  //  ★ 不能调用 `GetById(...)`：它也要拿同一把**非递归**互斥量 → 自死锁
+  //    （实测：并发用例挂死；加锁的类里"公开方法互调"是第一个要审的地方）
+  const Chain* chain = FindChain(partition, owner->second);
+  if (chain == nullptr || chain->empty()) {
+    return NotFound("Record Not Found");
+  }
+  return chain->back().record;
 }
 
 fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::Update(
     std::string_view partition, const domain::FileMetadataRecord& record) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(ValidatePartitionAndId(partition, record));
 
   const std::string part(partition);
@@ -125,6 +135,7 @@ fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::Update(
 
 fss::Result<void> InMemoryMetadataRepository::Delete(std::string_view partition,
                                                      std::string_view record_id) {
+  std::lock_guard<std::mutex> guard(mutex_);
   Chain* chain = nullptr;
   {
     const auto bucket = by_id_.find(std::string(partition));
@@ -142,6 +153,7 @@ fss::Result<void> InMemoryMetadataRepository::Delete(std::string_view partition,
 
 fss::Result<domain::MetadataPage> InMemoryMetadataRepository::List(
     std::string_view partition, const domain::MetadataQuery& query) {
+  std::lock_guard<std::mutex> guard(mutex_);
   if (query.limit <= 0) return Invalid("limit 必须 > 0");
   if (query.offset < 0) return Invalid("offset 必须 >= 0");
 
@@ -196,6 +208,7 @@ fss::Result<domain::MetadataPage> InMemoryMetadataRepository::List(
 
 std::size_t InMemoryMetadataRepository::version_count(std::string_view partition,
                                                       std::string_view record_id) const {
+  std::lock_guard<std::mutex> guard(mutex_);
   const Chain* chain = FindChain(partition, record_id);
   return chain == nullptr ? 0 : chain->size();
 }

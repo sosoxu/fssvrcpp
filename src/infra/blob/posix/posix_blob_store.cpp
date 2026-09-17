@@ -145,6 +145,9 @@ fss::Result<std::string> PosixBlobStore::WritableObjectPath(std::string_view con
   return ObjectPath(container, key);
 }
 
+//  进程级序号（定义见头文件；这里只做一次定义）
+std::atomic<std::uint64_t> PosixBlobStore::tmp_counter_{0};
+
 std::string PosixBlobStore::TempPathFor(const std::string& target) const {
   const auto counter = tmp_counter_.fetch_add(1);
   return target + std::string(kTempMarker) + options_.instance_id + "." +

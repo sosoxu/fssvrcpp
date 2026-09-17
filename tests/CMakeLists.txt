@@ -280,6 +280,19 @@ fss_add_test(test_sqlite_metadata_repository
   LIBS    fss_metadata_sqlite fss_metadata_memory
   LABELS  "phase6;integration")
 
+# C6.11：多实例幂等（内存 + SQLite 两个连接 + 朴素主键的对照）
+fss_add_test(test_multi_instance
+  SOURCES integration/test_multi_instance.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+          fss_metadata_sqlite Threads::Threads
+  LABELS  "phase6;integration")
+
+# C6.13：临时文件名唯一性（含"朴素临时名必错乱"的对照）
+fss_add_test(test_posix_tmp_names
+  SOURCES integration/test_posix_tmp_names.cpp
+  LIBS    fss_blob_posix fss_io Threads::Threads
+  LABELS  "phase6;integration")
+
 # C6.7：DMS 6 端点 + Delivery 的响应键集合与端到端流程
 fss_add_test(test_dms_delivery
   SOURCES conformance/test_dms_delivery.cpp

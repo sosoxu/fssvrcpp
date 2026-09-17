@@ -14,6 +14,7 @@
 //    既慢又不稳定。`ManualClock` 让它们在微秒级完成且完全确定。
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 
@@ -43,22 +44,26 @@ class ManualClock final : public IClock {
   explicit ManualClock(std::int64_t epoch_seconds = 1700000000)
       : seconds_(epoch_seconds) {}
 
-  std::int64_t NowEpochSeconds() const override { return seconds_; }
-  std::int64_t NowEpochMillis() const override { return seconds_ * 1000 + millis_; }
+  //  ★ 多线程（如并发实例用例）会同时读时钟：读-写用 `std::atomic` 而不是裸 `int64_t`
+  //    （否则是数据竞争；虽然实践中"读到旧值"无害，但 UB 会让 sanitizer/优化行为不可预期）
+  std::int64_t NowEpochSeconds() const override { return seconds_.load(); }
+  std::int64_t NowEpochMillis() const override {
+    return seconds_.load() * 1000 + millis_.load();
+  }
   std::chrono::steady_clock::time_point NowSteady() const override { return steady_; }
 
-  void SetEpochSeconds(std::int64_t s) { seconds_ = s; }
+  void SetEpochSeconds(std::int64_t s) { seconds_.store(s); }
   void AdvanceSeconds(std::int64_t s) { seconds_ += s; }
   void AdvanceMillis(std::int64_t ms) {
     millis_ += ms;
-    seconds_ += millis_ / 1000;
-    millis_ %= 1000;
+    seconds_ += millis_.load() / 1000;
+    millis_.store(millis_.load() % 1000);
   }
   void AdvanceSteady(std::chrono::milliseconds d) { steady_ += d; }
 
  private:
-  std::int64_t seconds_;
-  std::int64_t millis_ = 0;
+  std::atomic<std::int64_t> seconds_;
+  std::atomic<std::int64_t> millis_{0};
   std::chrono::steady_clock::time_point steady_{};
 };
 

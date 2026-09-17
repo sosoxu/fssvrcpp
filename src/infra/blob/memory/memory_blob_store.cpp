@@ -89,6 +89,7 @@ fss::Result<void> InMemoryBlobStore::ValidateRef(const domain::ObjectRef& ref) {
 }
 
 fss::Result<void> InMemoryBlobStore::ensure_container(const std::string& container) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(BeginOp(Op::kEnsureContainer));
   if (container.empty()) {
     return Err(fss::ErrorKind::kInvalidArgument, "容器名不能为空");
@@ -99,6 +100,7 @@ fss::Result<void> InMemoryBlobStore::ensure_container(const std::string& contain
 
 fss::Result<domain::SignedLocation> InMemoryBlobStore::presign_put(
     const domain::ObjectRef& ref, const domain::PresignOptions& options) {
+  std::lock_guard<std::mutex> guard(mutex_);
   (void)ref;
   (void)options;
   FSS_TRY(BeginOp(Op::kPresignPut));
@@ -109,6 +111,7 @@ fss::Result<domain::SignedLocation> InMemoryBlobStore::presign_put(
 
 fss::Result<domain::SignedLocation> InMemoryBlobStore::presign_get(
     const domain::ObjectRef& ref, const domain::PresignOptions& options) {
+  std::lock_guard<std::mutex> guard(mutex_);
   (void)ref;
   (void)options;
   FSS_TRY(BeginOp(Op::kPresignGet));
@@ -118,6 +121,7 @@ fss::Result<domain::SignedLocation> InMemoryBlobStore::presign_get(
 fss::Result<void> InMemoryBlobStore::put(const domain::ObjectRef& ref,
                                          bytes::ByteSource& source,
                                          const domain::PutOptions& options) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(BeginOp(Op::kPut));
   FSS_TRY(ValidateRef(ref));
 
@@ -172,6 +176,7 @@ fss::Result<void> InMemoryBlobStore::put(const domain::ObjectRef& ref,
 
 fss::Result<void> InMemoryBlobStore::get(const domain::ObjectRef& ref, bytes::ByteSink& sink,
                                          const domain::ByteRange& range) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(BeginOp(Op::kGet));
   FSS_TRY(ValidateRef(ref));
 
@@ -209,6 +214,7 @@ fss::Result<void> InMemoryBlobStore::get(const domain::ObjectRef& ref, bytes::By
 }
 
 fss::Result<domain::ObjectStat> InMemoryBlobStore::stat(const domain::ObjectRef& ref) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(BeginOp(Op::kStat));
   FSS_TRY(ValidateRef(ref));
 
@@ -236,6 +242,7 @@ fss::Result<domain::ObjectStat> InMemoryBlobStore::stat(const domain::ObjectRef&
 }
 
 fss::Result<void> InMemoryBlobStore::remove(const domain::ObjectRef& ref) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(BeginOp(Op::kRemove));
   FSS_TRY(ValidateRef(ref));
   const auto container_it = containers_.find(ref.container);
@@ -247,6 +254,7 @@ fss::Result<void> InMemoryBlobStore::remove(const domain::ObjectRef& ref) {
 
 fss::Result<domain::ObjectStat> InMemoryBlobStore::copy(const domain::ObjectRef& from,
                                                         const domain::ObjectRef& to) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(BeginOp(Op::kCopy));
   FSS_TRY(ValidateRef(from));
   FSS_TRY(ValidateRef(to));
@@ -286,6 +294,7 @@ fss::Result<domain::ListPage> InMemoryBlobStore::list(const std::string& contain
                                                       const std::string& prefix,
                                                       const std::string& continuation_token,
                                                       int limit) {
+  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(BeginOp(Op::kList));
   if (limit <= 0) {
     return Err(fss::ErrorKind::kInvalidArgument, "list 的 limit 必须 > 0");
@@ -320,12 +329,14 @@ fss::Result<domain::ListPage> InMemoryBlobStore::list(const std::string& contain
 }
 
 std::int64_t InMemoryBlobStore::TakeInjectedLatencyMillis() {
+  std::lock_guard<std::mutex> guard(mutex_);
   const std::int64_t value = injected_latency_millis_;
   injected_latency_millis_ = 0;
   return value;
 }
 
 std::size_t InMemoryBlobStore::object_count() const {
+  std::lock_guard<std::mutex> guard(mutex_);
   std::size_t total = 0;
   for (const auto& [name, objects] : containers_) {
     (void)name;
@@ -335,6 +346,7 @@ std::size_t InMemoryBlobStore::object_count() const {
 }
 
 bool InMemoryBlobStore::HasContainer(const std::string& container) const {
+  std::lock_guard<std::mutex> guard(mutex_);
   return containers_.find(container) != containers_.end();
 }
 

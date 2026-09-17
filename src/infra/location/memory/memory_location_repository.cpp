@@ -30,6 +30,7 @@ InMemoryLocationRepository::ById* InMemoryLocationRepository::FindPartition(
 
 fss::Result<void> InMemoryLocationRepository::Save(std::string_view partition,
                                                    const domain::FileLocation& location) {
+  std::lock_guard<std::mutex> guard(mutex_);
   if (partition.empty()) return Invalid("partition 不能为空");
   if (location.file_id.empty()) return Invalid("file_id 不能为空");
   if (location.file_source.empty()) return Invalid("file_source 不能为空");
@@ -60,6 +61,7 @@ fss::Result<void> InMemoryLocationRepository::Save(std::string_view partition,
 
 fss::Result<domain::FileLocation> InMemoryLocationRepository::Find(
     std::string_view partition, std::string_view file_id) {
+  std::lock_guard<std::mutex> guard(mutex_);
   const ById* bucket = FindPartition(partition);
   if (bucket == nullptr) return NotFound("位置记录不存在：partition=" + std::string(partition));
   const auto it = bucket->find(std::string(file_id));
@@ -72,6 +74,7 @@ fss::Result<domain::FileLocation> InMemoryLocationRepository::Find(
 fss::Result<void> InMemoryLocationRepository::UpdateSignedUrl(
     std::string_view partition, std::string_view file_id, std::string_view signed_url,
     std::int64_t updated_at_epoch_seconds) {
+  std::lock_guard<std::mutex> guard(mutex_);
   ById* bucket = FindPartition(partition);
   if (bucket == nullptr) return NotFound("位置记录不存在：" + std::string(file_id));
   const auto it = bucket->find(std::string(file_id));
@@ -83,6 +86,7 @@ fss::Result<void> InMemoryLocationRepository::UpdateSignedUrl(
 
 fss::Result<void> InMemoryLocationRepository::Delete(std::string_view partition,
                                                      std::string_view file_id) {
+  std::lock_guard<std::mutex> guard(mutex_);
   ById* bucket = FindPartition(partition);
   if (bucket == nullptr) return NotFound("位置记录不存在：" + std::string(file_id));
   const auto it = bucket->find(std::string(file_id));
@@ -96,20 +100,33 @@ fss::Result<void> InMemoryLocationRepository::Delete(std::string_view partition,
 
 fss::Result<domain::FileLocation> InMemoryLocationRepository::FindByFileSource(
     std::string_view partition, std::string_view file_source) {
+  std::lock_guard<std::mutex> guard(mutex_);
   const auto owner = source_index_.find(SourceKey{std::string(partition), std::string(file_source)});
   if (owner == source_index_.end()) {
     return NotFound("位置记录不存在（按 file_source）：" + std::string(file_source));
   }
-  return Find(partition, owner->second);
+  //  ★ 这里**不能**调用 `Find(partition, owner->second)`：它也会去拿同一把**非递归**
+  //    互斥量 → 自死锁（实测：两个实例并发时整个进程挂死）。查询逻辑内联一份。
+  const ById* bucket = FindPartition(partition);
+  if (bucket == nullptr) {
+    return NotFound("位置记录不存在：partition=" + std::string(partition));
+  }
+  const auto it = bucket->find(owner->second);
+  if (it == bucket->end()) {
+    return NotFound("Not found location for fileID : " + owner->second);
+  }
+  return it->second;
 }
 
 std::size_t InMemoryLocationRepository::size(std::string_view partition) const {
+  std::lock_guard<std::mutex> guard(mutex_);
   const ById* bucket = FindPartition(partition);
   return bucket == nullptr ? 0 : bucket->size();
 }
 
 fss::Result<domain::LocationPage> InMemoryLocationRepository::List(
     std::string_view partition, const domain::LocationQuery& query) {
+  std::lock_guard<std::mutex> guard(mutex_);
   if (query.limit <= 0) return Invalid("limit 必须 > 0");
   if (query.offset < 0) return Invalid("offset 必须 >= 0");
 

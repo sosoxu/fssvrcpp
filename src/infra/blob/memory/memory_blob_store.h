@@ -14,6 +14,7 @@
 //    · 区间读：offset >= size → kInvalidArgument；末端超界 → 截断
 //    · 时间来自注入的 `IClock`（默认 SystemClock 由组合根给；测试用 ManualClock）——
 //      契约测试要求"无真实睡眠"（C2.8）就必须能控制时间
+//    · **线程安全**（内部一把互斥量）：多实例并发用例会共享同一个对象
 //
 //  ★ 故障注入只属于本实现（不属于 IBlobStore 契约）：契约基类不得依赖它，
 //    否则 memory 的测试就无法套到 POSIX/S3 上。
@@ -27,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 
 namespace fss::infra {
@@ -86,11 +88,21 @@ class InMemoryBlobStore final : public domain::IBlobStore {
                                      const std::string& continuation_token, int limit) override;
 
   // ---- 故障注入（仅测试用） ----
-  void Inject(const FaultPlan& plan) { fault_ = plan; }
-  void ClearFaults() { fault_ = FaultPlan{}; }
+  //  ⚠️ 下面这些**不是**线程安全的读（跟其它方法一样不加锁）：只在测试的单线程阶段用。
+  void Inject(const FaultPlan& plan) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    fault_ = plan;
+  }
+  void ClearFaults() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    fault_ = FaultPlan{};
+  }
   // 取走累计的"本应延迟"毫秒数（取走后归零）
   std::int64_t TakeInjectedLatencyMillis();
-  int OpCount(Op op) const { return op_counts_[static_cast<std::size_t>(op)]; }
+  int OpCount(Op op) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return op_counts_[static_cast<std::size_t>(op)];
+  }
   std::size_t object_count() const;
   bool HasContainer(const std::string& container) const;
 
@@ -112,6 +124,11 @@ class InMemoryBlobStore final : public domain::IBlobStore {
 
   using Objects = std::map<std::string, Object>;  // key → object（std::map 保证字典序）
   std::map<std::string, Objects> containers_;
+  //  ★ 线程安全：C6.11 的"两个实例共享同一份存储"用例会在两个线程里同时打进来。
+  //    没有这把锁时并发 `put` 会**破坏 `std::map` 的内部结构**（实测 "double free or
+  //    corruption"），而不是给出错误 —— 静默的堆损坏是比"操作失败"更糟的失败模式。
+  //    （`InMemoryMetadataRepository` 一直是加锁的，这里对齐。）
+  mutable std::mutex mutex_;
 
   const fss::IClock& clock_;
   FaultPlan fault_{};

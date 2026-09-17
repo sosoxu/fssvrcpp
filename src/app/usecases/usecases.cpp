@@ -180,13 +180,35 @@ fss::Result<domain::ObjectStat> CopyBetweenZones(UseCasePorts& ports, std::strin
 //  ★ 三处必须**完全一致**：只报错不删会留下"元数据没有、对象却在"的孤儿（会被 GC 当成在途对象）；
 //    不回滚就会在客户端重试时留下一堆无主副本。
 void RollbackCreatedObject(UseCasePorts& ports, const CallerContext& caller,
-                           const domain::ObjectRef& to_ref, std::string_view record_id) {
-  if (auto to_store = ports.blobs.ForPartition(caller.partition, domain::StorageZone::kPersistent);
-      to_store.ok()) {
-    (void)to_store.value()->remove(to_ref);
+                           const domain::ObjectRef& to_ref, std::string_view file_source,
+                           std::string_view record_id) {
+  //  ★★ 只有确认"没有任何记录指向这个对象"时才删。并发实例可能已经把记录写成功 ——
+  //     此时 `to_ref` 是**对方的活对象**，删掉它就是数据丢失（P6-D13 的第二种形态：
+  //     第一种是"把 persistent 对象当 staging 清理"）。
+  bool owned_by_record = false;
+  if (auto existing = ports.metadata.GetLatestByFileSource(caller.partition, file_source);
+      existing.ok()) {
+    owned_by_record = true;
+  }
+  if (!owned_by_record) {
+    if (auto to_store = ports.blobs.ForPartition(caller.partition, domain::StorageZone::kPersistent);
+        to_store.ok()) {
+      (void)to_store.value()->remove(to_ref);
+    }
   }
   PublishStatus(ports, caller, "FAILED", 0);
   RecordAudit(ports, "createMetadataFailure", caller, record_id, false);
+}
+
+//  幂等命中：同 (partition, FileSource) 已有记录 → 发布成功事件并返回**既有记录**的 id。
+//  ★ 这是"客户端重试/并发实例"的正确语义：既不重复复制，也不会因为 staging 已被
+//    上一个成功请求清理掉而报错（ADR-009 M2）。
+fss::Result<std::string> ReturnExistingRecord(UseCasePorts& ports, const CallerContext& caller,
+                                              const domain::FileMetadataRecord& existing) {
+  PublishStatus(ports, caller, "SUCCESS", existing.version);
+  PublishDatasetDetails(ports, caller, existing.id, existing.version);
+  RecordAudit(ports, "createMetadataSuccess", caller, existing.id, true);
+  return existing.id;
 }
 
 //  读取对象内容（用于计算校验和；仅在存储没有给出校验和时调用）
@@ -377,6 +399,15 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   out.id = caller.partition + ":dataset--File.Generic:" + ports_.ids.NewUuidNoDash();
   out.version = 1;
 
+  // 4b. **幂等快路径**：同 (partition, FileSource) 已有记录 → 直接返回它。
+  //     ★ 顺序很重要：必须在"复制 + 清理 staging"**之前**判断。否则重试（或并发实例）
+  //       会去复制一个已经被上一个成功请求清理掉的 staging 对象 → 502（P6-D13）；
+  //       更糟的是它的回滚会把对方刚写好的 persistent 对象删掉。
+  if (auto existing = ports_.metadata.GetLatestByFileSource(caller.partition, file_source);
+      existing.ok()) {
+    return ReturnExistingRecord(ports_, caller, existing.value());
+  }
+
   // 5. 位置记录（FileSource → 物理位置）
   const auto location_result = ports_.locations.FindByFileSource(caller.partition, file_source);
   if (!location_result.ok()) {
@@ -397,13 +428,47 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   to_ref.key = from_ref.key;
 
   // 6. staging → persistent 复制
-  const auto copied = CopyBetweenZones(ports_, caller.partition, from_ref, to_ref, location.zone,
-                                       domain::StorageZone::kPersistent);
-  if (!copied.ok()) {
-    RollbackCreatedObject(ports_, caller, to_ref, out.id);
-    //  依赖服务（存储）异常 → 502（契约 §2.6：失败 → 502/500）
-    return Err(fss::ErrorKind::kBadGateway,
-               "复制到 persistent 失败：" + copied.error().message());
+  //
+  //  ★★ 只有"源确实在 staging"时才搬迁。位置记录里的 `zone` 会被**上一次成功**的
+  //     CreateFileMetadata 改成 persistent；并发实例 / 客户端重试如果再按它去
+  //     "复制 + 清理源对象"，就会把 **persistent 对象本身**当成 staging 清理掉
+  //     （记录还在、对象没了 —— P6-D13，本切片的并发用例抓到）。
+  const bool source_is_staging = location.zone == domain::StorageZone::kStaging;
+  domain::ObjectStat copied_stat;
+  if (source_is_staging) {
+    const auto copied = CopyBetweenZones(ports_, caller.partition, from_ref, to_ref, location.zone,
+                                         domain::StorageZone::kPersistent);
+    if (!copied.ok()) {
+      //  ★ 并发实例可能在我们复制期间已经登记成功并清理了 staging（源"消失"正是这么来的）：
+      //    此时幂等地返回既有记录，**不要**报错，更不要回滚（见 RollbackCreatedObject 的守卫）。
+      if (auto existing = ports_.metadata.GetLatestByFileSource(caller.partition, file_source);
+          existing.ok()) {
+        return ReturnExistingRecord(ports_, caller, existing.value());
+      }
+      RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
+      //  依赖服务（存储）异常 → 502（契约 §2.6：失败 → 502/500）
+      return Err(fss::ErrorKind::kBadGateway,
+                 "复制到 persistent 失败：" + copied.error().message());
+    }
+    copied_stat = copied.value();
+  } else {
+    //  已经搬迁过（并发/重试）：直接复用 persistent 对象，**不再复制、也不会清理它**
+    const auto persistent_store = ports_.blobs.ForPartition(caller.partition,
+                                                            domain::StorageZone::kPersistent);
+    if (!persistent_store.ok()) {
+      RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
+      return Err(fss::ErrorKind::kBadGateway,
+                 "无法解析 persistent 存储：" + persistent_store.error().message());
+    }
+    const auto existing = persistent_store.value()->stat(to_ref);
+    if (!existing.ok() || !existing.value().exists) {
+      //  位置记录说"已经迁过"，但对象不在 → 依赖故障（或被人删过）。
+      //  绝不能静默写一条指向空对象的记录。
+      RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
+      return Err(fss::ErrorKind::kBadGateway,
+                 "persistent 对象缺失（位置记录已迁移但对象不存在）");
+    }
+    copied_stat = existing.value();
   }
 
   // 7. 校验和：`checksum = storageUtil.getChecksum(persistentLocation)`，非空则**回写覆盖**
@@ -421,8 +486,8 @@ fss::Result<std::string> CreateFileMetadata::Execute(
 
   //  ★ 优先用复制返回的**原生**校验和（零额外读盘）；只有在"原生缺失/算法不认识/不是合法 hex"
   //    时才**流式回算**。`ETAG` 这类非 hex 摘要绝不能当校验和写进记录（那是"看起来有值"的假象）。
-  std::string checksum = copied.value().checksum;
-  std::string algorithm = copied.value().checksum_algorithm;
+  std::string checksum = copied_stat.checksum;
+  std::string algorithm = copied_stat.checksum_algorithm;
   const auto native_algorithm = crypto::ParseChecksumAlgorithm(algorithm);
   const bool native_usable =
       native_algorithm.has_value() && crypto::IsHexDigestOf(checksum, *native_algorithm);
@@ -437,7 +502,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     if (!computed.ok()) {
       //  ★ 第 7 步失败也属于第 12 步的"任一步 6/7/9 失败"：必须**回滚删除**已搬迁的对象。
       //    此前这里是 `FSS_TRY`，直接 return 就漏掉了回滚（C6.3 的故障注入点③抓到）。
-      RollbackCreatedObject(ports_, caller, to_ref, out.id);
+      RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
       return Err(fss::ErrorKind::kBadGateway,
                  "计算校验和失败：" + computed.error().message());
     }
@@ -455,7 +520,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   // 8/9. 写元数据记录（幂等键 = partition + FileSource）
   const auto created = ports_.metadata.Create(caller.partition, out);
   if (!created.ok()) {
-    RollbackCreatedObject(ports_, caller, to_ref, out.id);
+    RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
     return Err(fss::ErrorKind::kInternal, "写入元数据记录失败：" + created.error().message());
   }
 
@@ -477,12 +542,17 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   // 11. 删除 staging 对象：**失败被忽略**（上游 issue #76：清理失败不得让已成功的登记变失败），
   //     但必须留下审计告警（契约 §2.6 第 11 步），否则"staging 里堆着孤儿"会无人察觉。
   bool staging_removed = true;
-  if (auto staging_store = ports_.blobs.ForPartition(caller.partition, domain::StorageZone::kStaging);
-      staging_store.ok()) {
-    const auto removal = staging_store.value()->remove(from_ref);
-    staging_removed = removal.ok();
-    if (!staging_removed) {
-      RecordAudit(ports_, "createMetadataStagingCleanupFailure", caller, created.value().id, false);
+  //  ★ 只有"源在 staging"时才清理：`from_ref` 在 source_is_staging=false 时指向的是
+  //    **persistent** 对象，绝不能当 staging 清理（P6-D13）。
+  if (source_is_staging) {
+    if (auto staging_store =
+            ports_.blobs.ForPartition(caller.partition, domain::StorageZone::kStaging);
+        staging_store.ok()) {
+      const auto removal = staging_store.value()->remove(from_ref);
+      staging_removed = removal.ok();
+      if (!staging_removed) {
+        RecordAudit(ports_, "createMetadataStagingCleanupFailure", caller, created.value().id, false);
+      }
     }
   }
   (void)staging_removed;

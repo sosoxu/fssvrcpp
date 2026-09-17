@@ -23,6 +23,7 @@
 #include <catch2/catch.hpp>
 
 #include "app_fixture.h"
+#include "big_file.h"       // BigFileBytes / RssLimitKib（1 GiB 规模可被构建方式覆盖）
 #include "http_fixture.h"   // HttpFixture / HttpDo / Authed（端到端 correlation-id 用例）
 #include "raw_http.h"
 #include "temp_dir.h"
@@ -729,4 +730,42 @@ TEST_CASE("★ C6.3 端到端：`x-correlation-id` 头 → datasetDetails 事件
   REQUIRE(details.dataset_version_id == "1");
   REQUIRE(details.dataset_type == "FILE");
   REQUIRE(details.record_count == 1);
+}
+
+// =============================================================================
+//  C6.9：≥1 GiB staging→persistent 搬迁 + 校验和回算的 RSS
+// =============================================================================
+//  ★ 为什么另立一例（而不是把上面那例的规模调大）：
+//    上面 64 MiB 那例带"整块读回"的**自证对照**，跑得快、判别力强，适合每次门槛都跑；
+//    这一例负责判据 C6.9 的**规模**（≥1 GiB，RSS 峰值增长 < 64 MiB）。
+//  ★ 为什么用 `CurrentRssKib()` 的增量而不是 `PeakRssKib()`（VmHWM）：
+//    VmHWM 是**单调不减**的，同一个二进制里前面的用例（尤其带 64 MiB 对照的那例）
+//    会把它抬上去，之后测到的 Δ 会失真甚至变成 0（"恒真"的假断言）。
+//    规模与上限可被构建方式覆盖（ASan 下缩到 64 MiB / 放宽上限，见 big_file.h）。
+TEST_CASE("★ C6.9 ≥1 GiB 搬迁 + 流式回算：RSS 增长 < 64 MiB",
+          "[phase6][integration][c6.9]") {
+  PosixTwoStoreFixture fx;
+  const std::int64_t bytes = fss::test::BigFileBytes();
+
+  const std::uint64_t baseline = fss::test::CurrentRssKib();
+  fss::bytes::RepeatingSource source(bytes);
+  const auto uploaded = UploadSource(fx, source);
+  auto record = AppFixture::MakeRecord(uploaded.file_source, "huge.bin");
+  CreateFileMetadata create(*fx.ports);
+  const auto id = create.Execute(fx.caller, record);
+  const std::uint64_t after = fss::test::CurrentRssKib();
+  INFO("create 结果：" << (id.ok() ? std::string("ok") : id.error().ToString()));
+  REQUIRE(id.ok());
+
+  const std::uint64_t growth = after > baseline ? after - baseline : 0;
+  INFO("对象 " << bytes / (1024 * 1024) << " MiB，RSS 增长 " << growth << " KiB（上限 "
+               << fss::test::RssLimitKib() << " KiB）");
+  REQUIRE(growth < fss::test::RssLimitKib());
+
+  //  值与独立流式算出的摘要一致（1 GiB 上也证明"读的是完整对象"）
+  const std::string expected = DigestOfPattern(bytes);
+  const auto stored = Fetch(fx, id.value());
+  REQUIRE(stored.ok());
+  REQUIRE(*stored.value().data.checksum == expected);
+  REQUIRE(*stored.value().data.checksum_algorithm == "SHA256");
 }

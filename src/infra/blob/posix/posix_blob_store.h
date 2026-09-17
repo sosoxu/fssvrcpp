@@ -92,7 +92,13 @@ class PosixBlobStore final : public domain::IBlobStore {
   std::string root_;
   const fss::IClock& clock_;
   PosixBlobStoreOptions options_;
-  mutable std::atomic<std::uint64_t> tmp_counter_{0};
+  //  ★ 临时文件名的序号必须是**进程级**的，不能是"每个 store 对象各自从 0 开始"：
+  //    同一个进程里两个 store 对象（不同 zone / 不同 partition 但同一个 root，
+  //    或同一份配置被装配两次）如果共享 `instance_id`，各自从 0 开始的序号会让
+  //    它们算出**同一个临时路径** → 后者 `O_CREAT|O_EXCL` 直接失败，或（若不用 O_EXCL）
+  //    两个写入者交错写同一份临时文件，改名后得到**两份数据混在一起**的对象（ADR-009 M1）。
+  //    进程级序号 + pid（跨进程）+ instance_id（跨实例）三者合起来才能保证唯一。
+  static std::atomic<std::uint64_t> tmp_counter_;
 };
 
 }  // namespace fss::infra

@@ -243,6 +243,11 @@ fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::Create(
     BindText(stmt.get(), 2, record.id);
     const int rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_ROW) {
+      //  ★ 并发实例可能刚刚插入**同一个 file_source** 的那条记录：先按幂等键回读，
+      //    只有确实"同 id 但 file_source 不同"才拒绝（ADR-009 M2 / R5）
+      if (auto existing = FindLatestBySource(db_, partition, file_source); existing.ok()) {
+        return existing.value();
+      }
       return Invalid("同 id 已存在且 file_source 不同：" + record.id);
     }
     if (rc != SQLITE_DONE) {
@@ -280,6 +285,15 @@ fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::Create(
     const int rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE) {
       sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      //  ★ 唯一约束挡下并发插入（`ux_metadata_source` / 主键）时，幂等语义要求
+      //    返回**已存在的那条记录**，而不是把 UNIQUE 冲突当 500 抛给客户端。
+      //    ⚠️ `sqlite3_extended_result_codes` 打开时 `rc` 是**扩展码**，必须按主码比较（P3-D03）。
+      if ((rc & 0xFF) == SQLITE_CONSTRAINT) {
+        if (auto existing = FindLatestBySource(db_, partition, file_source); existing.ok()) {
+          return existing.value();
+        }
+        return Invalid("同 id 已存在且 file_source 不同：" + record.id);
+      }
       return fss::Err(fss::ErrorKind::kInternal, std::string("插入元数据失败：") + sqlite3_errstr(rc));
     }
   }

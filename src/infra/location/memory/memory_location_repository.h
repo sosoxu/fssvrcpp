@@ -18,12 +18,16 @@
 #include "domain/ports/ports.h"
 
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace fss::infra {
 
+//  ★ 线程安全（内部一把互斥量）：多实例用例会共享同一个对象（它是"共享存储"的角色），
+//    与 `InMemoryMetadataRepository` 的约定一致。没有锁时并发 `Save` 会破坏 `std::map`
+//    的内部结构（实测 "free(): invalid next size"），属于静默堆损坏。
 class InMemoryLocationRepository final : public domain::IFileLocationRepository {
  public:
   fss::Result<void> Save(std::string_view partition,
@@ -43,6 +47,7 @@ class InMemoryLocationRepository final : public domain::IFileLocationRepository 
   std::size_t size(std::string_view partition) const;
 
  private:
+  mutable std::mutex mutex_;
   using FileId = std::string;
   using Partition = std::string;
   using SourceKey = std::pair<Partition, std::string>;

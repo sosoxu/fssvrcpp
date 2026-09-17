@@ -14,6 +14,9 @@
 //      仓储的元数据）—— 因此 `List` 的时间区间过滤是可确定性测试的（C2.8）。
 //    · 排序：`created_at` 升序、同秒按 `id` 升序 —— 分页必须有**稳定**全序，
 //      否则 offset/limit 会漏项或重项。
+//    · **线程安全**（内部一把互斥量）：组合根在 `single` 模式下就是用它，HTTP 的
+//      并发请求会在多线程里同时打进来；没有锁时并发 `Create` 会破坏 `std::map` 的
+//      内部结构（实测堆损坏），而不是给出错误（P6-D16）。
 #pragma once
 
 #include "common/result/result.h"
@@ -21,6 +24,7 @@
 #include "domain/ports/ports.h"
 
 #include <cstdint>
+#include <mutex>
 #include <map>
 #include <string>
 #include <string_view>
@@ -49,6 +53,8 @@ class InMemoryMetadataRepository final : public domain::IMetadataRepository {
   std::size_t version_count(std::string_view partition, std::string_view record_id) const;
 
  private:
+  mutable std::mutex mutex_;
+
   struct Version {
     domain::FileMetadataRecord record;
     std::int64_t created_at_epoch_seconds = 0;
