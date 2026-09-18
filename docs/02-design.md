@@ -1115,7 +1115,7 @@ fssvrcpp/
 | **禁止在读路径算校验和** | 否则范围读退化为 O(文件大小)。**硬性禁令**，有专门回归测试 |
 | Range 处理 | 声明**完整** `content_length`，由 httplib 计算 `(offset,length)`；`fss_http` 只做越界/416 归一化 |
 | I/O 引擎 | **默认 `blocking`**（`pread`/`pwrite` + 有界线程池，到处能跑）；`IIoEngine` 抽象保留 `uring` 可选实现（启动探测 + 回退）。**默认容器 seccomp 阻断 io_uring（实测 EPERM）** → [ADR-010](adr/ADR-010-io-engine-choice.md) |
-| 零拷贝 | **ADR-006（拟定）**：大文件数据面走自持 socket + `sendfile`（循环处理 >2 GiB 上限）。实测 `sendfile` 比 `pread+write` 快 **2.05x**、每 GiB CPU 少 **42%**；叠加库开销后自持 socket 路径快 **~5–7x** |
+| 零拷贝 | **ADR-006（已采纳方向，P9 定稿）**：大文件数据面走自持 socket + `sendfile`（循环处理 >2 GiB 上限）；**实现未交付**。受控 A/B（同一负载生成器）实测 `sendfile` 比 httplib 内容提供者快 **2.12x**（几何平均；~~旧值 ~5–7x 来自不同探针的拼装比较，方法学不成立，已作废~~）。`sendfile` 比 `pread+write` 快 **2.05x**、每 GiB CPU 少 **42%**（探针） |
 | io_uring | **ADR-006 范围已扩展**：数据面文件侧用 io_uring（异步 `pread`/`write`/`fsync`，深度 ~64）。实测本机可用：1 线程 132,934 IOPS vs 128 线程 118,148 IOPS；写路径 1 线程 20,497 文件/s vs 64 线程 16,104。**实现形态：手写 submit/reap 事件循环 + 状态机，协程可选非必需**（ADR-007 §8.5） |
 | 页缓存 | 随机读 `posix_fadvise(RANDOM)`；大段顺序读后可 `DONTNEED`（可配） |
 | 超时 | 数据面**无整体超时**，只有"空闲无进展"超时，否则 TB 级传输会被打断 |
@@ -1142,6 +1142,13 @@ fssvrcpp/
 | 并发连接 | 按公式计算（见下） | **503 + `Retry-After`** |
 | 每租户并发 | 可配 | 503 |
 | 传输内存预算 | 256 MiB | **拒绝启动**（配置校验） |
+
+> **★ P9 实测（`docs/test-evidence/phase9.md` §9 / `docs/05-capacity-and-concurrency.md` §1.9）**：
+> 上表"传输内存预算 → 拒绝启动"已有正/反两条测试（C9.3 ⑥ / C9.13）；
+> `storage.posix.durability` 的三档在**产品进程**上的端到端差异为
+> `per_file` **96.4** files/s vs `batch` **410.1** vs `never` **426.0**（c4，4 KiB 对象），
+> 即 **4.3×** —— 收益来自"摊销 fsync"而不是"不做耐久性"（ADR-008）。
+> ⚠️ 这些数字来自 WSL2 虚拟盘，只作**本机量级参考**（C9.14 未验证）。
 
 **并发上限的取值公式**（取代初版硬编码的 8）：
 
@@ -1221,6 +1228,7 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 | [ADR-003](adr/ADR-003-storage-abstraction.md) | 以单一 `IBlobStore` 端口统一"集中存储"与"对象存储" | 已采纳 |
 | [ADR-004](adr/ADR-004-persistence-strategy.md) | 位置/元数据持久化：内置 SQLite + 可选远端 Storage Service | 已采纳（阶段 6 复核） |
 | [ADR-005](adr/ADR-005-s3-driver.md) | S3 驱动：**自研 SigV4**（OpenSSL）+ libcurl 数据面 + 原生预签名；编码/签名/寻址/错误映射约定与兼容矩阵 | 已采纳（P5 定稿；与 libcurl/Go SDK 的 4 处实测差异见其 §4） |
+| [ADR-006](adr/ADR-006-large-file-data-plane.md) | 大文件数据面：**采纳 `sendfile` 方向**（P9 受控复核几何平均 **2.12x ≥ 1.5x**），但**实现未交付**；落地必须与控制面校验**同源**、可关闭、默认仍走 httplib 内容提供者 | 已采纳（P9/C9.12 定稿；证据 `docs/test-evidence/phase9-adr006.md`） |
 | ADR-006 | 大文件数据面：自持 socket + `sendfile` 的独立数据面（替代 httplib 内容提供者） | **拟定**，待 P9 受控复核后定稿 |
 | [ADR-007](adr/ADR-007-async-and-coroutines.md) | 异步/协程采纳策略：分层决策 + 量化触发条件（T1–T3），现在不整体重写 | 已采纳 |
 | [ADR-008](adr/ADR-008-write-durability-protocol.md) | 小文件写入耐久性协议：两阶段批提交（同步先行、改名后置），更正了 ADR-007 的错误数字 | 已采纳（含机器可检查的不变量验证） |

@@ -29,7 +29,8 @@
 #include "infra/blob/posix/posix_blob_store.h"
 #include "infra/blob/s3/s3_blob_store.h"
 #include "infra/location/sqlite/sqlite_location_repository.h"
-#include "infra/metadata/memory/memory_metadata_repository.h"
+#include "infra/io/file_sync.h"
+#include "infra/metadata/sqlite/sqlite_metadata_repository.h"
 #include "infra/transfer/blob_byte_source.h"
 #include "infra/transfer/transfer_endpoint.h"
 #include "infra/transfer/transfer_token.h"
@@ -214,6 +215,21 @@ int main(int /*argc*/, char** /*argv*/) {
   const std::string s3_secret_key = Env("FSS_STORAGE_S3_SECRET_KEY", "");
   const bool s3_force_path_style = Env("FSS_STORAGE_S3_FORCE_PATH_STYLE", "true") != "false";
   const bool s3_verify_tls = Env("FSS_STORAGE_S3_VERIFY_TLS", "true") != "false";
+  //  ---- 落盘档位（`storage.posix.durability` / `fsync_threshold_bytes`）----
+  //  ★ 这三个值此前**只存在于 schema 与示例配置里**，组合根根本没读它们 —— 于是
+  //    "per_file / batch / never 的吞吐差异"在真实进程上**不可配置**（C9.15 无法实测）。
+  //    映射关系（写在这里，避免运维猜测）：
+  //      per_file → kAlways（每个对象都 fdatasync + fsync(dir)）
+  //      batch    → kBySize（小于阈值的对象不 fsync，靠调用方/批提交摊销）
+  //      never    → kNever（只用于可重建数据；**不得**用于 staging/persistent 的对象）
+  const std::string durability = Env("FSS_POSIX_DURABILITY", "per_file");
+  const std::int64_t fsync_threshold_bytes =
+      EnvInt("FSS_POSIX_FSYNC_THRESHOLD_BYTES", 1024 * 1024);
+  //  ---- 元数据仓储（ADR-004：单实例 = 内置 SQLite；P6 交付的实现在此接上）----
+  //  ★ 此前组合根用的是 `InMemoryMetadataRepository`（P6 的登记项"组合根改接 SQLite"），
+  //    那会让"重启后记录还在"这条**部署语义**在真实进程上不成立。
+  const std::string metadata_db_path =
+      Env("FSS_METADATA_SQLITE_PATH", storage_root + "/metadata.db");
 
   //  ---- 组合根：唯一实例化具体实现的位置（R12）----
   SystemClock clock;
@@ -241,7 +257,22 @@ int main(int /*argc*/, char** /*argv*/) {
       std::cerr << "创建存储根失败: " << blob_dir_error.message() << "\n";
       return 1;
     }
-    blob_store = std::make_unique<PosixBlobStore>(storage_root + "/blobs", clock);
+    PosixBlobStoreOptions posix_options;
+    if (durability == "per_file") {
+      posix_options.fsync_policy = FsyncPolicy::kAlways;
+    } else if (durability == "batch") {
+      posix_options.fsync_policy = FsyncPolicy::kBySize;
+      posix_options.fsync_threshold_bytes = fsync_threshold_bytes;
+    } else if (durability == "never") {
+      //  ★ 只能用于"数据可重建"的场景：这里显式告警，不做静默降级
+      std::cerr << "警告：storage.posix.durability=never —— 进程崩溃可能丢已确认的写入\n";
+      posix_options.fsync_policy = FsyncPolicy::kNever;
+    } else {
+      std::cerr << "未知的 storage.posix.durability: " << durability
+                << "（可选：per_file | batch | never）\n";
+      return 1;
+    }
+    blob_store = std::make_unique<PosixBlobStore>(storage_root + "/blobs", clock, posix_options);
   } else {
     std::cerr << "未知的 storage.driver: " << storage_driver << "（可选：posix | s3）\n";
     return 1;
@@ -253,7 +284,11 @@ int main(int /*argc*/, char** /*argv*/) {
     std::cerr << "打开位置仓储失败: " << location_repository.error().ToString() << "\n";
     return 1;
   }
-  InMemoryMetadataRepository metadata_repository(clock);  // P6 换成 SQLite
+  auto metadata_repository = SqliteMetadataRepository::Open(metadata_db_path, clock);
+  if (!metadata_repository.ok()) {
+    std::cerr << "打开元数据仓储失败: " << metadata_repository.error().ToString() << "\n";
+    return 1;
+  }
   HmacTransferTokenCodec token_codec(transfer_secret, clock);
 
   //  ---- 部署形态（ADR-009）----
@@ -342,7 +377,7 @@ int main(int /*argc*/, char** /*argv*/) {
   app::LocationIssuer issuer(blob_factory, *location_repository.value(), token_codec, clock, ids,
                              self_base_url);
 
-  app::UseCasePorts ports{blob_factory,      *location_repository.value(), metadata_repository,
+  app::UseCasePorts ports{blob_factory,      *location_repository.value(), *metadata_repository.value(),
                           *authorizer,       events,                         audit,
                           partitions,        legal,                          schema,
                           issuer,            clock,                          ids};

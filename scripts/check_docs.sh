@@ -137,7 +137,9 @@ adr_files = sorted(f for f in os.listdir(adr_dir) if f.startswith('ADR-') and f.
 adr_nums = {re.match(r'ADR-(\d+)', f).group(1): f for f in adr_files}
 
 # 允许"尚未定稿"的 ADR 编号（在索引里显式标注）
-PENDING = {'005', '006'}
+#  待定稿的 ADR 编号（文件尚不存在）：ADR-005/006 已分别在 P5/P9 定稿，故为空集。
+#  ★ 新增 ADR 文件后必须把它从这里移除，否则"引用了不存在的 ADR"这条检查会失效。
+PENDING = set()
 
 all_text = "\n".join(read(p) for p in md_files())
 referenced = set(re.findall(r'ADR-(\d{3})', all_text))

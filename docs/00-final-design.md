@@ -218,7 +218,7 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | [ADR-003](adr/ADR-003-storage-abstraction.md) | 单一 `IBlobStore` 端口 + `BlobCapabilities` 统一两种存储 | 已采纳 |
 | [ADR-004](adr/ADR-004-persistence-strategy.md) | 位置/元数据持久化：内置 SQLite + 可选远端 Storage Service | 已采纳（P6 复核） |
 | [**ADR-005**](adr/ADR-005-s3-driver.md) | S3 驱动：**自研 SigV4** + libcurl 数据面 + 原生预签名；编码/寻址/错误映射与兼容矩阵 | **已采纳（P5 定稿）** |
-| **ADR-006** | 大文件数据面：自持 socket + `sendfile` + **io_uring**，**协程可选非必需** | **拟定**，待 P9 受控复核（C9.12）后定稿或放弃 |
+| [**ADR-006**](adr/ADR-006-large-file-data-plane.md) | 大文件数据面：**采纳 sendfile 方向**（受控复核 2.12x ≥ 1.5x），但**实现未交付**；必须复用控制面校验、可关闭、默认走 httplib 内容提供者 | **已采纳（方向）**，P9/C9.12 定稿 |
 | [ADR-007](adr/ADR-007-async-and-coroutines.md) | 异步/协程：**现在不做**，按 T1–T3 触发条件分步推进 | 已采纳 |
 | [ADR-008](adr/ADR-008-write-durability-protocol.md) | 小文件写入：**两阶段批提交**（同步先行、改名后置） | 已采纳（含机器可检查的不变量验证） |
 | [ADR-009](adr/ADR-009-multi-instance-consistency.md) | 多实例：**PG 强一致 + 租约 + 领导者选举** | 已采纳（5 个竞态已实测复现并验证修复） |
@@ -235,6 +235,8 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | "**完全自研 HTTP/1.1 内核**"（ADR-002 初版） | **推翻**：改用 cpp-httplib 0.26.0 源码 + 强化包装层。初版从"某个二进制包不可用"推到了"自写整个 HTTP 栈"，是推理跳跃；且未评估 Boost.Beast 等候选 | 省下 600–900 行及其边界测试负担 |
 | "**组提交 = 58,741 文件/秒**"（ADR-007 §8.3） | **作废**：该数字来自**没有对文件数据做 fsync** 的不安全协议。正确值 **31,478**（P4，安全） | 原数字会误导"用安全换性能"的决策；实际不安全方案只快 **11%** |
 | `worker_threads: 8` | **改为按"并发连接数"公式推导**（该值是并发硬上限，不是 CPU 倍数） | 否则 64 并发的负载只有 8 个被服务 |
+| "sendfile 比 httplib 快 **5–7x**"（`docs/05` §1.7 初版） | **修正为 2.12x**：旧数字来自**不同探针 + 不同客户端**的拼装比较（不可比、方法学不成立）。P9 用**同一负载生成器 + 独立进程 + 互不重叠绑核**做受控 A/B：httplib 2387/7320/6990 MiB/s vs sendfile 5488/14785/14274（c1/c4/c16）→ 2.30/2.02/2.04x，几何平均 **2.12x**（`docs/test-evidence/phase9-adr006.md`） | 结论**方向不变**（仍 ≥1.5x → ADR-006 采纳 sendfile 方向），但幅度只有旧值的 1/3；据此**不**接受"独立进程 + 复制一套控制面校验"的方案，改要求数据面与控制面**同源**（ADR-006 §4）。旧数字已在 `docs/05` §1.7 就地标注 |
+| "单节点小段读上限 ~4 万 req/s"（`docs/05` §1.5 探针） | **未推翻，但适用范围要收窄**：那是**自有探针 + 简化服务端**（无鉴权/无 SQLite 读/无审计）。P9 在产品进程上实测控制面读 **14.3k req/s @c4**（c16/c64 回落到 11.0k/10.3k，p99 4.3/19.1 ms） | 两个数字**不能混用**：§1.5 用于定方向，§1.9 的基线用于回归判定；容量规划不得直接引用 4 万 req/s |
 | `fsync_policy: by_size` | **改为 `durability: batch \| per_file`**（默认 `batch` = 两阶段批提交，批大小 500） | 语义更准确；并显式声明"批级耐久性窗口" |
 | "`fss_http` 负责 Range 归一化" | **降级**：httplib 的内容提供者本身已 Range 感知（声明**完整**大小即可），`fss_http` 只做越界/416 归一化 | 避免过度设计 |
 | `ux_mr_source` 谓词只有 `state <> 'deleted'` | **修正**：必须加 `is_latest`，否则**阻断合法的版本链**（同一记录的新版本共享 `FileSource`）。已做成回归断言 I9b | schema 自检抓到的真实设计缺陷 |
@@ -362,7 +364,7 @@ FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh    # 额外纳入 PostgreSQL 基�
 
 | # | 项 | 门槛 |
 | --- | --- | --- |
-| 5 | **ADR-006 的受控复核**（`sendfile` 数据面 vs httplib，同一负载生成器；≥1.5x 才定稿，否则放弃） | C9.12 / C9.16 |
+| 5 | ~~**ADR-006 的受控复核**~~（`sendfile` 数据面 vs httplib，同一负载生成器；≥1.5x 才定稿，否则放弃） | ✅ **已完成（P9）**：**2.12x ≥ 1.5x → 采纳方向**，见 `docs/adr/ADR-006-large-file-data-plane.md`；实现未交付 |
 | 6 | ADR-005（S3 驱动）定稿 | P5 |
 | 7 | 真实存储（NVMe/HDD/NFS）上的 I/O 延迟与容量数字 | C9.14 / C9.22 |
 | 8 | io_uring 在**目标环境**（内核 + 容器 seccomp）的可用性与收益；HDD/NFS 上可能才有决定性价值 | C1.15 / C9.18 / C9.29 |

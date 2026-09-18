@@ -53,6 +53,10 @@ const std::vector<ConcreteType>& Inventory() {
       {"SqliteLocationRepository", "infra/location/sqlite/", true},
       {"InMemoryLocationRepository", "infra/location/memory/", false},
       {"InMemoryMetadataRepository", "infra/metadata/memory/", false},
+      //  ★ P9：组合根按 ADR-004 改接内置 SQLite 元数据仓储（单实例语义：重启后记录还在）。
+      //    清单必须同步 —— 否则"组合根里装配了几个具体实现"这个**非空洞性**断言会
+      //    因为"类名换了"而误报（实测：6 < 7 直接失败）。这正是它该有的行为。
+      {"SqliteMetadataRepository", "infra/metadata/sqlite/", true},
       {"HmacTransferTokenCodec", "infra/transfer/", false},
       {"BlobByteSource", "infra/transfer/", false},
       {"BlockingIoEngine", "infra/io/", false},
@@ -248,8 +252,9 @@ TEST_CASE("★ C4.9 组合根护栏的扫描器本身有效（合成文本）", 
   REQUIRE(ScanText("infra/blob/memory/memory_blob_store.cpp", "InMemoryBlobStore store(clock);")
               .empty());
   //  组合根里的构造能被检出（用于下面的非空洞性断言）
-  REQUIRE(ScanText("main/server_main.cpp", "InMemoryMetadataRepository metadata(clock);").size() ==
-          1);
+  REQUIRE(ScanText("main/server_main.cpp",
+                   "auto metadata_repository = SqliteMetadataRepository::Open(path, clock);")
+              .size() == 1);
 }
 
 TEST_CASE("★ C4.9 具体实现只在组合根装配（R12）", "[phase4][guard][c4.9]") {
@@ -277,7 +282,7 @@ TEST_CASE("★ C4.9 具体实现只在组合根装配（R12）", "[phase4][guard
       std::unique(instantiated_in_main.begin(), instantiated_in_main.end()),
       instantiated_in_main.end());
   INFO("组合根里装配的具体实现类型数：" << instantiated_in_main.size());
-  //  实测值 7（PosixBlobStore / SqliteLocationRepository / InMemoryMetadataRepository /
+  //  实测值 7（PosixBlobStore / SqliteLocationRepository / SqliteMetadataRepository /
   //  HmacTransferTokenCodec / BlobByteSource / Router / Server）。留 0 余量：一旦有人把
   //  装配从组合根挪走或删空，这条断言立刻失败
   REQUIRE(instantiated_in_main.size() >= 7);
