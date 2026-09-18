@@ -38,6 +38,16 @@ namespace fss::infra {
 struct SqliteMetadataRepositoryOptions {
   //  忙等超时：并发写时让 SQLite 自己等锁，而不是立刻返回 SQLITE_BUSY（C3.12 的同一策略）
   int busy_timeout_millis = 5000;
+  //  ★ 阶段 10（切片 4）：journal 模式。`true`（默认）= `PRAGMA journal_mode=WAL`
+  //    （与接线前逐字一致）；`false` = 不执行 PRAGMA → SQLite 默认 `DELETE`。
+  //    与 `SqliteLocationRepositoryOptions::wal` 同构；组合根从
+  //    `metadata.sqlite.journal_mode`（WAL|DELETE）映射，TRUNCATE → 拒绝启动。
+  bool wal = true;
+  //  ★ 阶段 10（切片 4）：`PRAGMA synchronous` 的取值（0 = OFF / 1 = NORMAL / 2 = FULL）。
+  //    ⚠ 该 PRAGMA **不随库文件持久化**（`journal_mode` 会），因此**不能**用"另开一个
+  //    sqlite3 连接读回"证明生效（新连接拿到的是它自己的默认值 FULL=2）。
+  //    可观测入口是本类新增的 `AppliedPragma("synchronous")`（在**本连接**上读回）。
+  int synchronous_level = 1;
 };
 
 class SqliteMetadataRepository final : public domain::IMetadataRepository {
@@ -62,6 +72,13 @@ class SqliteMetadataRepository final : public domain::IMetadataRepository {
   //  测试可观测性（与内存实现同名方法）：某个 record id 的版本数
   std::size_t VersionCount(std::string_view partition, std::string_view record_id);
 
+  //  ★ 阶段 10（切片 4）诊断访问器：读回**本连接**上 `PRAGMA <name>` 的实际值。
+  //    存在的唯一原因：`PRAGMA synchronous` **不落盘** —— 另开一个 sqlite3 连接读回得到
+  //    的是该新连接自己的默认值（FULL = 2），无法证明本仓储真的下发了 OFF/NORMAL/FULL。
+  //    `journal_mode` 会写进库文件头，用 `python3 -c "import sqlite3..."` 另开连接读回即可，
+  //    不需要本访问器。白名单只放行 `synchronous`（PRAGMA 名无法参数化，白名单是防注入手段）。
+  fss::Result<std::string> AppliedPragma(std::string_view name) const;
+
  private:
   SqliteMetadataRepository() = default;
 
@@ -76,7 +93,8 @@ class SqliteMetadataRepository final : public domain::IMetadataRepository {
   sqlite3* db_ = nullptr;
   const fss::IClock* clock_ = nullptr;
   SqliteMetadataRepositoryOptions options_{};
-  std::mutex mutex_;
+  //  `mutable`：允许 const 诊断访问器 `AppliedPragma` 也走同一把锁（DB 连接不可并发访问）。
+  mutable std::mutex mutex_;
 };
 
 }  // namespace fss::infra

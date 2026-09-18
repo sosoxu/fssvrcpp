@@ -991,9 +991,9 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 
 ## 9. 首个动作（下一步要做什么）
 
-P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）与
-切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态：**生效 89 / 拒绝启动 21 / 已读但无效果 46**（`docs/operations.md` §1.3）。
+P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
+切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）与切片 4（数据面 PUT 上限 + SQLite PRAGMA）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
+三态：**生效 93 / 拒绝启动 21 / 已读但无效果 42**（`docs/operations.md` §1.3）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
@@ -1067,7 +1067,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（切片 2 时为 生效 72 / 拒绝启动 16 / 已读但无效果 68 = 156；切片 3 后为 **81/16/59**；C10.16 后为 **82/18/56**，**C10.16 续后为 89/21/46**，见文末切片 3 状态）。
+  `docs/operations.md` 逐键三态化（**当前为 生效 93 / 拒绝启动 21 / 已读但无效果 42 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1110,7 +1110,14 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   `storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 两阶段批提交未实现，
   如实拒绝启动）与 `partition.file.opendes.storage_driver`（与顶层驱动冲突）→ **拒绝启动**（+3）。
   用例：`tests/integration/test_config_wiring.cpp` 的 `[c10.16]`（驱动层 + 真实进程）。
-* 三态计数：**生效 89 / 拒绝启动 21 / 已读但无效果 46 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* **切片 4（数据面上限 + SQLite PRAGMA）**：`server.http.transfer_max_body_bytes` → 数据面 PUT
+  上限（全局键 >0 时与 `partition.file.<p>.max_file_bytes` **取较小者**；两者都 0 → 仍不限）；
+  `metadata.sqlite.{journal_mode,synchronous}` 与 `location.sqlite.synchronous` → 两个仓储的
+  `wal` / `synchronous_level` 字段 + 真执行 PRAGMA。`synchronous` **不落盘**，用同连接访问器
+  `AppliedPragma("synchronous")` 做进程内断言；`journal_mode` 用 `python3 sqlite3` 读回。
+  用例：`tests/integration/test_config_wiring.cpp` 的切片 4 三用例 +
+  `tests/integration/test_sqlite_{location,metadata}_repository.cpp` 的 `AppliedPragma` 用例。
+* 三态计数：**生效 93 / 拒绝启动 21 / 已读但无效果 42 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
 
 **未做（本阶段不承诺）**：`events.publisher=webhook`（需新增 L2 webhook 发布器）、`legal/schema.validator=remote`、
 `metadata/location.repository=postgres|remote`、`leader_election.*`/`leases.*` 的 PG 语义、

@@ -1253,9 +1253,9 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
 exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、`expiry.*` 接进组合根，
 并把 16 个未实现键改为"非默认值 → 拒绝启动"（后续切片与 C10.16 / C10.16 续 继续收敛，当前三态为
-**生效 89 / 拒绝启动 21 / 已读但无效果 46**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
+**生效 93 / 拒绝启动 21 / 已读但无效果 42**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
 ② 多实例相关的 `shared_mount_required`/`one_filesystem_per_partition` 仍不可配（在 §1.3 的
-68 个"已读但无效果"键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
+42 个"已读但无效果"键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
 实现（ADR-006 §6 的门槛）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
 
 ---

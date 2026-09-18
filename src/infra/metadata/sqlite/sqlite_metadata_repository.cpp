@@ -163,8 +163,28 @@ fss::Result<std::unique_ptr<SqliteMetadataRepository>> SqliteMetadataRepository:
   }
   //  WAL：读不阻塞写；busy_timeout：并发写时等待而不是立刻 SQLITE_BUSY
   char* error = nullptr;
-  sqlite3_exec(repository->db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, &error);
-  if (error != nullptr) sqlite3_free(error);
+  if (options.wal) {
+    sqlite3_exec(repository->db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, &error);
+    if (error != nullptr) sqlite3_free(error);
+  }
+  //  ★ 阶段 10（切片 4）：`metadata.sqlite.synchronous` → `PRAGMA synchronous=<n>`。
+  //    0 = OFF / 1 = NORMAL（默认）/ 2 = FULL；组合根在启动期就拒绝白名单外的取值。
+  //    ⚠ 这个 PRAGMA **不落盘**，验证只能用同连接的 `AppliedPragma("synchronous")`。
+  {
+    const std::string synchronous_pragma =
+        "PRAGMA synchronous=" + std::to_string(options.synchronous_level) + ";";
+    char* pragma_error = nullptr;
+    if (sqlite3_exec(repository->db_, synchronous_pragma.c_str(), nullptr, nullptr,
+                     &pragma_error) != SQLITE_OK) {
+      const std::string message = pragma_error != nullptr ? pragma_error : "未知错误";
+      if (pragma_error != nullptr) sqlite3_free(pragma_error);
+      sqlite3_close(repository->db_);
+      repository->db_ = nullptr;
+      return fss::Err(fss::ErrorKind::kInvalidArgument,
+                      "设置 PRAGMA synchronous 失败：" + message);
+    }
+    if (pragma_error != nullptr) sqlite3_free(pragma_error);
+  }
   sqlite3_busy_timeout(repository->db_, options.busy_timeout_millis);
 
   for (const char* schema : {kSchemaMetadata, kSchemaSourceUnique, kSchemaLatestUnique,
@@ -475,6 +495,25 @@ std::size_t SqliteMetadataRepository::VersionCount(std::string_view partition,
   BindText(stmt.get(), 2, record_id);
   if (sqlite3_step(stmt.get()) != SQLITE_ROW) return 0;
   return static_cast<std::size_t>(sqlite3_column_int64(stmt.get(), 0));
+}
+
+//  ★ 阶段 10（切片 4）：诊断访问器。为什么需要它（而不是"另开连接读回"）：
+//    `PRAGMA synchronous` 是**连接级**设置，**不写进库文件**；另开一个 sqlite3 连接
+//    读回只会得到那个新连接自己的默认值（FULL = 2），与被测仓储是否真的下发了 OFF /
+//    NORMAL / FULL 完全无关。因此必须在**同一个连接**上读回。
+//  PRAGMA 名不能参数化（不是绑定值），只放行白名单里的名字以避免 SQL 注入。
+fss::Result<std::string> SqliteMetadataRepository::AppliedPragma(std::string_view name) const {
+  if (name != "synchronous") {
+    return fss::Err(fss::ErrorKind::kInvalidArgument,
+                    "AppliedPragma 只支持 synchronous（收到 '" + std::string(name) + "'）");
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  Statement stmt(db_, "PRAGMA synchronous");
+  if (!stmt.ok()) return fss::Err(fss::ErrorKind::kInternal, "准备 PRAGMA synchronous 失败");
+  if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
+    return fss::Err(fss::ErrorKind::kInternal, "读取 PRAGMA synchronous 失败");
+  }
+  return ColumnText(stmt.get(), 0);
 }
 
 }  // namespace fss::infra

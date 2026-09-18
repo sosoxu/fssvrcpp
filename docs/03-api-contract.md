@@ -199,7 +199,7 @@
 | 端点组 | 默认上限 | 配置项 |
 | --- | --- | --- |
 | JSON 端点（`/v2/files/metadata`、DMS、Delivery 等） | 10 MiB | `server.http.max_body_bytes` |
-| 数据面 `/v1/transfer/{token}` | 不限（受租户配额与磁盘水位约束） | `server.http.transfer_max_body_bytes` |
+| 数据面 `/v1/transfer/{token}` | 不限（受租户配额与磁盘水位约束；可经 `server.http.transfer_max_body_bytes` 收紧 —— `>0` 时与 `partition.file.<p>.max_file_bytes` 取较小者，超限在**读体前** 413） | `server.http.transfer_max_body_bytes` |
 | `/v2/getFileList`、`/v2/getFileLocation`、`revokeURL` | 256 KiB | 按端点覆盖 |
 
 **由包装层（`fss_http`）**额外强制**的项**（库在这两条路径上不检查）：

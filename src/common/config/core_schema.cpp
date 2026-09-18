@@ -79,7 +79,16 @@ Schema CoreSchema() {
   s.Add(FieldSpec{"server.http.json_request_timeout_seconds"}.Int(1, 86400).Default("15"));
   s.Add(FieldSpec{"server.http.transfer_idle_timeout_seconds"}
           .Int(1, 86400, "数据面只有“空闲无进展”超时，无整体超时").Default("120"));
-  s.Add(FieldSpec{"server.http.transfer_max_body_bytes"}.Int(0, 0, "0=不限").Default("0"));
+  //  ★ 阶段 10（切片 4）：原先 `Int(0, 0)` 在 `hi == lo` 时**只允许 0**（见 `FieldSpec` 的
+  //    `max_value >= min_value` 才校验范围的语义）→ 这个键等于摆设，写任何正数都被
+  //    schema 拒绝。放宽为"0 = 不限；>0 = 数据面 PUT 请求体上限"，上限取 1 TiB
+  //    （与 `storage.posix.fsync_threshold_bytes` 同一量级：覆盖任何现实的单对象，
+  //    又能否掉明显无意义的巨值）。
+  s.Add(FieldSpec{"server.http.transfer_max_body_bytes"}
+            .Int(0, 1L << 40,
+                 "0 = 不限；>0 = 数据面 `/v1/transfer/{token}` PUT 请求体上限（字节），"
+                 "与 `partition.file.<p>.max_file_bytes` 取较小者")
+            .Default("0"));
   s.Add(FieldSpec{"server.http.transfer_buffer_bytes"}.Int(4096, 67108864).Default("262144"));
   s.Add(FieldSpec{"server.http.transfer_memory_budget_bytes"}
           .Int(1048576, 0, "并发×缓冲 ≤ 该值，违反拒绝启动").Default("268435456"));

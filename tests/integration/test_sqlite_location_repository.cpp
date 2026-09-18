@@ -126,3 +126,55 @@ TEST_CASE("C3.8 Save 是 upsert：同 file_id 再次保存更新 zone 与位置"
   REQUIRE(found.value().zone == StorageZone::kPersistent);
   REQUIRE(found.value().updated_at_epoch_seconds == 999);
 }
+
+// =============================================================================
+//  阶段 10 切片 4：`location.sqlite.synchronous` → `PRAGMA synchronous`
+// =============================================================================
+//  ★ 关键陷阱（这也是 `AppliedPragma` 这个窄诊断访问器**存在的原因**）：
+//    `PRAGMA synchronous` 是**连接级**设置，**不写进库文件**。`Open` 之后再另开一个
+//    sqlite3 连接读回，得到的是那个新连接自己的默认值（FULL = 2），与仓储是否真的
+//    下发了 OFF/NORMAL/FULL 无关 —— 不能用它证明生效。
+//    对比：`journal_mode` 写进库文件头，`python3 sqlite3` 另开连接就能读回
+//    （见 tests/integration/test_config_wiring.cpp 的 C10.14 用例）。
+TEST_CASE("★ 切片 4：SqliteLocationRepository 的 synchronous 真的下发到**本连接**",
+          "[phase10][sqlite][c10.14]") {
+  fss::test::TempDir dir("sqlite_location_pragma");
+
+  SECTION("默认 = NORMAL(1)（R16 正例：不能只测非默认值）") {
+    auto opened = SqliteLocationRepository::Open(dir.child("default.db"));
+    REQUIRE(opened.ok());
+    const auto applied = opened.value()->AppliedPragma("synchronous");
+    REQUIRE(applied.ok());
+    REQUIRE(applied.value() == "1");
+  }
+
+  SECTION("synchronous_level=0（OFF）→ 读回 0（与默认值不同，排除恒真）") {
+    fss::infra::SqliteLocationRepositoryOptions options;
+    options.synchronous_level = 0;
+    auto opened = SqliteLocationRepository::Open(dir.child("off.db"), options);
+    REQUIRE(opened.ok());
+    const auto applied = opened.value()->AppliedPragma("synchronous");
+    REQUIRE(applied.ok());
+    REQUIRE(applied.value() == "0");
+  }
+
+  SECTION("synchronous_level=2（FULL）→ 读回 2") {
+    fss::infra::SqliteLocationRepositoryOptions options;
+    options.synchronous_level = 2;
+    auto opened = SqliteLocationRepository::Open(dir.child("full.db"), options);
+    REQUIRE(opened.ok());
+    const auto applied = opened.value()->AppliedPragma("synchronous");
+    REQUIRE(applied.ok());
+    REQUIRE(applied.value() == "2");
+  }
+
+  SECTION("访问器只放行白名单内的 PRAGMA 名（PRAGMA 名不能参数化）") {
+    auto opened = SqliteLocationRepository::Open(dir.child("guard.db"));
+    REQUIRE(opened.ok());
+    const auto rejected = opened.value()->AppliedPragma("journal_mode; DROP TABLE file_locations");
+    REQUIRE_FALSE(rejected.ok());
+    REQUIRE(rejected.error().kind() == fss::ErrorKind::kInvalidArgument);
+    //  白名单外被拒；白名单内仍可用
+    REQUIRE(opened.value()->AppliedPragma("synchronous").ok());
+  }
+}

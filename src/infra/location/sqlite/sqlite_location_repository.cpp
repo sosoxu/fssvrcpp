@@ -212,6 +212,23 @@ fss::Result<std::unique_ptr<SqliteLocationRepository>> SqliteLocationRepository:
     sqlite3_exec(repository->db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, &message);
     if (message != nullptr) sqlite3_free(message);
   }
+  //  ★ 阶段 10（切片 4）：`location.sqlite.synchronous` → `PRAGMA synchronous=<n>`。
+  //    0 = OFF / 1 = NORMAL（默认）/ 2 = FULL；组合根在启动期拒绝白名单外的取值。
+  //    ⚠ 不落盘，验证只能用同连接的 `AppliedPragma("synchronous")`。
+  {
+    const std::string synchronous_pragma =
+        "PRAGMA synchronous=" + std::to_string(options.synchronous_level) + ";";
+    char* pragma_error = nullptr;
+    if (sqlite3_exec(repository->db_, synchronous_pragma.c_str(), nullptr, nullptr,
+                     &pragma_error) != SQLITE_OK) {
+      const std::string detail = pragma_error != nullptr ? pragma_error : "未知错误";
+      if (pragma_error != nullptr) sqlite3_free(pragma_error);
+      sqlite3_close(repository->db_);
+      repository->db_ = nullptr;
+      return Err(fss::ErrorKind::kInvalidArgument, "设置 PRAGMA synchronous 失败：" + detail);
+    }
+    if (pragma_error != nullptr) sqlite3_free(pragma_error);
+  }
   sqlite3_busy_timeout(repository->db_, options.busy_timeout_millis);
 
   FSS_TRY(repository->EnsureSchema());
@@ -410,6 +427,22 @@ fss::Result<domain::LocationPage> SqliteLocationRepository::List(
     page.records.push_back(std::move(location.value()));
   }
   return page;
+}
+
+//  ★ 阶段 10（切片 4）：诊断访问器。为什么需要它（而不是"另开连接读回"）：
+//    `PRAGMA synchronous` 是**连接级**设置，**不写进库文件**；另开一个 sqlite3 连接读回
+//    只会得到那个新连接自己的默认值（FULL = 2），与仓储是否真的下发了 OFF/NORMAL/FULL
+//    无关。因此必须在**同一个连接**上读回。PRAGMA 名不能参数化（不是绑定值），只放行
+//    白名单里的名字以避免 SQL 注入。
+fss::Result<std::string> SqliteLocationRepository::AppliedPragma(std::string_view name) const {
+  if (name != "synchronous") {
+    return Invalid("AppliedPragma 只支持 synchronous（收到 '" + std::string(name) + "'）");
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  Statement stmt(db_, "PRAGMA synchronous");
+  if (!stmt.ok()) return SqliteError(db_, "准备 PRAGMA synchronous 失败");
+  if (sqlite3_step(stmt.get()) != SQLITE_ROW) return SqliteError(db_, "读取 PRAGMA synchronous 失败");
+  return ColumnText(stmt.get(), 0);
 }
 
 }  // namespace fss::infra

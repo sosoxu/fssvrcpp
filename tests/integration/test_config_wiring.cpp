@@ -1304,6 +1304,250 @@ TEST_CASE("★ C10.16：非法校验算法 → exit 78；默认算法不在集�
 }
 
 // =============================================================================
+//  阶段 10 切片 4：`server.http.transfer_max_body_bytes` 与 SQLite 的
+//  `journal_mode` / `synchronous`
+// =============================================================================
+//  ★ 数据面 PUT 上限的**落点** = 全局键（>0 时）与
+//    `partition.file.<p>.max_file_bytes`（0 = 不限）的**较小者**；两者都为 0/不限时结果
+//    仍是 0（行为与接线前逐字一致）。超限由 HTTP 包装层在**读体前**拒绝（带
+//    `Content-Length` → 413），HTTP 包装层本身不改。
+//  ★ `journal_mode` 会写进库文件头 → 可用 `python3 sqlite3` 另开连接读回；
+//    `synchronous` **不落盘** → 真实进程侧只断言横幅打印了实际取值（"另开连接读回"
+//    的进程内 L2 断言见 `tests/integration/test_sqlite_{location,metadata}_repository.cpp`
+//    的 `AppliedPragma` 用例——`synchronous` 必须用同连接访问器）。
+// =============================================================================
+
+TEST_CASE("★ 切片 4：server.http.transfer_max_body_bytes 收紧数据面 PUT（413 / 200 / 取较小者）",
+          "[phase10][config][c10.16]") {
+  TempDir data_dir("c10s4_transfer");
+
+  //  `global_value` / `partition_value` 为空串 = **不写**该键（走默认 0 = 不限）。
+  const auto write_config = [&](const std::string& tag, int port,
+                                const std::string& global_value,
+                                const std::string& partition_value) {
+    std::string server_http = "{\"port\": " + std::to_string(port) + ", \"bind\": \"127.0.0.1\"";
+    if (!global_value.empty()) {
+      server_http += ", \"transfer_max_body_bytes\": " + global_value;
+    }
+    server_http += "}";
+    std::string partition_json;
+    if (!partition_value.empty()) {
+      partition_json = "  \"partition\": {\"file\": {\"opendes\": {\"max_file_bytes\": " +
+                       partition_value + "}}},\n";
+    }
+    return WriteFile(
+        data_dir, tag + ".json",
+        "{\n  \"server\": {\"http\": " + server_http + "},\n"
+        "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child(tag + "-data") + "\"}},\n"
+        "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-loc.db") + "\"}},\n"
+        "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-meta.db") + "\"}},\n"
+        "  \"self_signed\": {\"signing_key\": \"c10s4\"},\n" + partition_json +
+        "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  };
+
+  //  每次 PUT 都用**新签发**的自签 URL（数据面从 token 载荷解析对象键）。
+  const auto upload_target = [](int http_port) -> std::string {
+    const auto reply = HttpGet(http_port, "/api/file/v2/files/uploadURL", Authed());
+    REQUIRE(reply.status == 200);
+    const auto parsed = fss::json::Parse(reply.body);
+    REQUIRE(parsed.ok());
+    const auto& url = parsed.value()["Location"]["SignedURL"];
+    REQUIRE(url.is_string());
+    return fss::test::TargetOf(url.get<std::string>());
+  };
+
+  //  ★ 为什么"超限"这一侧只发**请求头**（用 `Content-Length` 声明 2 MiB / 8192），
+  //    而不真的把字节发完：`max_body_bytes` 的真实语义就是**按 Content-Length 前置拒绝**
+  //    （`common/http` 的 H-2①：一个字节都不读）。真把 2 MiB 灌进去时，服务端在读体前
+  //    就 413 并关闭连接，未读的残余请求体会让内核回 RST，把已经收到的 413 丢掉
+  //    （客户端 send 报错 + 响应丢失，非确定性）。只发头 + 声明长度正好命中那条真实路径。
+  const auto put_declared_length = [](int http_port, const std::string& target,
+                                      std::size_t declared_len) -> int {
+    RawClient client(http_port, /*tcp_nodelay=*/true);
+    if (!client.Connect()) return 0;
+    std::string head = "PUT " + target + " HTTP/1.1\r\nHost: h\r\n";
+    head += "Content-Length: " + std::to_string(declared_len) + "\r\n";
+    head += "authorization: Bearer test-token\r\ndata-partition-id: opendes\r\n\r\n";
+    if (!client.Send(head)) return 0;
+    const auto response = client.ReadResponse(10000);
+    return response.has_value() ? response->status : 0;
+  };
+
+  SECTION("全局键 > 0 且未设 partition：2 MiB → 413；恰好 1 MiB → 200") {
+    const int port = FreePort();
+    const std::string config = write_config("global_only", port, "1048576", "");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(server.http_port() == port);
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    //  横幅打印**实际生效值**（= 全局键，因为 partition 侧不限）
+    REQUIRE(server.DumpLog().find("transfer limit : 数据面 PUT max_body_bytes=1048576") !=
+            std::string::npos);
+
+    const int over = put_declared_length(port, upload_target(port), std::size_t{2} * 1024 * 1024);
+    CAPTURE(over);
+    REQUIRE(over == 413);
+
+    //  正例（R16）：恰好 1 MiB 必须通过 —— 否则"超限被拒"可能只是"恒拒"。
+    const auto exact = fss::test::HttpDo(port, "PUT", upload_target(port), {},
+                                         std::string(std::size_t{1024} * 1024, 'x'));
+    CAPTURE(exact.status, exact.body);
+    REQUIRE(exact.status == 200);
+  }
+
+  SECTION("R16 正例对照：**未设**该键（默认 0 = 不限）→ 同一个 2 MiB PUT 必须 200") {
+    const int port = FreePort();
+    const std::string config = write_config("unlimited", port, "", "");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("max_body_bytes=0（0=不限") != std::string::npos);
+    const auto reply = fss::test::HttpDo(port, "PUT", upload_target(port), {},
+                                         std::string(std::size_t{2} * 1024 * 1024, 'x'));
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 200);
+  }
+
+  SECTION("全局 > 0 且 partition 更小 → 取较小者（4096 生效，而非全局 1 MiB）") {
+    const int port = FreePort();
+    const std::string config = write_config("min_wins", port, "1048576", "4096");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("max_body_bytes=4096") != std::string::npos);
+
+    //  8192 > partition 的 4096（但 < 全局 1 MiB）→ 必须 413：证明取的是**较小者**。
+    const int over = put_declared_length(port, upload_target(port), 8192);
+    CAPTURE(over);
+    REQUIRE(over == 413);
+    //  正例：恰好 4096 → 200
+    const auto exact =
+        fss::test::HttpDo(port, "PUT", upload_target(port), {}, std::string(4096, 'x'));
+    REQUIRE(exact.status == 200);
+  }
+}
+
+TEST_CASE("★ 切片 4：metadata.sqlite.journal_mode 生效（python3 读回）；TRUNCATE → exit 78",
+          "[phase10][config][c10.14]") {
+  TempDir cfg_dir("fss_cfg_meta_sqlite");
+  TempDir data_dir("fss_cfg_meta_sqlite_data");
+
+  const auto run_with = [&](const std::string& name, const std::string& journal_mode) {
+    const int port = FreePort();
+    const std::string db = data_dir.child(name + "-meta.db");
+    const std::string config = WriteFile(
+        cfg_dir, name + ".json",
+        std::string("{\n  \"server\": {\"http\": {\"bind\": \"127.0.0.1\", \"port\": ") +
+            std::to_string(port) + "}},\n  \"storage\": {\"posix\": {\"root\": \"" +
+            data_dir.child(name + "-store") + "\"}},\n  \"location\": {\"sqlite\": {\"path\": \"" +
+            data_dir.child(name + "-loc.db") +
+            "\"}},\n  \"metadata\": {\"sqlite\": {\"path\": \"" + db + "\", \"journal_mode\": \"" +
+            journal_mode + "\"}},\n  \"self_signed\": {\"signing_key\": \"c10s4\"},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+    return std::make_tuple(db, config, port);
+  };
+
+  SECTION("WAL（默认）→ python3 读回 'wal'，横幅可见实际取值") {
+    const auto [db, config, port] = run_with("meta_wal", "WAL");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("metadata busy_timeout=5000ms journal_mode=WAL") !=
+            std::string::npos);
+    const std::string mode = PythonJournalMode(db);
+    CAPTURE(db, mode);
+    REQUIRE(mode == "wal");
+  }
+
+  SECTION("DELETE → python3 读回 'delete'（证明配置真的改了行为，而不是恒为 WAL）") {
+    const auto [db, config, port] = run_with("meta_del", "DELETE");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("metadata busy_timeout=5000ms journal_mode=DELETE") !=
+            std::string::npos);
+    const std::string mode = PythonJournalMode(db);
+    CAPTURE(db, mode);
+    REQUIRE(mode == "delete");
+  }
+
+  SECTION("TRUNCATE → 拒绝启动（只接通 WAL|DELETE，不静默当成 DELETE）") {
+    const auto [db, config, port] = run_with("meta_trunc", "TRUNCATE");
+    (void)db;
+    (void)port;
+    const ProcessOutcome outcome = RunServerForExit({"--config", config});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("metadata.sqlite.journal_mode=TRUNCATE") != std::string::npos);
+    REQUIRE(outcome.output.find("已启动") == std::string::npos);
+  }
+}
+
+TEST_CASE("★ 切片 4：*.sqlite.synchronous 映射到 PRAGMA 并在横幅可见；非法 → exit 78",
+          "[phase10][config][c10.14]") {
+  TempDir cfg_dir("fss_cfg_sync");
+  TempDir data_dir("fss_cfg_sync_data");
+
+  const auto write_config = [&](const std::string& name, int port,
+                                const std::string& metadata_sync,
+                                const std::string& location_sync) {
+    return WriteFile(
+        cfg_dir, name + ".json",
+        "{\n  \"server\": {\"http\": {\"bind\": \"127.0.0.1\", \"port\": " +
+            std::to_string(port) + "}},\n  \"storage\": {\"posix\": {\"root\": \"" +
+            data_dir.child(name + "-store") +
+            "\"}},\n  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(name + "-loc.db") +
+            "\", \"synchronous\": \"" + location_sync +
+            "\"}},\n  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(name + "-meta.db") +
+            "\", \"synchronous\": \"" + metadata_sync +
+            "\"}},\n  \"self_signed\": {\"signing_key\": \"c10s4\"},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  };
+
+  SECTION("FULL / OFF 落到横幅（实际生效取值可见），readiness 200") {
+    const int port = FreePort();
+    const std::string config = write_config("sync_full_off", port, "FULL", "OFF");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(server.http_port() == port);
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("synchronous=FULL") != std::string::npos);
+    REQUIRE(server.DumpLog().find("synchronous=OFF") != std::string::npos);
+  }
+
+  SECTION("正例（R16）：默认 NORMAL 两个仓储都能启动且横幅可见") {
+    const int port = FreePort();
+    const std::string config = write_config("sync_default", port, "NORMAL", "NORMAL");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    //  横幅同时打印 location 与 metadata 两处（同一行），出现两次
+    REQUIRE(server.DumpLog().find("synchronous=NORMAL") != std::string::npos);
+  }
+
+  SECTION("非法 metadata.sqlite.synchronous=FAST → exit 78 + 可读原因") {
+    const int port = FreePort();
+    const std::string config = write_config("bad_meta_sync", port, "FAST", "NORMAL");
+    const ProcessOutcome outcome = RunServerForExit({"--config", config});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("metadata.sqlite.synchronous") != std::string::npos);
+    REQUIRE(outcome.output.find("FAST") != std::string::npos);
+    REQUIRE(outcome.output.find("已启动") == std::string::npos);
+  }
+
+  SECTION("非法 location.sqlite.synchronous=FAST → exit 78 + 可读原因") {
+    const int port = FreePort();
+    const std::string config = write_config("bad_loc_sync", port, "NORMAL", "FAST");
+    const ProcessOutcome outcome = RunServerForExit({"--config", config});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("location.sqlite.synchronous") != std::string::npos);
+    REQUIRE(outcome.output.find("FAST") != std::string::npos);
+  }
+}
+
+// =============================================================================
 //  C10.16 续（阶段 10 收尾）：`storage.posix.*` 细节键 与 `partition.file.*` 容器名
 // =============================================================================
 //  ★ 为什么分两层验证：

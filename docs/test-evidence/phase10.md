@@ -6,11 +6,11 @@
 | 状态 | ✅ **切片 1/2/3 全部完成 + C10.16 + C10.16 续**：C10.1~C10.16 满足；**本轮（C10.16 续）**把原先「无字段可接」的 10 个键接通（5 + 2 生效、3 拒绝启动；见 §7） |
 | 门槛命令 | `ctest -L phase10 && scripts/verify_config_wiring.sh` |
 | 退出码 | `0` |
-| 新测试 | `tests/integration/test_config_wiring.cpp`：**26 个 TEST_CASE / 499 断言**（真实 `build/bin/fss_server` + 驱动层；C10.16 续新增 4 用例 / 75 断言） |
+| 新测试 | `tests/integration/test_config_wiring.cpp`：**29 个 TEST_CASE / 607 断言**（真实 `build/bin/fss_server` + 驱动层；切片 4 新增 3 用例 / 108 断言） |
 | 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
 | 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **76/76** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 89 / 拒绝启动（触发条件）21 / 已读但无效果 46**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 93 / 拒绝启动（触发条件）21 / 已读但无效果 42**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
 | 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
@@ -339,11 +339,14 @@ All tests passed (14 assertions in 1 test case)
 * ADR-008 的 P4（两阶段批提交）**仍未实现** —— 本轮不假装接通，改为对
   `group_commit_max_batch` / `sync_dir_after_batch` 的非默认值**拒绝启动**。
 
-### 7.6 三态计数（收尾）
+### 7.6 三态计数（C10.16 续 收尾；**该数字已被 §9 的切片 4 取代**）
 
-`config/fss.example.json` 的 **156** 个叶子键：**生效 89 / 拒绝启动（触发条件）21 /
-已读但无效果 46**（`89 + 21 + 46 = 156`；由 `tests/unit/test_operations_doc.cpp` 的
+`config/fss.example.json` 的 **156** 个叶子键：**生效 93 / 拒绝启动（触发条件）21 /
+已读但无效果 42**（`93 + 21 + 42 = 156`；由 `tests/unit/test_operations_doc.cpp` 的
 C10.11 用例从 §1.2 的 156 行程序化提取并机械断言，正文声明的数字也一并断言）。
+> 本节的数字是 C10.16 续 收尾时的快照，**已被 §9 的切片 4 取代**（切片 4 把
+> `server.http.transfer_max_body_bytes`、`metadata.sqlite.{journal_mode,synchronous}`、
+> `location.sqlite.synchronous` 4 键从「已读但无效果」移入「生效」，见 §9）。
 
 ---
 
@@ -429,3 +432,126 @@ $ ctest --test-dir build -j4
 即：**P0~P10 全绿**（第一次修复后跑为 377 s / 11 阶段，第二次在最终提交树上为 252 s / 11 阶段，
 两次都 `失败: 无`；D4/D5 的修复没有掩盖任何既有问题——修复前后"通过"的差异只体现在
 **检查范围从 10 阶段/126 条门槛扩到 11 阶段/142 条门槛**）。
+
+---
+
+## 9. 切片 4（本轮）：数据面 PUT 上限 与 SQLite 的 journal_mode / synchronous
+
+**背景**：`docs/operations.md` §1.3 的 156 键三态里还有 4 个键是「已读但无效果」：
+`server.http.transfer_max_body_bytes`（schema 写成 `Int(0, 0)`，而 `FieldSpec` 在 `hi == lo`
+时**只允许 0** → 这个键等于摆设）、`metadata.sqlite.journal_mode`（元数据仓储内硬编码 WAL）、
+`metadata.sqlite.synchronous` / `location.sqlite.synchronous`（两个仓储都没有这个 PRAGMA）。
+本轮先读代码确认"字段/通路是否真实存在"，再逐个接通。
+
+### 9.1 逐键结论（4 个键）
+
+| 键 | 最终状态 | 判据 / 证据 |
+| --- | --- | --- |
+| `server.http.transfer_max_body_bytes` | **生效** | schema 放宽为 `Int(0, 1L << 40)`（`0` = 不限）；落点 = 全局键与 `partition.file.<p>.max_file_bytes` 的**较小者**（都为 0 → 仍不限，逐字保持接线前行为）。真实进程：全局 `1048576` + 无 partition → 声明 2 MiB → **413**、恰好 1 MiB → **200**；未设该键（默认 0）→ 2 MiB → **200**（R16 对照）；全局 1 MiB + partition `4096` → 8192 → **413**、4096 → **200**（证明取较小者） |
+| `metadata.sqlite.journal_mode` | **生效** | `SqliteMetadataRepositoryOptions.wal`（新增，默认 `true` = 与接线前逐字一致）；`WAL`→`PRAGMA journal_mode=WAL`；`DELETE`→不执行 PRAGMA（SQLite 默认 `delete`）。真实进程 `python3 sqlite3` 读回 metadata 库：WAL→`wal`、DELETE→`delete`；`TRUNCATE`→**exit 78** + 可读原因 |
+| `metadata.sqlite.synchronous` | **生效** | `SqliteMetadataRepositoryOptions.synchronous_level`（新增）+ `PRAGMA synchronous=<n>`；同连接访问器 `AppliedPragma("synchronous")`：默认 `"1"`（NORMAL，R16 正例）、OFF `"0"`、FULL `"2"`；真实进程横幅打印 `synchronous=FULL/OFF/NORMAL` |
+| `location.sqlite.synchronous` | **生效** | `SqliteLocationRepositoryOptions.synchronous_level`（新增，放在结构体**最后**，避免既有聚合初始化按位置静默错位）+ 同款 PRAGMA 与 `AppliedPragma` |
+
+### 9.2 实现点（可点击）
+
+* `src/common/config/core_schema.cpp`：`server.http.transfer_max_body_bytes` 由 `Int(0, 0)` 放宽为
+  `Int(0, 1L << 40)`（上限与 `storage.posix.fsync_threshold_bytes` 同量级，description 写明语义）。
+* `src/infra/metadata/sqlite/sqlite_metadata_repository.{h,cpp}`：Options 新增 `wal` /
+  `synchronous_level`；`Open()` 按 `wal` 决定是否执行 WAL PRAGMA、按 `synchronous_level` 执行
+  `PRAGMA synchronous`；新增 `AppliedPragma`（白名单只放行 `synchronous`，PRAGMA 名不能参数化）。
+* `src/infra/location/sqlite/sqlite_location_repository.{h,cpp}`：同上（`synchronous_level` 加在最后）。
+* `src/main/server_main.cpp`：读全局键 + 两个 `synchronous` 枚举（`ParseSynchronousLevel`，
+  `NORMAL/FULL/OFF` → `1/2/0`）；metadata `journal_mode` 同样只接通 WAL|DELETE；两个仓储 Options
+  改**具名赋值**；`router_options.transfer_put_max_body_bytes` = 全局与 partition 的较小者；
+  横幅新增 `transfer limit` 行并把 `sqlite tuning` 扩展到 journal_mode/synchronous。
+* `tests/integration/test_config_wiring.cpp`：+3 用例 / 108 断言（数据面 413/200/默认不限/较小者、
+  metadata journal_mode python3 读回与 TRUNCATE→78、synchronous 横幅与非法值→78）。
+* `tests/integration/test_sqlite_{location,metadata}_repository.cpp`：各 +1 用例 / 13 断言
+  （`AppliedPragma` 的默认/OFF/FULL + 白名单护栏）。
+* 文档：`docs/operations.md`（§1.2 逐键行、§1.3 三态与三个清单、§1.3.3 理由表、§8）、
+  `docs/03-api-contract.md`（数据面默认上限行）、`docs/00-final-design.md` §P10、
+  `docs/02-design.md` §16、`docs/04-implementation-plan.md` 末、`AGENTS.md`（§0 三态 + §4.3 新增
+  synchronous 陷阱行）、`tests/unit/test_operations_doc.cpp`（期望值 93/21/42）。
+
+### 9.3 实测命令与输出摘要
+
+```
+$ cmake --build build -j"$(nproc)"
+[100%] Built target test_grpc_streaming                 # 0 error
+#   ★ 说明：首次 -j$(nproc) 在 test_protocol_equivalence 上触发 AGENTS §4.3 的 OOM
+#   （Killed signal terminated program cc1plus）；按该条用 -j4 续跑后全量构建通过。
+$ ctest --test-dir build -j4
+100% tests passed, 0 tests failed out of 76
+$ ctest --test-dir build -L phase10 --output-on-failure
+100% tests passed, 0 tests failed out of 1
+$ ./build/bin/test_config_wiring
+All tests passed (607 assertions in 29 test cases)
+$ ./scripts/check_docs.sh --selftest
+  ✓ 自证：D1/D2/D4/D5 都能检出注入的错误（检查器有效）
+  D1 检查了 53 个本地链接 / D3 ADR 12 个 / D5 11 个阶段 142 条门槛
+  全部检查通过（D1~D5）
+$ ./scripts/verify_config_wiring.sh
+配置面接线：全部通过（54 条断言）
+$ ./scripts/run_all_gates.sh              # 父代理在最终工作树上重跑（含 check_docs --selftest）
+  汇总
+    失败: 无
+  ⏱  总耗时: 5 分 27 秒（327 s，阶段数 11）
+  ✅ 全部已启用阶段门槛通过。
+```
+
+**父代理独立复核**（不是转述切片实现者）：`cmake --build build -j4` 通过、`ctest` **76/76**、
+`test_config_wiring` **607 断言 / 29 用例**、`test_operations_doc` **24 断言 / 2 用例**、
+`check_docs.sh --selftest` 通过、`verify_config_wiring.sh` 54 条断言通过、
+`grep -rn "R1-INJECT" src/ tests/` 无残留 —— 与 §9.3 的报告一致。
+
+### 9.4 R1 自证（注入 → 用例失败 → 还原 → 实测输出）
+
+4 个键**各**注入一次"错误实现"，都让对应用例失败；随后完整还原，
+`grep -rn "R1-INJECT" src/` 无残留：
+
+1. transfer 上限改成"直接取全局"（忽略 partition 的较小者）：
+```
+REQUIRE( server.DumpLog().find("max_body_bytes=4096") != std::string::npos )   FAILED
+with expansion: transfer limit : ... max_body_bytes=1048576 ...
+test cases: 1 | 0 passed | 1 failed      assertions: 46 | 45 passed | 1 failed
+```
+2. metadata `wal` 写死 `true`（DELETE 不生效）：
+```
+REQUIRE( mode == "delete" )   FAILED      with expansion: "wal" == "delete"
+test cases: 1 | 0 passed | 1 failed      assertions: 22 | 21 passed | 1 failed
+```
+3. metadata 仓储注释掉 `PRAGMA synchronous`：
+```
+REQUIRE( applied.value() == "1" )   FAILED   with expansion: "2" == "1"
+REQUIRE( applied.value() == "0" )   FAILED   with expansion: "2" == "0"
+test cases: 1 | 0 passed | 1 failed      assertions: 13 | 11 passed | 2 failed
+```
+（`"2"` 正是"另开连接读回会拿到新连接默认值 FULL=2"的直接实证 —— 所以必须用同连接访问器）
+4. location 仓储注释掉 `PRAGMA synchronous`：同上，`"2" == "1"` / `"2" == "0"`，2 条失败。
+
+还原后的实测：
+```
+$ grep -rn "R1-INJECT" src/                              # 无输出
+$ ./build/bin/test_config_wiring "★ 切片 4*"              → All tests passed (108 assertions in 3 test cases)
+$ ./build/bin/test_sqlite_location_repository "★ 切片 4*"  → All tests passed (13 assertions in 1 test case)
+$ ./build/bin/test_sqlite_metadata_repository "★ 切片 4*"  → All tests passed (13 assertions in 1 test case)
+```
+
+### 9.5 未做 / 降级（如实登记）
+
+* `*.sqlite.{max_write_concurrency,group_commit*}` 仍「已读但无效果」：两个仓储都是
+  "单连接 + 互斥"（`max_write_concurrency` 不改变行为），且实现里没有组提交。
+* `metadata/location.sqlite.synchronous` 的**非枚举值**由 schema 的 `.Enum` 在 `config::Load`
+  阶段就拒绝（exit 78 +「取值非法」），因此组合根里 `ParseSynchronousLevel() < 0` 那条分支在
+  当前 schema 下不可达，保留为纵深防御；`journal_mode=TRUNCATE` 能到达组合根，因为 schema 的
+  枚举**刻意**包含 TRUNCATE（组合根只接通 WAL|DELETE）。
+* 数据面 PUT 超限的 413 用例**只发请求头**（用 `Content-Length` 声明 2 MiB），不真的灌 2 MiB：
+  包装层按 Content-Length **读体前**拒绝（H-2①），真灌字节会因未读残余触发 RST、丢掉已收到的
+  413（用例注释里写明了这条）。
+* 未跑 `run_all_gates.sh` 全量（由父代理收尾跑）；上面 6 项与本切片相关的命令全绿。
+
+### 9.6 三态计数（收尾）
+
+`config/fss.example.json` 的 **156** 个叶子键：**生效 93 / 拒绝启动（触发条件）21 /
+已读但无效果 42**（`93 + 21 + 42 = 156`），由 `tests/unit/test_operations_doc.cpp` 的 C10.11
+用例从 §1.2 的 156 行程序化提取并机械断言（表格计数 + 正文两处字符串同时断言）。

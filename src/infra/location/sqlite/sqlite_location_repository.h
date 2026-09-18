@@ -45,6 +45,12 @@ struct SqliteLocationRepositoryOptions {
   //  当前实现是"单连接 + 互斥"（实际并发 1 ≤ 上限），因此不会出现 `SQLITE_BUSY`；
   //  将来的连接池可以真正用起这个值。必须 > 0。
   int max_write_concurrency = 8;
+  //  ★ 阶段 10（切片 4）：`PRAGMA synchronous` 的取值（0 = OFF / 1 = NORMAL / 2 = FULL）。
+  //    ⚠ 与 `journal_mode` 不同，该 PRAGMA **不随库文件持久化**：另开一个 sqlite3 连接
+  //    读回的是新连接的默认值（FULL = 2），不能用来证明生效。可观测入口是
+  //    `AppliedPragma("synchronous")`（在**本连接**上读回）。放在结构体**最后**，避免
+  //    既有的聚合初始化按位置取值时静默错位。
+  int synchronous_level = 1;
 };
 
 class SqliteLocationRepository final : public domain::IFileLocationRepository {
@@ -70,6 +76,12 @@ class SqliteLocationRepository final : public domain::IFileLocationRepository {
   fss::Result<domain::LocationPage> List(std::string_view partition,
                                          const domain::LocationQuery& query) override;
 
+  //  ★ 阶段 10（切片 4）诊断访问器：读回**本连接**上 `PRAGMA <name>` 的实际值。
+  //    存在的唯一原因：`PRAGMA synchronous` **不落盘**，另开一个 sqlite3 连接读回得到的是
+  //    该新连接自己的默认值（FULL = 2），与仓储是否真的下发了 OFF/NORMAL/FULL 无关。
+  //    白名单只放行 `synchronous`（PRAGMA 名无法参数化，白名单是防注入手段）。
+  fss::Result<std::string> AppliedPragma(std::string_view name) const;
+
  private:
   SqliteLocationRepository() = default;
   fss::Result<void> EnsureSchema();
@@ -80,7 +92,8 @@ class SqliteLocationRepository final : public domain::IFileLocationRepository {
 
   sqlite3* db_ = nullptr;
   SqliteLocationRepositoryOptions options_{};
-  std::mutex mutex_;  // 单连接串行化：让并发调用者排队（C3.12）
+  //  `mutable`：允许 const 诊断访问器 `AppliedPragma` 也走同一把锁（DB 连接不可并发访问）。
+  mutable std::mutex mutex_;  // 单连接串行化：让并发调用者排队（C3.12）
 };
 
 }  // namespace fss::infra

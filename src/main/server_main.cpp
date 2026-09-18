@@ -590,6 +590,16 @@ PartitionFileOptions ReadPartitionFileOptions(const fss::config::Config& cfg, Re
   return out;
 }
 
+//  ★ 阶段 10（切片 4）：`*.sqlite.synchronous` 的枚举 → `PRAGMA synchronous` 数值。
+//  SQLite 的整数值是稳定的（OFF=0 / NORMAL=1 / FULL=2），schema 的枚举名才是给人看的。
+//  非法值返回 -1，由调用方 → 拒绝启动（exit 78），绝不静默折成默认值。
+int ParseSynchronousLevel(const std::string& text) {
+  if (text == "OFF") return 0;
+  if (text == "NORMAL") return 1;
+  if (text == "FULL") return 2;
+  return -1;
+}
+
 //  校验算法集合与默认算法：**按真实语义**只做启动期校验（R16：正例必须能通过）。
 //    ① 集合里每个名字必须是我们真的支持的算法（SHA-256 / SHA-1 / MD5）；
 //    ② 默认算法必须在这个集合里。
@@ -997,6 +1007,10 @@ int main(int argc, char** argv) {
   const long max_header_bytes = resolver.Int("server.http.max_header_bytes", 16384);
   const long max_uri_bytes = resolver.Int("server.http.max_uri_bytes", 8192);
   const long max_body_bytes = resolver.Int("server.http.max_body_bytes", 10485760);
+  //  ★ 阶段 10（切片 4）：数据面 PUT 的**全局**请求体上限（0 = 不限）。真正的落点值还要与
+  //    `partition.file.<p>.max_file_bytes` 取较小者（见下方 router_options 赋值处）。
+  const long transfer_max_body_bytes =
+      resolver.Int("server.http.transfer_max_body_bytes", 0);
   const std::string error_format = resolver.Str("http.error_format", "apperror");
 
   //  ---- 存储（storage.*，C10.4）----
@@ -1028,16 +1042,27 @@ int main(int argc, char** argv) {
       resolver.Str("metadata.sqlite.path", storage_root + "/metadata.db");
   const std::string sqlite_path =
       resolver.Str("location.sqlite.path", storage_root + "/location.db");
-  //  ---- C10.14：SQLite 调优键（只接**真实存在**的 Options 字段）----
-  //  ★ 按仓库既有 `SqliteMetadataRepositoryOptions` / `SqliteLocationRepositoryOptions`
-  //    的字段接线；两个结构体里**没有**的键（`synchronous`/`group_commit*`）不发明，
-  //    继续留在"已读但无效果"清单里（理由与下一步见 operations.md §1.3.3）。
+  //  ---- C10.14 / 切片 4：SQLite 调优键（只接**真实存在**的 Options 字段）----
+  //  ★ 按 `SqliteMetadataRepositoryOptions` / `SqliteLocationRepositoryOptions` 的字段接线；
+  //    切片 4 给两个结构体补齐了 `journal_mode`（`wal` 布尔）与 `synchronous`
+  //    （`synchronous_level`），因此这四个键从「已读但无效果」移入「生效」。
+  //    仍未接的是 `group_commit*`（实现里没有组提交）与 `max_write_concurrency`
+  //    （单连接 + 互斥，实际并发恒为 1）—— 见 operations.md §1.3.3。
   const long metadata_sqlite_busy_timeout_ms =
       resolver.Int("metadata.sqlite.busy_timeout_ms", 5000);
   const long location_sqlite_busy_timeout_ms =
       resolver.Int("location.sqlite.busy_timeout_ms", 5000);
+  const std::string metadata_sqlite_journal_mode =
+      resolver.Str("metadata.sqlite.journal_mode", "WAL");
   const std::string location_sqlite_journal_mode =
       resolver.Str("location.sqlite.journal_mode", "WAL");
+  //  enum NORMAL / FULL / OFF → PRAGMA synchronous 的 1 / 2 / 0（非法 → -1 → exit 78）
+  const std::string metadata_sqlite_synchronous_text =
+      resolver.Str("metadata.sqlite.synchronous", "NORMAL");
+  const std::string location_sqlite_synchronous_text =
+      resolver.Str("location.sqlite.synchronous", "NORMAL");
+  const int metadata_sqlite_synchronous = ParseSynchronousLevel(metadata_sqlite_synchronous_text);
+  const int location_sqlite_synchronous = ParseSynchronousLevel(location_sqlite_synchronous_text);
   //  `max_write_concurrency`：字段存在，但当前实现是"单连接 + 互斥"（实际并发 1），
   //  取值不改变行为 → 仍如实登记为"已读但无效果"（见 §1.3.3），这里只把值传进 Options。
   const long location_sqlite_max_write_concurrency =
@@ -1279,13 +1304,33 @@ int main(int argc, char** argv) {
         "这两个参数没有可接的真实语义。下一步：保持 group_commit_max_batch=500 且 "
         "sync_dir_after_batch=true，或在 ADR-008 §6 落地 P4 后再接通。");
   }
+  //  ★ 切片 4：两个仓储的 journal_mode 只接通 WAL / DELETE 两档（Options 里是 `wal` 布尔）。
+  //    TRUNCATE 若被静默当成 DELETE，运维会得到"配置写了 TRUNCATE、实际是 DELETE"的假象。
   if (location_sqlite_journal_mode != "WAL" && location_sqlite_journal_mode != "DELETE") {
-    //  C10.14：位置仓储的 journal 模式只接通 WAL / DELETE 两档（Options 里是 `wal` 布尔）。
-    //  TRUNCATE 若被静默当成 DELETE，运维会得到"配置写了 TRUNCATE、实际是 DELETE"的假象。
     return reject_startup(
         "location.sqlite.journal_mode=" + location_sqlite_journal_mode +
         " —— 组合根只接通 WAL | DELETE 两档（SQLite Options 里是 `wal` 布尔；TRUNCATE 未接通）。"
         "下一步：保持 WAL（默认）或 DELETE；需要 TRUNCATE 时先在仓储 Options 上显式加字段。");
+  }
+  if (metadata_sqlite_journal_mode != "WAL" && metadata_sqlite_journal_mode != "DELETE") {
+    return reject_startup(
+        "metadata.sqlite.journal_mode=" + metadata_sqlite_journal_mode +
+        " —— 组合根只接通 WAL | DELETE 两档（SQLite Options 里是 `wal` 布尔；TRUNCATE 未接通）。"
+        "下一步：保持 WAL（默认）或 DELETE；需要 TRUNCATE 时先在仓储 Options 上显式加字段。");
+  }
+  //  ★ 切片 4：`PRAGMA synchronous` 只接通 OFF / NORMAL / FULL（映射到 0 / 1 / 2）。
+  //    非法值绝不静默折成默认值（否则运维以为配了 FULL，实际是 NORMAL）。
+  if (metadata_sqlite_synchronous < 0) {
+    return reject_startup(
+        "metadata.sqlite.synchronous=" + metadata_sqlite_synchronous_text +
+        " —— 只接通 OFF | NORMAL | FULL（映射到 PRAGMA synchronous 的 0 | 1 | 2）。"
+        "下一步：改成三者之一（默认 NORMAL）。");
+  }
+  if (location_sqlite_synchronous < 0) {
+    return reject_startup(
+        "location.sqlite.synchronous=" + location_sqlite_synchronous_text +
+        " —— 只接通 OFF | NORMAL | FULL（映射到 PRAGMA synchronous 的 0 | 1 | 2）。"
+        "下一步：改成三者之一（默认 NORMAL）。");
   }
 
   //  ---- 有效期（expiry.*，C10.12）：把两个字符串解析成基数 ----
@@ -1453,18 +1498,26 @@ int main(int argc, char** argv) {
                                storage_driver == "s3" ? "s3" : "posix");
   SingleStoreFactory blob_factory(metered_blob);
 
-  auto location_repository = SqliteLocationRepository::Open(
-      sqlite_path,
-      SqliteLocationRepositoryOptions{
-          static_cast<int>(location_sqlite_busy_timeout_ms),
-          location_sqlite_journal_mode != "DELETE",
-          static_cast<int>(location_sqlite_max_write_concurrency)});
+  //  ★ 切片 4：改用**具名赋值**（而不是聚合初始化）—— 结构体新增字段时，按位置的
+  //    聚合初始化会把后面的 int 静默错位到新字段上（`-Wmissing-field-initializers`
+  //    也拦不住），具名赋值让"哪个键落到哪个字段"一眼可见。
+  SqliteLocationRepositoryOptions location_sqlite_options;
+  location_sqlite_options.busy_timeout_millis =
+      static_cast<int>(location_sqlite_busy_timeout_ms);
+  location_sqlite_options.wal = location_sqlite_journal_mode != "DELETE";
+  location_sqlite_options.max_write_concurrency =
+      static_cast<int>(location_sqlite_max_write_concurrency);
+  location_sqlite_options.synchronous_level = location_sqlite_synchronous;
+  auto location_repository =
+      SqliteLocationRepository::Open(sqlite_path, location_sqlite_options);
   if (!location_repository.ok()) {
     std::cerr << "打开位置仓储失败: " << location_repository.error().ToString() << "\n";
     return kExitConfigError;
   }
   SqliteMetadataRepositoryOptions metadata_sqlite_options;
   metadata_sqlite_options.busy_timeout_millis = static_cast<int>(metadata_sqlite_busy_timeout_ms);
+  metadata_sqlite_options.wal = metadata_sqlite_journal_mode != "DELETE";
+  metadata_sqlite_options.synchronous_level = metadata_sqlite_synchronous;
   auto metadata_repository_handle =
       SqliteMetadataRepository::Open(metadata_db_path, clock, metadata_sqlite_options);
   if (!metadata_repository_handle.ok()) {
@@ -1653,10 +1706,17 @@ int main(int argc, char** argv) {
   router_options.metrics_enabled = metrics_enabled;
   router_options.metrics_path = metrics_path;
   router_options.json_body_limit_bytes = max_body_bytes;
-  //  ★ C10.16：数据面 PUT 的请求体上限 = `partition.file.<partition>.max_file_bytes`
-  //    （0 = 不限，与接线前一致）。超限由 HTTP 包装层拒绝：有 `Content-Length` → 413，
-  //    chunked → 400（`common/http/http.h` 的既定语义）。
-  router_options.transfer_put_max_body_bytes = partition_file.max_file_bytes;
+  //  ★ C10.16 / 切片 4：数据面 PUT 的请求体上限 = 全局键
+  //    `server.http.transfer_max_body_bytes` 与分区键
+  //    `partition.file.<partition>.max_file_bytes` 的**较小者**（0 = 该侧"不限"，
+  //    因此只在两侧都 > 0 时取 min；否则取非 0 的那一侧）。两个都为 0/不限 → 结果 0，
+  //    行为与接线前**逐字一致**。超限由 HTTP 包装层拒绝：有 `Content-Length` → 413，
+  //    chunked → 400（`common/http/http.h` 的既定语义，不改包装层）。
+  const std::int64_t transfer_put_max_body_bytes =
+      (transfer_max_body_bytes > 0 && partition_file.max_file_bytes > 0)
+          ? std::min<std::int64_t>(transfer_max_body_bytes, partition_file.max_file_bytes)
+          : std::max<std::int64_t>(transfer_max_body_bytes, partition_file.max_file_bytes);
+  router_options.transfer_put_max_body_bytes = transfer_put_max_body_bytes;
 
   //  数据面回调：适配层不认识 L2，由这里把 TransferEndpoint 绑上去（R12）。
   //  ★ 只在**集中存储**模式下注册：S3 有原生预签名，客户端直连存储端点，
@@ -1781,7 +1841,15 @@ int main(int argc, char** argv) {
             << "ms journal_mode=" << location_sqlite_journal_mode << "（wal="
             << (location_sqlite_journal_mode != "DELETE" ? "true" : "false")
             << "，max_write_concurrency=" << location_sqlite_max_write_concurrency
-            << "）| metadata busy_timeout=" << metadata_sqlite_busy_timeout_ms << "ms\n"
+            << "，synchronous=" << location_sqlite_synchronous_text
+            << "）| metadata busy_timeout=" << metadata_sqlite_busy_timeout_ms
+            << "ms journal_mode=" << metadata_sqlite_journal_mode << "（wal="
+            << (metadata_sqlite_journal_mode != "DELETE" ? "true" : "false")
+            << "，synchronous=" << metadata_sqlite_synchronous_text << "）\n"
+            << "  transfer limit : 数据面 PUT max_body_bytes=" << transfer_put_max_body_bytes
+            << "（0=不限；全局 server.http.transfer_max_body_bytes=" << transfer_max_body_bytes
+            << "，partition.file." << partition_file.partition
+            << ".max_file_bytes=" << partition_file.max_file_bytes << "，取较小者）\n"
             << "  metadata path  : " << metadata_db_path << "\n"
             << "  io engine      : " << io_engine_active << "（请求 " << io_engine
             << (io_fallback ? "；已回退" : "") << "） — " << io_note << "\n"

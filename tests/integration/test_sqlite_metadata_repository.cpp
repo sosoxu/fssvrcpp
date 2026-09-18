@@ -84,3 +84,55 @@ TEST_CASE("★ C6.5 版本链在**数据库层面**的真实形态（列与唯�
     sqlite3_close(db);
   }
 }
+
+// =============================================================================
+//  阶段 10 切片 4：`metadata.sqlite.synchronous` → `PRAGMA synchronous`
+// =============================================================================
+//  ★ 关键陷阱（`AppliedPragma` 存在的唯一原因）：`PRAGMA synchronous` 是**连接级**
+//    设置，**不随库文件持久化**。`Open` 之后再另开一个 sqlite3 连接读回，得到的是
+//    那个新连接自己的默认值（FULL = 2），与被测仓储是否真的下发了 OFF/NORMAL/FULL
+//    无关。必须用仓储自己的 `AppliedPragma("synchronous")` 在**同一连接**上读回。
+//    （`journal_mode` 相反：它写进库文件头，另开连接能读回，见
+//    tests/integration/test_config_wiring.cpp 的 C10.14。）
+TEST_CASE("★ 切片 4：SqliteMetadataRepository 的 synchronous 真的下发到**本连接**",
+          "[phase10][sqlite][c6.1]") {
+  fss::test::TempDir dir("sqlite_metadata_pragma");
+  fss::ManualClock clock{1700000000};
+
+  SECTION("默认 = NORMAL(1)（R16 正例：不能只测非默认值）") {
+    auto opened = SqliteMetadataRepository::Open(dir.child("default.db"), clock);
+    REQUIRE(opened.ok());
+    const auto applied = opened.value()->AppliedPragma("synchronous");
+    REQUIRE(applied.ok());
+    REQUIRE(applied.value() == "1");
+  }
+
+  SECTION("synchronous_level=0（OFF）→ 读回 0（与默认值不同，排除恒真）") {
+    fss::infra::SqliteMetadataRepositoryOptions options;
+    options.synchronous_level = 0;
+    auto opened = SqliteMetadataRepository::Open(dir.child("off.db"), clock, options);
+    REQUIRE(opened.ok());
+    const auto applied = opened.value()->AppliedPragma("synchronous");
+    REQUIRE(applied.ok());
+    REQUIRE(applied.value() == "0");
+  }
+
+  SECTION("synchronous_level=2（FULL）→ 读回 2") {
+    fss::infra::SqliteMetadataRepositoryOptions options;
+    options.synchronous_level = 2;
+    auto opened = SqliteMetadataRepository::Open(dir.child("full.db"), clock, options);
+    REQUIRE(opened.ok());
+    const auto applied = opened.value()->AppliedPragma("synchronous");
+    REQUIRE(applied.ok());
+    REQUIRE(applied.value() == "2");
+  }
+
+  SECTION("访问器只放行白名单内的 PRAGMA 名（PRAGMA 名不能参数化）") {
+    auto opened = SqliteMetadataRepository::Open(dir.child("guard.db"), clock);
+    REQUIRE(opened.ok());
+    const auto rejected = opened.value()->AppliedPragma("journal_mode; DROP TABLE metadata");
+    REQUIRE_FALSE(rejected.ok());
+    REQUIRE(rejected.error().kind() == fss::ErrorKind::kInvalidArgument);
+    REQUIRE(opened.value()->AppliedPragma("synchronous").ok());
+  }
+}
