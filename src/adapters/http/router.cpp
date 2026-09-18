@@ -520,10 +520,12 @@ void Router::Register(fss::http::Server& server) {
   // ---------------------------------------------------------------------------
   //  §7 扩展数据面 `/v1/transfer/{token}`（集中存储的字节通道）
   //  · 只做 token 校验 + 字节转发；**对象键来自 token 载荷**，不来自 URL
-  //  · 请求体不限大小，因此 `max_body_bytes = 0`；请求体走流式（不整块驻留）
+  //  · 请求体默认不限大小（`max_body_bytes = 0`）；C10.16 起可由
+  //    `partition.file.<partition>.max_file_bytes` 收紧（>0 时超限 → 413/400）。
   // ---------------------------------------------------------------------------
   if (transfers_.put) {
-    fss::http::RouteOptions stream_options = MakeRoute("transfer.put", 0);
+    fss::http::RouteOptions stream_options =
+        MakeRoute("transfer.put", options_.transfer_put_max_body_bytes);
     stream_options.stream_body = true;
     server.Put(base + "/v1/transfer/:token", stream_options,
                Wrap([this](fss::http::Request& request, const app::CallerContext& caller)

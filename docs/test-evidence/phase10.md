@@ -1,16 +1,16 @@
-# 阶段 10 测试证据（🚧 切片 1/2/3 完成：配置面接线 + GC/expiry + 审计 fail-closed/SQLite 调优/鉴权与 gRPC 面；C10.16 未做）
+# 阶段 10 测试证据（✅ 切片 1/2/3 全部完成：配置面接线 + GC/expiry + 审计 fail-closed/SQLite 调优/鉴权与 gRPC 面 + C10.16）
 
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P10（配置面接线） |
-| 状态 | 🚧 **切片 1/2/3 完成**：C10.1~C10.15 满足；**C10.16 未做（如实登记）** |
+| 状态 | ✅ **切片 1/2/3 全部完成**：C10.1~C10.16 满足（C10.16 的容器名与 `storage.posix.*` 7 键无字段可接，按「不发明字段」如实登记；见 §6.5） |
 | 门槛命令 | `ctest -L phase10 && scripts/verify_config_wiring.sh` |
 | 退出码 | `0` |
 | 新测试 | `tests/integration/test_config_wiring.cpp`：**16 个 TEST_CASE / 288 断言**（全部在真实 `build/bin/fss_server` 上；切片 2 在同一文件追加 6 个用例） |
 | 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
 | 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **76/76** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 81 / 拒绝启动（触发条件）16 / 已读但无效果 59**（切片 3 新接通 9 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 82 / 拒绝启动（触发条件）18 / 已读但无效果 56**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出） |
 | 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
@@ -167,7 +167,7 @@ $ ctest --test-dir build -L phase10                                # 1/1 Test #.
 
 ---
 
-## 6. 切片 3（C10.13~C10.15；C10.16 未做）
+## 6. 切片 3（C10.13~C10.16）
 
 ### 6.1 判据逐条
 
@@ -176,7 +176,7 @@ $ ctest --test-dir build -L phase10                                # 1/1 Test #.
 | **C10.13** 审计 fail-closed | ✅ | `src/app/usecases/usecases.cpp` 的 `RecordAudit()` 现在返回 `Result<void>` 并按 `UseCasePorts::audit_fail_closed` 判定；`AuditGuard::Success()` 在**返回前**记录成功审计并返回 `Result`（调用点 14 处改成 `FSS_TRY(audit.Success())`）—— 析构阶段改不了状态码，那正是"审计失败却报 200"的静默缺陷。可驱动接缝 `FSS_AUDIT_FAULT_INJECT=1`（组合根装配 `FailingAuditLogger`；**不是**配置键）。`test_config_wiring` 三条：`fail_closed=true` + 注入 → `uploadURL` **500** 且响应无成功载荷；**正例对照** `fail_closed=false` + 同一坏后端 → **200**；无注入 → 200 |
 | **C10.14** SQLite 调优键 | ⚠️ **部分满足** | 只接**真实存在**的 Options 字段：`metadata.sqlite.busy_timeout_ms`、`location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`（→ `SqliteLocationRepositoryOptions.wal`；`WAL|DELETE`，`TRUNCATE` → exit 78）。`test_config_wiring` 用 `python3 -c "import sqlite3…PRAGMA journal_mode"` 从库文件读回 `wal` / `delete`（配置真的改变了文件头，不是恒为 WAL）；`busy_timeout` 只作用于连接、**无法从文件读回** → 由启动横幅（`sqlite tuning : location busy_timeout=… journal_mode=…`）确认。`synchronous`/`group_commit*` 在两个 Options 结构体里**没有**字段 → 按"不发明字段"留在"已读但无效果"（§1.3.3） |
 | **C10.15** 鉴权与 gRPC 面 | ✅ | `auth.jwt.roles_claim` + `auth.local_roles.*` → `LocalJwtOptions`；`test_config_wiring` 用真实 HS256 token 断言：claim 名 `myroles` 携带 editors → **200**；同一角色放在默认 `roles` 里 → **403**；无 claim 但 email 命中 `local_roles` → **200**；**正例对照**：没有 `local_roles` 的实例上同一 token → **403**。`server.grpc.enabled=false`（端口非 0）→ 横幅 `server.grpc.enabled=false` 且该端口**不监听**（TCP connect 失败）；`=true` → 端口在监听且 **`GetInfo` 返回 OK / version=v2**（真实 gRPC channel） |
-| **C10.16** 分区与存储细节 | ❌ **未做** | 时间盒内未实现：`partition.file.opendes.*`（容器名/`max_file_bytes`/校验算法）与 `storage.posix.{group_commit_max_batch,sync_dir_after_batch,atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 仍为"已读但无效果"（`operations.md` §1.3.3 已补下一步：先给 `PosixBlobStoreOptions` / `PartitionConfig` 加字段）。**没有**为了凑判据而发明无效接线 |
+| **C10.16** 分区与存储细节 | ✅ **已完成（1 键接通 + 2 键拒绝启动；其余无字段可接）** | 只接**真实存在**的字段：`partition.file.opendes.max_file_bytes` → `PartitionConfig.max_object_bytes`（0 → -1 = 不限），并落到数据面 PUT 的 `RouteOptions::max_body_bytes`（新增 `RouterOptions::transfer_put_max_body_bytes`，**默认 0 = 与接线前逐字一致**）→ 带 `Content-Length` 超限 **413**、恰好等于上限 **200**（R16 正例）；`allowed_checksum_algorithms` / `default_checksum_algorithm` → **启动期校验**（未知算法名 / 默认不在集合内 → **exit 78**；正例：合法集合 + 默认 `MD5` 真的 readiness 200）。证据：`tests/integration/test_config_wiring.cpp` 的 `[c10.16]`（**2 用例 / 39 断言**）、全量 `ctest` **76/76**。`partition.file.{staging_container,persistent_container,storage_driver}` 与 7 个 `storage.posix.*` 细节键在 `PartitionConfig`/`PosixBlobStoreOptions` 里**没有字段** → 按「不发明字段」留「已读但无效果」（§1.3.3，附下一步） |
 
 ### 6.2 命令与关键输出
 
@@ -192,12 +192,52 @@ $ ./scripts/verify_config_wiring.sh                     # 54 条（切片 3 未�
 `journal_mode` 读出处强制改回常量 `"WAL"`（等价"配置读了但没接上"），重建后
 `test_config_wiring "★ C10.14*"` 的 DELETE 分支必须失败（python3 读回 `wal` 而不是 `delete`）。
 
+**C10.16 的自证（本轮实测）**：把组合根里
+`router_options.transfer_put_max_body_bytes = partition_file.max_file_bytes;`
+短路成 `= 0;  // R1 自证注入`（等价"配置读了但没接上"）→ 重建后
+`./build/bin/test_config_wiring "[c10.16]"` 必须失败（17 字节 PUT 得到 **200** 而不是 413）：
+
+```console
+test cases:  2 |  1 passed | 1 failed
+assertions: 31 | 30 passed | 1 failed
+```
+
+还原后：`All tests passed (39 assertions in 2 test cases)`；全量 `ctest` **76/76**；
+`git diff -- src | grep -c '自证注入\|selftest\|injected'` = **0**。
+
 ### 6.4 未做 / 降级（切片 3）
 
 | 项 | 状态 |
 | --- | --- |
-| C10.16（`partition.file.*` / `storage.posix.*` 7 键） | **未做**，保持"已读但无效果" |
+| C10.16（`partition.file.*` / `storage.posix.*` 7 键） | **部分完成**：`max_file_bytes` 已接通（413 + 200 正例）、`{allowed,default}_checksum_algorithm` 已改为拒绝启动；容器名（3 键）与 `storage.posix.*`（7 键）在结构体里**没有对应字段** → 仍为"已读但无效果"，下一步 = 先给 `PosixBlobStoreOptions`/`PartitionConfig` 加字段 |
 | `metadata.sqlite.journal_mode`/`synchronous`/`max_write_concurrency`/`group_commit*`、`location.sqlite.synchronous`/`group_commit*` | **未接通**（Options 里无字段；不发明字段） |
 | `location.sqlite.max_write_concurrency` | 值已传进 Options 并参与 `>0` 校验，但实现是"单连接 + 互斥"（实际并发 1）→ 仍为"已读但无效果" |
 | `FSS_AUDIT_FAULT_INJECT` | **故障注入开关，不是配置键**（不进 156 键清单）；生产**不要**设置 |
 | `busy_timeout` 的锁竞争 A/B 实测 | **未做**（只做了横幅 + PRAGMA 应用证据）——如实标注 |
+
+### 6.5 C10.16 的接线范围，以及「3 个既有测试失败」的复核
+
+**接线范围（哪条键 → 哪条路径 → 哪条契约）**
+* `partition.file.opendes.max_file_bytes` → 组合根新增的 `RouterOptions::transfer_put_max_body_bytes`
+  （默认 `0`）→ **只**作用在数据面 `PUT /v1/transfer/:token`（`MakeRoute("transfer.put", …)`）的
+  `RouteOptions::max_body_bytes` → 契约 §1.7 的"超限拒绝"：带 `Content-Length` → **413**（读体前前置拒绝）。
+* 默认值 `0` 与接线前 HEAD 的字面量 `MakeRoute("transfer.put", 0)` **逐字一致** → 未设置该键的进程
+  （含所有测试夹具）行为不变。组合根另把该值填给 `domain::PartitionConfig::max_object_bytes`
+  （端口语义 `-1` = 不限）。
+* **JSON 路由不受影响**：`server.http.max_header_bytes` / `max_uri_bytes` / `max_body_bytes` 与
+  `json_body_limit_bytes` / `small_body_limit_bytes` 全部未改；`src/common/http/*`（phase1 的契约所在层）
+  **零改动**（`git diff -- src/common/http` 为空）。
+
+**「3 个测试失败」的复核结论：本轮未能复现，判定不是该改动引入的回归**
+* `test_config_wiring.cpp` 的 C10.16 新用例（曾报"期望 413、实际 400"）：干净重建后**通过**
+  （`HttpDo` 对 PUT 显式补 `Content-Length` → 命中 HTTP 层读体前前置拒绝 → 413）。
+* `tests/hardening/test_resource_limits.cpp`（phase9）与 `tests/integration/test_httplib_hardening.cpp`
+  （phase1）都是**夹具级**测试：直接构造 `Router` / `fss::http::Server`，**从不启动**
+  `src/main/server_main.cpp` → 组合根的 C10.16 改动**结构上不可达**。实测：
+  `All tests passed (44 assertions in 5 test cases)` 与
+  `All tests passed (270 assertions in 13 test cases)`。
+* 全量 `ctest --test-dir build -j4` → **100% tests passed, 0 tests failed out of 76**。
+* 复核了 stash 的第三个父提交：`git cat-file -p 4e3f701b` 有 `^3`，而
+  `git ls-tree -r 4e3f701b^3` **为空** → 该 stash **不含未跟踪文件**，
+  不存在"未跟踪改动丢失导致无法复现"的情形。
+* 既有断言**一条未放宽**（phase1/phase9 用例的期望值原样保留；C10.16 正例 200 与反例 413 并存，R16）。

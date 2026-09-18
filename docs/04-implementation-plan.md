@@ -992,12 +992,12 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 ## 9. 首个动作（下一步要做什么）
 
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）与
-切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）已完成**（见文末「阶段 10」）。
-三态：**生效 81 / 拒绝启动 16 / 已读但无效果 59**（`docs/operations.md` §1.3）。
+切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）与 **C10.16** 已完成**（见文末「阶段 10」）。
+三态：**生效 82 / 拒绝启动 18 / 已读但无效果 56**（`docs/operations.md` §1.3）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
-1. **C10.16**：`partition.file.<partition>.*`（容器名/`max_file_bytes`/校验算法）与
-   `storage.posix.*` 的批提交/权限/fadvise 细节 —— 需要先给 Options 加字段（切片 3 未做）；
+1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78；
+   `storage.posix.*` 细节键与容器名**无字段可接**，按"不发明字段"留下并写明下一步）；
 2. GC 的 **HTTP 端点**（周期调度与 `--once` 已在切片 2 交付；手动触发/查询未做）；
 3. `storage.proxy_mode=always` / 远端 Storage Service（`metadata.repository=remote`）；
 4. PG 仓储/租约 + `deployment.mode=multi` 运行形态（ADR-009）—— 同时解锁 `leases.*`/`leader_election.*`；
@@ -1066,7 +1066,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（切片 2 时为 生效 72 / 拒绝启动 16 / 已读但无效果 68 = 156；切片 3 后为 **81/16/59**，见文末切片 3 状态）。
+  `docs/operations.md` 逐键三态化（切片 2 时为 生效 72 / 拒绝启动 16 / 已读但无效果 68 = 156；切片 3 后为 **81/16/59**；C10.16 后为 **82/18/56**，见文末切片 3 状态）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1082,7 +1082,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 | **C10.15** | **鉴权与 gRPC 面**：`auth.jwt.roles_claim` 与 `auth.local_roles.*` 接通（配置里的"用户 → 角色"表真的决定 403/200）；`server.grpc.enabled` 接通（false → 不开 gRPC 端口，true → 开且 `GetInfo` 可用） |
 | **C10.16** | **分区与存储细节**：`partition.file.<partition>.*`（容器名/`max_file_bytes`/校验算法集合与默认算法）与 `storage.posix.{group_commit_max_batch,sync_dir_after_batch,atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 接通；**超限必须被拒**（上传超过 `max_file_bytes` → 413 或契约规定的错误），非法的校验算法 → 400/拒绝启动（按真实语义断言） |
 
-**状态：🚧 切片 3（C10.13~C10.15）完成；C10.16 未做**。
+**状态：✅ 切片 1/2/3 完成（含 C10.16）**。
 * **C10.13**：`observability.audit_fail_closed` 真的决定"审计写入失败是否让请求失败"。
   用例层 `RecordAudit()` 现在返回 `Result<void>`，`AuditGuard::Success()` 在**返回前**记录成功审计
   并把结果交回（`FSS_TRY(audit.Success())`）——析构无法改状态码，那正是"审计失败却报 200"的静默缺陷。
@@ -1097,8 +1097,17 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.15**：`auth.jwt.roles_claim`（默认 `roles`）与 `auth.local_roles.*` 接到 `LocalJwtOptions`
   （claim 名与"用户→角色表"真的决定 200/403）；`server.grpc.enabled` 接通
   （`false` → 不开端口；`true` 且 `port≠0` → 开且 `GetInfo` 可用；`FSS_GRPC_PORT=0` 的既有语义不变）。
-* 三态计数：**生效 81 / 拒绝启动 16 / 已读但无效果 59 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
-* **C10.16 未做**：`partition.file.opendes.*` 与 `storage.posix.*` 的 7 个细节键仍为"已读但无效果"（如实登记）。
+* **C10.16**：只接**真实存在**的字段（先读了 `PartitionConfig` 与 `PosixBlobStoreOptions`）。
+  `partition.file.opendes.max_file_bytes` → `PartitionConfig.max_object_bytes`（0 → -1 = 不限），
+  并落到数据面 PUT 的 `RouteOptions::max_body_bytes`：带 `Content-Length` 超限 → **413**（读体前
+  前置拒绝），chunked → 400。`allowed_checksum_algorithms` / `default_checksum_algorithm` →
+  **启动期校验**（未知算法名 / 默认不在集合内 → **exit 78**）：这是"按真实语义"的断言 ——
+  C6.4 有上游一手证据表明客户端声明的算法是**被覆写**的输入，请求期不做 400。
+  容器名（`staging_container`/`persistent_container`）、分区级 `storage_driver` 与 7 个
+  `storage.posix.*` 细节键在 `PartitionConfig`/`PosixBlobStoreOptions` 里**没有**字段 →
+  按"不发明字段"留在"已读但无效果"（§1.3.3，附理由与下一步）。
+  用例：`tests/integration/test_config_wiring.cpp` 的 `[c10.16]`（2 用例 / 39 断言）。
+* 三态计数：**生效 82 / 拒绝启动 18 / 已读但无效果 56 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
 
 **未做（本阶段不承诺）**：`events.publisher=webhook`（需新增 L2 webhook 发布器）、`legal/schema.validator=remote`、
 `metadata/location.repository=postgres|remote`、`leader_election.*`/`leases.*` 的 PG 语义、

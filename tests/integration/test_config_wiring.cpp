@@ -1202,3 +1202,101 @@ TEST_CASE("★ C10.15：server.grpc.enabled=false 不开端口；true 时 GetInf
     REQUIRE(response.version() == "v2");
   }
 }
+
+// =============================================================================
+//  C10.16：`partition.file.<partition>.*`（max_file_bytes / 校验算法集合与默认算法）
+// =============================================================================
+//  ★ 真实语义（不发明）：
+//    · `max_file_bytes` → `PartitionConfig::max_object_bytes`（-1 = 不限），
+//      并落到数据面 PUT 的 `RouteOptions::max_body_bytes`：带 `Content-Length` 超限
+//      → **413**（读体前前置拒绝，一个字节都不读）；chunked → 400。
+//    · 校验算法集合 / 默认算法：`C6.4` 有上游一手证据"客户端声明的算法**被覆写**"，
+//      所以请求期不做 400；真实语义是**启动期校验**：未知算法名 / 默认不在集合内
+//      → **exit 78**。R16 正例：合法的集合 + 默认必须能启动。
+TEST_CASE("★ C10.16：partition.file.<p>.max_file_bytes 超限上传被拒（413），等于上限通过",
+          "[phase10][config][c10.16]") {
+  TempDir data_dir("c1016_max");
+  const int http_port = FreePort();
+  const std::string config = WriteFile(
+      data_dir, "c1016_max.json",
+      "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(http_port) +
+          ", \"bind\": \"127.0.0.1\"}},\n"
+          "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child("data") + "\"}},\n"
+          "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child("loc.db") + "\"}},\n"
+          "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child("meta.db") + "\"}},\n"
+          "  \"self_signed\": {\"signing_key\": \"c1016\"},\n"
+          "  \"partition\": {\"file\": {\"opendes\": {\"max_file_bytes\": 16}}},\n"
+          "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  ServerProcess server(SelfContainedOptions({"--config", config}));
+  REQUIRE(server.http_port() == http_port);
+  REQUIRE(WaitReady(http_port));
+
+  auto upload_target = [&]() -> std::string {
+    const auto reply = HttpGet(http_port, "/api/file/v2/files/uploadURL", Authed());
+    REQUIRE(reply.status == 200);
+    const auto parsed = fss::json::Parse(reply.body);
+    REQUIRE(parsed.ok());
+    const auto& url = parsed.value()["Location"]["SignedURL"];
+    REQUIRE(url.is_string());
+    return fss::test::TargetOf(url.get<std::string>());
+  };
+
+  // 反向：17 字节 > 16 → 413
+  const auto over =
+      fss::test::HttpDo(http_port, "PUT", upload_target(), {}, std::string(17, 'x'));
+  CAPTURE(server.DumpLog());
+  REQUIRE(over.status == 413);
+
+  // 正例对照（R16）：恰好 16 字节必须通过 —— 否则"超限被拒"可能只是"恒拒"。
+  const auto exact =
+      fss::test::HttpDo(http_port, "PUT", upload_target(), {}, std::string(16, 'x'));
+  REQUIRE(exact.status == 200);
+}
+
+TEST_CASE("★ C10.16：非法校验算法 → exit 78；默认算法不在集合内 → exit 78；合法 → 能启动",
+          "[phase10][config][c10.16]") {
+  TempDir data_dir("c1016_checksum");
+  const int http_port = FreePort();
+  auto config_with = [&](const std::string& tag, const std::string& algorithms,
+                         const std::string& def) {
+    return WriteFile(
+        data_dir, tag + ".json",
+        "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(http_port) +
+            ", \"bind\": \"127.0.0.1\"}},\n"
+            "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child(tag + "-data") +
+            "\"}},\n"
+            "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-loc.db") +
+            "\"}},\n"
+            "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-meta.db") +
+            "\"}},\n"
+            "  \"self_signed\": {\"signing_key\": \"c1016\"},\n"
+            "  \"partition\": {\"file\": {\"opendes\": {\"allowed_checksum_algorithms\": [" +
+            algorithms + "], \"default_checksum_algorithm\": \"" + def + "\"}}},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  };
+
+  SECTION("集合含未知算法 → exit 78") {
+    const auto outcome =
+        RunServerForExit({"--config", config_with("bad_algo", "\"SHA-256\", \"CRC-32\"", "SHA-256")});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("CRC-32") != std::string::npos);
+  }
+
+  SECTION("默认算法不在集合内 → exit 78") {
+    const auto outcome =
+        RunServerForExit({"--config", config_with("bad_default", "\"MD5\"", "SHA-256")});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("default_checksum_algorithm") != std::string::npos);
+  }
+
+  SECTION("正例（R16）：合法集合 + 合法默认 → 真的启动（readiness 200）") {
+    const std::string config = config_with("ok_checksum", "\"SHA-256\", \"SHA-1\", \"MD5\"", "MD5");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(server.http_port() == http_port);
+    CAPTURE(server.DumpLog());
+    REQUIRE(WaitReady(http_port));
+    REQUIRE(HttpGet(http_port, "/api/file/v2/readiness_check").status == 200);
+  }
+}

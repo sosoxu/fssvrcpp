@@ -28,6 +28,7 @@
 #include "app/tasks/gc_task.h"
 #include "app/usecases/usecases.h"
 #include "common/config/config.h"
+#include "common/crypto/crypto.h"
 #include "common/http/http.h"
 #include "common/ids/id_generator.h"
 #include "common/json/json.h"
@@ -521,6 +522,86 @@ std::map<std::string, std::vector<std::string>, std::less<>> CollectLocalRoles(
     resolver.NoteDynamic("auth.local_roles." + user, Join(roles));
   }
   return out;
+}
+
+// =============================================================================
+//  动态子树：`partition.file.<partition>.*`（C10.16）
+// =============================================================================
+//  与 `auth.local_roles.*` 同源：schema 用 `AllowDynamicPrefix("partition.file")` 放行，
+//  但**没有逐键声明**，`Load` 不登记来源 → 只能从 `effective()` 自己枚举
+//  （键名含 partition，不能进 CoreSchema，否则 156 键的计数会失真）。
+//
+//  ★ 只接**真实存在**的字段：`PartitionConfig` 的成员只有 `max_object_bytes`
+//    （-1 = 不限）。容器名（`staging_container`/`persistent_container`）与
+//    分区级 `storage_driver` 在 `PartitionConfig`/`ObjectKeyPolicy` 里**没有**对应字段
+//    → 不发明，继续登记为"已读但无效果"（见 operations.md §1.3.3）。
+struct PartitionFileOptions {
+  std::string partition = "opendes";
+  //  schema 语义：0 = 不限；`PartitionConfig::max_object_bytes` 用 -1 表示不限。
+  std::int64_t max_file_bytes = 0;
+  std::vector<std::string> allowed_checksum_algorithms = {"SHA-256", "SHA-1", "MD5"};
+  std::string default_checksum_algorithm = "SHA-256";
+};
+
+PartitionFileOptions ReadPartitionFileOptions(const fss::config::Config& cfg, Resolver& resolver) {
+  PartitionFileOptions out;
+  const std::string prefix = "partition.file." + out.partition + ".";
+  if (const auto* v = FindIn(cfg.effective(), prefix + "max_file_bytes");
+      v != nullptr && v->is_number_integer()) {
+    const long n = v->get<long>();
+    if (n >= 0) out.max_file_bytes = n;
+    resolver.NoteDynamic(prefix + "max_file_bytes", std::to_string(out.max_file_bytes));
+  }
+  if (const auto* v = FindIn(cfg.effective(), prefix + "allowed_checksum_algorithms");
+      v != nullptr && v->is_array()) {
+    std::vector<std::string> items;
+    for (const auto& e : *v) items.push_back(RenderScalar(e));
+    if (!items.empty()) out.allowed_checksum_algorithms = items;
+    resolver.NoteDynamic(prefix + "allowed_checksum_algorithms",
+                         Join(out.allowed_checksum_algorithms));
+  }
+  if (const auto* v = FindIn(cfg.effective(), prefix + "default_checksum_algorithm");
+      v != nullptr && v->is_string()) {
+    out.default_checksum_algorithm = v->get<std::string>();
+    resolver.NoteDynamic(prefix + "default_checksum_algorithm", out.default_checksum_algorithm);
+  }
+  return out;
+}
+
+//  校验算法集合与默认算法：**按真实语义**只做启动期校验（R16：正例必须能通过）。
+//    ① 集合里每个名字必须是我们真的支持的算法（SHA-256 / SHA-1 / MD5）；
+//    ② 默认算法必须在这个集合里。
+//  为什么不是"请求里声明非法算法 → 400"：C6.4 有上游一手证据 —— 客户端传入的
+//  `Checksum`/`ChecksumAlgorithm` 是**被服务端覆写**的输入，不是待校验的断言
+//  （`File_CorrectPayload.json` 声明 SHA-256 却给 MD5 值，期望响应是 201）。
+//  返回空串 = 通过；否则是"拒绝启动"的原因。
+std::string ValidatePartitionChecksums(const PartitionFileOptions& options) {
+  std::vector<fss::crypto::ChecksumAlgorithm> allowed;
+  for (const auto& name : options.allowed_checksum_algorithms) {
+    const auto algorithm = fss::crypto::ParseChecksumAlgorithm(name);
+    if (!algorithm.has_value()) {
+      return "partition.file." + options.partition +
+             ".allowed_checksum_algorithms 含未知算法：" + name +
+             "（允许 SHA-256 | SHA-1 | MD5）";
+    }
+    allowed.push_back(*algorithm);
+  }
+  if (allowed.empty()) {
+    return "partition.file." + options.partition +
+           ".allowed_checksum_algorithms 不能为空（否则没有任何算法可用于校验和）";
+  }
+  const auto default_algorithm =
+      fss::crypto::ParseChecksumAlgorithm(options.default_checksum_algorithm);
+  if (!default_algorithm.has_value()) {
+    return "partition.file." + options.partition +
+           ".default_checksum_algorithm 是未知算法：" + options.default_checksum_algorithm +
+           "（允许 SHA-256 | SHA-1 | MD5）";
+  }
+  if (std::find(allowed.begin(), allowed.end(), *default_algorithm) == allowed.end()) {
+    return "partition.file." + options.partition + ".default_checksum_algorithm（" +
+           options.default_checksum_algorithm + "）不在 allowed_checksum_algorithms 集合内";
+  }
+  return {};
 }
 
 // =============================================================================
@@ -1347,11 +1428,25 @@ int main(int argc, char** argv) {
     audit_logger = &failing_audit;
   }
 
+  //  ★ C10.16：`partition.file.<partition>.*`（动态子树）。只接**真实存在**的字段：
+  //    `PartitionConfig::max_object_bytes`（-1 = 不限）；校验算法集合/默认算法按真实语义
+  //    只做**启动期校验**（非法算法名 → exit 78），请求期客户端声明的算法按 C6.4 被覆写。
+  const PartitionFileOptions partition_file = ReadPartitionFileOptions(cfg, resolver);
+  if (const std::string problem = ValidatePartitionChecksums(partition_file); !problem.empty()) {
+    std::cerr << "拒绝启动（exit " << kExitConfigError << "）：" << problem
+              << "\n下一步：把 allowed/default 校验算法改成 SHA-256 | SHA-1 | MD5 之一"
+                 "（大小写与 `-`/`_` 不计）。\n";
+    return kExitConfigError;
+  }
+
   domain::PartitionConfig partition;
-  partition.partition = "opendes";
+  partition.partition = partition_file.partition;
   partition.driver = storage_driver == "s3" ? domain::StorageDriver::kS3
                                             : domain::StorageDriver::kPosix;
   partition.posix_root = storage_root;
+  //  0（schema 语义：不限）→ -1（端口语义：不限）
+  partition.max_object_bytes = partition_file.max_file_bytes > 0 ? partition_file.max_file_bytes
+                                                                 : -1;
   StaticPartitionRegistry partitions(partition);
 
   NoopLegalValidator legal;
@@ -1428,6 +1523,10 @@ int main(int argc, char** argv) {
   router_options.metrics_enabled = metrics_enabled;
   router_options.metrics_path = metrics_path;
   router_options.json_body_limit_bytes = max_body_bytes;
+  //  ★ C10.16：数据面 PUT 的请求体上限 = `partition.file.<partition>.max_file_bytes`
+  //    （0 = 不限，与接线前一致）。超限由 HTTP 包装层拒绝：有 `Content-Length` → 413，
+  //    chunked → 400（`common/http/http.h` 的既定语义）。
+  router_options.transfer_put_max_body_bytes = partition_file.max_file_bytes;
 
   //  数据面回调：适配层不认识 L2，由这里把 TransferEndpoint 绑上去（R12）。
   //  ★ 只在**集中存储**模式下注册：S3 有原生预签名，客户端直连存储端点，

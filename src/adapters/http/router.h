@@ -70,6 +70,11 @@ struct RouterOptions {
   std::string default_user_id = "osdu-user";
   std::int64_t json_body_limit_bytes = 10 * 1024 * 1024;
   std::int64_t small_body_limit_bytes = 256 * 1024;
+  //  ★ C10.16：`partition.file.<partition>.max_file_bytes` 的落点（0 = 不限，保持接线前行为）。
+  //    数据面 `/v1/transfer/{token}` 的请求体上限；由组合根从**分区配置**填入。
+  //    HTTP 包装层的既有语义（`common/http/http.h` 的 `RouteOptions::max_body_bytes`）：
+  //    带 `Content-Length` → **413**（读体前前置拒绝）；chunked → 400。
+  std::int64_t transfer_put_max_body_bytes = 0;
   //  契约 §7：指标是**非 OSDU 扩展**，因此不走 base path（否则污染 OSDU 路径空间）
   bool metrics_enabled = true;
   std::string metrics_path = "/metrics";
