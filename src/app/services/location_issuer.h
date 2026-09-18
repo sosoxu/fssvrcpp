@@ -63,13 +63,15 @@ class LocationIssuer {
 
   LocationIssuer(domain::IBlobStoreFactory& blobs, domain::IFileLocationRepository& locations,
                  domain::ISelfSignedUrlCodec& self_signed, const fss::IClock& clock,
-                 const fss::IIdGenerator& ids, std::string self_base_url)
+                 const fss::IIdGenerator& ids, std::string self_base_url,
+                 ExpiryOptions expiry = {})
       : blobs_(blobs),
         locations_(locations),
         self_signed_(self_signed),
         clock_(clock),
         ids_(ids),
-        self_base_url_(std::move(self_base_url)) {}
+        self_base_url_(std::move(self_base_url)),
+        expiry_(expiry) {}
 
   //  上传地址（staging 区）：
   //    · `requested_file_id` 为空 → 服务端生成（`NewUuidNoDash()`，与契约 §2.1 样例一致）
@@ -95,6 +97,8 @@ class LocationIssuer {
   const fss::IClock& clock_;
   const fss::IIdGenerator& ids_;
   std::string self_base_url_;
+  //  ★ C10.12：`expiry.default` / `expiry.max` 解析后的基数（默认 = 契约值）
+  ExpiryOptions expiry_;
 };
 
 }  // namespace fss::app

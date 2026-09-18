@@ -186,3 +186,81 @@ TEST_CASE("★ C9.9 operations.md 覆盖 example 的全部叶子键且不写不�
   for (const auto& key : unknown) INFO("  不存在的键: " << key);
   REQUIRE(unknown.empty());
 }
+
+// =============================================================================
+//  C10.11（阶段 10 切片 2）：operations.md 的"接通状态"必须是**三态**且计数自洽
+// =============================================================================
+//  判据原文："对每个键，operations.md 必须标注三态之一 —— `生效` /
+//            `拒绝启动（列出触发条件）` / `已读但无效果（必须给出理由与下一步）`"。
+//  这条测试把"计数"变成机械断言（否则文档里的数字只是人写的字，会漂移）：
+//    ① 示例文件的每个叶子键都必须在 §1.2 的某一行里以状态标记开头；
+//    ② 三态计数 = 生效 72 / 拒绝启动 16 / 已读但无效果 68，且相加 = 156；
+//    ③ 文档正文里声明的数字也必须一致（防止只改表格不改正文）。
+//  ★ 只认"最后一列以状态标记开头"的行：同一个键在别处（如 §5.1 的档位表）出现不算。
+// =============================================================================
+TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 72 / 拒绝启动 16 / 已读但无效果 68）",
+          "[phase10][docs][c10.11]") {
+  const std::string example_path = std::string(FSS_REPO_ROOT) + "/config/fss.example.json";
+  const std::string doc_path = std::string(FSS_REPO_ROOT) + "/docs/operations.md";
+  std::string example_text;
+  std::string doc;
+  REQUIRE(ReadFile(example_path, example_text));
+  REQUIRE(ReadFile(doc_path, doc));
+  const auto parsed = fss::json::ParseWithComments(example_text);
+  REQUIRE(parsed.ok());
+  const std::vector<std::string> leaves = LeafPaths(parsed.value());
+
+  const std::string kEffective = "**生效**";
+  const std::string kReject = "**拒绝启动（触发条件）**";
+  const std::string kIneffective = "**已读但无效果**";
+
+  std::size_t n_effective = 0;
+  std::size_t n_reject = 0;
+  std::size_t n_ineffective = 0;
+  std::vector<std::string> unmarked;
+  for (const auto& leaf : leaves) {
+    const std::string row_prefix = "| `" + leaf + "` |";
+    bool found = false;
+    std::istringstream stream(doc);
+    std::string line;
+    while (std::getline(stream, line)) {
+      if (line.rfind(row_prefix, 0) != 0) continue;
+      const auto last_bar = line.rfind('|');
+      if (last_bar == std::string::npos || last_bar == 0) continue;
+      const auto prev_bar = line.rfind('|', last_bar - 1);
+      if (prev_bar == std::string::npos) continue;
+      std::string cell = line.substr(prev_bar + 1, last_bar - prev_bar - 1);
+      const auto first = cell.find_first_not_of(" \t");
+      cell = (first == std::string::npos) ? std::string() : cell.substr(first);
+      if (cell.rfind(kEffective, 0) == 0) {
+        ++n_effective;
+        found = true;
+        break;
+      }
+      if (cell.rfind(kReject, 0) == 0) {
+        ++n_reject;
+        found = true;
+        break;
+      }
+      if (cell.rfind(kIneffective, 0) == 0) {
+        ++n_ineffective;
+        found = true;
+        break;
+      }
+    }
+    if (!found) unmarked.push_back(leaf);
+  }
+
+  INFO("未标注三态的键（共 " << unmarked.size() << "）:");
+  for (const auto& key : unmarked) INFO("  未标注: " << key);
+  REQUIRE(unmarked.empty());
+  INFO("生效=" << n_effective << " 拒绝启动=" << n_reject << " 已读但无效果=" << n_ineffective
+               << " 合计=" << leaves.size());
+  REQUIRE(n_effective == 72);
+  REQUIRE(n_reject == 16);
+  REQUIRE(n_ineffective == 68);
+  REQUIRE(n_effective + n_reject + n_ineffective == leaves.size());
+  //  正文声明的数字也必须一致（防止"只改表格、不改正文"）
+  REQUIRE(doc.find("生效 72 / 拒绝启动 16 / 已读但无效果 68") != std::string::npos);
+  REQUIRE(doc.find("**72 + 16 + 68 = 156**") != std::string::npos);
+}

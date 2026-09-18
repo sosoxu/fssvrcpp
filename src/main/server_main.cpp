@@ -22,7 +22,10 @@
 #include "adapters/grpc/file_service_adapter.h"
 #include "adapters/grpc/grpc_server.h"
 #include "adapters/http/router.h"
+#include "app/services/expiry_policy.h"
 #include "app/services/location_issuer.h"
+#include "app/services/object_key_policy.h"
+#include "app/tasks/gc_task.h"
 #include "app/usecases/usecases.h"
 #include "common/config/config.h"
 #include "common/http/http.h"
@@ -40,6 +43,7 @@
 #include "infra/blob/posix/posix_blob_store.h"
 #include "infra/blob/s3/s3_blob_store.h"
 #include "infra/io/uring_io_engine.h"
+#include "infra/location/memory/memory_lease_repository.h"
 #include "infra/location/sqlite/sqlite_location_repository.h"
 #include "infra/io/file_sync.h"
 #include "infra/metadata/sqlite/sqlite_metadata_repository.h"
@@ -48,7 +52,11 @@
 #include "infra/transfer/transfer_token.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -56,11 +64,13 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -73,6 +83,7 @@ const char* const kUsage =
     "用法: fss_server [选项]\n"
     "  --config <path>          加载带注释的 JSON 配置文件（等价环境变量 FSS_CONFIG）\n"
     "  --set <json.path>=<值>   覆盖单个配置项，可重复；优先级最高\n"
+    "  --once                   只跑一轮 GC 后退出（退出码 0；便于 cron/一次性清理）\n"
     "  --print-config           打印脱敏后的有效配置与每项来源，随后退出（退出码 0）\n"
     "  --help, -h               打印本用法\n"
     "优先级: --set(cli) > 环境变量(通用名 FSS_<PATH>) > 旧环境变量别名 > 配置文件 > 默认值\n"
@@ -111,6 +122,7 @@ struct CliOptions {
   bool config_from_cli = false;
   std::vector<std::pair<std::string, std::string>> set_overrides;
   bool print_config = false;
+  bool once = false;
   bool help = false;
 };
 
@@ -153,6 +165,8 @@ bool ParseCli(int argc, char** argv, CliOptions* out, std::string* error) {
       out->set_overrides.push_back(std::move(kv));
     } else if (arg == "--print-config") {
       out->print_config = true;
+    } else if (arg == "--once") {
+      out->once = true;
     } else if (arg == "--help" || arg == "-h") {
       out->help = true;
     } else {
@@ -608,6 +622,101 @@ class NoopAuditLogger final : public fss::domain::IAuditLogger {
   fss::Result<void> Record(const fss::domain::AuditEvent&) override { return fss::Ok(); }
 };
 
+// =============================================================================
+//  GC 周期调度（阶段 10 切片 2 / C10.9）
+// =============================================================================
+//  为什么要有这个类：`GcTask` 从 P6 起就实现了语义，但**组合根从不装配它** ——
+//  "测试里通过、产品里不存在"（R15 的同族陷阱）。这里把它接到真实进程的**后台线程**上。
+//
+//  ★ 优雅停止：`Stop()` 置位 + `notify_all` + `join`，且析构函数也调用 `Stop()`，
+//    因此**任何提前 return 都不会留下 joinable 线程**（AGENTS §4.3 第一条陷阱）。
+//    等待用 `condition_variable::wait_for`（不是固定 sleep）：SIGTERM 后立刻退出。
+//  ★ 第一轮**立即执行**（不等一个 interval）：运维最需要的是"启动后马上有一轮结果"，
+//    而不是等一小时。之后按 `gc.interval_seconds` 周期运行。
+//  ★ `interval_seconds <= 0` 时**不启动**：宁可"不跑并在横幅说明"，也不要空转把机器压满。
+class GcScheduler {
+ public:
+  GcScheduler(fss::app::GcTask& task, std::string partition, fss::app::GcOptions options,
+              std::int64_t interval_seconds, const fss::logging::ILogger& logger)
+      : task_(task),
+        partition_(std::move(partition)),
+        options_(options),
+        interval_seconds_(interval_seconds),
+        logger_(logger) {}
+
+  ~GcScheduler() { Stop(); }
+  GcScheduler(const GcScheduler&) = delete;
+  GcScheduler& operator=(const GcScheduler&) = delete;
+
+  void Start() {
+    thread_ = std::thread([this] { Loop(); });
+  }
+
+  void Stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+  }
+
+  std::int64_t runs() const { return runs_.load(); }
+
+ private:
+  void Loop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!stop_) {
+      lock.unlock();
+      RunOnce();
+      lock.lock();
+      if (stop_) break;
+      cv_.wait_for(lock, std::chrono::seconds(interval_seconds_), [this] { return stop_; });
+    }
+  }
+
+  void RunOnce() {
+    const auto report = task_.Run(partition_, options_);
+    runs_.fetch_add(1);
+    if (!report.ok()) {
+      fss::logging::Warn(logger_, "gc_run_failed",
+                         {{"partition", partition_},
+                          {"error", report.error().message()}});
+      return;
+    }
+    const auto& value = report.value();
+    fss::logging::Info(logger_, "gc_run",
+                       {{"partition", partition_},
+                        {"dry_run", value.dry_run ? "true" : "false"},
+                        {"expired_leases_claimed", std::to_string(value.expired_leases_claimed)},
+                        {"deleted_objects", std::to_string(value.deleted_objects)},
+                        {"deleted_locations", std::to_string(value.deleted_locations)},
+                        {"tmp_removed", std::to_string(value.tmp_removed)},
+                        {"tmp_skipped_too_young", std::to_string(value.tmp_skipped_too_young)},
+                        {"skipped_has_record", std::to_string(value.skipped_has_record)},
+                        {"skipped_too_young", std::to_string(value.skipped_too_young)},
+                        {"errors", std::to_string(value.errors)}});
+  }
+
+  fss::app::GcTask& task_;
+  std::string partition_;
+  fss::app::GcOptions options_;
+  std::int64_t interval_seconds_ = 3600;
+  const fss::logging::ILogger& logger_;
+  std::thread thread_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool stop_ = false;
+  std::atomic<std::int64_t> runs_{0};
+};
+
+//  SIGINT / SIGTERM → 置位（**信号处理器里只做这一件事**：async-signal-safe）。
+//  ★ 主循环轮询它（AGENTS §4.3："不要用固定 sleep 等状态"），随后走统一退出路径：
+//    Stop GC 调度 → Stop HTTP → Shutdown gRPC。绝不留下 joinable 线程。
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+extern "C" void HandleStopSignal(int) { g_stop_requested = 1; }
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -728,6 +837,45 @@ int main(int argc, char** argv) {
       resolver.Str("self_signed.public_base_url",
                    "http://127.0.0.1:" + std::to_string(http_port) + base_path);
 
+  //  ---- 有效期（expiry.*，C10.12）----
+  //  ★ 判定规则不变（缺省 / 静默夹紧 / 非法固定消息），配置只改**缺省值**与**上限基数**；
+  //    上限本身用 `ParseExact`（**不夹紧**），否则"把上限配成 30D"会被静默改成 7D。
+  const std::string expiry_default_text = resolver.Str("expiry.default", "1H");
+  const std::string expiry_max_text = resolver.Str("expiry.max", "7D");
+
+  //  ---- GC（gc.*，C10.9）----
+  const bool gc_enabled = resolver.Bool("gc.enabled", false);
+  const bool gc_dry_run = resolver.Bool("gc.dry_run", true);
+  const bool gc_require_lease_expiry = resolver.Bool("gc.require_lease_expiry", true);
+  const long gc_staging_ttl_hours = resolver.Int("gc.staging_ttl_hours", 24);
+  const long gc_orphan_grace_hours = resolver.Int("gc.orphan_grace_hours", 72);
+  const long gc_interval_seconds = resolver.Int("gc.interval_seconds", 3600);
+
+  //  ---- 未实现能力的守卫键（C10.11：非默认值必须**拒绝启动**，不许静默无效）----
+  const bool large_file_plane_enabled =
+      resolver.Bool("server.http.large_file_plane.enabled", false);
+  const long max_connections_per_partition =
+      resolver.Int("server.http.max_connections_per_partition", 0);
+  const long grpc_max_message_bytes = resolver.Int("server.grpc.max_message_bytes", 4194304);
+  const long grpc_streaming_chunk_bytes =
+      resolver.Int("server.grpc.streaming_chunk_bytes", 262144);
+  const std::string proxy_mode = resolver.Str("storage.proxy_mode", "auto");
+  const bool io_uring_register_files = resolver.Bool("storage.io_uring.register_files", false);
+  const bool leases_enabled = resolver.Bool("leases.enabled", false);
+  const long leases_ttl_seconds = resolver.Int("leases.ttl_seconds", 60);
+  const long leases_renew_interval_seconds =
+      resolver.Int("leases.renew_interval_seconds", 20);
+  const std::string leases_time_source = resolver.Str("leases.time_source", "database");
+  const bool leader_election_enabled = resolver.Bool("leader_election.enabled", false);
+  const std::string legal_validator = resolver.Str("legal.validator", "noop");
+  const std::string schema_validator_kind = resolver.Str("schema.validator", "noop");
+  const std::string events_publisher = resolver.Str("events.publisher", "log");
+  const bool single_use_nonce = resolver.Bool("self_signed.single_use_nonce", false);
+  const std::string nonce_store = resolver.Str("self_signed.nonce_store", "memory");
+  const std::string partition_registry = resolver.Str("partition.registry", "file");
+  const long clock_skew_tolerance_seconds =
+      resolver.Int("deployment.clock_skew_tolerance_seconds", 60);
+
   //  ---- 部署形态（ADR-009）----
   const std::string deployment_mode = resolver.Str("deployment.mode", "single");
   const long max_clock_skew_seconds =
@@ -779,6 +927,109 @@ int main(int argc, char** argv) {
     resolver.Print(std::cout);
     return 0;
   }
+
+  //  ---- C10.11：未实现能力的非默认值 → 拒绝启动（"未实现 + 下一步"）----
+  //  ★ 这一节的存在理由是"不许读了但静默无效"：如果一个键的实现不存在，把非默认值
+  //    接受下来就是让运维**以为配置生效了**。宁可拒绝启动，并给出下一步。
+  //    每条都配一个正例对照（默认值必须能启动）—— 见 tests/integration/test_gc_scheduling.cpp。
+  const auto reject_startup = [](const std::string& message) {
+    std::cerr << "拒绝启动：" << message << "\n";
+    return kExitConfigError;
+  };
+
+  if (large_file_plane_enabled) {
+    return reject_startup(
+        "server.http.large_file_plane.enabled=true —— 独立大文件数据面（sendfile）尚未交付"
+        "（ADR-006 只定稿方向，实现未交付）。下一步：保持 false（默认，走 httplib 内容提供者），"
+        "或在 ADR-006 §6 落地后开启。");
+  }
+  if (max_connections_per_partition != 0) {
+    return reject_startup(
+        "server.http.max_connections_per_partition 非 0 —— 每租户并发上限尚未实现"
+        "（当前只有全局 max_connections）。下一步：保持 0，或用 "
+        "server.http.max_connections 表达全局上限。");
+  }
+  if (grpc_max_message_bytes != 4194304 || grpc_streaming_chunk_bytes != 262144) {
+    return reject_startup(
+        "server.grpc.max_message_bytes / server.grpc.streaming_chunk_bytes 非默认 —— "
+        "gRPC 侧消息上限尚未接通（实现内固定 4 MiB / 256 KiB）。下一步：保持默认值，"
+        "或先接通 gRPC 适配层的 options。");
+  }
+  if (proxy_mode == "always") {
+    return reject_startup(
+        "storage.proxy_mode=always —— 「强制服务代理所有字节」尚未实现"
+        "（地址形态当前只按驱动能力决定，见 LocationIssuer）。下一步：保持 auto。");
+  }
+  if (io_uring_register_files) {
+    return reject_startup(
+        "storage.io_uring.register_files=true —— io_uring 引擎本身未启用（ADR-010 U1~U4），"
+        "注册文件表更不可能生效。下一步：保持 false，并先跑 scripts/check_io_uring.sh。");
+  }
+  if (leases_enabled) {
+    return reject_startup(
+        "leases.enabled=true —— PG 版租约未交付（ADR-009），单实例组合根装配的是**内存**租约，"
+        "跨进程不共享。下一步：保持 false（单实例），或等 PG 租约（metadata.repository=postgres）"
+        "交付后一起开启。");
+  }
+  if (leader_election_enabled) {
+    return reject_startup(
+        "leader_election.enabled=true —— 领导者选举依赖 PG advisory lock，尚未交付（ADR-009）。"
+        "下一步：保持 false（单实例下 GC 只有一个实例在跑，无需选举）。");
+  }
+  if (events_publisher != "log") {
+    return reject_startup(
+        "events.publisher=" + events_publisher +
+        " —— 事件发布只实现了写日志（log）。webhook 未交付；none 也无法真正关闭"
+        "（组合根固定装配 LogEventPublisher）。下一步：保持 log，或先实现 webhook/none 分支。");
+  }
+  if (legal_validator == "remote") {
+    return reject_startup(
+        "legal.validator=remote —— 远端法务校验未交付（实现内固定 noop）。"
+        "下一步：保持 noop，或先实现 legal.remote.* 的调用。");
+  }
+  if (schema_validator_kind == "remote") {
+    return reject_startup(
+        "schema.validator=remote —— 远端 schema 校验未交付（实现内固定 noop）。"
+        "下一步：保持 noop，或先实现 schema.remote.* 的调用。");
+  }
+  if (single_use_nonce) {
+    return reject_startup(
+        "self_signed.single_use_nonce=true —— nonce 存储未交付（ADR-009 M5：本地表无法跨实例）。"
+        "下一步：保持 false；多实例防重放需要共享 nonce 存储。");
+  }
+  if (nonce_store != "memory") {
+    return reject_startup(
+        "self_signed.nonce_store=" + nonce_store +
+        " —— 只有内存 nonce 存储存在，且它在 single_use_nonce=false 时并不被使用。"
+        "下一步：保持 memory，并在实现 PG nonce 表后再启用 single_use_nonce。");
+  }
+  if (partition_registry == "remote") {
+    return reject_startup(
+        "partition.registry=remote —— 远端租户注册表未交付（组合根只装配内置租户 opendes）。"
+        "下一步：保持 file，或先实现 partition.registry=remote 的拉取与校验。");
+  }
+  if (clock_skew_tolerance_seconds != 60) {
+    return reject_startup(
+        "deployment.clock_skew_tolerance_seconds 非默认 —— 该键用于「与数据库 now() 的偏移容忍」，"
+        "而数据库时钟未交付（单实例用本地钟；multi 已拒绝启动）。下一步：保持 60。");
+  }
+
+  //  ---- 有效期（expiry.*，C10.12）：把两个字符串解析成基数 ----
+  const auto expiry_default = app::ExpiryPolicy::ParseExact(expiry_default_text);
+  const auto expiry_max = app::ExpiryPolicy::ParseExact(expiry_max_text);
+  if (!expiry_default.ok() || !expiry_max.ok()) {
+    std::cerr << "拒绝启动：expiry.default / expiry.max 必须是 <数字><M|H|D> 形态"
+                 "（实际 expiry.default=\"" << expiry_default_text << "\"，expiry.max=\""
+              << expiry_max_text << "\"）。\n";
+    return kExitConfigError;
+  }
+  if (expiry_default.value() > expiry_max.value()) {
+    std::cerr << "拒绝启动：expiry.default（" << expiry_default_text
+              << " = " << expiry_default.value() << "s）不得大于 expiry.max（"
+              << expiry_max_text << " = " << expiry_max.value() << "s）。\n";
+    return kExitConfigError;
+  }
+  const app::ExpiryOptions expiry_options{expiry_default.value(), expiry_max.value()};
 
   //  ---- 值域/依赖关系校验：任何一条不过 → 拒绝启动（exit 78）----
   if (deployment_mode == "multi") {
@@ -930,6 +1181,10 @@ int main(int argc, char** argv) {
     std::cerr << "打开元数据仓储失败: " << metadata_repository_handle.error().ToString() << "\n";
     return kExitConfigError;
   }
+  //  ---- 在途租约（C10.9）：单实例 = 内存实现 ----
+  //  ★ PG 版 `ILeaseRepository` 未交付（ADR-009），单实例下内存租约语义正确；
+  //    `deployment.mode=multi` 在更早处已拒绝启动，因此不存在"以为共享、其实各存一份"。
+  infra::InMemoryLeaseRepository lease_repository(clock);
   HmacTransferTokenCodec token_codec(transfer_secret, clock);
 
   //  ---- 认证（P8 / ADR-012）----
@@ -1000,7 +1255,7 @@ int main(int argc, char** argv) {
   NoopSchemaValidator schema_validator;
 
   app::LocationIssuer issuer(blob_factory, *location_repository.value(), token_codec, clock, ids,
-                             self_base_url);
+                             self_base_url, expiry_options);
 
   app::UseCasePorts ports{blob_factory,      *location_repository.value(),
                           *metadata_repository_handle.value(),
@@ -1010,6 +1265,49 @@ int main(int argc, char** argv) {
                           issuer,            clock,
                           ids};
   ports.auth_mode = auth_mode;  // C8.5：让 `/v2/info` 与 gRPC 的 `GetInfo` 都能看到
+
+  // ===========================================================================
+  //  GC（C10.9）：GcTask + 调度参数。`--once` 与周期调度共用同一份 options。
+  // ===========================================================================
+  app::GcOptions gc_options;
+  gc_options.dry_run = gc_dry_run;
+  gc_options.require_lease_expiry = gc_require_lease_expiry;
+  gc_options.staging_ttl_hours = gc_staging_ttl_hours;
+  gc_options.orphan_grace_hours = gc_orphan_grace_hours;
+  const std::string gc_partition = "opendes";  // 组合根内置的单租户（与 StaticPartitionRegistry 同源）
+  app::GcTask gc_task(ports, lease_repository, posix_instance_id, &metrics_registry);
+
+  //  ★ GC 的两条 `list()` 路径要求容器真实存在（POSIX 驱动对不存在的容器返回
+  //    `kNotFound`）。启动时按 `ObjectKeyPolicy` 生成的两个容器名确保目录存在 ——
+  //    否则**全新实例**每轮 GC 都会把"没有残留"记成 errors（`outcome="error"`），
+  //    把正常状态误报成扫描失败。
+  for (const auto zone : {domain::StorageZone::kStaging, domain::StorageZone::kPersistent}) {
+    const auto container = app::ObjectKeyPolicy::ContainerFor(gc_partition, zone);
+    if (container.ok()) (void)metered_blob.ensure_container(container.value());
+  }
+
+  //  `--once`（便于 cron）：跑**一轮** GC 就退出（退出码 0），与正常启动共用配置加载。
+  if (cli.once) {
+    const auto once_report = gc_task.Run(gc_partition, gc_options);
+    if (!once_report.ok()) {
+      std::cerr << "GC 单次运行失败：" << once_report.error().ToString() << "\n";
+      return kExitConfigError;
+    }
+    const auto& report = once_report.value();
+    std::cout << "gc once : partition=" << gc_partition
+              << " dry_run=" << (report.dry_run ? "true" : "false")
+              << " expired_leases_claimed=" << report.expired_leases_claimed
+              << " deleted_objects=" << report.deleted_objects
+              << " deleted_locations=" << report.deleted_locations
+              << " tmp_removed=" << report.tmp_removed
+              << " tmp_skipped_too_young=" << report.tmp_skipped_too_young
+              << " tmp_skipped_unknown_mtime=" << report.tmp_skipped_unknown_mtime
+              << " skipped_has_record=" << report.skipped_has_record
+              << " skipped_no_location=" << report.skipped_no_location
+              << " skipped_too_young=" << report.skipped_too_young
+              << " errors=" << report.errors << "\n";
+    return 0;
+  }
 
   //  ---- 路由 ----
   const auto parsed_error_format = adapters::http::ParseErrorFormat(error_format);
@@ -1103,7 +1401,27 @@ int main(int argc, char** argv) {
   http::Server server(server_options, logger, clock);
   router.Register(server);
 
-  if (!server.Bind()) {
+  //  ---- GC 周期调度（C10.9）：先判定，再在横幅里如实说明"跑/不跑 + 原因" ----
+  const bool gc_schedule = gc_enabled && gc_interval_seconds > 0;
+  std::unique_ptr<GcScheduler> gc_scheduler;
+  std::string gc_banner;
+  if (!gc_enabled) {
+    gc_banner =
+        "未启动（gc.enabled=false；schema 与组合根默认都是 false —— 不提供配置时不跑 GC，"
+        "与接线前的行为一致）";
+  } else if (gc_interval_seconds <= 0) {
+    gc_banner = "未启动（gc.interval_seconds=" + std::to_string(gc_interval_seconds) +
+                " <= 0：调度周期必须为正，否则等于空转压满机器）";
+  } else {
+    gc_banner = "已启动（间隔 " + std::to_string(gc_interval_seconds) + "s，dry_run=" +
+                std::string(gc_dry_run ? "true" : "false") +
+                "，require_lease_expiry=" +
+                std::string(gc_require_lease_expiry ? "true" : "false") + "，staging_ttl=" +
+                std::to_string(gc_staging_ttl_hours) + "h，orphan_grace=" +
+                std::to_string(gc_orphan_grace_hours) + "h；每轮立即跑一次再按间隔重复）";
+  }
+
+  if (!server.Start()) {
     std::cerr << "监听失败: " << server.last_error() << "\n";
     return kExitConfigError;
   }
@@ -1131,7 +1449,7 @@ int main(int argc, char** argv) {
             << logger.options().redact_keys.size() << " 个键\n"
             << "  metrics        : "
             << (router_options.metrics_enabled
-                    ? "已接入 " + router_options.metrics_path + "（含存储计量）"
+                    ? "已接入 " + router_options.metrics_path + "（含存储计量 + fss_gc_*）"
                     : std::string("未接入（observability.metrics_enabled=false）"))
             << "\n"
             << "  audit          : "
@@ -1144,7 +1462,15 @@ int main(int argc, char** argv) {
                            ? "remote-entitlements（fail-closed，地址 " + entitlements_url + "）"
                            : "disabled（allow-all，仅开发/测试）"))
             << "\n"
-            << "  environment    : " << deployment_environment << "\n";
+            << "  environment    : " << deployment_environment << "\n"
+            << "  gc             : " << gc_banner << "\n"
+            << "  expiry         : default=" << expiry_default_text << "（"
+            << expiry_options.default_seconds << "s）max=" << expiry_max_text << "（"
+            << expiry_options.max_seconds << "s）\n"
+            << "  leases         : 内存租约（单实例；enabled="
+            << (leases_enabled ? "true" : "false")
+            << " ttl=" << leases_ttl_seconds << "s renew=" << leases_renew_interval_seconds
+            << "s time_source=" << leases_time_source << "）\n";
   //  C10.2：逐键打印来源缩写（cli/env/file/default），`(别名 FSS_X)` 表示旧环境变量。
   std::cout << "  config sources :\n";
   for (const auto& [path, row] : resolver.rows()) {
@@ -1154,7 +1480,25 @@ int main(int argc, char** argv) {
   }
   std::cout.flush();
 
-  server.Listen();
+  //  ---- 启动周期调度（在横幅之后：横幅要先回答"它会不会跑"）----
+  if (gc_schedule) {
+    gc_scheduler = std::make_unique<GcScheduler>(gc_task, gc_partition, gc_options,
+                                                 gc_interval_seconds, logger);
+    gc_scheduler->Start();
+  }
+
+  //  ★ 优雅停止（C10.9）：SIGINT/SIGTERM 只置位；主循环**轮询**该标志
+  //    （不用固定 sleep 等状态 —— AGENTS §4.3），随后走**唯一的**退出路径。
+  std::signal(SIGINT, HandleStopSignal);
+  std::signal(SIGTERM, HandleStopSignal);
+  while (g_stop_requested == 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  //  统一退出路径：先停 GC 调度（signal + join；绝不留 joinable thread），
+  //  再停 HTTP（Server::Stop 会 join 自己的 runner），最后 shutdown gRPC。
+  if (gc_scheduler) gc_scheduler->Stop();
+  server.Stop();
 
   //  ★ 退出路径必须**显式**关掉 gRPC 服务：`grpc::Server` 是 joinable 的资源，
   //    提前 return 或析构顺序不当会让进程挂在 gRPC 的线程池上（与"先 stop 再 join"

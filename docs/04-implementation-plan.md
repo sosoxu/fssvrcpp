@@ -991,14 +991,16 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 
 ## 9. 首个动作（下一步要做什么）
 
-P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）已完成**（见文末「阶段 10」）。
-**下一步 = 阶段 10 的后续切片**，按 `docs/operations.md` §1.3 的未接通清单收敛：
+P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）与切片 2（GC/expiry/拒绝语义）已完成**
+（见文末「阶段 10」）。三态：**生效 72 / 拒绝启动 16 / 已读但无效果 68**（`docs/operations.md` §1.3）。
+**下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. `observability.audit_fail_closed` 的"致命审计"路径（当前 `RecordAudit()` 丢弃结果）；
-2. `gc.*`（调度器 + GC 端点）接入组合根；
-3. `storage.proxy_mode` / 远端 Storage Service（`metadata.repository=remote`）；
-4. PG 仓储/租约 + `deployment.mode=multi` 运行形态（ADR-009）；
-5. `server.http.large_file_plane.*` 与 sendfile 数据面（ADR-006 §6）。
+2. GC 的 **HTTP 端点**（周期调度与 `--once` 已在切片 2 交付；手动触发/查询未做）；
+3. `storage.proxy_mode=always` / 远端 Storage Service（`metadata.repository=remote`）；
+4. PG 仓储/租约 + `deployment.mode=multi` 运行形态（ADR-009）—— 同时解锁 `leases.*`/`leader_election.*`；
+5. `server.http.large_file_plane.*` 与 sendfile 数据面（ADR-006 §6）；
+6. `auth.local_roles` 静态角色表与 `auth.jwt.roles_claim`；SQLite 调优键（`metadata.sqlite.*`/`location.sqlite.*`）。
 
 ---
 
@@ -1042,7 +1044,33 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）已
 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，真实二进制）+
 `scripts/verify_config_wiring.sh`；自证（R1）：去掉组合根的配置文件层后新用例失败。
 
-**未做（本阶段不承诺）**：`gc.*` 的调度与端点（P9 登记的"GC 未接入组合根"）、
+**切片 2（判据）**
+
+| # | 判据 |
+| --- | --- |
+| **C10.9** | **GC 真正跑起来**：组合根装配 `GcTask`（此前只在测试里被构造）+ **周期调度**（`gc.interval_seconds`；`gc.enabled=false` 或 `interval=0` → 不启动调度，横幅显式说明）；`gc.dry_run`/`require_lease_expiry`/`staging_ttl_hours`/`orphan_grace_hours` 生效；调度循环**可优雅停止**（与 `Stop`/join 同一退出路径，AGENTS 陷阱：不得留下 joinable thread）；GC 指标在**真实进程**的 `/metrics` 可见（`fss_gc_*`）；`--once`（或等价开关）支持"跑一轮就退出"便于 cron |
+| **C10.10** | **样例配置真的能起来**：用 `config/fss.example.json` 作为 `--config`（仅覆盖路径/密钥等环境相关项）**启动成功**并 `readiness_check` 200 —— 这条把"156 键的文档"变成"可执行的事实"；同时在测试里断言"故意改坏一个键 → 拒绝启动" |
+| **C10.11** | **不许"读了但静默无效"**：对每个键，`docs/operations.md` 必须标注三态之一 —— `生效` / `拒绝启动（列出触发条件）` / `已读但无效果（必须给出理由与下一步）`；对**未实现**的键（`large_file_plane.enabled=true`、`storage.io_engine=uring`、`metadata.repository=postgres|remote`、`leases.*`/`leader_election.*` 在 single 模式、`events.publisher=webhook`、`legal/schema.validator=remote`、`self_signed.single_use_nonce=true`）**非默认值必须拒绝启动**而不是被忽略 |
+| **C10.12** | `expiry.default`/`expiry.max` 接通（`app::ExpiryPolicy`），并有正/反用例（超上限拒绝、边界通过） |
+
+**状态：🚧 切片 2（C10.9~C10.12）完成**。
+* **C10.9**：组合根装配 `GcTask` + 后台周期调度（`gc.interval_seconds`，第一轮立即跑；
+  `gc.enabled=false`/`interval<=0` → 不启动 + 横幅说明）；`gc.dry_run`/`require_lease_expiry`/
+  `staging_ttl_hours`/`orphan_grace_hours` 读入 `GcOptions`；SIGINT/SIGTERM → 统一退出路径
+  （先 `Stop()`+`join()`，绝不留 joinable thread）；`fss_gc_*` 在真实进程 `/metrics` 可见；
+  新增 `--once`（跑一轮 GC 退出 0，打印 `GcReport` 摘要）；单实例用
+  `src/infra/location/memory/memory_lease_repository.h`（PG 版未交付）。
+* **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
+  readiness 200**；改坏 `server.http.port` → exit 78。
+* **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
+  `docs/operations.md` 逐键三态化（生效 72 / 拒绝启动 16 / 已读但无效果 68 = 156）。
+* **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
+  超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
+* 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
+  `scripts/verify_config_wiring.sh`（54 条断言）+ `docs/test-evidence/phase10.md`。
+* 自证（R1）：把 GC 调度的 interval 强行设为 0 → C10.9 用例失败（指标不涨/tmp 不删），还原后全绿。
+
+**未做（本阶段不承诺）**：`gc.*` 的 HTTP 端点（只做周期调度与一次性运行）；
 PG 仓储/租约与 `mode=multi` 运行形态、`storage.proxy_mode`/远端 Storage Service、
 `leader_election.*`/`leases.*`（依赖 PG）、sendfile 数据面（ADR-006 §6）、
 `observability.audit_fail_closed` 的"致命审计"行为（已读但行为未实现，见 `operations.md` §8）。

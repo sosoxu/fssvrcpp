@@ -23,7 +23,7 @@ fss::Result<LocationResult> LocationIssuer::IssueUploadLocation(
   if (user_id.empty()) return Invalid("user_id 不能为空");
 
   //  ① 有效期：缺省 1H / 超限静默截断 7D / 非法 → 固定消息（ExpiryPolicy，C2.3）
-  FSS_TRY(ttl_seconds, ExpiryPolicy::Parse(expiry_time));
+  FSS_TRY(ttl_seconds, ExpiryPolicy::Parse(expiry_time, expiry_));
 
   //  ② fileID：客户端可指定（旧接口 getLocation），否则服务端生成
   std::string file_id;
@@ -95,7 +95,7 @@ fss::Result<LocationResult> LocationIssuer::IssueDownloadLocation(
   if (partition.empty()) return Invalid("partition 不能为空");
   if (file_id.empty()) return Invalid("file_id 不能为空");
 
-  FSS_TRY(ttl_seconds, ExpiryPolicy::Parse(expiry_time));
+  FSS_TRY(ttl_seconds, ExpiryPolicy::Parse(expiry_time, expiry_));
 
   //  ① 位置记录是权威映射；缺失 → 404（固定消息 "Not found location for fileID : <id>"）
   FSS_TRY(location, locations_.Find(partition, file_id));

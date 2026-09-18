@@ -23,16 +23,11 @@ bool ParseDigits(std::string_view text, std::int64_t* out) {
   return true;
 }
 
-}  // namespace
-
-std::int64_t ExpiryPolicy::Cap(std::int64_t seconds) {
-  if (seconds < 0) return 0;
-  return std::min(seconds, kMaxExpirySeconds);
-}
-
-Result<std::int64_t> ExpiryPolicy::Parse(const std::optional<std::string>& raw) {
-  if (!raw.has_value() || raw->empty()) return kDefaultExpirySeconds;  // 缺省 1 小时
-
+//  语法解析（不夹紧）：返回原始秒数；非法 → 固定消息。
+Result<std::int64_t> ParseSeconds(const std::optional<std::string>& raw) {
+  if (!raw.has_value() || raw->empty()) {
+    return Err(ErrorKind::kInvalidArgument, std::string(kExpiryInvalidMessage));
+  }
   const std::string_view text = *raw;
   const char unit = text.back();
   const std::string_view digits = text.substr(0, text.size() - 1);
@@ -42,6 +37,49 @@ Result<std::int64_t> ExpiryPolicy::Parse(const std::optional<std::string>& raw) 
     return Err(ErrorKind::kInvalidArgument, std::string(kExpiryInvalidMessage));
   }
 
+  switch (unit) {
+    case 'M':
+      return value * 60;
+    case 'H':
+      return value * 3600;
+    case 'D':
+      return value * 86400;
+    default:
+      return Err(ErrorKind::kInvalidArgument, std::string(kExpiryInvalidMessage));
+  }
+}
+
+std::int64_t CapWith(std::int64_t seconds, const ExpiryOptions& options) {
+  if (seconds < 0) return 0;
+  return std::min(seconds, options.max_seconds);
+}
+
+}  // namespace
+
+std::int64_t ExpiryPolicy::Cap(std::int64_t seconds) {
+  return CapWith(seconds, ExpiryOptions{});
+}
+
+std::int64_t ExpiryPolicy::Cap(std::int64_t seconds, const ExpiryOptions& options) {
+  return CapWith(seconds, options);
+}
+
+Result<std::int64_t> ExpiryPolicy::Parse(const std::optional<std::string>& raw) {
+  return Parse(raw, ExpiryOptions{});
+}
+
+Result<std::int64_t> ExpiryPolicy::Parse(const std::optional<std::string>& raw,
+                                         const ExpiryOptions& options) {
+  if (!raw.has_value() || raw->empty()) return options.default_seconds;  // 缺省
+
+  //  语法非法 → 固定消息（**与上限无关**：非法不是"超限"，不能夹紧成合法值）
+  const std::string_view text = *raw;
+  const char unit = text.back();
+  const std::string_view digits = text.substr(0, text.size() - 1);
+  std::int64_t value = 0;
+  if (!ParseDigits(digits, &value)) {
+    return Err(ErrorKind::kInvalidArgument, std::string(kExpiryInvalidMessage));
+  }
   std::int64_t seconds = 0;
   switch (unit) {
     case 'M':
@@ -56,8 +94,12 @@ Result<std::int64_t> ExpiryPolicy::Parse(const std::optional<std::string>& raw) 
     default:
       return Err(ErrorKind::kInvalidArgument, std::string(kExpiryInvalidMessage));
   }
-  //  ★ 超限**静默截断**（契约 §1.4）：不报错。这里必须与"非法"分开处理。
-  return Cap(seconds);
+  //  ★ 超限**静默夹紧**（契约 §1.4）：不报错。这里必须与"非法"分开处理。
+  return CapWith(seconds, options);
+}
+
+Result<std::int64_t> ExpiryPolicy::ParseExact(const std::optional<std::string>& raw) {
+  return ParseSeconds(raw);
 }
 
 std::string ExpiryPolicy::Format(std::int64_t seconds) {

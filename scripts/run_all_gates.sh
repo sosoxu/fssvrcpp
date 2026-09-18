@@ -224,7 +224,7 @@ for p in 0 1 2 3 4 5 6 7 8 9 10; do
 
   # C10.x：配置面接线（真实二进制 + 临时配置文件；"配置生效"与"拒绝启动"两侧）
   if [[ "${p}" == "10" ]]; then
-    echo "==> [phase10] scripts/verify_config_wiring.sh（C10.1~C10.8：配置面接线）"
+    echo "==> [phase10] scripts/verify_config_wiring.sh（C10.1~C10.12：配置面接线 + GC/expiry/拒绝语义）"
     if ./scripts/verify_config_wiring.sh "${BUILD_DIR}"; then
       echo "==> [phase10] ✅ 配置面接线验证通过"
     else

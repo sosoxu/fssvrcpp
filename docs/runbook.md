@@ -118,7 +118,7 @@ find "$FSS_STORAGE_ROOT/blobs/opendes-staging" -name '*.tmp.*' -mmin +60 -ls | h
 | `fss_gc_runs_total{mode="dry_run"}` 涨、`fss_gc_tmp_removed_total` 不涨 | dry-run 只报候选 | 确认无误后把 `gc.dry_run` 置 false |
 | `fss_gc_skipped_total{reason="has_record"}` 涨 | GC 按设计**永不删**有记录的对象 | 正常 |
 | `fss_gc_skipped_total{reason="tmp_too_young"}` 涨 | **在途上传被正确保护**（TTL 内） | 正常；持续不降说明有上传卡住（查 §3 的 408） |
-| `fss_gc_tmp_removed_total` 长期不涨但目录里全是 `.tmp.` | **本版本的 GC 没有接入组合根**：`GcTask` 只在测试里被构造，既无调度器也无 HTTP 端点（计划里登记为"P9 未做：GC 调度/领导者选举"） | 运行中的服务**不会**自动回收残留。需要清理时按 §4 的命令人工确认后处理（或在后续版本接上 GC 后交给它）；**不要**用 `rm -rf` 清整个容器目录 |
+| `fss_gc_tmp_removed_total` 长期不涨但目录里全是 `.tmp.` | **GC 未启用**：组合根装配了周期调度，但 `gc.enabled` 的默认是 `false`（不提供配置时不跑 GC）；也可能是 `gc.dry_run=true` 只报候选 | 显式配 `gc.enabled=true` + `gc.dry_run=false` 后重启（看启动横幅的 `gc :` 行）；一次性清理用 `--once`；**不要**用 `rm -rf` 清整个容器目录 |
 | 误删/误留（怀疑 TTL 判定） | 时间戳语义问题曾在 P9 被修复（P9-D04/D08） | 升级到修复版本；用 `list()`/`stat()` 的时间戳与 `stat -c %Y` 对照 |
 
 ---

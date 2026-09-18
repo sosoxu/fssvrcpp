@@ -100,8 +100,8 @@ add_executable(fss_server
   main/server_main.cpp)
 target_link_libraries(fss_server PRIVATE
   fss_http_adapter fss_grpc_adapter fss_auth_local fss_auth_remote fss_blob_posix fss_blob_s3
-  fss_blob_metered fss_metrics fss_location_sqlite fss_metadata_sqlite fss_transfer
-  fss_metadata_memory fss_logging fss_config Threads::Threads)
+  fss_blob_metered fss_metrics fss_location_sqlite fss_location_memory fss_metadata_sqlite
+  fss_transfer fss_metadata_memory fss_logging fss_config Threads::Threads)
 
 # -----------------------------------------------------------------------------
 #  L2 基础设施适配层：每个端口实现一个独立目标（依赖倒置：L2 → L3 端口）
@@ -150,9 +150,11 @@ target_include_directories(fss_blob_metered PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fss_blob_metered PUBLIC fss_domain fss_metrics)
 
 add_library(fss_location_memory STATIC
-  infra/location/memory/memory_location_repository.cpp)
+  infra/location/memory/memory_location_repository.cpp
+  infra/location/memory/memory_lease_repository.cpp)
 target_include_directories(fss_location_memory PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(fss_location_memory PUBLIC fss_domain)
+# IClock 声明在 L1（fss_time），内存租约用它取"当前时间"（单实例下等价于数据库 now()）
+target_link_libraries(fss_location_memory PUBLIC fss_domain fss_time)
 
 # L2：单实例位置仓储（SQLite）。只链接 fss_domain + SQLite3。
 add_library(fss_location_sqlite STATIC

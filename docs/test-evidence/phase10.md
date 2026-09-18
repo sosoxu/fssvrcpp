@@ -1,16 +1,17 @@
-# 阶段 10 测试证据（🚧 切片 1 完成：配置面接线）
+# 阶段 10 测试证据（🚧 切片 1/2 完成：配置面接线 + GC 调度/expiry/拒绝语义）
 
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P10（配置面接线） |
-| 状态 | 🚧 **切片 1（配置面接线）完成**：C10.1~C10.8 全部满足 |
+| 状态 | 🚧 **切片 1/2 完成**：C10.1~C10.12 全部满足 |
 | 门槛命令 | `ctest -L phase10 && scripts/verify_config_wiring.sh` |
 | 退出码 | `0` |
-| 新测试 | `tests/integration/test_config_wiring.cpp`：**10 个 TEST_CASE / 137 断言**（全部在真实 `build/bin/fss_server` 上） |
-| 脚本 | `scripts/verify_config_wiring.sh`：**22 条断言**（配置生效 7 + 优先级 3 + print-config 5 + 生产拒绝 3 + 未知键 2 + io_uring 2） |
-| 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 230 s（3 分 50 秒，11 个阶段）**；`ctest` **76/76** 通过 |
+| 新测试 | `tests/integration/test_config_wiring.cpp`：**16 个 TEST_CASE / 288 断言**（全部在真实 `build/bin/fss_server` 上；切片 2 在同一文件追加 6 个用例） |
+| 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
+| 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **76/76** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键计数 | `config/fss.example.json` **156** 个叶子键：**66 个已接通**、**90 个未接通**（逐键见 `docs/operations.md` §1.3/§1.4，计数由人工逐条核对：5+23+5+29+8+2+1+17+11+4+3+18+3+3+4+7+6+7 = 156） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 72 / 拒绝启动（触发条件）16 / 已读但无效果 68**（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出） |
+| 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
 
@@ -78,4 +79,88 @@
 | 旧别名的布尔语义 | `FSS_JWT_VERIFY_SIGNATURE` 等沿用接线前语义（**只有字面 `false` 才为假**），不改成 `ParseBool` 的全部别名（如 `0`/`no`）—— 为了"不破坏既有行为"；已在 §1.4 注明 |
 | `storage.posix.durability=never` | schema enum 未含 `never`（配置面拒绝），只有旧别名 `FSS_POSIX_DURABILITY=never` 能表达；已在 §1.4/§5.1 注明 |
 | `--config` 与更高优先级冲突时的"文件非法值" | 若文件里某键非法、但该键又被更高优先级（cli/通用 env/旧别名）覆盖，`Load` 仍会因文件值非法而拒绝启动（校验在优先级决议之前）。这是"非法值拒绝启动"的有意取舍，未做"按最终来源再校验一次" |
+| GC 的 HTTP 端点 | **未做**：只交付周期调度与 `--once`；没有 `POST /gc` 之类的端点 |
+| PG 版 `ILeaseRepository` | **未交付**：单实例用内存租约；产品里当前**没有用例 `Acquire` 租约**，因此 `leases.ttl_seconds`/`renew_interval_seconds`/`time_source` 归入"已读但无效果"（§1.3.3） |
+| `events.publisher=none` | **拒绝启动**（比 C10.11 列出的 `webhook` 更严）：组合根固定装配 `LogEventPublisher`，`none` 无法真正关闭事件 → 宁可拒绝 |
+| `expiry.default > expiry.max` | 组合根**拒绝启动**（可读原因）。这是配置一致性问题（不是请求级语义）：请求级仍是"超限静默夹紧"，与本仓库既有 `ExpiryPolicy` 语义一致 |
 | `config/fss.example.json` 不能"零环境变量"直接启动 | 示例里 7 个密文键是 `${ENV:VAR}`；变量未注入时加载器把"引用未解析"计为问题 → **exit 78**（fail-closed）。这是加载器的既有语义，已在 `operations.md` §0 显式提示；启动示例配置前必须先注入这些 Secret |
+
+
+---
+
+## 5. 切片 2（C10.9~C10.12）证据
+
+### 5.1 判据逐条
+
+| 判据 | 状态 | 证据 |
+| --- | --- | --- |
+| **C10.9** GC 真正跑起来 | ✅ | `test_config_wiring` 的 C10.9 用例：`gc.enabled=true` + `interval_seconds=1` → 造一个 3 天前的 `residue.bin.tmp.local.7.1` 与一个 5 秒前的 `inflight.bin.tmp.local.7.2`；**轮询**（100 ms × 200）直到 `/metrics` 出现 `fss_gc_runs_total{mode="real",...}` 且 `fss_gc_tmp_removed_total 1`、旧文件消失；断言**在途文件仍在**（TTL 保护）。正例对照：`gc.enabled=false` → 横幅 `未启动（gc.enabled=false...）` 且 `/metrics` **不含** `fss_gc_runs_total`。`--once` 用例：exit 0 + `gc once : partition=opendes dry_run=false ... tmp_removed=1 errors=0`。脚本 4+3 条 |
+| **C10.10** 样例配置真的能起来 | ✅ | `--config config/fss.example.json` + 注入 6 个 `${ENV:...}` + 覆盖路径/端口/`FSS_GRPC_PORT=0` → `readiness_check` 200 且 body `File service is ready`；反面：把样例的 `"port": 8080` 改成 `-1` → exit 78 且输出含 `server.http.port`、不含 `已启动` |
+| **C10.11** 不许"读了但静默无效" | ✅ | 16 个守卫键：非默认值 → exit 78 + `拒绝启动` + 原因指向该键（用例里逐条 `REQUIRE`）；**正例对照（R16）**：同一批键全部取默认/合法值 → 真实进程 readiness 200。`operations.md` 逐键三态：新增 `test_operations_doc.cpp` 的 C10.11 用例**机械**提取 §1.2 的 156 行状态标记并断言 **生效 72 / 拒绝启动 16 / 已读但无效果 68（= 156）**，同时断言正文声明的数字一致 |
+| **C10.12** expiry 接通 | ✅ | `expiry.default=5M` + `expiry.max=10M`：无 `expiryTime` → 自签 URL `exp=now+300`；`?expiryTime=10M`（边界）→ 200 且 `exp=now+600`；`?expiryTime=60M`（超限）→ **静默夹紧**到 `now+600`（不是拒绝）；`?expiryTime=5X` → 400 + 固定消息。横幅打印 `expiry : default=5M（300s）max=10M（600s）` |
+
+### 5.2 命令与关键输出
+
+```console
+$ cmake -S . -B build && cmake --build build -j"$(nproc)"         # 全绿
+$ ctest --test-dir build -j4                                       # 100% tests passed, 0 failed out of 76
+$ ./build/bin/test_config_wiring                                   # All tests passed (288 assertions in 16 test cases)
+$ ./build/bin/test_operations_doc                                  # All tests passed (24 assertions in 2 test cases)
+$ ./scripts/verify_config_wiring.sh                                # 配置面接线：全部通过（54 条断言）
+$ ctest --test-dir build -L phase10                                # 1/1 Test #.. test_config_wiring ... Passed
+```
+
+### 5.3 自证（R1）：把 GC 调度的 interval 强行设为 0 → C10.9 必须失败
+
+* **注入**：`src/main/server_main.cpp` 第 1405 行
+  `const bool gc_schedule = gc_enabled && gc_interval_seconds > 0;`
+  → `const bool gc_schedule = false;`（等价"interval 强行设为 0"：**不启动调度**）。
+* **重建后** `./build/bin/test_config_wiring "★ C10.9：GC 调度真的跑起来*"`：
+  ```
+  test cases:  1 |  0 passed | 1 failed
+  assertions: 14 | 13 passed | 1 failed
+  residue_gone := false
+  metric_visible := false
+  ```
+  （`/metrics` 里始终没有 `fss_gc_runs_total`/`fss_gc_tmp_removed_total`，`.tmp.*` 也一直在。）
+* **脚本** `./scripts/verify_config_wiring.sh`（注入下）→ 退出码 **1**：
+  ```
+  ✗ 周期调度清理了够旧的 .tmp.*，且 /metrics 的 fss_gc_tmp_removed_total 动过：期望 '1'，实际 '0'
+  ✗ --once 真的清掉了旧的 .tmp.*：输出里找不到 'tmp_removed=1'
+  配置面接线：2 条断言失败（通过 52 条）
+  ```
+  第二条是**连带**：第 ⑦ 节没清掉 residue，`--once` 一次性清掉了 2 个 tmp（`tmp_removed=2`），
+  因此"=1"的断言也失败 —— 根因仍是"调度没跑"。
+* **还原**：`cp build/server_main.cpp.bak src/main/server_main.cpp` → 重建 →
+  `./build/bin/test_config_wiring "★ C10.9：GC 调度真的跑起来*"` → **All tests passed
+  (16 assertions in 1 test case)**；`git diff -- src/main/server_main.cpp | grep -c "R1 自证注入"` = **0**
+  （无注入残留，`run_all_gates.sh` 的前置检查通过）。
+
+### 5.5 `scripts/bench_baseline.sh` 的 A/B 实测（**环境漂移，非切片 2 回归**）
+
+本机当前状态下 `scripts/bench_baseline.sh` 的 `--check` 判据**失败**（吞吐退化 >20%），
+但这是**环境/会话漂移**，不是切片 2 引入的回归 —— 用"同一台机器、同一会话、同一负载生成器"
+对 **HEAD（切片 1，未含本切片改动）** 与**工作树（切片 2）**各跑了一遍：
+
+| 点位 | 基线（BASELINE.tsv） | HEAD（切片 1） | 工作树（切片 2） |
+| --- | --- | --- | --- |
+| `control_read_c4/rps` | 13849 | 10598（**-23.5%**） | 10494（**-24.2%**） |
+| `control_read_c16/rps` | 12636 | 通过（未进入失败列表） | 10082（**-20.2%**） |
+| `data_small_get_c16/rps` | 16678 | 11810（**-29.2%**） | 12478（**-25.2%**） |
+| `large_stream_c4/rps` | 62 | 41（**-34.9%**） | 47（**-24.8%**） |
+
+* 结论：**HEAD 与切片 2 都以几乎相同的幅度失败**（甚至切片 2 在 `large_stream_c4` 上更好），
+  因此失败**不可归因于本切片的代码**。`operations.md` §4.2 早已登记该判据的适用范围：
+  "跨会话实测漂移可达 ≈40%；该判据只在**同一会话、独占硬件**上有判定力"（R4）。
+* 未采取的动作：**没有**用 `--save` 覆写 `BASELINE.tsv`（那会把环境漂移洗成"新基线"，
+  等于把判据变成恒真）。基线文件保持原样（`git status` 无改动）。
+* 与切片 2 无关的旁证：`data_put_c1`（磁盘类，脚本只告警）在切片 2 上 **+0.4%**；
+  `sqlite_write_t1` **+4.0%**；只有 CPU/网络密集的读点位整体下移 —— 典型的整机状态差异。
+
+### 5.4 组合根生命周期（AGENTS §4.3 的"joinable thread"陷阱）
+
+* HTTP 从 `Bind()`+阻塞 `Listen()` 改为 `Start()`（后台 runner，`Server::Stop()` 会 join），
+  主线程**轮询** `volatile std::sig_atomic_t g_stop_requested`（`std::signal` 的处理器只置位）；
+  退出路径统一为：`gc_scheduler->Stop()`（signal + join）→ `server.Stop()` → `grpc_server->Shutdown()`。
+* `GcScheduler` 的析构函数也调用 `Stop()`，因此**任何提前 return 都不会留下 joinable 线程**。
+* SIGTERM 实测：`kill -TERM` 后进程退出码 0（见 §5.2 的手工验证与脚本的 `stop_server`）。
