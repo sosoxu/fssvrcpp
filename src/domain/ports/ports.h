@@ -333,7 +333,10 @@ struct AuditEvent {
 class IAuditLogger {
  public:
   virtual ~IAuditLogger() = default;
-  //  ★ 审计失败是否影响主流程由实现决定（`audit_fail_closed` 配置）；端口只表达"要记"
+  //  端口只表达"要记"，并如实返回写入结果（失败 → `Err`）。
+  //  ★ C10.13：**是否让请求失败**是调用方（用例）的策略：`observability.audit_fail_closed=true`
+  //    时用例把这个 `Err` 传播成 500（`UseCasePorts::audit_fail_closed`），
+  //    `false`（默认）时审计失败非致命 —— 端口本身不做这个判定。
   virtual Result<void> Record(const AuditEvent& event) = 0;
 };
 

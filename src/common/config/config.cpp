@@ -383,6 +383,19 @@ LoadResult Load(const LoadRequest& req) {
     cfg.sources_[f.path] = src;
   }
 
+  // ---------- 动态子树（`AllowDynamicPrefix`）----------
+  //  ★ 为什么必须把动态子树也搬进 `effective_`：`fields()` 里**没有**逐键声明
+  //    （`auth.local_roles.<邮箱>` / `partition.file.<租户>.*` 的键名是数据，不是 schema），
+  //    因此上面的循环不会把它们放进有效配置 —— 结果是"文件里写了、加载器校验通过了，
+  //    但组合根读不到"（阶段 10 切片 3 的 C10.15 就是被这条坑到：`local_roles` 恒为空）。
+  //    这里按前缀整棵拷贝；动态子树的键**不做**逐键类型校验（schema 无声明），
+  //    读取方（组合根）必须自行做形态检查。
+  for (const auto& prefix : req.schema.dynamic_prefixes()) {
+    const json::Value* subtree = GetAt(merged, prefix);
+    if (subtree == nullptr || !subtree->is_object()) continue;
+    SetAt(cfg.effective_, prefix, *subtree);
+  }
+
   // ---------- 跨字段规则 ----------
   for (const auto& [name, check] : req.schema.cross_checks()) {
     for (auto& [path, msg] : check(cfg.effective_)) {

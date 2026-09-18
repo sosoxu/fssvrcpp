@@ -59,9 +59,16 @@ fss::Result<void> AuthorizeCallerAny(UseCasePorts& ports, const CallerContext& c
   return ports.authorizer.AuthorizeAny(roles, caller.partition, caller.bearer_token);
 }
 
-//  审计失败**不影响**主流程（是否 fail-closed 由实现决定，端口只表达"要记"）
-void RecordAudit(UseCasePorts& ports, std::string_view operation, const CallerContext& caller,
-                 std::string_view object_id, bool success) {
+//  审计（C8.7 + C10.13）。返回值语义：
+//    · `observability.audit_fail_closed=false`（默认）→ 审计写入失败**不影响**主流程（非致命），
+//      函数仍返回 Ok（保持接线前的行为）；
+//    · `=true` → 审计写入失败必须让**请求失败**：返回 `kInternal`（契约 §5 → 500），
+//      绝不"审计丢了还报成功"。
+//  ★ 为什么判定放在用例层而不是 `IAuditLogger` 实现里：端口只能表达"记录失败"，
+//    "是否让请求失败"是关于**这次操作**的策略，必须由调用方（用例）决定。
+fss::Result<void> RecordAudit(UseCasePorts& ports, std::string_view operation,
+                              const CallerContext& caller, std::string_view object_id,
+                              bool success) {
   domain::AuditEvent event;
   event.operation = std::string(operation);
   event.user = caller.user_id;
@@ -70,7 +77,12 @@ void RecordAudit(UseCasePorts& ports, std::string_view operation, const CallerCo
   event.result = success ? "success" : "failure";
   event.epoch_millis = ports.clock.NowEpochMillis();
   event.correlation_id = caller.correlation_id;
-  (void)ports.audit.Record(event);
+  const auto recorded = ports.audit.Record(event);
+  if (!recorded.ok() && ports.audit_fail_closed) {
+    return Err(fss::ErrorKind::kInternal, "审计写入失败（audit_fail_closed=true）：" +
+                                              recorded.error().message());
+  }
+  return Ok();
 }
 
 //  审计守卫（C8.7）：**每个受保护端点在成功与失败两侧都要有审计记录**。
@@ -78,6 +90,11 @@ void RecordAudit(UseCasePorts& ports, std::string_view operation, const CallerCo
 //  （授权、解析、仓储、存储、事件…），手写必然漏掉某一条 —— 而"漏审计"是**静默**的。
 //  守卫在析构时按 `Success()` 是否被调用决定 success/failure，任何 `FSS_TRY` 提前返回
 //  都会走到它。`SetObjectId` 用于"对象 id 在过程中才知道"的用例（如创建类端点）。
+//
+//  ★ C10.13：**成功审计不在析构里做**，而是由 `Success()` 在返回前**立即**做并把
+//    `Result` 交回调用方（调用点写成 `FSS_TRY(audit.Success());`）。原因：析构发生在
+//    返回值已经形成之后，无法再改状态码 —— 那正是"审计失败却报 200"的静默缺陷。
+//    失败审计仍然在析构里做（请求本来就失败了；审计再失败不改变结论）。
 class AuditGuard {
  public:
   AuditGuard(UseCasePorts& ports, const CallerContext& caller, std::string_view operation,
@@ -89,12 +106,19 @@ class AuditGuard {
   //  ★ 操作名按上游 `AuditOperation` 的约定带结果后缀（createLocationSuccess / Failure）：
   //    调用点只写"业务动作"，避免每个 endpoint 各写两遍名字（写错一个就少一条审计）
   ~AuditGuard() {
-    RecordAudit(ports_, operation_ + (success_ ? "Success" : "Failure"), caller_, object_id_,
-                success_);
+    if (recorded_) return;
+    //  失败路径：请求已经失败，审计再失败不改变结论（非致命）。
+    (void)RecordAudit(ports_, operation_ + "Failure", caller_, object_id_, /*success=*/false);
   }
 
   void SetObjectId(std::string object_id) { object_id_ = std::move(object_id); }
-  void Success() { success_ = true; }
+
+  //  记录"成功"审计并返回结果。`audit_fail_closed=true` 且写入失败 → 返回 500 类错误，
+  //  调用点用 `FSS_TRY` 传播（绝不谎报成功）。
+  fss::Result<void> Success() {
+    recorded_ = true;
+    return RecordAudit(ports_, operation_ + "Success", caller_, object_id_, /*success=*/true);
+  }
 
   AuditGuard(const AuditGuard&) = delete;
   AuditGuard& operator=(const AuditGuard&) = delete;
@@ -104,7 +128,7 @@ class AuditGuard {
   const CallerContext& caller_;
   std::string operation_;
   std::string object_id_;
-  bool success_ = false;
+  bool recorded_ = false;
 };
 
 //  状态变更事件（契约 §2.6 的第 1/10/12 步）：**非致命**
@@ -249,7 +273,7 @@ void RollbackCreatedObject(UseCasePorts& ports, const CallerContext& caller,
     }
   }
   PublishStatus(ports, caller, "FAILED", 0);
-  RecordAudit(ports, "createMetadataFailure", caller, record_id, false);
+  (void)RecordAudit(ports, "createMetadataFailure", caller, record_id, false);
 }
 
 //  幂等命中：同 (partition, FileSource) 已有记录 → 发布成功事件并返回**既有记录**的 id。
@@ -259,7 +283,7 @@ fss::Result<std::string> ReturnExistingRecord(UseCasePorts& ports, const CallerC
                                               const domain::FileMetadataRecord& existing) {
   PublishStatus(ports, caller, "SUCCESS", existing.version);
   PublishDatasetDetails(ports, caller, existing.id, existing.version);
-  RecordAudit(ports, "createMetadataSuccess", caller, existing.id, true);
+  FSS_TRY(RecordAudit(ports, "createMetadataSuccess", caller, existing.id, true));
   return existing.id;
 }
 
@@ -314,7 +338,7 @@ fss::Result<LocationResult> GetUploadLocation::Execute(
     return result.error();  // 失败路径由守卫记 `createLocationFailure`
   }
   audit.SetObjectId(result.value().file_id);
-  audit.Success();
+  FSS_TRY(audit.Success());
   return result;
 }
 
@@ -334,7 +358,7 @@ fss::Result<FileLocationView> GetFileLocation::Execute(const CallerContext& call
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   view.location = PhysicalLocationOf(location);
   view.file_source = location.file_source;
-  audit.Success();
+  FSS_TRY(audit.Success());
   return view;
 }
 
@@ -354,7 +378,7 @@ fss::Result<DownloadLocationResult> GetDownloadLocation::Execute(
   out.driver = result.driver;
   out.expires_at_epoch_seconds = result.expires_at_epoch_seconds;
   out.native_presign = result.native_presign;
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 
@@ -409,7 +433,7 @@ fss::Result<FileListResult> GetFileList::Execute(const CallerContext& caller,
     out.content.push_back(std::move(entry));
   }
   out.number_of_elements = static_cast<int>(out.content.size());
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 
@@ -472,7 +496,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   // 5. 位置记录（FileSource → 物理位置）
   const auto location_result = ports_.locations.FindByFileSource(caller.partition, file_source);
   if (!location_result.ok()) {
-    RecordAudit(ports_, "createMetadataFailure", caller, out.id, false);
+    (void)RecordAudit(ports_, "createMetadataFailure", caller, out.id, false);
     //  ★ 消息逐字对齐上游：源路径在存储侧不存在时，上游（Azure/GCP provider 的 copyFile
     //    失败分支）抛 `INVALID_SOURCE_EXCEPTION + "/" + <path>`，期望报文见
     //    `output_payloads/File_invalid_fileSource_msg.json`。此前这里给的是中文消息，
@@ -612,13 +636,14 @@ fss::Result<std::string> CreateFileMetadata::Execute(
       const auto removal = staging_store.value()->remove(from_ref);
       staging_removed = removal.ok();
       if (!staging_removed) {
-        RecordAudit(ports_, "createMetadataStagingCleanupFailure", caller, created.value().id, false);
+        (void)RecordAudit(ports_, "createMetadataStagingCleanupFailure", caller,
+                          created.value().id, false);
       }
     }
   }
   (void)staging_removed;
   audit.SetObjectId(created.value().id);
-  audit.Success();
+  FSS_TRY(audit.Success());
   return created.value().id;
 }
 
@@ -630,7 +655,7 @@ fss::Result<domain::FileMetadataRecord> GetFileMetadata::Execute(
   AuditGuard audit(ports_, caller, "readMetadata", std::string(record_id));
   FSS_TRY(AuthorizeCaller(ports_, caller, domain::kRoleViewers, true));
   FSS_TRY(record, ports_.metadata.GetById(caller.partition, record_id));
-  audit.Success();
+  FSS_TRY(audit.Success());
   return record;
 }
 
@@ -664,7 +689,7 @@ fss::Result<void> DeleteFileMetadata::Execute(const CallerContext& caller,
       (void)ports_.locations.Delete(caller.partition, location.value().file_id);
     }
   }
-  audit.Success();
+  FSS_TRY(audit.Success());
   return Ok();
 }
 
@@ -685,7 +710,7 @@ fss::Result<StorageInstructions> GetStorageInstructions::Execute(
   out.created_by = caller.user_id;
   out.expires_at_epoch_seconds = location.expires_at_epoch_seconds;
   audit.SetObjectId(location.file_id);
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 
@@ -721,7 +746,7 @@ fss::Result<std::vector<RetrievalInstruction>> GetRetrievalInstructions::Execute
     instruction.expires_at_epoch_seconds = signed_url.value().expires_at_epoch_seconds;
     out.push_back(std::move(instruction));
   }
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 
@@ -767,7 +792,7 @@ fss::Result<std::vector<CopyFileOutcome>> CopyFiles::Execute(
     outcome.dataset_blob_storage_path = to_ref.container + "/" + to_ref.key;
     out.push_back(std::move(outcome));
   }
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 
@@ -807,7 +832,7 @@ fss::Result<SignedUrlResult> GetFileSignedUrl::Execute(
     if (record.ok()) entry.kind = record.value().kind;
     out.processed.emplace(srn, std::move(entry));
   }
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 
@@ -817,7 +842,7 @@ fss::Result<SignedUrlResult> GetFileSignedUrl::Execute(
 fss::Result<void> RevokeUrl::Execute(const CallerContext& caller) {
   AuditGuard audit(ports_, caller, "revokeUrl");
   FSS_TRY(AuthorizeCaller(ports_, caller, kRoleAdmin, /*require_partition=*/false));
-  audit.Success();
+  FSS_TRY(audit.Success());
   return Ok();
 }
 
@@ -914,7 +939,7 @@ fss::Result<UploadStreamResult> UploadFile::Execute(const CallerContext& caller,
     out.metadata_record_id = created.value();
   }
   audit.SetObjectId(location.value().file_id);
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 
@@ -957,7 +982,7 @@ fss::Result<DownloadStreamResult> DownloadFile::Execute(const CallerContext& cal
   out.checksum = stat.checksum;
   out.checksum_algorithm = stat.checksum_algorithm;
   out.bytes_written = static_cast<std::uint64_t>(counter.bytes_written());
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 
@@ -998,7 +1023,7 @@ fss::Result<ServerSideCopyResult> ServerSideCopy::Execute(
   out.file_source = std::string(target_file_source);
   out.bytes_copied = stat.size > 0 ? static_cast<std::uint64_t>(stat.size) : 0;
   audit.SetObjectId(source_location.file_id);
-  audit.Success();
+  FSS_TRY(audit.Success());
   return out;
 }
 

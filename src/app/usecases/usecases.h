@@ -76,6 +76,10 @@ struct UseCasePorts {
   //  运维响应需要的**只读**运行时配置（`/v2/info` 的 `authMode`，C8.5）。
   //  放在端口集合里而不是各适配层，是为了让 REST 与 gRPC 返回**同一个**值。
   std::string auth_mode = "disabled";
+  //  ★ C10.13：`observability.audit_fail_closed`。
+  //    `true` → 审计写入失败让**请求失败**（契约 §5 → 500），绝不"审计丢了还报成功"；
+  //    `false`（默认，= 接线前的行为）→ 审计失败非致命，只影响记录本身。
+  bool audit_fail_closed = false;
 };
 
 // =============================================================================

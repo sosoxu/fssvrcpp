@@ -385,6 +385,16 @@ class Resolver {
     return out;
   }
 
+  //  动态子树（`auth.local_roles.<user>` / `partition.file.<partition>.*`）：schema 里
+  //  只声明了 `AllowDynamicPrefix`，`Load` 不为这些键登记来源 → `SourceOf` 返回
+  //  "unknown"。值确实来自 `effective()`（file/env/cli 已合并）；无法区分具体层时
+  //  如实标为 `file`（比标成 `default` 更接近事实：默认值里没有这些键）。
+  void NoteDynamic(const std::string& path, const std::string& value) {
+    std::string source = cfg_.SourceOf(path);
+    if (source.empty() || source == "unknown") source = "file";
+    Record(path, value, Origin{false, value, source, {}});
+  }
+
   //  `--print-config`：按 schema 顺序打印**全部**键 + 每项来源（secret 一律 `***`）。
   void Print(std::ostream& os) const {
     os << "== 有效配置（脱敏）+ 每项来源 ==\n";
@@ -483,6 +493,35 @@ class Resolver {
   std::vector<std::string> conflicts_;
   std::vector<fss::config::Problem> problems_;
 };
+
+// =============================================================================
+//  动态子树：`auth.local_roles.<user>`（C10.15）
+// =============================================================================
+//  为什么不能用 `Resolver::Str/List`：schema 用 `AllowDynamicPrefix("auth.local_roles")`
+//  放行该子树，但**没有逐键声明**，因此 `Load` 不为这些键登记来源 —— 只能从
+//  `effective()` 里自己枚举。键名是邮箱，**不能**进 CoreSchema（否则 156 键的计数
+//  与 `test_operations_doc` 的机械比对都会失真，见 operations.md §1.2）。
+std::map<std::string, std::vector<std::string>, std::less<>> CollectLocalRoles(
+    const fss::config::Config& cfg, Resolver& resolver) {
+  std::map<std::string, std::vector<std::string>, std::less<>> out;
+  const fss::json::Value* node = FindIn(cfg.effective(), "auth.local_roles");
+  if (node == nullptr || !node->is_object()) return out;
+  for (auto it = node->begin(); it != node->end(); ++it) {
+    const std::string user = it.key();
+    std::vector<std::string> roles;
+    if (it.value().is_array()) {
+      for (const auto& item : it.value()) {
+        if (item.is_string()) roles.push_back(item.get<std::string>());
+      }
+    } else if (it.value().is_string()) {
+      roles.push_back(it.value().get<std::string>());  // 单值写法也接受（`"a@b": "role"`）
+    }
+    if (user.empty() || roles.empty()) continue;
+    out.emplace(user, roles);
+    resolver.NoteDynamic("auth.local_roles." + user, Join(roles));
+  }
+  return out;
+}
 
 // =============================================================================
 //  组合根内联实现（R12：具体实现只在这里被创建）
@@ -620,6 +659,19 @@ class LogAuditLogger final : public fss::domain::IAuditLogger {
 class NoopAuditLogger final : public fss::domain::IAuditLogger {
  public:
   fss::Result<void> Record(const fss::domain::AuditEvent&) override { return fss::Ok(); }
+};
+
+//  ★ C10.13 的**故障注入接缝**（仅用于验证 fail-closed 路径；`FSS_AUDIT_FAULT_INJECT=1`
+//    时装配）：一个"必然失败"的审计后端，让"审计写入失败 → 请求失败"这条路径在**真实
+//    进程**上可被驱动。为什么不做成配置键：156 个叶子键的三态清单是机械比对的
+//    （`test_operations_doc`），加键会让清单失真；而它本身也不是运维语义的一部分，
+//    只是测试/演练用的故障开关（与 P9 的 mock_entitlements --fail-file 同族）。
+class FailingAuditLogger final : public fss::domain::IAuditLogger {
+ public:
+  fss::Result<void> Record(const fss::domain::AuditEvent&) override {
+    return fss::Err(fss::ErrorKind::kInternal,
+                    "审计后端不可用（FSS_AUDIT_FAULT_INJECT=1 注入的必然失败）");
+  }
 };
 
 // =============================================================================
@@ -781,6 +833,11 @@ int main(int argc, char** argv) {
   const long http_port = resolver.Int("server.http.port", 8080);
   const long grpc_port = resolver.Int("server.grpc.port", 0);
   const std::string grpc_bind = resolver.Str("server.grpc.bind", bind_address);
+  //  ★ C10.15：`server.grpc.enabled` 真的参与判定（此前"读了但无效果"：只有
+  //    `server.grpc.port=0` 能表达关闭）。两者是**与**关系：
+  //      · `enabled=false` → 无论端口配成什么，都不开 gRPC 面；
+  //      · `enabled=true` 且 `port=0` → 仍然关闭（`FSS_GRPC_PORT=0` 的既有语义不变）。
+  const bool grpc_enabled = resolver.Bool("server.grpc.enabled", true);
   const long worker_threads = resolver.Int("server.http.worker_threads", 0);
   const long max_connections = resolver.Int("server.http.max_connections", 0);
   const bool tcp_nodelay = resolver.Bool("server.http.tcp_nodelay", true);
@@ -825,6 +882,20 @@ int main(int argc, char** argv) {
       resolver.Str("metadata.sqlite.path", storage_root + "/metadata.db");
   const std::string sqlite_path =
       resolver.Str("location.sqlite.path", storage_root + "/location.db");
+  //  ---- C10.14：SQLite 调优键（只接**真实存在**的 Options 字段）----
+  //  ★ 按仓库既有 `SqliteMetadataRepositoryOptions` / `SqliteLocationRepositoryOptions`
+  //    的字段接线；两个结构体里**没有**的键（`synchronous`/`group_commit*`）不发明，
+  //    继续留在"已读但无效果"清单里（理由与下一步见 operations.md §1.3.3）。
+  const long metadata_sqlite_busy_timeout_ms =
+      resolver.Int("metadata.sqlite.busy_timeout_ms", 5000);
+  const long location_sqlite_busy_timeout_ms =
+      resolver.Int("location.sqlite.busy_timeout_ms", 5000);
+  const std::string location_sqlite_journal_mode =
+      resolver.Str("location.sqlite.journal_mode", "WAL");
+  //  `max_write_concurrency`：字段存在，但当前实现是"单连接 + 互斥"（实际并发 1），
+  //  取值不改变行为 → 仍如实登记为"已读但无效果"（见 §1.3.3），这里只把值传进 Options。
+  const long location_sqlite_max_write_concurrency =
+      resolver.Int("location.sqlite.max_write_concurrency", 8);
 
   //  ---- 自签数据面 ----
   const bool self_signed_enabled = resolver.Bool("self_signed.enabled", true);
@@ -890,6 +961,11 @@ int main(int argc, char** argv) {
   const std::string jwt_audience = resolver.Str("auth.jwt.audience", "");
   const bool jwt_verify_signature = resolver.Bool("auth.jwt.verify_signature", true);
   const std::string jwt_user_id_claim = resolver.Str("auth.jwt.user_id_claim", "email");
+  //  ★ C10.15：`auth.jwt.roles_claim`（默认 `roles`）与 `auth.local_roles.*`（静态角色表）
+  //    真的接到 `LocalJwtOptions` —— 此前两者都是"已读但无效果"（固定 `roles`、
+  //    静态表未装配），于是"配置里的用户 → 角色"完全不参与 200/403 判定。
+  const std::string jwt_roles_claim = resolver.Str("auth.jwt.roles_claim", "roles");
+  const auto local_roles = CollectLocalRoles(cfg, resolver);
   const std::string jwt_partition_claim =
       resolver.Str("auth.jwt.partition_claim", "data-partition-id");
   const bool jwt_require_partition_claim =
@@ -914,10 +990,12 @@ int main(int argc, char** argv) {
   const std::vector<std::string> redact_keys =
       resolver.List("observability.redact_keys", kDefaultRedactKeys);
   const bool audit_enabled = resolver.Bool("observability.audit_enabled", true);
-  //  ★ `audit_fail_closed` 已读并可打印来源，但当前**没有"致命审计"路径**：
-  //    `RecordAudit()` 丢弃 `IAuditLogger::Record` 的结果（审计失败只影响记录本身），
-  //    因此本键的行为**未实现**（如实登记在 docs/operations.md §8）。
+  //  ★ C10.13：`audit_fail_closed` **行为已实现** —— `true` 时审计写入失败会让请求
+  //    以 500 结束（契约 §5 的 `kInternal`），`false`（默认）保持接线前的非致命语义。
+  //    判定在用例层（`UseCasePorts::audit_fail_closed`），见 usecases.cpp 的 RecordAudit。
   const bool audit_fail_closed = resolver.Bool("observability.audit_fail_closed", false);
+  //  故障注入接缝（测试/演练用；不是配置键，见 FailingAuditLogger 的说明）
+  const bool audit_fault_inject = Env("FSS_AUDIT_FAULT_INJECT", "") == "1";
   const bool metrics_enabled = resolver.Bool("observability.metrics_enabled", true);
   const std::string metrics_path = resolver.Str("observability.metrics_path", "/metrics");
 
@@ -1012,6 +1090,14 @@ int main(int argc, char** argv) {
     return reject_startup(
         "deployment.clock_skew_tolerance_seconds 非默认 —— 该键用于「与数据库 now() 的偏移容忍」，"
         "而数据库时钟未交付（单实例用本地钟；multi 已拒绝启动）。下一步：保持 60。");
+  }
+  if (location_sqlite_journal_mode != "WAL" && location_sqlite_journal_mode != "DELETE") {
+    //  C10.14：位置仓储的 journal 模式只接通 WAL / DELETE 两档（Options 里是 `wal` 布尔）。
+    //  TRUNCATE 若被静默当成 DELETE，运维会得到"配置写了 TRUNCATE、实际是 DELETE"的假象。
+    return reject_startup(
+        "location.sqlite.journal_mode=" + location_sqlite_journal_mode +
+        " —— 组合根只接通 WAL | DELETE 两档（SQLite Options 里是 `wal` 布尔；TRUNCATE 未接通）。"
+        "下一步：保持 WAL（默认）或 DELETE；需要 TRUNCATE 时先在仓储 Options 上显式加字段。");
   }
 
   //  ---- 有效期（expiry.*，C10.12）：把两个字符串解析成基数 ----
@@ -1171,12 +1257,20 @@ int main(int argc, char** argv) {
                                storage_driver == "s3" ? "s3" : "posix");
   SingleStoreFactory blob_factory(metered_blob);
 
-  auto location_repository = SqliteLocationRepository::Open(sqlite_path);
+  auto location_repository = SqliteLocationRepository::Open(
+      sqlite_path,
+      SqliteLocationRepositoryOptions{
+          static_cast<int>(location_sqlite_busy_timeout_ms),
+          location_sqlite_journal_mode != "DELETE",
+          static_cast<int>(location_sqlite_max_write_concurrency)});
   if (!location_repository.ok()) {
     std::cerr << "打开位置仓储失败: " << location_repository.error().ToString() << "\n";
     return kExitConfigError;
   }
-  auto metadata_repository_handle = SqliteMetadataRepository::Open(metadata_db_path, clock);
+  SqliteMetadataRepositoryOptions metadata_sqlite_options;
+  metadata_sqlite_options.busy_timeout_millis = static_cast<int>(metadata_sqlite_busy_timeout_ms);
+  auto metadata_repository_handle =
+      SqliteMetadataRepository::Open(metadata_db_path, clock, metadata_sqlite_options);
   if (!metadata_repository_handle.ok()) {
     std::cerr << "打开元数据仓储失败: " << metadata_repository_handle.error().ToString() << "\n";
     return kExitConfigError;
@@ -1199,6 +1293,8 @@ int main(int argc, char** argv) {
     jwt_options.issuer = jwt_issuer;
     jwt_options.audience = jwt_audience;
     jwt_options.verify_signature = jwt_verify_signature;
+    jwt_options.roles_claim = jwt_roles_claim;
+    jwt_options.local_roles = local_roles;
     jwt_options.user_id_claim = jwt_user_id_claim;
     jwt_options.partition_claim = jwt_partition_claim;
     jwt_options.require_partition_claim = jwt_require_partition_claim;
@@ -1241,8 +1337,15 @@ int main(int argc, char** argv) {
   LogEventPublisher events(logger);
   LogAuditLogger log_audit(logger);
   NoopAuditLogger noop_audit;
-  domain::IAuditLogger* audit_logger =
-      audit_enabled ? static_cast<domain::IAuditLogger*>(&log_audit) : &noop_audit;
+  FailingAuditLogger failing_audit;
+  //  ★ 优先级：`audit_enabled=false` → no-op（记录被关掉，谈不上"失败"）；
+  //    否则注入开关打开时用"必然失败"的后端（C10.13 的可驱动接缝）；否则真实日志审计器。
+  domain::IAuditLogger* audit_logger = &log_audit;
+  if (!audit_enabled) {
+    audit_logger = &noop_audit;
+  } else if (audit_fault_inject) {
+    audit_logger = &failing_audit;
+  }
 
   domain::PartitionConfig partition;
   partition.partition = "opendes";
@@ -1265,6 +1368,8 @@ int main(int argc, char** argv) {
                           issuer,            clock,
                           ids};
   ports.auth_mode = auth_mode;  // C8.5：让 `/v2/info` 与 gRPC 的 `GetInfo` 都能看到
+  //  C10.13：审计失败是否让请求失败（用例层判定；见 usecases.cpp 的 RecordAudit）
+  ports.audit_fail_closed = audit_fail_closed;
 
   // ===========================================================================
   //  GC（C10.9）：GcTask + 调度参数。`--once` 与周期调度共用同一份 options。
@@ -1365,7 +1470,8 @@ int main(int argc, char** argv) {
   //    与 `fss_http` 把 httplib 挡在适配层内是同一条纪律）。
   std::unique_ptr<adapters::grpc::FileServiceAdapter> grpc_service;
   std::unique_ptr<adapters::grpc::GrpcServerHandle> grpc_server;
-  if (grpc_port != 0) {
+  //  C10.15：`server.grpc.enabled=false` 或 `server.grpc.port=0` 都表示"不开 gRPC 面"。
+  if (grpc_enabled && grpc_port != 0) {
     grpc_service = std::make_unique<adapters::grpc::FileServiceAdapter>(ports, "osdu-user");
     grpc_server =
         adapters::grpc::StartGrpcServer(*grpc_service, grpc_bind, static_cast<int>(grpc_port));
@@ -1433,12 +1539,20 @@ int main(int argc, char** argv) {
             << "  bind           : " << bind_address << ":" << server.port() << "\n"
             << "  grpc bind      : "
             << (grpc_server ? grpc_bind + ":" + std::to_string(grpc_server->port())
-                            : std::string("disabled（server.grpc.port=0）"))
+                            : std::string("disabled（") +
+                                  (grpc_enabled ? "server.grpc.port=0"
+                                                : "server.grpc.enabled=false") +
+                                  "）")
             << "\n"
             << "  base path      : " << base_path << "\n"
             << "  storage driver : " << storage_driver << "\n"
             << "  storage root   : " << storage_root << "\n"
             << "  sqlite path    : " << sqlite_path << "\n"
+            << "  sqlite tuning  : location busy_timeout=" << location_sqlite_busy_timeout_ms
+            << "ms journal_mode=" << location_sqlite_journal_mode << "（wal="
+            << (location_sqlite_journal_mode != "DELETE" ? "true" : "false")
+            << "，max_write_concurrency=" << location_sqlite_max_write_concurrency
+            << "）| metadata busy_timeout=" << metadata_sqlite_busy_timeout_ms << "ms\n"
             << "  metadata path  : " << metadata_db_path << "\n"
             << "  io engine      : " << io_engine_active << "（请求 " << io_engine
             << (io_fallback ? "；已回退" : "") << "） — " << io_note << "\n"
@@ -1454,7 +1568,12 @@ int main(int argc, char** argv) {
             << "\n"
             << "  audit          : "
             << (audit_enabled ? "开启" : "关闭（observability.audit_enabled=false）")
-            << (audit_fail_closed ? "；fail_closed=true（★该行为未实现，仅登记）" : "") << "\n"
+            << (audit_enabled && audit_fault_inject ? "（★故障注入：审计后端必然失败）" : "")
+            << (audit_enabled
+                    ? (audit_fail_closed ? "；fail_closed=true（审计失败 → 请求 500）"
+                                         : "；fail_closed=false（审计失败非致命）")
+                    : "")
+            << "\n"
             << "  auth           : "
             << (auth_mode == "jwt"
                     ? "jwt（HS256 本地校验）"
@@ -1462,6 +1581,8 @@ int main(int argc, char** argv) {
                            ? "remote-entitlements（fail-closed，地址 " + entitlements_url + "）"
                            : "disabled（allow-all，仅开发/测试）"))
             << "\n"
+            << "  auth claims    : roles_claim=" << jwt_roles_claim << "，local_roles="
+            << local_roles.size() << " 个用户（auth.mode=jwt 时参与角色判定）\n"
             << "  environment    : " << deployment_environment << "\n"
             << "  gc             : " << gc_banner << "\n"
             << "  expiry         : default=" << expiry_default_text << "（"

@@ -36,6 +36,12 @@
 #include "server_process.h"
 #include "temp_dir.h"
 
+#include "common/crypto/crypto.h"
+#include "common/json/json.h"
+
+#include <grpcpp/grpcpp.h>
+#include <osdu/file/v1/file_service.grpc.pb.h>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -44,6 +50,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -866,5 +873,332 @@ TEST_CASE("★ C10.12：expiry.default / expiry.max 作用于签发 URL 的 TTL�
     CAPTURE(reply.status, reply.body);
     REQUIRE(reply.status == 400);
     REQUIRE(reply.body.find("expiryTime pattern isn't supported") != std::string::npos);
+  }
+}
+
+// =============================================================================
+//  ---- 阶段 10 切片 3（C10.13~C10.15）----
+// =============================================================================
+//  C10.13：`observability.audit_fail_closed` 真的决定"审计写入失败是否让请求失败"。
+//          可驱动接缝：`FSS_AUDIT_FAULT_INJECT=1`（测试/演练用的故障注入，**不是**配置键，
+//          见 server_main.cpp 的 FailingAuditLogger）。正例对照：同一个坏后端下
+//          fail_closed=false 必须照常 200（R16）。
+//  C10.14：SQLite 调优键作用到两个仓储 —— `journal_mode` 用 `python3 sqlite3` 读回
+//          数据库文件（WAL 持久在文件头），`busy_timeout` 由启动横幅确认（它只作用于
+//          连接，不落盘，无法从文件读回 —— 如实标注）。
+//  C10.15：`auth.jwt.roles_claim` / `auth.local_roles.*` / `server.grpc.enabled`。
+// =============================================================================
+namespace {
+
+//  ---- C10.13：审计注入故障下的"必然失败"后端 ----
+struct AuditConfig {
+  std::string path;
+  int port = 0;
+};
+
+AuditConfig WriteAuditConfig(const TempDir& dir, const std::string& name, int port,
+                             const std::string& root, bool fail_closed) {
+  AuditConfig out;
+  out.port = port;
+  out.path = WriteFile(
+      dir, name,
+      std::string("{\n  \"server\": {\"http\": {\"bind\": \"127.0.0.1\", \"port\": ") +
+          std::to_string(port) + "}},\n  \"storage\": {\"posix\": {\"root\": \"" + root +
+          "\"}},\n  \"location\": {\"sqlite\": {\"path\": \"" + dir.child(name + ".loc.db") +
+          "\"}},\n  \"metadata\": {\"sqlite\": {\"path\": \"" + dir.child(name + ".meta.db") +
+          "\"}},\n  \"self_signed\": {\"signing_key\": \"audit-test\"},\n  \"auth\": {\"mode\": "
+          "\"disabled\"},\n  \"observability\": {\"audit_enabled\": true, \"audit_fail_closed\": " +
+          (fail_closed ? "true" : "false") + "}\n}\n");
+  return out;
+}
+
+//  ---- C10.14：用 python3 读回数据库文件的 journal_mode（环境没有 sqlite3 CLI）----
+std::string RunCapture(const std::string& command) {
+  std::string out;
+  std::FILE* pipe = ::popen(command.c_str(), "r");
+  if (pipe == nullptr) return out;
+  char buffer[256] = {0};
+  while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) out += buffer;
+  ::pclose(pipe);
+  while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+  return out;
+}
+
+std::string PythonJournalMode(const std::string& db_path) {
+  const std::string script =
+      "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);"
+      "print(c.execute('PRAGMA journal_mode').fetchone()[0])";
+  return RunCapture("python3 -c \"" + script + "\" \"" + db_path + "\"");
+}
+
+//  ---- C10.15：手工签一个 HS256 JWT（claim 名与是否带 roles 都可控）----
+std::string MintToken(const std::string& secret, const std::string& email,
+                      const std::string& claim_name, const std::vector<std::string>& roles,
+                      bool include_claim) {
+  const auto now = static_cast<std::int64_t>(::time(nullptr));
+  fss::json::Value header;
+  header["alg"] = "HS256";
+  fss::json::Value payload;
+  payload["sub"] = "user-1";
+  payload["email"] = email;
+  payload["data-partition-id"] = "opendes";
+  payload["nbf"] = now - 10;
+  payload["exp"] = now + 3600;
+  if (include_claim) payload[claim_name] = roles;
+  const std::string header_b64 = fss::crypto::Base64UrlEncode(fss::json::Dump(header));
+  const std::string payload_b64 = fss::crypto::Base64UrlEncode(fss::json::Dump(payload));
+  const std::string signing_input = header_b64 + "." + payload_b64;
+  const auto digest = fss::crypto::HmacSha256(secret, signing_input);
+  return signing_input + "." + fss::crypto::Base64UrlEncode(digest);
+}
+
+bool TcpConnects(int port) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  const bool ok = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+  ::close(fd);
+  return ok;
+}
+
+constexpr char kAuditJwtSecret[] = "c10.15-hs256-secret";
+//  `GET .../files/uploadURL` 要求 `service.file.editors`（契约 §1.3），且无需请求体 ——
+//  比 `getFileList` 更适合只验"角色判定"（后者的 Items 形状另有 400 规则）。
+constexpr char kEditorsEndpoint[] = "/api/file/v2/files/uploadURL";
+
+}  // namespace
+
+TEST_CASE("★ C10.13：audit_fail_closed=true → 审计写入失败让请求 500；false → 仍 200（正例对照）",
+          "[phase10][config][c10.13]") {
+  TempDir cfg_dir("fss_cfg_audit");
+  TempDir data_dir("fss_cfg_audit_data");
+  const int closed_port = FreePort();
+  const int open_port = FreePort();
+  const auto closed_cfg =
+      WriteAuditConfig(cfg_dir, "closed.json", closed_port, data_dir.child("store_a"), true);
+  const auto open_cfg =
+      WriteAuditConfig(cfg_dir, "open.json", open_port, data_dir.child("store_b"), false);
+  const std::vector<std::pair<std::string, std::string>> inject = {
+      {"FSS_AUDIT_FAULT_INJECT", "1"}};
+
+  SECTION("fail_closed=true：审计后端必然失败 → 请求 500，且响应里没有成功载荷") {
+    ServerProcess server(SelfContainedOptions({"--config", closed_cfg.path}, inject));
+    REQUIRE(server.http_port() == closed_port);
+    REQUIRE(WaitReady(closed_port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("fail_closed=true") != std::string::npos);
+    REQUIRE(server.DumpLog().find("故障注入") != std::string::npos);
+
+    const auto reply = HttpGet(closed_port, "/api/file/v2/files/uploadURL", Authed());
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 500);
+    //  ★ 绝不谎报成功：不能出现成功载荷（uploadURL / signedUrl）
+    REQUIRE(reply.body.find("SignedURL") == std::string::npos);
+  }
+
+  SECTION("正例对照（R16）：fail_closed=false + 同一个坏后端 → 照常 200") {
+    ServerProcess server(SelfContainedOptions({"--config", open_cfg.path}, inject));
+    REQUIRE(server.http_port() == open_port);
+    REQUIRE(WaitReady(open_port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("fail_closed=false") != std::string::npos);
+    const auto reply = HttpGet(open_port, "/api/file/v2/files/uploadURL", Authed());
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 200);
+    REQUIRE(reply.body.find("SignedURL") != std::string::npos);
+  }
+
+  SECTION("无注入（默认）时 audit_fail_closed 不影响正常请求") {
+    ServerProcess server(SelfContainedOptions({"--config", closed_cfg.path}));
+    REQUIRE(WaitReady(closed_port));
+    const auto reply = HttpGet(closed_port, "/api/file/v2/files/uploadURL", Authed());
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 200);
+  }
+}
+
+TEST_CASE("★ C10.14：location.sqlite.journal_mode 真的作用到位置仓储（python3 读回）",
+          "[phase10][config][c10.14]") {
+  TempDir cfg_dir("fss_cfg_sqlite");
+  TempDir data_dir("fss_cfg_sqlite_data");
+
+  const auto run_with = [&](const std::string& name, const std::string& journal_mode) {
+    const int port = FreePort();
+    const std::string db = data_dir.child(name + ".db");
+    const std::string config = WriteFile(
+        cfg_dir, name + ".json",
+        std::string("{\n  \"server\": {\"http\": {\"bind\": \"127.0.0.1\", \"port\": ") +
+            std::to_string(port) + "}},\n  \"storage\": {\"posix\": {\"root\": \"" +
+            data_dir.child(name + "-store") + "\"}},\n  \"location\": {\"sqlite\": {\"path\": \"" +
+            db + "\", \"journal_mode\": \"" + journal_mode +
+            "\", \"busy_timeout_ms\": 7000}},\n  \"metadata\": {\"sqlite\": {\"path\": \"" +
+            data_dir.child(name + "-meta.db") +
+            "\", \"busy_timeout_ms\": 8000}},\n  \"self_signed\": {\"signing_key\": \"slite\"},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+    return std::make_tuple(db, config, port);
+  };
+
+  SECTION("WAL（默认）→ python3 读回 'wal'；busy_timeout 由横幅确认") {
+    const auto [db, config, port] = run_with("wal", "WAL");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("journal_mode=WAL") != std::string::npos);
+    REQUIRE(server.DumpLog().find("busy_timeout=7000ms") != std::string::npos);
+    REQUIRE(server.DumpLog().find("metadata busy_timeout=8000ms") != std::string::npos);
+    const std::string mode = PythonJournalMode(db);
+    CAPTURE(db, mode);
+    REQUIRE(mode == "wal");
+  }
+
+  SECTION("DELETE → python3 读回 'delete'（证明配置真的改了行为，而不是恒为 WAL）") {
+    const auto [db, config, port] = run_with("del", "DELETE");
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("journal_mode=DELETE") != std::string::npos);
+    const std::string mode = PythonJournalMode(db);
+    CAPTURE(db, mode);
+    REQUIRE(mode == "delete");
+  }
+
+  SECTION("TRUNCATE → 拒绝启动（只接通 WAL|DELETE 两档，不静默当成 DELETE）") {
+    const auto [db, config, port] = run_with("trunc", "TRUNCATE");
+    (void)db;
+    (void)port;
+    const ProcessOutcome outcome = RunServerForExit({"--config", config});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("location.sqlite.journal_mode=TRUNCATE") != std::string::npos);
+    REQUIRE(outcome.output.find("已启动") == std::string::npos);
+  }
+}
+
+TEST_CASE("★ C10.15：auth.jwt.roles_claim 与 auth.local_roles.* 决定 200/403（真实 JWT）",
+          "[phase10][config][c10.15]") {
+  TempDir cfg_dir("fss_cfg_roles");
+  TempDir data_dir("fss_cfg_roles_data");
+  const int with_roles_port = FreePort();
+  const int without_roles_port = FreePort();
+
+  const auto jwt_config = [&](const std::string& name, int port, bool with_local_roles) {
+    std::string body =
+        std::string("{\n  \"server\": {\"http\": {\"bind\": \"127.0.0.1\", \"port\": ") +
+        std::to_string(port) + "}},\n  \"storage\": {\"posix\": {\"root\": \"" +
+        data_dir.child(name + "-store") +
+        "\"}},\n  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(name + "-loc.db") +
+        "\"}},\n  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(name + "-meta.db") +
+        "\"}},\n  \"self_signed\": {\"signing_key\": \"roles\"},\n  \"auth\": {\"mode\": \"jwt\", "
+        "\"jwt\": {\"hmac_secret\": \"" +
+        std::string(kAuditJwtSecret) + "\", \"verify_signature\": true, \"roles_claim\": \"myroles\"}";
+    if (with_local_roles) {
+      body += ", \"local_roles\": {\"viewer@example.com\": [\"service.file.editors\"]}";
+    }
+    body += "}\n}\n";
+    return WriteFile(cfg_dir, name + ".json", body);
+  };
+
+  const std::string with_roles = jwt_config("roles_on", with_roles_port, true);
+  const std::string without_roles = jwt_config("roles_off", without_roles_port, false);
+
+  ServerProcess server(SelfContainedOptions({"--config", with_roles}));
+  REQUIRE(WaitReady(with_roles_port));
+
+  //  ① roles_claim=myroles：token 用 `myroles` 携带角色 → 200
+  {
+    const std::string token = MintToken(kAuditJwtSecret, "someone@example.com", "myroles",
+                                        {"service.file.editors"}, true);
+    const auto reply = HttpGet(with_roles_port, kEditorsEndpoint,
+                               {"authorization: Bearer " + token, "data-partition-id: opendes"});
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 200);
+  }
+  //  ② 同一个 token 内容放在**默认 claim 名** `roles` 里 → 403（roles_claim 真的在生效）
+  {
+    const std::string token = MintToken(kAuditJwtSecret, "someone@example.com", "roles",
+                                        {"service.file.editors"}, true);
+    const auto reply = HttpGet(with_roles_port, kEditorsEndpoint,
+                               {"authorization: Bearer " + token, "data-partition-id: opendes"});
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 403);
+  }
+  //  ③ 无 roles claim，但 email 命中 `auth.local_roles` → 200（静态角色表真的被装配）
+  {
+    const std::string token =
+        MintToken(kAuditJwtSecret, "viewer@example.com", "myroles", {}, false);
+    const auto reply = HttpGet(with_roles_port, kEditorsEndpoint,
+                               {"authorization: Bearer " + token, "data-partition-id: opendes"});
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 200);
+  }
+
+  //  ④ 正例对照（R16）：**没有** local_roles 的实例上，同一个 token → 403
+  {
+    ServerProcess control(SelfContainedOptions({"--config", without_roles}));
+    REQUIRE(WaitReady(without_roles_port));
+    const std::string token =
+        MintToken(kAuditJwtSecret, "viewer@example.com", "myroles", {}, false);
+    const auto reply = HttpGet(without_roles_port, kEditorsEndpoint,
+                               {"authorization: Bearer " + token, "data-partition-id: opendes"});
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 403);
+  }
+}
+
+TEST_CASE("★ C10.15：server.grpc.enabled=false 不开端口；true 时 GetInfo 可用",
+          "[phase10][config][c10.15]") {
+  TempDir cfg_dir("fss_cfg_grpc");
+  TempDir data_dir("fss_cfg_grpc_data");
+
+  const auto grpc_config = [&](const std::string& name, int http_port, int grpc_port,
+                               bool enabled) {
+    return WriteFile(
+        cfg_dir, name + ".json",
+        std::string("{\n  \"server\": {\"http\": {\"bind\": \"127.0.0.1\", \"port\": ") +
+            std::to_string(http_port) + "}, \"grpc\": {\"enabled\": " +
+            (enabled ? "true" : "false") + ", \"bind\": \"127.0.0.1\", \"port\": " +
+            std::to_string(grpc_port) +
+            "}},\n  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child(name + "-store") +
+            "\"}},\n  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(name + "-loc.db") +
+            "\"}},\n  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(name + "-meta.db") +
+            "\"}},\n  \"self_signed\": {\"signing_key\": \"grpc\"},\n  \"auth\": {\"mode\": "
+            "\"disabled\"}\n}\n");
+  };
+
+  SECTION("enabled=false + port 非 0 → gRPC 端口**不监听**（横幅给出原因）") {
+    const int http_port = FreePort();
+    const int grpc_port = FreePort();
+    const std::string config = grpc_config("grpc_off", http_port, grpc_port, false);
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(server.http_port() == http_port);
+    REQUIRE(WaitReady(http_port));
+    CAPTURE(server.DumpLog(), grpc_port);
+    REQUIRE(server.DumpLog().find("server.grpc.enabled=false") != std::string::npos);
+    REQUIRE_FALSE(TcpConnects(grpc_port));
+  }
+
+  SECTION("enabled=true → gRPC 端口在监听，且 GetInfo 可用（免鉴权）") {
+    const int http_port = FreePort();
+    const int grpc_port = FreePort();
+    const std::string config = grpc_config("grpc_on", http_port, grpc_port, true);
+    ServerProcess server(SelfContainedOptions({"--config", config}));
+    REQUIRE(server.http_port() == http_port);
+    REQUIRE(WaitReady(http_port));
+    CAPTURE(server.DumpLog(), grpc_port);
+    REQUIRE(TcpConnects(grpc_port));
+
+    auto channel = ::grpc::CreateChannel("127.0.0.1:" + std::to_string(grpc_port),
+                                         ::grpc::InsecureChannelCredentials());
+    auto stub = osdu::file::v1::FileService::NewStub(channel);
+    ::grpc::ClientContext context;
+    ::google::protobuf::Empty request;
+    osdu::file::v1::InfoResponse response;
+    const auto status = stub->GetInfo(&context, request, &response);
+    INFO("gRPC 状态：" << status.error_code() << " " << status.error_message());
+    REQUIRE(status.ok());
+    REQUIRE(response.version() == "v2");
   }
 }

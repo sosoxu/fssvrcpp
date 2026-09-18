@@ -1,16 +1,16 @@
-# 阶段 10 测试证据（🚧 切片 1/2 完成：配置面接线 + GC 调度/expiry/拒绝语义）
+# 阶段 10 测试证据（🚧 切片 1/2/3 完成：配置面接线 + GC/expiry + 审计 fail-closed/SQLite 调优/鉴权与 gRPC 面；C10.16 未做）
 
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P10（配置面接线） |
-| 状态 | 🚧 **切片 1/2 完成**：C10.1~C10.12 全部满足 |
+| 状态 | 🚧 **切片 1/2/3 完成**：C10.1~C10.15 满足；**C10.16 未做（如实登记）** |
 | 门槛命令 | `ctest -L phase10 && scripts/verify_config_wiring.sh` |
 | 退出码 | `0` |
 | 新测试 | `tests/integration/test_config_wiring.cpp`：**16 个 TEST_CASE / 288 断言**（全部在真实 `build/bin/fss_server` 上；切片 2 在同一文件追加 6 个用例） |
 | 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
 | 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **76/76** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 72 / 拒绝启动（触发条件）16 / 已读但无效果 68**（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 81 / 拒绝启动（触发条件）16 / 已读但无效果 59**（切片 3 新接通 9 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出） |
 | 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
@@ -164,3 +164,40 @@ $ ctest --test-dir build -L phase10                                # 1/1 Test #.
   退出路径统一为：`gc_scheduler->Stop()`（signal + join）→ `server.Stop()` → `grpc_server->Shutdown()`。
 * `GcScheduler` 的析构函数也调用 `Stop()`，因此**任何提前 return 都不会留下 joinable 线程**。
 * SIGTERM 实测：`kill -TERM` 后进程退出码 0（见 §5.2 的手工验证与脚本的 `stop_server`）。
+
+---
+
+## 6. 切片 3（C10.13~C10.15；C10.16 未做）
+
+### 6.1 判据逐条
+
+| 判据 | 状态 | 证据 |
+| --- | --- | --- |
+| **C10.13** 审计 fail-closed | ✅ | `src/app/usecases/usecases.cpp` 的 `RecordAudit()` 现在返回 `Result<void>` 并按 `UseCasePorts::audit_fail_closed` 判定；`AuditGuard::Success()` 在**返回前**记录成功审计并返回 `Result`（调用点 14 处改成 `FSS_TRY(audit.Success())`）—— 析构阶段改不了状态码，那正是"审计失败却报 200"的静默缺陷。可驱动接缝 `FSS_AUDIT_FAULT_INJECT=1`（组合根装配 `FailingAuditLogger`；**不是**配置键）。`test_config_wiring` 三条：`fail_closed=true` + 注入 → `uploadURL` **500** 且响应无成功载荷；**正例对照** `fail_closed=false` + 同一坏后端 → **200**；无注入 → 200 |
+| **C10.14** SQLite 调优键 | ⚠️ **部分满足** | 只接**真实存在**的 Options 字段：`metadata.sqlite.busy_timeout_ms`、`location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`（→ `SqliteLocationRepositoryOptions.wal`；`WAL|DELETE`，`TRUNCATE` → exit 78）。`test_config_wiring` 用 `python3 -c "import sqlite3…PRAGMA journal_mode"` 从库文件读回 `wal` / `delete`（配置真的改变了文件头，不是恒为 WAL）；`busy_timeout` 只作用于连接、**无法从文件读回** → 由启动横幅（`sqlite tuning : location busy_timeout=… journal_mode=…`）确认。`synchronous`/`group_commit*` 在两个 Options 结构体里**没有**字段 → 按"不发明字段"留在"已读但无效果"（§1.3.3） |
+| **C10.15** 鉴权与 gRPC 面 | ✅ | `auth.jwt.roles_claim` + `auth.local_roles.*` → `LocalJwtOptions`；`test_config_wiring` 用真实 HS256 token 断言：claim 名 `myroles` 携带 editors → **200**；同一角色放在默认 `roles` 里 → **403**；无 claim 但 email 命中 `local_roles` → **200**；**正例对照**：没有 `local_roles` 的实例上同一 token → **403**。`server.grpc.enabled=false`（端口非 0）→ 横幅 `server.grpc.enabled=false` 且该端口**不监听**（TCP connect 失败）；`=true` → 端口在监听且 **`GetInfo` 返回 OK / version=v2**（真实 gRPC channel） |
+| **C10.16** 分区与存储细节 | ❌ **未做** | 时间盒内未实现：`partition.file.opendes.*`（容器名/`max_file_bytes`/校验算法）与 `storage.posix.{group_commit_max_batch,sync_dir_after_batch,atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 仍为"已读但无效果"（`operations.md` §1.3.3 已补下一步：先给 `PosixBlobStoreOptions` / `PartitionConfig` 加字段）。**没有**为了凑判据而发明无效接线 |
+
+### 6.2 命令与关键输出
+
+```console
+$ cmake --build build -j"$(nproc)"                      # 全绿
+$ ctest --test-dir build -L phase10                     # 见最终回复
+$ ./scripts/verify_config_wiring.sh                     # 54 条（切片 3 未改脚本）
+```
+
+### 6.3 自证（R1）—— 见最终回复的实测输出
+
+注入方式：把 `src/main/server_main.cpp` 里 `location_sqlite_journal_mode != "DELETE"` 的
+`journal_mode` 读出处强制改回常量 `"WAL"`（等价"配置读了但没接上"），重建后
+`test_config_wiring "★ C10.14*"` 的 DELETE 分支必须失败（python3 读回 `wal` 而不是 `delete`）。
+
+### 6.4 未做 / 降级（切片 3）
+
+| 项 | 状态 |
+| --- | --- |
+| C10.16（`partition.file.*` / `storage.posix.*` 7 键） | **未做**，保持"已读但无效果" |
+| `metadata.sqlite.journal_mode`/`synchronous`/`max_write_concurrency`/`group_commit*`、`location.sqlite.synchronous`/`group_commit*` | **未接通**（Options 里无字段；不发明字段） |
+| `location.sqlite.max_write_concurrency` | 值已传进 Options 并参与 `>0` 校验，但实现是"单连接 + 互斥"（实际并发 1）→ 仍为"已读但无效果" |
+| `FSS_AUDIT_FAULT_INJECT` | **故障注入开关，不是配置键**（不进 156 键清单）；生产**不要**设置 |
+| `busy_timeout` 的锁竞争 A/B 实测 | **未做**（只做了横幅 + PRAGMA 应用证据）——如实标注 |
