@@ -565,7 +565,7 @@ fss_add_test(test_operations_doc
 # =============================================================================
 fss_add_test(test_config_wiring
   SOURCES integration/test_config_wiring.cpp
-  LIBS    fss_app fss_grpc_adapter Threads::Threads
+  LIBS    fss_app fss_grpc_adapter fss_blob_posix fss_io Threads::Threads
   LABELS  "phase10;integration")
 # C10.15：本文件用真实 gRPC channel 调 GetInfo → 需要 gRPC/proto 头与库；
 # 同时被测进程就是 build/bin/fss_server，构建它必须先于本测试

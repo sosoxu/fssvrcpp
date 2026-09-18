@@ -104,7 +104,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 > | **拒绝启动（触发条件）** | 该键在组合根里**唯一**的作用就是"非默认/不支持的值 → exit 78"；默认/合法值不产生额外行为。触发条件与"下一步"逐条写在该单元格里 |
 > | **已读但无效果** | 组合根**不接线**该键（或读了但行为未实现）→ 改它对真实进程没有影响。必须给出**理由与下一步** |
 >
-> 三态计数见 §1.3（**生效 82 / 拒绝启动 18 / 已读但无效果 56；合计 156**，与 `config/fss.example.json` 的叶子键一一对应）。
+> 三态计数见 §1.3（**生效 89 / 拒绝启动 21 / 已读但无效果 46；合计 156**，与 `config/fss.example.json` 的叶子键一一对应）。
 
 
 #### 1.2.1 `deployment`
@@ -168,14 +168,14 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `storage.io_uring.register_files` | io_uring 注册文件表 | `false` | bool；默认 `false` | **拒绝启动（触发条件）**：`true` → exit 78（io_uring 引擎未启用，ADR-010）。下一步：保持 `false` |
 | `storage.posix.root` | 集中存储根目录 | `/var/lib/fss/data` | string，Required；默认 `/var/lib/fss/data` | **生效**：已接通（`storage.posix.root`；旧别名 `FSS_STORAGE_ROOT`；**组合根历史默认 `/tmp/fss-data`**）；对象落在 `<root>/blobs` |
 | `storage.posix.durability` | 落盘档位 | `batch` | enum `batch` / `per_file`（★ **schema 未含 `never`**）；默认 `batch` | **生效**：已接通（`storage.posix.durability`；旧别名 `FSS_POSIX_DURABILITY`，**接受 `never`**）。映射见 §5；**组合根历史默认 `per_file`** |
-| `storage.posix.group_commit_max_batch` | 批提交最大批大小 | `500` | int 1..100000；默认 `500` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `storage.posix.sync_dir_after_batch` | 批末 `fsync(dir)`（ADR-008 的 R2 不变量） | `true` | bool；默认 `true` | **已读但无效果**：组合根未接线（登记为未实现；实现内固定按 R2 执行） |
+| `storage.posix.group_commit_max_batch` | 批提交最大批大小 | `500` | int 1..100000；默认 `500` | **拒绝启动（触发条件）**：非默认（`500`）→ exit 78（**批提交协议未实现（ADR-008 的 P4 待做）**：实现里只有「按大小决定是否 fdatasync + 改名后 fsync 目录」，没有「整批 `.tmp` → `syncfs` → 统一 rename」）。下一步：保持 `500`，或在 ADR-008 §6 落地 P4 后再接通 |
+| `storage.posix.sync_dir_after_batch` | 批末 `fsync(dir)`（ADR-008 的 R2 不变量） | `true` | bool；默认 `true` | **拒绝启动（触发条件）**：非默认（`true`）→ exit 78（同上：**批提交协议未实现（ADR-008 的 P4 待做）**，没有「批末」这个时刻）。下一步：保持 `true` |
 | `storage.posix.fsync_threshold_bytes` | ≥ 该值的对象强制 per-file 落盘（只对 `batch` 生效） | `1048576` | int 0..1099511627776；默认 `0`（0 = 所有对象都必须 fsync） | **生效**：已接通（`storage.posix.fsync_threshold_bytes`；旧别名 `FSS_POSIX_FSYNC_THRESHOLD_BYTES`）。**只在 durability=batch 时生效**；组合根历史默认 1 MiB（1048576）。⚠️ 阈值 `0` 会让 batch 退化成 per_file 的耐久性与速度（见 §5.1） |
-| `storage.posix.atomic_write` | tmp + rename 原子写 | `true` | bool；默认 `true` | **已读但无效果**：组合根未接线（实现内固定开启，不可关） |
-| `storage.posix.dir_mode` | 目录权限 | `0750` | string；默认 `0750` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `storage.posix.file_mode` | 文件权限 | `0640` | string；默认 `0640` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `storage.posix.fadvise_random` | 随机读提示 | `true` | bool；默认 `true` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `storage.posix.fadvise_dontneed_after_large_read` | 大段读后 `DONTNEED` | `false` | bool；默认 `false` | **已读但无效果**：组合根未接线（登记为未实现） |
+| `storage.posix.atomic_write` | tmp + rename 原子写 | `true` | bool；默认 `true` | **生效**：接通 `storage.posix.atomic_write` → `PosixBlobStoreOptions::atomic_write`（默认 `true` = 既有 tmp + rename）。`false` → **直接写目标文件**；失败路径**删除目标**，目标与 `.tmp.*` 都不残留（驱动级故障注入断言，正反两模式对照） |
+| `storage.posix.dir_mode` | 目录权限 | `0750` | string；默认 `0750` | **生效**：接通 `storage.posix.dir_mode` → `PosixBlobStoreOptions::dir_mode`（建容器目录与对象父目录时显式 `chmod`）。非法八进制 → exit 78。证据：真实进程 `stat` 目录 = `0700`（配置 `"0700"`） |
+| `storage.posix.file_mode` | 文件权限 | `0640` | string；默认 `0640` | **生效**：接通 `storage.posix.file_mode` → `PosixBlobStoreOptions::file_mode`（`open(2)` 的 mode）。⚠️ 接线前实现固定 `0644`，现按配置落盘（默认 `0640`）。证据：真实进程 `stat` 对象 = `0600`（配置 `"0600"`） |
+| `storage.posix.fadvise_random` | 随机读提示 | `true` | bool；默认 `true` | **生效**：接通 `storage.posix.fadvise_random` → 写路径（`put`）与读路径（`get`）的打开 fd 各下发一次 `POSIX_FADV_RANDOM`；可注入 `IFadviseSink` 计数接缝断言（关闭对照 = 0 次） |
+| `storage.posix.fadvise_dontneed_after_large_read` | 大段读后 `DONTNEED` | `false` | bool；默认 `false` | **生效**：接通 `storage.posix.fadvise_dontneed_after_large_read` → 读出的字节数 **> 1 MiB** 时下发 `POSIX_FADV_DONTNEED`；1 KiB 的读不触发（阈值边界在用例里断言） |
 | `storage.posix.shared_mount_required` | `multi` 下必须 true（共享挂载探针） | `false` | bool；默认 `false`；`multi` 必须 true | **已读但无效果**：组合根未接线（登记为未实现；`multi` 本身拒绝启动） |
 | `storage.posix.one_filesystem_per_partition` | 每 partition 独占文件系统（`syncfs` 隔离） | `false` | bool；默认 `false` | **已读但无效果**：组合根未接线（登记为未实现） |
 | `storage.s3.endpoint` | S3 端点 | `http://127.0.0.1:9000` | string；默认 `http://127.0.0.1:9000` | **生效**：已接通（`storage.s3.endpoint` / 通用名 `FSS_STORAGE_S3_ENDPOINT`）；**组合根历史默认为空**，空值 + `driver=s3` → exit 78 |
@@ -303,9 +303,9 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 接通状态（三态：生效 / 拒绝启动 / 已读但无效果） |
 | --- | --- | --- | --- | --- |
 | `partition.registry` | 租户注册表来源 | `file` | enum `file` / `remote`；默认 `file` | **拒绝启动（触发条件）**：`remote` → exit 78（远端租户注册表未交付）。下一步：保持 `file` |
-| `partition.file.opendes.staging_container` | staging 容器名 | `opendes-staging` | 动态子树（`partition.file` 前缀），无逐键约束 | **已读但无效果**：组合根未接线（登记为未实现；实现按 `ObjectKeyPolicy::ContainerFor` 生成 `<partition>-staging`） |
-| `partition.file.opendes.persistent_container` | persistent 容器名 | `opendes-persistent` | 同上 | **已读但无效果**：组合根未接线（登记为未实现；实现生成 `<partition>-persistent`） |
-| `partition.file.opendes.storage_driver` | 分区级驱动覆盖 | `posix` | 同上 | **已读但无效果**：组合根未接线（登记为未实现；组合根的租户驱动由 `FSS_STORAGE_DRIVER` 决定） |
+| `partition.file.opendes.staging_container` | staging 容器名 | `opendes-staging` | 动态子树（`partition.file` 前缀），无逐键约束 | **生效**：接通 `partition.file.<p>.staging_container` → `PartitionConfig::staging_container` → `ObjectKeyPolicy::ContainerFor(PartitionConfig&, zone)`（uploadURL 签发 / 用例 / GC / 启动建目录都走同一条）；空串 = 默认 `<partition>-staging`（逐字一致）。非法字符（控制字符 / `/` / `\\` / `%`）→ exit 78。证据：真实进程下 `custom-stage-1` 目录出现、`opendes-staging` 不出现 |
+| `partition.file.opendes.persistent_container` | persistent 容器名 | `opendes-persistent` | 同上 | **生效**：同 `staging_container`（→ `PartitionConfig::persistent_container`）；空串 = 默认 `<partition>-persistent`。证据：真实进程下 `custom-persist-1` 目录出现 |
+| `partition.file.opendes.storage_driver` | 分区级驱动覆盖 | `posix` | 同上 | **拒绝启动（触发条件）**：与顶层 `storage.driver` **不一致** → exit 78（分区级驱动覆盖未交付：组合根只装配一个 BlobStore，`SingleStoreFactory` 的所有 partition/zone 共用它）；等于顶层值（或空）→ 正常启动（R16 正例）。下一步：删除该键（跟随顶层），或等按 partition/zone 分盘的工厂交付 |
 | `partition.file.opendes.max_file_bytes` | 单对象上限（0 = 不限） | `0` | 同上 | **生效**（C10.16）：接到 `PartitionConfig.max_object_bytes`（0 → -1 = 不限），并落到数据面 PUT 的 `RouteOptions::max_body_bytes`；超限 → **413**（带 `Content-Length`，读体前前置拒绝）/ 400（chunked）。上传用例见 `tests/integration/test_config_wiring.cpp` 的 C10.16 |
 | `partition.file.opendes.allowed_checksum_algorithms` | 允许的校验和算法 | `["SHA-256","MD5","SHA-1"]` | 同上 | **拒绝启动（触发条件）**：含未知算法名 → exit 78。**为什么不是"请求期 400"**：C6.4 有上游一手证据 —— 客户端声明的算法是**被覆写**的输入，不是待校验断言（`File_CorrectPayload.json` 声明 SHA-256 却给 MD5 值，期望 201）。下一步：保持 SHA-256 / SHA-1 / MD5 的子集 |
 | `partition.file.opendes.default_checksum_algorithm` | 缺省校验和算法 | `SHA-256` | 同上 | **拒绝启动（触发条件）**：未知算法名，或不在 `allowed_checksum_algorithms` 集合内 → exit 78（与上一键是跨字段校验）。下一步：保证它属于 allowed 集合 |
@@ -336,19 +336,19 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 ### 1.3 接通状态三态（逐键核对；合计 **156** 个叶子键）
 
 > 口径：**组合根在真实进程里对每个键做了什么**。三态的定义见 §1.2 开头的表。
-> 计数由本节的三个清单逐条相加得出：**82 + 18 + 56 = 156**。
+> 计数由本节的三个清单逐条相加得出：**89 + 21 + 46 = 156**。
 
 | 状态 | 键数 | 说明 |
 | --- | --- | --- |
-| **生效** | **82** | 读取后真的改变运行行为（含"非法值拒绝启动"的触发条件，写在 §1.2 对应行） |
-| **拒绝启动（触发条件）** | **18** | 非默认/不支持的值 → **exit 78（EX_CONFIG）** + 「未实现 + 下一步」 |
-| **已读但无效果** | **56** | 组合根未接线（或读了但行为未实现）→ 改它对真实进程没有影响；理由与下一步逐个登记 |
+| **生效** | **89** | 读取后真的改变运行行为（含"非法值拒绝启动"的触发条件，写在 §1.2 对应行） |
+| **拒绝启动（触发条件）** | **21** | 非默认/不支持的值 → **exit 78（EX_CONFIG）** + 「未实现 + 下一步」 |
+| **已读但无效果** | **46** | 组合根未接线（或读了但行为未实现）→ 改它对真实进程没有影响；理由与下一步逐个登记 |
 
-#### 1.3.1 生效（82）
+#### 1.3.1 生效（89）
 
-`auth.jwt.audience`、`auth.jwt.hmac_secret`、`auth.jwt.issuer`、`auth.jwt.partition_claim`、`auth.jwt.require_partition_claim`、`auth.jwt.roles_claim`、`auth.jwt.user_id_claim`、`auth.jwt.verify_signature`、`auth.local_roles.admin@example.com`、`auth.local_roles.editor@example.com`、`auth.local_roles.viewer@example.com`、`auth.mode`、`auth.remote_entitlements.authorize_path`、`auth.remote_entitlements.base_url`、`auth.remote_entitlements.connect_timeout_ms`、`auth.remote_entitlements.timeout_ms`、`deployment.environment`、`deployment.instance_id`、`deployment.max_clock_skew_seconds`、`deployment.mode`、`expiry.default`、`expiry.max`、`gc.dry_run`、`gc.enabled`、`gc.interval_seconds`、`gc.orphan_grace_hours`、`gc.require_lease_expiry`、`gc.staging_ttl_hours`、`http.error_format`、`location.repository`、`location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`、`location.sqlite.path`、`metadata.repository`、`metadata.sqlite.busy_timeout_ms`、`metadata.sqlite.path`、`observability.audit_enabled`、`observability.audit_fail_closed`、`observability.log_format`、`observability.log_level`、`observability.metrics_enabled`、`observability.metrics_path`、`observability.redact_keys`、`partition.file.opendes.max_file_bytes`、`self_signed.enabled`、`self_signed.public_base_url`、`self_signed.signing_key`、`server.grpc.bind`、`server.grpc.enabled`、`server.grpc.port`、`server.http.base_path`、`server.http.bind`、`server.http.idle_timeout_seconds`、`server.http.json_request_timeout_seconds`、`server.http.max_body_bytes`、`server.http.max_connections`、`server.http.max_header_bytes`、`server.http.max_uri_bytes`、`server.http.port`、`server.http.tcp_nodelay`、`server.http.transfer_buffer_bytes`、`server.http.transfer_idle_timeout_seconds`、`server.http.transfer_memory_budget_bytes`、`server.http.worker_threads`、`storage.driver_report_override`、`storage.driver`、`storage.io_engine`、`storage.io_uring.queue_depth`、`storage.posix.durability`、`storage.posix.fsync_threshold_bytes`、`storage.posix.root`、`storage.provider_key_override`、`storage.s3.access_key`、`storage.s3.connect_timeout_ms`、`storage.s3.endpoint`、`storage.s3.force_path_style`、`storage.s3.presign_default_seconds`、`storage.s3.presign_max_seconds`、`storage.s3.region`、`storage.s3.secret_key`、`storage.s3.total_timeout_ms`、`storage.s3.verify_tls`
+`auth.jwt.audience`、`auth.jwt.hmac_secret`、`auth.jwt.issuer`、`auth.jwt.partition_claim`、`auth.jwt.require_partition_claim`、`auth.jwt.roles_claim`、`auth.jwt.user_id_claim`、`auth.jwt.verify_signature`、`auth.local_roles.admin@example.com`、`auth.local_roles.editor@example.com`、`auth.local_roles.viewer@example.com`、`auth.mode`、`auth.remote_entitlements.authorize_path`、`auth.remote_entitlements.base_url`、`auth.remote_entitlements.connect_timeout_ms`、`auth.remote_entitlements.timeout_ms`、`deployment.environment`、`deployment.instance_id`、`deployment.max_clock_skew_seconds`、`deployment.mode`、`expiry.default`、`expiry.max`、`gc.dry_run`、`gc.enabled`、`gc.interval_seconds`、`gc.orphan_grace_hours`、`gc.require_lease_expiry`、`gc.staging_ttl_hours`、`http.error_format`、`location.repository`、`location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`、`location.sqlite.path`、`metadata.repository`、`metadata.sqlite.busy_timeout_ms`、`metadata.sqlite.path`、`observability.audit_enabled`、`observability.audit_fail_closed`、`observability.log_format`、`observability.log_level`、`observability.metrics_enabled`、`observability.metrics_path`、`observability.redact_keys`、`partition.file.opendes.max_file_bytes`、`partition.file.opendes.persistent_container`、`partition.file.opendes.staging_container`、`self_signed.enabled`、`self_signed.public_base_url`、`self_signed.signing_key`、`server.grpc.bind`、`server.grpc.enabled`、`server.grpc.port`、`server.http.base_path`、`server.http.bind`、`server.http.idle_timeout_seconds`、`server.http.json_request_timeout_seconds`、`server.http.max_body_bytes`、`server.http.max_connections`、`server.http.max_header_bytes`、`server.http.max_uri_bytes`、`server.http.port`、`server.http.tcp_nodelay`、`server.http.transfer_buffer_bytes`、`server.http.transfer_idle_timeout_seconds`、`server.http.transfer_memory_budget_bytes`、`server.http.worker_threads`、`storage.driver_report_override`、`storage.driver`、`storage.io_engine`、`storage.io_uring.queue_depth`、`storage.posix.atomic_write`、`storage.posix.dir_mode`、`storage.posix.durability`、`storage.posix.fadvise_dontneed_after_large_read`、`storage.posix.fadvise_random`、`storage.posix.file_mode`、`storage.posix.fsync_threshold_bytes`、`storage.posix.root`、`storage.provider_key_override`、`storage.s3.access_key`、`storage.s3.connect_timeout_ms`、`storage.s3.endpoint`、`storage.s3.force_path_style`、`storage.s3.presign_default_seconds`、`storage.s3.presign_max_seconds`、`storage.s3.region`、`storage.s3.secret_key`、`storage.s3.total_timeout_ms`、`storage.s3.verify_tls`
 
-#### 1.3.2 拒绝启动（触发条件）（18）
+#### 1.3.2 拒绝启动（触发条件）（21）
 
 | 键 | 触发条件（非默认/不支持的值） |
 | --- | --- |
@@ -361,6 +361,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `partition.registry` | `remote` → exit 78（远端租户注册表未交付）。下一步：保持 `file` |
 | `partition.file.opendes.allowed_checksum_algorithms` | 含未知算法名（不在 SHA-256 / SHA-1 / MD5 内）→ exit 78。下一步：保持这三个名字的子集（大小写与 `-`/`_` 不计） |
 | `partition.file.opendes.default_checksum_algorithm` | 未知算法名，或不在 `allowed_checksum_algorithms` 内 → exit 78。下一步：保证它属于 allowed 集合 |
+| `partition.file.opendes.storage_driver` | 与顶层 `storage.driver` 不一致 → exit 78（分区级驱动覆盖未交付；等于顶层值或为空 → 正常启动）。下一步：删除该键（跟随顶层），或等按 partition/zone 分盘的工厂交付 |
 | `schema.validator` | `remote` → exit 78（远端 schema 校验未交付）。下一步：保持 `noop` |
 | `self_signed.nonce_store` | 非 `memory` → exit 78（只有内存 nonce 存储，且 `single_use_nonce=false` 时不用它）。下一步：保持 `memory` |
 | `self_signed.single_use_nonce` | `true` → exit 78（nonce 存储未交付，ADR-009 M5）。下一步：保持 `false` |
@@ -370,22 +371,25 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `server.http.max_connections_per_partition` | 非 `0` → exit 78（每租户并发上限未实现）。下一步：保持 `0`，用 `server.http.max_connections` 表达全局上限 |
 | `storage.io_uring.register_files` | `true` → exit 78（io_uring 引擎未启用，ADR-010）。下一步：保持 `false` |
 | `storage.proxy_mode` | `always` → exit 78（「强制服务代理所有字节」未实现）。下一步：保持 `auto` |
+| `storage.posix.group_commit_max_batch` | 非默认（`500`）→ exit 78（**批提交协议未实现（ADR-008 的 P4 待做）**）。下一步：保持 `500` |
+| `storage.posix.sync_dir_after_batch` | 非默认（`true`）→ exit 78（同上，ADR-008 的 P4 待做）。下一步：保持 `true` |
 
-#### 1.3.3 已读但无效果（56）
+#### 1.3.3 已读但无效果（46）
 
 > 这些键**改了不生效**（组合根不读，或读了但没有行为分支）。每一条都给出**下一步**；
 > 其中 8 个键（`expiry.*` 与 `gc.*`）在切片 2、**9 个键**在切片 3 已从本清单移入「生效」，见 §1.3.1
 > （切片 3：`observability.audit_fail_closed`、`metadata.sqlite.busy_timeout_ms`、`location.sqlite.{busy_timeout_ms,journal_mode}`、`auth.jwt.roles_claim`、`auth.local_roles.*`（3）、`server.grpc.enabled`）。
-> **C10.16 的净变化**：`partition.file.opendes.max_file_bytes` 移入「生效」（§1.3.1）；`allowed/default_checksum_algorithm` 移入「拒绝启动」（§1.3.2）；`partition.file.opendes.{staging_container,persistent_container,storage_driver}` 与 7 个 `storage.posix.*` 细节键**没有对应的结构体字段**（`PartitionConfig` / `PosixBlobStoreOptions`），按「不发明字段」留下。
+> **C10.16 的净变化**：`partition.file.opendes.max_file_bytes` 移入「生效」（§1.3.1）；`allowed/default_checksum_algorithm` 移入「拒绝启动」（§1.3.2）。
+> **C10.16 续（本轮）的净变化**：`storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 与 `partition.file.opendes.{staging,persistent}_container` 移入「生效」（+7，§1.3.1）；`storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 未实现）与 `partition.file.opendes.storage_driver`（与顶层驱动冲突）移入「拒绝启动」（+3，§1.3.2）。此前「这 10 个键没有对应结构体字段」的结论**已被本轮推翻**：`PosixBlobStoreOptions` / `PartitionConfig` 已加上真实字段（记录见 `docs/00-final-design.md` §5）。
 
-`auth.remote_entitlements.fail_closed`、`events.webhook.timeout_ms`、`events.webhook.topic`、`events.webhook.url`、`leader_election.backend`、`leader_election.lock_key`、`leases.renew_interval_seconds`、`leases.time_source`、`leases.ttl_seconds`、`legal.remote.base_url`、`legal.remote.timeout_ms`、`location.postgres.dsn`、`location.postgres.max_connections`、`location.sqlite.group_commit`、`location.sqlite.group_commit_max_batch`、`location.sqlite.group_commit_max_wait_ms`、`location.sqlite.max_write_concurrency`、`location.sqlite.synchronous`、`metadata.postgres.dsn`、`metadata.postgres.max_connections`、`metadata.postgres.schema_version_check`、`metadata.postgres.statement_timeout_ms`、`metadata.remote.base_url`、`metadata.remote.static_token`、`metadata.remote.timeout_ms`、`metadata.remote.token_provider`、`metadata.sqlite.group_commit`、`metadata.sqlite.group_commit_max_batch`、`metadata.sqlite.group_commit_max_wait_ms`、`metadata.sqlite.journal_mode`、`metadata.sqlite.max_write_concurrency`、`metadata.sqlite.synchronous`、`partition.file.opendes.persistent_container`、`partition.file.opendes.staging_container`、`partition.file.opendes.storage_driver`、`schema.remote.base_url`、`schema.remote.timeout_ms`、`self_signed.default_ttl_seconds`、`self_signed.key_id`、`self_signed.max_ttl_seconds`、`server.http.large_file_plane.bind`、`server.http.large_file_plane.max_connections`、`server.http.large_file_plane.port`、`server.http.large_file_plane.sendfile_chunk_bytes`、`server.http.large_file_plane.use_sendfile`、`server.http.large_file_plane.workers`、`server.http.transfer_max_body_bytes`、`storage.posix.atomic_write`、`storage.posix.dir_mode`、`storage.posix.fadvise_dontneed_after_large_read`、`storage.posix.fadvise_random`、`storage.posix.file_mode`、`storage.posix.group_commit_max_batch`、`storage.posix.one_filesystem_per_partition`、`storage.posix.shared_mount_required`、`storage.posix.sync_dir_after_batch`
+`auth.remote_entitlements.fail_closed`、`events.webhook.timeout_ms`、`events.webhook.topic`、`events.webhook.url`、`leader_election.backend`、`leader_election.lock_key`、`leases.renew_interval_seconds`、`leases.time_source`、`leases.ttl_seconds`、`legal.remote.base_url`、`legal.remote.timeout_ms`、`location.postgres.dsn`、`location.postgres.max_connections`、`location.sqlite.group_commit`、`location.sqlite.group_commit_max_batch`、`location.sqlite.group_commit_max_wait_ms`、`location.sqlite.max_write_concurrency`、`location.sqlite.synchronous`、`metadata.postgres.dsn`、`metadata.postgres.max_connections`、`metadata.postgres.schema_version_check`、`metadata.postgres.statement_timeout_ms`、`metadata.remote.base_url`、`metadata.remote.static_token`、`metadata.remote.timeout_ms`、`metadata.remote.token_provider`、`metadata.sqlite.group_commit`、`metadata.sqlite.group_commit_max_batch`、`metadata.sqlite.group_commit_max_wait_ms`、`metadata.sqlite.journal_mode`、`metadata.sqlite.max_write_concurrency`、`metadata.sqlite.synchronous`、`schema.remote.base_url`、`schema.remote.timeout_ms`、`self_signed.default_ttl_seconds`、`self_signed.key_id`、`self_signed.max_ttl_seconds`、`server.http.large_file_plane.bind`、`server.http.large_file_plane.max_connections`、`server.http.large_file_plane.port`、`server.http.large_file_plane.sendfile_chunk_bytes`、`server.http.large_file_plane.use_sendfile`、`server.http.large_file_plane.workers`、`server.http.transfer_max_body_bytes`、`storage.posix.one_filesystem_per_partition`、`storage.posix.shared_mount_required`
 
 **理由与下一步（按前缀归类）**
 
 | 前缀 | 键数 | 为什么不生效 / 下一步 |
 | --- | --- | --- |
 | server.http | 7 | `large_file_plane.bind/port/use_sendfile/sendfile_chunk_bytes/workers/max_connections`（6 个）随 sendfile 数据面一起未交付；`transfer_max_body_bytes` 实现恒为「不限」。下一步：ADR-006 §6 落地数据面后才接通（`large_file_plane.enabled` 见 §1.3.2） |
-| `storage` | 9 | `posix` 批提交细节（`group_commit_max_batch`/`sync_dir_after_batch`/`atomic_write`/`dir_mode`/`file_mode`/`fadvise_random`/`fadvise_dontneed_after_large_read`）由实现内固定；`shared_mount_required`/`one_filesystem_per_partition` 依赖 multi。下一步：按 ADR-008 把参数提升为可选 |
+| `storage` | 2 | 只剩 `shared_mount_required`/`one_filesystem_per_partition`（依赖 multi 运行形态）。本轮已把 `atomic_write`/`dir_mode`/`file_mode`/`fadvise_random`/`fadvise_dontneed_after_large_read` 接到驱动层（§1.3.1）、把 `group_commit_max_batch`/`sync_dir_after_batch` 改为拒绝启动（§1.3.2，ADR-008 的 P4 未实现）。下一步：multi 运行形态交付后接通这两个 |
 | `self_signed` | 3 | `key_id`/`default_ttl_seconds`/`max_ttl_seconds` 未接线。下一步：把 TTL 与 key_id 接到 `HmacTransferTokenCodec`（`single_use_nonce`/`nonce_store` 见 §1.3.2） |
 | `metadata` | 14 | `busy_timeout_ms` 已接通（切片 3）；`journal_mode`/`synchronous`/`max_write_concurrency`/`group_commit*`（6）未接线 —— `SqliteMetadataRepositoryOptions` 里**没有**这些字段（元数据仓储内硬编码 WAL），按「不发明字段」登记。`postgres.*`（4）/`remote.*`（4）依赖未交付的仓储。下一步：为元数据仓储 Options 显式加字段后再接 PRAGMA |
 | `location` | 7 | `busy_timeout_ms`/`journal_mode` 已接通（切片 3）；`synchronous`/`max_write_concurrency`/`group_commit*`（5）未接线 —— Options 里只有 `wal` 布尔与 `max_write_concurrency`（后者只参与 `>0` 校验，单连接串行实现下不改变行为）。`postgres.*`（2）依赖 PG 仓储。下一步：为 Options 加 `synchronous`/组提交字段后再接 |
@@ -395,7 +399,6 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `legal` | 2 | `remote.base_url`/`remote.timeout_ms` 随远端校验器一起未交付。下一步：实现远端校验调用（`validator` 见 §1.3.2） |
 | `schema` | 2 | 同 `legal`。下一步：实现远端 schema 校验调用 |
 | `events` | 3 | `webhook.url`/`webhook.timeout_ms`/`webhook.topic` 随 webhook 发布器一起未交付。下一步：实现 webhook 发布（`publisher` 见 §1.3.2） |
-| `partition` | 3 | `staging_container`/`persistent_container`/`storage_driver`：容器名由 `ObjectKeyPolicy::ContainerFor` 固定生成（`<partition>-<zone>`），分区级驱动覆盖与组合根的 `storage.driver` 会冲突 —— `PartitionConfig` 里没有容器名字段，按「不发明字段」登记。`max_file_bytes` 与校验和两键已在 C10.16 接通（§1.3.1/§1.3.2）。下一步：把租户注册表读进 `StaticPartitionRegistry`（`registry` 见 §1.3.2） |
 
 ---
 
@@ -919,7 +922,7 @@ find /var/lib/fss/data/blobs -name '*.tmp.*' -mmin +1440 -delete
 
 | 项 | 状态 | 说明 / 证据 |
 | --- | --- | --- |
-| 组合根接 `config/fss.example.json` | **切片 1/2/3 已接通（含 C10.16）** | `--config`/`FSS_CONFIG` + `--set` + 环境变量；156 键的三态计数为 **生效 82 / 拒绝启动 18 / 已读但无效果 56**（逐键见 §1.3；样例配置在 C10.10 用例里真的启动成功）。切片 3 新接通 9 键：`observability.audit_fail_closed`、`metadata.sqlite.busy_timeout_ms`、`location.sqlite.{busy_timeout_ms,journal_mode}`、`auth.jwt.roles_claim`、`auth.local_roles.*`（3）、`server.grpc.enabled`；C10.16 新增：`partition.file.opendes.max_file_bytes` → 生效，`partition.file.opendes.{allowed,default}_checksum_algorithm` → 拒绝启动 |
+| 组合根接 `config/fss.example.json` | **切片 1/2/3 已接通（含 C10.16）** | `--config`/`FSS_CONFIG` + `--set` + 环境变量；156 键的三态计数为 **生效 82 / 拒绝启动 18 / 已读但无效果 56**（逐键见 §1.3；样例配置在 C10.10 用例里真的启动成功）。切片 3 新接通 9 键：`observability.audit_fail_closed`、`metadata.sqlite.busy_timeout_ms`、`location.sqlite.{busy_timeout_ms,journal_mode}`、`auth.jwt.roles_claim`、`auth.local_roles.*`（3）、`server.grpc.enabled`；C10.16 新增：`partition.file.opendes.max_file_bytes` → 生效，`partition.file.opendes.{allowed,default}_checksum_algorithm` → 拒绝启动。**C10.16 续（本轮）**：`storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 与 `partition.file.opendes.{staging,persistent}_container` → 生效（+7）；`storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 未实现）与 `partition.file.opendes.storage_driver`（驱动冲突）→ 拒绝启动（+3） |
 | `observability.audit_fail_closed` | **已接通（C10.13）** | `UseCasePorts.audit_fail_closed`：`true` 时审计写入失败让请求以 **500** 结束；`false`（默认）保持非致命。真实进程用例：`FSS_AUDIT_FAULT_INJECT=1` 注入"必然失败"的审计后端（**故障注入开关，不是配置键**）→ `fail_closed=true` 时 `uploadURL` = 500、`false` 时 = 200（正例对照，R16）。★ 该注入开关只用于测试/演练：生产环境**不要**设置 `FSS_AUDIT_FAULT_INJECT` |
 | `storage.io_engine=uring` | **不可用（引擎未启用）** | 组合根会真实探测（`sys::ProbeIoUring`）并按 ADR-010 拒绝/回退；但 `UringIoEngine::enabled()=false`（U1~U4 未满足）→ 显式要求 `uring` 一律 **exit 78**，`auto` 回退 blocking（横幅 + `fss_io_engine` 可见） |
 | `metadata.repository`/`location.repository` 的 `postgres`/`remote` | **未实现（显式拒绝）** | 配成非 `sqlite` → **exit 78**，绝不静默降级为 SQLite |

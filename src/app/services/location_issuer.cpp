@@ -52,7 +52,10 @@ fss::Result<LocationResult> LocationIssuer::IssueUploadLocation(
 
   FSS_TRY(file_source, ObjectKeyPolicy::MakeFileSource(parts));
   const auto zone = domain::StorageZone::kStaging;
-  FSS_TRY(container, ObjectKeyPolicy::ContainerFor(partition, zone));
+  //  ★ 阶段 10：容器名走租户注册表（分区级覆盖）；没有注册表时退回默认命名。
+  FSS_TRY(container, partitions_ != nullptr
+                         ? ObjectKeyPolicy::ContainerFor(*partitions_, partition, zone)
+                         : ObjectKeyPolicy::ContainerFor(partition, zone));
 
   domain::ObjectRef ref;
   ref.container = container;

@@ -992,12 +992,13 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 ## 9. 首个动作（下一步要做什么）
 
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）与
-切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）与 **C10.16** 已完成**（见文末「阶段 10」）。
-三态：**生效 82 / 拒绝启动 18 / 已读但无效果 56**（`docs/operations.md` §1.3）。
+切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
+三态：**生效 89 / 拒绝启动 21 / 已读但无效果 46**（`docs/operations.md` §1.3）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
-1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78；
-   `storage.posix.*` 细节键与容器名**无字段可接**，按"不发明字段"留下并写明下一步）；
+1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
+   ~~`storage.posix.*` 细节键与容器名无字段可接~~ → **C10.16 续已完成**：`PosixBlobStoreOptions` /
+   `PartitionConfig` 加上真实字段并接通（5 + 2 键生效、3 键拒绝启动，见文末）；
 2. GC 的 **HTTP 端点**（周期调度与 `--once` 已在切片 2 交付；手动触发/查询未做）；
 3. `storage.proxy_mode=always` / 远端 Storage Service（`metadata.repository=remote`）；
 4. PG 仓储/租约 + `deployment.mode=multi` 运行形态（ADR-009）—— 同时解锁 `leases.*`/`leader_election.*`；
@@ -1066,7 +1067,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（切片 2 时为 生效 72 / 拒绝启动 16 / 已读但无效果 68 = 156；切片 3 后为 **81/16/59**；C10.16 后为 **82/18/56**，见文末切片 3 状态）。
+  `docs/operations.md` 逐键三态化（切片 2 时为 生效 72 / 拒绝启动 16 / 已读但无效果 68 = 156；切片 3 后为 **81/16/59**；C10.16 后为 **82/18/56**，**C10.16 续后为 89/21/46**，见文末切片 3 状态）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1103,11 +1104,13 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   前置拒绝），chunked → 400。`allowed_checksum_algorithms` / `default_checksum_algorithm` →
   **启动期校验**（未知算法名 / 默认不在集合内 → **exit 78**）：这是"按真实语义"的断言 ——
   C6.4 有上游一手证据表明客户端声明的算法是**被覆写**的输入，请求期不做 400。
-  容器名（`staging_container`/`persistent_container`）、分区级 `storage_driver` 与 7 个
-  `storage.posix.*` 细节键在 `PartitionConfig`/`PosixBlobStoreOptions` 里**没有**字段 →
-  按"不发明字段"留在"已读但无效果"（§1.3.3，附理由与下一步）。
-  用例：`tests/integration/test_config_wiring.cpp` 的 `[c10.16]`（2 用例 / 39 断言）。
-* 三态计数：**生效 82 / 拒绝启动 18 / 已读但无效果 56 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+  **C10.16 续（本轮收尾）**：为 `PosixBlobStoreOptions` 与 `PartitionConfig` 加上真实字段并接通 ——
+  `storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}`
+  与 `partition.file.opendes.{staging,persistent}_container` → **生效**（+7）；
+  `storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 两阶段批提交未实现，
+  如实拒绝启动）与 `partition.file.opendes.storage_driver`（与顶层驱动冲突）→ **拒绝启动**（+3）。
+  用例：`tests/integration/test_config_wiring.cpp` 的 `[c10.16]`（驱动层 + 真实进程）。
+* 三态计数：**生效 89 / 拒绝启动 21 / 已读但无效果 46 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
 
 **未做（本阶段不承诺）**：`events.publisher=webhook`（需新增 L2 webhook 发布器）、`legal/schema.validator=remote`、
 `metadata/location.repository=postgres|remote`、`leader_election.*`/`leases.*` 的 PG 语义、

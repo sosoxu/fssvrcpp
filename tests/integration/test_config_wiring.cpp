@@ -38,6 +38,7 @@
 
 #include "common/crypto/crypto.h"
 #include "common/json/json.h"
+#include "infra/blob/posix/posix_blob_store.h"
 
 #include <grpcpp/grpcpp.h>
 #include <osdu/file/v1/file_service.grpc.pb.h>
@@ -45,6 +46,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utime.h>
 
@@ -1298,5 +1300,341 @@ TEST_CASE("★ C10.16：非法校验算法 → exit 78；默认算法不在集�
     CAPTURE(server.DumpLog());
     REQUIRE(WaitReady(http_port));
     REQUIRE(HttpGet(http_port, "/api/file/v2/readiness_check").status == 200);
+  }
+}
+
+// =============================================================================
+//  C10.16 续（阶段 10 收尾）：`storage.posix.*` 细节键 与 `partition.file.*` 容器名
+// =============================================================================
+//  ★ 为什么分两层验证：
+//    · **驱动层**（真实 `PosixBlobStore` + 可注入 fadvise 接缝）—— 权限位、原子写分支、
+//      fadvise 是否真的被下发，这些在进程级不可观察（`posix_fadvise` 没有可依赖的返回值）；
+//    · **真实进程**（`build/bin/fss_server` + `--config`）—— 证明组合根确实把这些键
+//      映射到了驱动与装配点（"测试夹具接上了、组合根没接"= 产品里不存在，P9-D10）。
+//  ★ R1 对照：atomic_write 两种模式在同一个"失败注入"下都不得留下半成品；fadvise
+//    关掉开关后同一段大读必须**不再**下发 DONTNEED（否则"计数 > 0"可能只是恒真）。
+// =============================================================================
+namespace {
+
+//  故障注入字节源：给出 `good_bytes` 个字节后返回错误 → `put` 必须失败。
+class FailingSource final : public fss::bytes::ByteSource {
+ public:
+  explicit FailingSource(std::size_t good_bytes) : good_bytes_(good_bytes) {}
+  fss::Result<std::size_t> Read(char* out, std::size_t capacity) override {
+    if (emitted_ >= good_bytes_) {
+      return fss::Err(fss::ErrorKind::kInternal, "注入的读取失败（C10.16 续的故障注入）");
+    }
+    const std::size_t n = std::min(capacity, good_bytes_ - emitted_);
+    for (std::size_t i = 0; i < n; ++i) out[i] = 'x';
+    emitted_ += n;
+    return n;
+  }
+
+ private:
+  std::size_t good_bytes_;
+  std::size_t emitted_ = 0;
+};
+
+//  计数型 fadvise 接缝：把"提示真的被下发"变成可断言的事实。
+class CountingFadviseSink final : public fss::infra::IFadviseSink {
+ public:
+  void Random(int) override { ++random; }
+  void DontNeed(int) override { ++dontneed; }
+  int random = 0;
+  int dontneed = 0;
+};
+
+std::size_t CountRegularFiles(const std::string& dir) {
+  std::size_t count = 0;
+  if (!std::filesystem::is_directory(dir)) return 0;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(dir)) {
+    if (entry.is_regular_file()) ++count;
+  }
+  return count;
+}
+
+unsigned ModeBits(const std::string& path) {
+  struct ::stat info {};
+  if (::stat(path.c_str(), &info) != 0) return 0xFFFFFFFFu;
+  return static_cast<unsigned>(info.st_mode & 07777);
+}
+
+}  // namespace
+
+TEST_CASE("★ C10.16 续：storage.posix.{dir_mode,file_mode,atomic_write,fadvise_*} 在驱动层生效",
+          "[phase10][config][c10.16][posix]") {
+  TempDir work("c1016_posix_opts");
+  const std::string root = work.child("blobs");
+  fss::SystemClock clock;
+  fss::domain::ObjectRef ref;
+  ref.container = "opendes-staging";
+  ref.key = "osdu-user/seq-1/file";
+
+  SECTION("dir_mode / file_mode → mkdir/open 用的就是配置的权限位") {
+    fss::infra::PosixBlobStoreOptions options;
+    options.fsync_policy = fss::infra::FsyncPolicy::kNever;
+    options.dir_mode = 0700;
+    options.file_mode = 0600;
+    fss::infra::PosixBlobStore store(root, clock, options);
+    REQUIRE(store.ensure_container(ref.container).ok());
+    fss::bytes::StringSource source(std::string("mode-check"));
+    REQUIRE(store.put(ref, source, fss::domain::PutOptions{}).ok());
+
+    const std::string dir = root + "/" + ref.container;
+    const std::string file = dir + "/" + ref.key;
+    INFO("dir=" << dir << " mode=" << std::oct << ModeBits(dir));
+    INFO("file=" << file << " mode=" << std::oct << ModeBits(file));
+    REQUIRE(ModeBits(dir) == 0700u);
+    REQUIRE(ModeBits(file) == 0600u);
+  }
+
+  SECTION("fadvise_random → 写/读路径各一次；DONTNEED 只对 > 1 MiB 的读（含关闭对照）") {
+    CountingFadviseSink sink;
+    fss::infra::PosixBlobStoreOptions options;
+    options.fsync_policy = fss::infra::FsyncPolicy::kNever;
+    options.fadvise_sink = &sink;
+    options.fadvise_random = true;
+    options.fadvise_dontneed_after_large_read = true;
+    fss::infra::PosixBlobStore store(root, clock, options);
+    REQUIRE(store.ensure_container(ref.container).ok());
+
+    fss::bytes::StringSource small(std::string(1024, 'a'));
+    REQUIRE(store.put(ref, small, fss::domain::PutOptions{}).ok());
+    REQUIRE(sink.random == 1);  // 写路径
+    REQUIRE(sink.dontneed == 0);
+
+    fss::bytes::StringSink small_out;
+    REQUIRE(store.get(ref, small_out, fss::domain::ByteRange{}).ok());
+    REQUIRE(small_out.str().size() == 1024);
+    REQUIRE(sink.random == 2);  // 读路径
+    REQUIRE(sink.dontneed == 0);  // 1 KiB < 阈值 → 不触发
+
+    fss::domain::ObjectRef big_ref;
+    big_ref.container = ref.container;
+    big_ref.key = "osdu-user/seq-1/big";
+    fss::bytes::StringSource big(std::string(2 * 1024 * 1024, 'b'));
+    REQUIRE(store.put(big_ref, big, fss::domain::PutOptions{}).ok());
+    fss::bytes::StringSink big_out;
+    REQUIRE(store.get(big_ref, big_out, fss::domain::ByteRange{}).ok());
+    REQUIRE(big_out.str().size() == 2 * 1024 * 1024);
+    REQUIRE(sink.dontneed == 1);  // 2 MiB > 1 MiB → 触发一次
+
+    //  ★ R1 对照：把两个开关都关掉 → 同一段大读**不再**下发任何提示。
+    //    （没有这条，"dontneed == 1" 无法区分"配置生效"与"实现恒发"。）
+    CountingFadviseSink off_sink;
+    fss::infra::PosixBlobStoreOptions off_options;
+    off_options.fsync_policy = fss::infra::FsyncPolicy::kNever;
+    off_options.fadvise_sink = &off_sink;
+    off_options.fadvise_random = false;
+    off_options.fadvise_dontneed_after_large_read = false;
+    fss::infra::PosixBlobStore off_store(root, clock, off_options);
+    fss::bytes::StringSink off_out;
+    REQUIRE(off_store.get(big_ref, off_out, fss::domain::ByteRange{}).ok());
+    REQUIRE(off_out.str().size() == 2 * 1024 * 1024);
+    REQUIRE(off_sink.random == 0);
+    REQUIRE(off_sink.dontneed == 0);
+  }
+
+  SECTION("atomic_write=false：失败注入后目标不残留（默认 true 同样不留半成品）") {
+    for (const bool atomic : {false, true}) {
+      const std::string sub_root = work.child(atomic ? "atomic_on" : "atomic_off");
+      fss::infra::PosixBlobStoreOptions options;
+      options.fsync_policy = fss::infra::FsyncPolicy::kNever;
+      options.atomic_write = atomic;
+      fss::infra::PosixBlobStore store(sub_root, clock, options);
+      REQUIRE(store.ensure_container(ref.container).ok());
+
+      FailingSource failing(1024);
+      const auto result = store.put(ref, failing, fss::domain::PutOptions{});
+      INFO("atomic_write=" << atomic << " 错误=" << result.error().ToString());
+      REQUIRE_FALSE(result.ok());
+      //  ① 目标文件绝不残留（"打开即截断"的非原子模式尤其关键）
+      REQUIRE_FALSE(
+          std::filesystem::exists(sub_root + "/" + ref.container + "/" + ref.key));
+      //  ② 临时文件也不残留
+      std::size_t leftovers = 0;
+      for (const auto& entry : std::filesystem::recursive_directory_iterator(sub_root)) {
+        if (entry.is_regular_file() &&
+            entry.path().filename().string().find(".tmp.") != std::string::npos) {
+          ++leftovers;
+        }
+      }
+      REQUIRE(leftovers == 0);
+    }
+
+    //  ★ 正例对照（R16）：同一段代码在成功路径上**必须**留下对象 ——
+    //    否则上面的"不存在"可能只是"这个 key 永远写不进去"。
+    fss::infra::PosixBlobStoreOptions ok_options;
+    ok_options.fsync_policy = fss::infra::FsyncPolicy::kNever;
+    fss::infra::PosixBlobStore ok_store(work.child("atomic_ok"), clock, ok_options);
+    REQUIRE(ok_store.ensure_container(ref.container).ok());
+    fss::bytes::StringSource good(std::string("complete-object"));
+    REQUIRE(ok_store.put(ref, good, fss::domain::PutOptions{}).ok());
+    REQUIRE(std::filesystem::exists(work.child("atomic_ok") + "/" + ref.container + "/" +
+                                    ref.key));
+  }
+}
+
+TEST_CASE("★ C10.16 续：storage.posix.dir_mode / file_mode 从配置生效（真实进程 stat 权限位）",
+          "[phase10][config][c10.16]") {
+  TempDir data_dir("c1016_posix_mode");
+  const int http_port = FreePort();
+  const std::string root = data_dir.child("data");
+  const std::string config = WriteFile(
+      data_dir, "posix_mode.json",
+      "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(http_port) +
+          ", \"bind\": \"127.0.0.1\"}},\n"
+          "  \"storage\": {\"posix\": {\"root\": \"" + root +
+          "\", \"dir_mode\": \"0700\", \"file_mode\": \"0600\"}},\n"
+          "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child("loc.db") + "\"}},\n"
+          "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child("meta.db") + "\"}},\n"
+          "  \"self_signed\": {\"signing_key\": \"c1016-posix-mode\"},\n"
+          "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  ServerProcess server(SelfContainedOptions({"--config", config}));
+  REQUIRE(server.http_port() == http_port);
+  CAPTURE(server.DumpLog());
+  REQUIRE(WaitReady(http_port));
+
+  //  uploadURL 会在 staging 区创建空对象 → 触发目录创建（dir_mode）与文件写入（file_mode）
+  const auto reply = HttpGet(http_port, "/api/file/v2/files/uploadURL", Authed());
+  REQUIRE(reply.status == 200);
+
+  const std::string staging_dir = root + "/blobs/opendes-staging";
+  const std::string persistent_dir = root + "/blobs/opendes-persistent";
+  CAPTURE(staging_dir, persistent_dir);
+  REQUIRE(ModeBits(staging_dir) == 0700u);
+  REQUIRE(ModeBits(persistent_dir) == 0700u);
+
+  bool saw_object = false;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(staging_dir)) {
+    if (!entry.is_regular_file()) continue;
+    if (entry.path().extension() == ".fssmeta") continue;  // 侧车文件另算
+    CAPTURE(entry.path().string());
+    REQUIRE(ModeBits(entry.path().string()) == 0600u);
+    saw_object = true;
+  }
+  REQUIRE(saw_object);
+}
+
+TEST_CASE("★ C10.16 续：partition.file.opendes.{staging,persistent}_container 自定义值真的生效",
+          "[phase10][config][c10.16]") {
+  TempDir data_dir("c1016_container");
+  const int http_port = FreePort();
+  const std::string root = data_dir.child("data");
+  const std::string config = WriteFile(
+      data_dir, "container.json",
+      "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(http_port) +
+          ", \"bind\": \"127.0.0.1\"}},\n"
+          "  \"storage\": {\"posix\": {\"root\": \"" + root + "\"}},\n"
+          "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child("loc.db") + "\"}},\n"
+          "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child("meta.db") + "\"}},\n"
+          "  \"self_signed\": {\"signing_key\": \"c1016-container\"},\n"
+          "  \"partition\": {\"file\": {\"opendes\": {\"staging_container\": \"custom-stage-1\","
+          " \"persistent_container\": \"custom-persist-1\", \"storage_driver\": \"posix\"}}},\n"
+          "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  //  ★ R16 正例：自定义容器名 + 与顶层一致的 storage_driver → 必须能启动。
+  ServerProcess server(SelfContainedOptions({"--config", config}));
+  REQUIRE(server.http_port() == http_port);
+  CAPTURE(server.DumpLog());
+  REQUIRE(WaitReady(http_port));
+
+  const std::string custom_staging = root + "/blobs/custom-stage-1";
+  const std::string default_staging = root + "/blobs/opendes-staging";
+  CAPTURE(custom_staging, default_staging);
+  //  ① 启动时按**配置的**容器名创建目录；默认名目录不出现
+  REQUIRE(std::filesystem::is_directory(custom_staging));
+  REQUIRE(std::filesystem::is_directory(root + "/blobs/custom-persist-1"));
+  REQUIRE_FALSE(std::filesystem::exists(default_staging));
+
+  //  ② 上传地址签发（ObjectKeyPolicy::ContainerFor → 配置值）→ 对象落在自定义容器下
+  const auto reply = HttpGet(http_port, "/api/file/v2/files/uploadURL", Authed());
+  REQUIRE(reply.status == 200);
+  REQUIRE(CountRegularFiles(custom_staging) > 0);
+  REQUIRE_FALSE(std::filesystem::exists(default_staging));
+}
+
+TEST_CASE("★ C10.16 续：非法容器名 / 分区级驱动冲突 / 非法权限位 → exit 78",
+          "[phase10][config][c10.16]") {
+  TempDir data_dir("c1016_container_bad");
+  const int http_port = FreePort();
+  auto config_with = [&](const std::string& tag, const std::string& partition_body) {
+    return WriteFile(
+        data_dir, tag + ".json",
+        "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(http_port) +
+            ", \"bind\": \"127.0.0.1\"}},\n"
+            "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child(tag + "-data") +
+            "\"}},\n"
+            "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-loc.db") +
+            "\"}},\n"
+            "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-meta.db") +
+            "\"}},\n"
+            "  \"self_signed\": {\"signing_key\": \"c1016-bad\"},\n"
+            "  \"partition\": {\"file\": {\"opendes\": {" + partition_body + "}}},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  };
+
+  SECTION("容器名含 '/' → exit 78，且信息里点名 staging_container") {
+    const auto outcome = RunServerForExit(
+        {"--config", config_with("bad_container", "\"staging_container\": \"a/b\"")});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("staging_container") != std::string::npos);
+  }
+
+  SECTION("分区级 storage_driver 与顶层 storage.driver 冲突 → exit 78 并说明") {
+    const auto outcome =
+        RunServerForExit({"--config", config_with("bad_driver", "\"storage_driver\": \"s3\"")});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("storage_driver") != std::string::npos);
+    REQUIRE(outcome.output.find("冲突") != std::string::npos);
+  }
+
+  SECTION("storage.posix.dir_mode 不是八进制权限位 → exit 78") {
+    const std::string config = WriteFile(
+        data_dir, "bad_mode.json",
+        "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(http_port) +
+            ", \"bind\": \"127.0.0.1\"}},\n"
+            "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child("bad_mode-data") +
+            "\", \"dir_mode\": \"8x\"}},\n"
+            "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child("bad_mode-loc.db") +
+            "\"}},\n"
+            "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child("bad_mode-meta.db") +
+            "\"}},\n"
+            "  \"self_signed\": {\"signing_key\": \"c1016-bad\"},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+    const auto outcome = RunServerForExit({"--config", config});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("dir_mode") != std::string::npos);
+  }
+
+  SECTION("storage.posix.group_commit_max_batch / sync_dir_after_batch 非默认 → exit 78（批提交未实现）") {
+    auto cfg_with_posix = [&](const std::string& tag, const std::string& posix_extra) {
+      return WriteFile(
+          data_dir, tag + ".json",
+          "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(http_port) +
+              ", \"bind\": \"127.0.0.1\"}},\n"
+              "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child(tag + "-data") +
+              "\", " + posix_extra + "}},\n"
+              "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-loc.db") +
+              "\"}},\n"
+              "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-meta.db") +
+              "\"}},\n"
+              "  \"self_signed\": {\"signing_key\": \"c1016-bad\"},\n"
+              "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+    };
+    const auto outcome = RunServerForExit(
+        {"--config", cfg_with_posix("bad_batch", "\"group_commit_max_batch\": 7")});
+    CAPTURE(outcome.exit_code, outcome.output);
+    REQUIRE(outcome.exit_code == 78);
+    REQUIRE(outcome.output.find("批提交协议未实现") != std::string::npos);
+    REQUIRE(outcome.output.find("ADR-008") != std::string::npos);
+
+    const auto outcome2 = RunServerForExit(
+        {"--config", cfg_with_posix("bad_syncdir", "\"sync_dir_after_batch\": false")});
+    CAPTURE(outcome2.exit_code, outcome2.output);
+    REQUIRE(outcome2.exit_code == 78);
+    REQUIRE(outcome2.output.find("批提交协议未实现") != std::string::npos);
   }
 }

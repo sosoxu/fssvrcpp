@@ -17,6 +17,7 @@
 
 #include "common/result/result.h"
 #include "domain/model/types.h"
+#include "domain/ports/ports.h"
 
 #include <cstdint>
 #include <string>
@@ -58,8 +59,20 @@ class ObjectKeyPolicy {
   static std::string MakePosixKey(const SourcePath& parts);
   static std::string MakeS3Key(const SourcePath& parts);
 
-  //  容器名：`<partition>-<zone 小写>`（如 `opendes-staging`）
+  //  容器名：`<partition>-<zone 小写>`（如 `opendes-staging`）—— **默认命名**，
+  //  与接线前逐字一致。
   static Result<std::string> ContainerFor(std::string_view partition, domain::StorageZone zone);
+
+  //  ★ 阶段 10（C10.16 续）：分区级容器名覆盖
+  //    `partition.file.<partition>.{staging,persistent}_container`。配置为空串时
+  //    **退回上面的默认命名**（逐字一致），非空时用配置值（同样过安全白名单校验）。
+  static Result<std::string> ContainerFor(const domain::PartitionConfig& config,
+                                          domain::StorageZone zone);
+
+  //  经租户注册表解析容器名：注册表查不到该 partition → 退回默认命名。所有需要
+  //  "与分区配置一致的容器名"的调用点（用例 / GC / 组合根）都走这一条。
+  static Result<std::string> ContainerFor(domain::IPartitionRegistry& partitions,
+                                          std::string_view partition, domain::StorageZone zone);
 
   //  旧接口 `FileID` 校验：`^[\w,\s-]+(\.\w+)?$` + 长度上限（契约 §1.5）
   static bool IsValidFileId(std::string_view file_id);

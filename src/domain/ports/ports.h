@@ -214,6 +214,14 @@ struct PartitionConfig {
   std::int64_t quota_bytes = -1;         // -1 = 不限
   bool legal_tag_validation = true;
   bool schema_validation = false;
+  //  ★ 阶段 10（C10.16 续）：`partition.file.<partition>.{staging_container,
+  //    persistent_container,storage_driver}`。空串 = **与接线前逐字一致**的默认命名
+  //    （`<partition>-staging` / `<partition>-persistent`）与"驱动跟随顶层
+  //    `storage.driver`"。非空值由组合根从配置读入；`storage_driver` 与顶层冲突时
+  //    组合根**拒绝启动**（分区级驱动覆盖未交付 —— 组合根只装配一个 BlobStore）。
+  std::string staging_container;
+  std::string persistent_container;
+  std::string storage_driver;
   json::Value extra = json::Value::object();
 };
 

@@ -1,5 +1,6 @@
 #include "app/services/object_key_policy.h"
 
+#include "common/result/result.h"
 #include "common/time/time_format.h"
 
 #include <algorithm>
@@ -180,20 +181,52 @@ std::string ObjectKeyPolicy::MakeS3Key(const SourcePath& parts) {
   return yyyy + "/" + mm + "/" + dd + "/" + parts.file_id;
 }
 
-Result<std::string> ObjectKeyPolicy::ContainerFor(std::string_view partition, domain::StorageZone zone) {
-  if (partition.empty()) {
-    return Err(ErrorKind::kInvalidArgument, "partition 不能为空");
+namespace {
+
+//  容器名的安全白名单（partition 名与**配置里的容器名**共用一套规则）：
+//  非空、无控制字符、无路径分隔符、无 '%'（避免二次编码）。容器名随后会作为
+//  `fs::LexicalJoin` 的 key 段使用，任何能构成路径语义的字符都不能放过。
+Result<std::string> ValidateContainerName(std::string_view name, const char* what) {
+  if (name.empty()) {
+    return Err(ErrorKind::kInvalidArgument, std::string(what) + " 不能为空");
   }
-  for (const char c : partition) {
+  for (const char c : name) {
     const auto u = static_cast<unsigned char>(c);
     if (u < 0x20 || u == 0x7F || c == '/' || c == '\\' || c == '%') {
-      return Err(ErrorKind::kInvalidArgument, "partition 含非法字符：" + std::string(partition));
+      return Err(ErrorKind::kInvalidArgument,
+                 std::string(what) + " 含非法字符：" + std::string(name));
     }
   }
-  std::string out = UpperToLower(partition);
+  return std::string(name);
+}
+
+}  // namespace
+
+Result<std::string> ObjectKeyPolicy::ContainerFor(std::string_view partition, domain::StorageZone zone) {
+  FSS_TRY(name, ValidateContainerName(partition, "partition"));
+  std::string out = UpperToLower(name);
   out += '-';
   out += (zone == domain::StorageZone::kStaging) ? "staging" : "persistent";
   return out;
+}
+
+Result<std::string> ObjectKeyPolicy::ContainerFor(const domain::PartitionConfig& config,
+                                                  domain::StorageZone zone) {
+  const std::string& override_name = (zone == domain::StorageZone::kStaging)
+                                         ? config.staging_container
+                                         : config.persistent_container;
+  if (override_name.empty()) return ContainerFor(config.partition, zone);
+  return ValidateContainerName(override_name, "配置的容器名");
+}
+
+Result<std::string> ObjectKeyPolicy::ContainerFor(domain::IPartitionRegistry& partitions,
+                                                  std::string_view partition,
+                                                  domain::StorageZone zone) {
+  const auto config = partitions.Get(partition);
+  if (config.ok()) return ContainerFor(config.value(), zone);
+  //  注册表里没有这个 partition（例如内置注册表只登记 opendes）→ **接线前的默认命名**，
+  //  绝不因为"查不到配置"而改变既有行为。
+  return ContainerFor(partition, zone);
 }
 
 bool ObjectKeyPolicy::IsValidFileId(std::string_view file_id) {

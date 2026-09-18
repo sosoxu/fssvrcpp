@@ -541,6 +541,11 @@ struct PartitionFileOptions {
   std::int64_t max_file_bytes = 0;
   std::vector<std::string> allowed_checksum_algorithms = {"SHA-256", "SHA-1", "MD5"};
   std::string default_checksum_algorithm = "SHA-256";
+  //  ★ 阶段 10（C10.16 续）：容器名与分区级驱动。空串 = 与接线前逐字一致的默认
+  //    （`<partition>-staging` / `<partition>-persistent` / 跟随顶层 `storage.driver`）。
+  std::string staging_container;
+  std::string persistent_container;
+  std::string storage_driver;
 };
 
 PartitionFileOptions ReadPartitionFileOptions(const fss::config::Config& cfg, Resolver& resolver) {
@@ -564,6 +569,23 @@ PartitionFileOptions ReadPartitionFileOptions(const fss::config::Config& cfg, Re
       v != nullptr && v->is_string()) {
     out.default_checksum_algorithm = v->get<std::string>();
     resolver.NoteDynamic(prefix + "default_checksum_algorithm", out.default_checksum_algorithm);
+  }
+  //  ★ 阶段 10（C10.16 续）：容器名与分区级驱动 —— 这三条是**真正被使用**的（容器名）
+  //    或**做启动期冲突判定**的（driver），不是只登记来源。
+  if (const auto* v = FindIn(cfg.effective(), prefix + "staging_container");
+      v != nullptr && v->is_string()) {
+    out.staging_container = v->get<std::string>();
+    resolver.NoteDynamic(prefix + "staging_container", out.staging_container);
+  }
+  if (const auto* v = FindIn(cfg.effective(), prefix + "persistent_container");
+      v != nullptr && v->is_string()) {
+    out.persistent_container = v->get<std::string>();
+    resolver.NoteDynamic(prefix + "persistent_container", out.persistent_container);
+  }
+  if (const auto* v = FindIn(cfg.effective(), prefix + "storage_driver");
+      v != nullptr && v->is_string()) {
+    out.storage_driver = v->get<std::string>();
+    resolver.NoteDynamic(prefix + "storage_driver", out.storage_driver);
   }
   return out;
 }
@@ -600,6 +622,49 @@ std::string ValidatePartitionChecksums(const PartitionFileOptions& options) {
   if (std::find(allowed.begin(), allowed.end(), *default_algorithm) == allowed.end()) {
     return "partition.file." + options.partition + ".default_checksum_algorithm（" +
            options.default_checksum_algorithm + "）不在 allowed_checksum_algorithms 集合内";
+  }
+  return {};
+}
+
+//  ★ 阶段 10（C10.16 续）：容器名与分区级驱动的启动期校验。
+//    · 容器名是**安全边界**（`ObjectKeyPolicy::ContainerFor` 会把它拼进对象路径）：
+//      非法字符必须在启动期被拒，而不是等到请求期在 `fs::SafeJoin` 里失败 —— 那时
+//      运维看到的是"上传 500"，与配置的因果关系太远。
+//    · `storage_driver` 只能"跟随顶层"：组合根只装配**一个** BlobStore
+//      （`SingleStoreFactory` 的所有 partition/zone 共用它），分区级覆盖做不到。
+//      冲突时**拒绝启动**并说明，而不是静默忽略（R15：「写了但没生效」等于不存在）。
+//    返回空串 = 通过（R16：默认/合法值必须能启动）。
+std::string ValidatePartitionContainers(const PartitionFileOptions& options,
+                                        const std::string& top_level_driver) {
+  const auto check_name = [&](const std::string& name, const char* key) -> std::string {
+    if (name.empty()) return {};  // 空 = 默认命名
+    if (name == "." || name == "..") {
+      return "partition.file." + options.partition + "." + key + " 不能是 \".\" / \"..\"";
+    }
+    for (const char c : name) {
+      const auto u = static_cast<unsigned char>(c);
+      if (u < 0x20 || u == 0x7F || c == '/' || c == '\\' || c == '%') {
+        return "partition.file." + options.partition + "." + key +
+               " 含非法字符（不允许控制字符 / '/' / '\\' / '%'）：" + name;
+      }
+    }
+    return {};
+  };
+  if (const std::string problem = check_name(options.staging_container, "staging_container");
+      !problem.empty()) {
+    return problem;
+  }
+  if (const std::string problem = check_name(options.persistent_container, "persistent_container");
+      !problem.empty()) {
+    return problem;
+  }
+  if (!options.storage_driver.empty() && options.storage_driver != top_level_driver) {
+    return "partition.file." + options.partition + ".storage_driver（" + options.storage_driver +
+           "）与顶层 storage.driver（" + top_level_driver +
+           "）冲突 —— 分区级驱动覆盖未交付（组合根只装配一个 BlobStore，"
+           "SingleStoreFactory 的所有 partition/zone 共用它）。"
+           "下一步：删除该键（跟随顶层 storage.driver），或等按 partition/zone 分盘的"
+           "工厂交付后再接通。";
   }
   return {};
 }
@@ -1028,6 +1093,36 @@ int main(int argc, char** argv) {
   const long clock_skew_tolerance_seconds =
       resolver.Int("deployment.clock_skew_tolerance_seconds", 60);
 
+  //  ---- 阶段 10（C10.16 续）：`storage.posix.*` 细节键 ----
+  //  ★ 5 个**真接通**（驱动层有对应字段），2 个只做拒绝启动守卫（批提交协议未实现）。
+  const long posix_group_commit_max_batch =
+      resolver.Int("storage.posix.group_commit_max_batch", 500);
+  const bool posix_sync_dir_after_batch =
+      resolver.Bool("storage.posix.sync_dir_after_batch", true);
+  const bool posix_atomic_write = resolver.Bool("storage.posix.atomic_write", true);
+  const std::string posix_dir_mode_text = resolver.Str("storage.posix.dir_mode", "0750");
+  const std::string posix_file_mode_text = resolver.Str("storage.posix.file_mode", "0640");
+  const bool posix_fadvise_random = resolver.Bool("storage.posix.fadvise_random", true);
+  const bool posix_fadvise_dontneed =
+      resolver.Bool("storage.posix.fadvise_dontneed_after_large_read", false);
+  //  权限位是**八进制**字符串（schema 类型是 string，如 "0750"）。非法形态必须拒绝启动，
+  //  不能静默退回默认值（否则运维会以为生效了）。
+  const auto parse_octal_mode = [](const std::string& text) -> long {
+    if (text.empty()) return -1;
+    char* end = nullptr;
+    const long value = std::strtol(text.c_str(), &end, 8);
+    if (end == text.c_str() || *end != '\0' || value < 0 || value > 07777) return -1;
+    return value;
+  };
+  const long posix_dir_mode = parse_octal_mode(posix_dir_mode_text);
+  const long posix_file_mode = parse_octal_mode(posix_file_mode_text);
+  if (posix_dir_mode < 0 || posix_file_mode < 0) {
+    std::cerr << "拒绝启动：storage.posix.dir_mode / file_mode 必须是八进制权限位"
+                 "（如 \"0750\" / \"0640\"）；实际 dir_mode=\"" << posix_dir_mode_text
+              << "\"，file_mode=\"" << posix_file_mode_text << "\"。\n";
+    return kExitConfigError;
+  }
+
   //  ---- 部署形态（ADR-009）----
   const std::string deployment_mode = resolver.Str("deployment.mode", "single");
   const long max_clock_skew_seconds =
@@ -1171,6 +1266,18 @@ int main(int argc, char** argv) {
     return reject_startup(
         "deployment.clock_skew_tolerance_seconds 非默认 —— 该键用于「与数据库 now() 的偏移容忍」，"
         "而数据库时钟未交付（单实例用本地钟；multi 已拒绝启动）。下一步：保持 60。");
+  }
+  if (posix_group_commit_max_batch != 500 || !posix_sync_dir_after_batch) {
+    //  ★ 如实拒绝，不假装生效：ADR-008 的 P4（两阶段批提交：写整批 .tmp → syncfs →
+    //    统一 rename → fsync(dir)）在实现里**不存在**。现有代码只有"按大小决定是否
+    //    fdatasync + 改名后 fsync 目录"（`FsyncPolicy::kBySize`），既没有批边界，
+    //    也没有 `syncfs`。把这两个参数接上去只能是"读了但无效果"的假象。
+    return reject_startup(
+        "storage.posix.group_commit_max_batch / sync_dir_after_batch 非默认 —— "
+        "批提交协议未实现（ADR-008 的 P4 待做）：实现里只有「按大小决定是否 fdatasync + "
+        "改名后 fsync 目录」，没有「整批 .tmp → syncfs → 统一 rename」的两阶段顺序，"
+        "这两个参数没有可接的真实语义。下一步：保持 group_commit_max_batch=500 且 "
+        "sync_dir_after_batch=true，或在 ADR-008 §6 落地 P4 后再接通。");
   }
   if (location_sqlite_journal_mode != "WAL" && location_sqlite_journal_mode != "DELETE") {
     //  C10.14：位置仓储的 journal 模式只接通 WAL / DELETE 两档（Options 里是 `wal` 布尔）。
@@ -1316,6 +1423,14 @@ int main(int argc, char** argv) {
     //  ★ 临时文件名里的实例标识（ADR-009 M1：多实例共盘时不得互相踩）来自
     //    `deployment.instance_id`（schema 里唯一的实例标识键；默认 local）。
     posix_options.instance_id = posix_instance_id;
+    //  ★ 阶段 10（C10.16 续）：`storage.posix.*` 细节键 → 驱动层 Options。
+    //    `atomic_write=false` 走"直接写目标文件"分支（失败时删除目标，不留半成品）；
+    //    `dir_mode`/`file_mode` 是显式权限位；两个 fadvise 在读写路径上真的下发提示。
+    posix_options.atomic_write = posix_atomic_write;
+    posix_options.dir_mode = static_cast<decltype(posix_options.dir_mode)>(posix_dir_mode);
+    posix_options.file_mode = static_cast<decltype(posix_options.file_mode)>(posix_file_mode);
+    posix_options.fadvise_random = posix_fadvise_random;
+    posix_options.fadvise_dontneed_after_large_read = posix_fadvise_dontneed;
     blob_store = std::make_unique<PosixBlobStore>(storage_root + "/blobs", clock, posix_options);
   } else {
     std::cerr << "拒绝启动：未知的 storage.driver：" << storage_driver
@@ -1438,12 +1553,22 @@ int main(int argc, char** argv) {
                  "（大小写与 `-`/`_` 不计）。\n";
     return kExitConfigError;
   }
+  //  ★ 阶段 10（C10.16 续）：容器名 / 分区级驱动（非法容器名或驱动冲突 → exit 78）
+  if (const std::string problem = ValidatePartitionContainers(partition_file, storage_driver);
+      !problem.empty()) {
+    std::cerr << "拒绝启动（exit " << kExitConfigError << "）：" << problem << "\n";
+    return kExitConfigError;
+  }
 
   domain::PartitionConfig partition;
   partition.partition = partition_file.partition;
   partition.driver = storage_driver == "s3" ? domain::StorageDriver::kS3
                                             : domain::StorageDriver::kPosix;
   partition.posix_root = storage_root;
+  //  ★ 阶段 10：容器名覆盖（空串 → `ObjectKeyPolicy` 的默认命名，逐字一致）
+  partition.staging_container = partition_file.staging_container;
+  partition.persistent_container = partition_file.persistent_container;
+  partition.storage_driver = partition_file.storage_driver;
   //  0（schema 语义：不限）→ -1（端口语义：不限）
   partition.max_object_bytes = partition_file.max_file_bytes > 0 ? partition_file.max_file_bytes
                                                                  : -1;
@@ -1452,8 +1577,11 @@ int main(int argc, char** argv) {
   NoopLegalValidator legal;
   NoopSchemaValidator schema_validator;
 
+  //  ★ 阶段 10：把租户注册表交给 LocationIssuer —— 否则 uploadURL 签发的容器名与
+  //    用例/GC 解析出的容器名会不一致（`partition.file.*.staging_container` 只对
+  //    一半路径生效，等于没生效）。
   app::LocationIssuer issuer(blob_factory, *location_repository.value(), token_codec, clock, ids,
-                             self_base_url, expiry_options);
+                             self_base_url, expiry_options, &partitions);
 
   app::UseCasePorts ports{blob_factory,      *location_repository.value(),
                           *metadata_repository_handle.value(),
@@ -1482,7 +1610,9 @@ int main(int argc, char** argv) {
   //    否则**全新实例**每轮 GC 都会把"没有残留"记成 errors（`outcome="error"`），
   //    把正常状态误报成扫描失败。
   for (const auto zone : {domain::StorageZone::kStaging, domain::StorageZone::kPersistent}) {
-    const auto container = app::ObjectKeyPolicy::ContainerFor(gc_partition, zone);
+    //  ★ 阶段 10：用**注册表**解析容器名（分区级覆盖），否则自定义容器名在启动时
+    //    不会被创建，GC 每轮把"没有残留"记成 errors。
+    const auto container = app::ObjectKeyPolicy::ContainerFor(partitions, gc_partition, zone);
     if (container.ok()) (void)metered_blob.ensure_container(container.value());
   }
 

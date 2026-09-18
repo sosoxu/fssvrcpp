@@ -125,7 +125,8 @@ void GcTask::CollectExpiredStaging(std::string_view partition, const GcOptions& 
                                    GcReport& report) {
   //  ★ 单实例降级路径（`require_lease_expiry=false`）。多实例下这条路径被启动校验禁止：
   //    它的判据是"对象够旧"，而"够旧"无法区分"在途上传卡住了"与"上传者已经放弃"。
-  const auto container = ObjectKeyPolicy::ContainerFor(partition, domain::StorageZone::kStaging);
+  const auto container = ObjectKeyPolicy::ContainerFor(ports_.partitions, partition,
+                                                       domain::StorageZone::kStaging);
   if (!container.ok()) {
     ++report.errors;
     return;
@@ -190,7 +191,8 @@ void GcTask::CollectExpiredStaging(std::string_view partition, const GcOptions& 
 void GcTask::CollectOrphanObjects(std::string_view partition, const GcOptions& options,
                                   domain::IBlobStore& persistent, std::int64_t now_seconds,
                                   GcReport& report) {
-  const auto container = ObjectKeyPolicy::ContainerFor(partition, domain::StorageZone::kPersistent);
+  const auto container = ObjectKeyPolicy::ContainerFor(ports_.partitions, partition,
+                                                       domain::StorageZone::kPersistent);
   if (!container.ok()) {
     ++report.errors;
     return;
@@ -301,7 +303,8 @@ Result<GcReport> GcTask::Run(std::string_view partition, const GcOptions& option
     const SweepTarget targets[] = {{staging.value(), domain::StorageZone::kStaging},
                                    {persistent.value(), domain::StorageZone::kPersistent}};
     for (const auto& target : targets) {
-      const auto container = ObjectKeyPolicy::ContainerFor(partition, target.zone);
+      const auto container =
+          ObjectKeyPolicy::ContainerFor(ports_.partitions, partition, target.zone);
       if (!container.ok()) {
         ++report.errors;
         continue;

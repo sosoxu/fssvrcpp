@@ -3,14 +3,14 @@
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P10（配置面接线） |
-| 状态 | ✅ **切片 1/2/3 全部完成**：C10.1~C10.16 满足（C10.16 的容器名与 `storage.posix.*` 7 键无字段可接，按「不发明字段」如实登记；见 §6.5） |
+| 状态 | ✅ **切片 1/2/3 全部完成 + C10.16 + C10.16 续**：C10.1~C10.16 满足；**本轮（C10.16 续）**把原先「无字段可接」的 10 个键接通（5 + 2 生效、3 拒绝启动；见 §7） |
 | 门槛命令 | `ctest -L phase10 && scripts/verify_config_wiring.sh` |
 | 退出码 | `0` |
-| 新测试 | `tests/integration/test_config_wiring.cpp`：**16 个 TEST_CASE / 288 断言**（全部在真实 `build/bin/fss_server` 上；切片 2 在同一文件追加 6 个用例） |
+| 新测试 | `tests/integration/test_config_wiring.cpp`：**26 个 TEST_CASE / 499 断言**（真实 `build/bin/fss_server` + 驱动层；C10.16 续新增 4 用例 / 75 断言） |
 | 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
 | 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **76/76** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 82 / 拒绝启动（触发条件）18 / 已读但无效果 56**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 89 / 拒绝启动（触发条件）21 / 已读但无效果 46**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
 | 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
@@ -241,3 +241,106 @@ assertions: 31 | 30 passed | 1 failed
   `git ls-tree -r 4e3f701b^3` **为空** → 该 stash **不含未跟踪文件**，
   不存在"未跟踪改动丢失导致无法复现"的情形。
 * 既有断言**一条未放宽**（phase1/phase9 用例的期望值原样保留；C10.16 正例 200 与反例 413 并存，R16）。
+
+---
+
+## 7. C10.16 续（本轮收尾）：`storage.posix.*` 细节键与 `partition.file.*` 容器名
+
+**背景**：切片 1/2/3 与 C10.16 之后，`operations.md` §1.3.3 里还剩 10 个被标注为
+「无对应结构体字段」的键。本轮把「缺的是**字段**而不是行为」这件事如实推翻并接通：
+先读代码（`PosixBlobStore` 的真实读写路径、`ObjectKeyPolicy::ContainerFor` 的全部调用点、
+ADR-008 的 P4 是否落地），再决定**生效**或**拒绝启动**。
+
+### 7.1 逐键结论（10 个键）
+
+| 键 | 最终状态 | 依据 / 证据 |
+| --- | --- | --- |
+| `storage.posix.dir_mode` | **生效** | → `PosixBlobStoreOptions::dir_mode`；`ensure_container` 与对象父目录都走 `fs::EnsureDir(dir, mode)`。真实进程：配置 `"0700"` → `stat` `opendes-staging` / `opendes-persistent` 均为 `0700`。非法八进制（`"8x"`）→ exit 78 |
+| `storage.posix.file_mode` | **生效** | → `PosixBlobStoreOptions::file_mode`（`open(2)` 的 mode）。真实进程：配置 `"0600"` → `stat` staging 对象 = `0600`。⚠️ 接线前实现固定 `0644`；`PosixBlobStoreOptions` 的默认仍是 `0644`（既有驱动/契约测试不变），schema 默认 `0640` 由组合根传入 |
+| `storage.posix.atomic_write` | **生效** | 默认 `true`（tmp + rename，与接线前一致）；`false` → 直接写目标文件。驱动层故障注入（读到一半返回错误）：**两种模式**下目标与 `.tmp.*` 都不残留；正例对照 = 同一段代码写成功时对象存在 |
+| `storage.posix.fadvise_random` | **生效** | 写路径（`put`）/读路径（`get`）各下发一次 `POSIX_FADV_RANDOM`；`IFadviseSink` 计数接缝断言（默认关闭 → 0 次；打开 → 1/2 次） |
+| `storage.posix.fadvise_dontneed_after_large_read` | **生效** | 读出 > 1 MiB 才下发 `POSIX_FADV_DONTNEED`；1 KiB 读 0 次、2 MiB 读 1 次、关掉开关后同一段大读 0 次（R1 对照） |
+| `partition.file.opendes.staging_container` | **生效** | → `PartitionConfig::staging_container`；`ObjectKeyPolicy::ContainerFor(IPartitionRegistry&, …)` 统一解析（uploadURL 签发 / 用例 / GC / 启动建目录）。真实进程：`custom-stage-1` 目录出现且 uploadURL 后其下有对象，`opendes-staging` **不出现** |
+| `partition.file.opendes.persistent_container` | **生效** | 同上；真实进程：`custom-persist-1` 目录出现 |
+| `storage.posix.group_commit_max_batch` | **拒绝启动** | ADR-008 的 **P4（写整批 `.tmp` → `syncfs` → 统一 rename → `fsync(dir)`）实现里不存在**：只有 `FsyncPolicy::kBySize` 的"按大小决定是否 fdatasync + 改名后 fsync 目录"。非默认（`500`）→ exit 78 + 「批提交协议未实现（ADR-008 的 P4 待做）」 |
+| `storage.posix.sync_dir_after_batch` | **拒绝启动** | 同上（没有"批末"这个时刻）。非默认（`false`）→ exit 78 |
+| `partition.file.opendes.storage_driver` | **拒绝启动** | 与顶层 `storage.driver` 不一致 → exit 78 并说明（组合根只装配一个 `BlobStore`，`SingleStoreFactory` 的所有 partition/zone 共用）；**等于顶层值（或空）→ 正常启动**（R16 正例） |
+
+### 7.2 实现点（可点击）
+
+* `src/infra/blob/posix/posix_blob_store.h` / `.cpp`：`PosixBlobStoreOptions` 新增 5 字段 +
+  `IFadviseSink` 可注入接缝；`put`/`copy` 支持非原子直写（失败删目标）、`get` 的 DONTNEED 阈值；
+  `ensure_container` / `WritableObjectPath` 用 `dir_mode`。
+* `src/domain/ports/ports.h`：`PartitionConfig` 新增 `staging_container` / `persistent_container` /
+  `storage_driver`（空串 = 与接线前逐字一致的默认命名）。
+* `src/app/services/object_key_policy.{h,cpp}`：新增
+  `ContainerFor(const PartitionConfig&, zone)` 与 `ContainerFor(IPartitionRegistry&, partition, zone)`
+  （注册表查不到 → 退回默认命名）；容器名白名单校验与 partition 名共用。
+* `src/app/services/location_issuer.{h,cpp}`：可选的租户注册表（默认 `nullptr` → 既有调用点不变）。
+* `src/app/usecases/usecases.cpp`（3 处）、`src/app/tasks/gc_task.cpp`（3 处）、
+  `src/main/server_main.cpp`（启动建容器）：容器名统一走注册表。
+* `src/main/server_main.cpp`：读取 7 个 `storage.posix.*` 键（八进制解析失败 → exit 78）、
+  映射到 `PosixBlobStoreOptions`；批提交两键 → 拒绝启动；`partition.file.*` 的容器名/驱动
+  启动期校验；`LocationIssuer` 传入 `&partitions`。
+* `tests/integration/test_config_wiring.cpp`：新增 4 用例 / 75 断言（驱动层 + 真实进程两层；
+  含关闭对照与失败注入的 R1 对照）；`tests/CMakeLists.txt` 给该测试补 `fss_blob_posix fss_io`。
+* 文档：`docs/operations.md`（§1.2 逐键行、§1.3 三态表与三个清单、§1.3.3 理由表、§7 汇总行）、
+  `docs/00-final-design.md` §5.w（推翻「无字段可接」）与 §6/§7、`docs/02-design.md` §16.1、
+  `docs/04-implementation-plan.md`、`AGENTS.md`、`tests/unit/test_operations_doc.cpp`（期望值同步）。
+
+### 7.3 实测命令与输出摘要
+
+```
+$ cmake -S . -B build && cmake --build build -j"$(nproc)"          # 构建通过（0 error）
+$ ctest --test-dir build -j4
+100% tests passed, 0 tests failed out of 76
+
+$ ctest --test-dir build -L phase10
+phase10 = 3.03 sec*proc (1 test)         # 1 个测试二进制 / 26 用例 / 499 断言
+
+$ ./build/bin/test_config_wiring "★ C10.16 续*"
+All tests passed (75 assertions in 4 test cases)
+
+$ ./scripts/check_docs.sh
+全部检查通过（D1~D5）                 # 53 链接 / 12 ADR / 阶段表一致 / 126 条门槛
+
+$ ./scripts/verify_config_wiring.sh
+配置面接线：全部通过（54 条断言）
+```
+
+### 7.4 R1 自证（注入 → 用例失败 → 还原 → 实测输出）
+
+注入：把 `ObjectKeyPolicy::ContainerFor(const PartitionConfig&, …)` 的
+`if (override_name.empty())` 改成 `if (true)`（等价于"容器名覆盖永远不生效"）：
+
+```
+$ ./build/bin/test_config_wiring "★ C10.16 续：partition.file*"
+/home/ll/fssvrcpp/tests/integration/test_config_wiring.cpp:1545: FAILED:
+  REQUIRE( std::filesystem::is_directory(custom_staging) )
+with expansion:
+  false
+$ echo $?      # 1
+```
+
+还原（`git diff -- src` 无注入残留；`grep -rn R1-INJECT src/` → none）后：
+
+```
+$ ./build/bin/test_config_wiring "★ C10.16 续：partition.file*"
+All tests passed (14 assertions in 1 test case)
+```
+
+即：该用例**真的**依赖配置值经过 `ContainerFor` 生效，而不是"恒真"。
+
+### 7.5 未做 / 仍无效果（如实登记）
+
+* `storage.posix.{shared_mount_required,one_filesystem_per_partition}` 仍「已读但无效果」
+  （依赖 `deployment.mode=multi` 运行形态，而 multi 本身拒绝启动）。
+* 其余 44 个「已读但无效果」键不变（逐键理由与下一步见 `operations.md` §1.3.3）。
+* ADR-008 的 P4（两阶段批提交）**仍未实现** —— 本轮不假装接通，改为对
+  `group_commit_max_batch` / `sync_dir_after_batch` 的非默认值**拒绝启动**。
+
+### 7.6 三态计数（收尾）
+
+`config/fss.example.json` 的 **156** 个叶子键：**生效 89 / 拒绝启动（触发条件）21 /
+已读但无效果 46**（`89 + 21 + 46 = 156`；由 `tests/unit/test_operations_doc.cpp` 的
+C10.11 用例从 §1.2 的 156 行程序化提取并机械断言，正文声明的数字也一并断言）。

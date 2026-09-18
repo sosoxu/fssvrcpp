@@ -507,7 +507,8 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   const domain::FileLocation location = location_result.value();
   FSS_TRY(from_ref, ObjectRefFromLocation(location));
   FSS_TRY(persistent_container,
-          ObjectKeyPolicy::ContainerFor(caller.partition, domain::StorageZone::kPersistent));
+          ObjectKeyPolicy::ContainerFor(ports_.partitions, caller.partition,
+                                        domain::StorageZone::kPersistent));
   domain::ObjectRef to_ref;
   to_ref.container = persistent_container;
   to_ref.key = from_ref.key;
@@ -777,7 +778,8 @@ fss::Result<std::vector<CopyFileOutcome>> CopyFiles::Execute(
     }
     const auto from_ref = ObjectRefFromLocation(location.value());
     const auto persistent_container =
-        ObjectKeyPolicy::ContainerFor(caller.partition, domain::StorageZone::kPersistent);
+        ObjectKeyPolicy::ContainerFor(ports_.partitions, caller.partition,
+                                      domain::StorageZone::kPersistent);
     if (!from_ref.ok() || !persistent_container.ok()) {
       outcome.success = false;
       out.push_back(std::move(outcome));
@@ -1011,7 +1013,8 @@ fss::Result<ServerSideCopyResult> ServerSideCopy::Execute(
   FSS_TRY(from_ref, ObjectRefFromLocation(source_location));
   //  目标键由目标的 FileSource 按同一套安全策略推导（逐段白名单，避免任意键写入）
   FSS_TRY(parts, ObjectKeyPolicy::ParseFileSource(target_file_source));
-  FSS_TRY(container, ObjectKeyPolicy::ContainerFor(caller.partition, target_zone));
+  FSS_TRY(container,
+          ObjectKeyPolicy::ContainerFor(ports_.partitions, caller.partition, target_zone));
   domain::ObjectRef to_ref;
   to_ref.container = container;
   to_ref.key = ObjectKeyPolicy::MakePosixKey(parts);

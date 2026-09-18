@@ -64,14 +64,20 @@ class LocationIssuer {
   LocationIssuer(domain::IBlobStoreFactory& blobs, domain::IFileLocationRepository& locations,
                  domain::ISelfSignedUrlCodec& self_signed, const fss::IClock& clock,
                  const fss::IIdGenerator& ids, std::string self_base_url,
-                 ExpiryOptions expiry = {})
+                 ExpiryOptions expiry = {},
+                 //  ★ 阶段 10（C10.16 续）：租户注册表（可选）。非空且注册表里登记了该
+                 //    partition 时，容器名按 `PartitionConfig` 的
+                 //    `staging_container`/`persistent_container` 覆盖解析；否则退回
+                 //    `ObjectKeyPolicy` 的默认命名（接线前逐字一致）。
+                 domain::IPartitionRegistry* partitions = nullptr)
       : blobs_(blobs),
         locations_(locations),
         self_signed_(self_signed),
         clock_(clock),
         ids_(ids),
         self_base_url_(std::move(self_base_url)),
-        expiry_(expiry) {}
+        expiry_(expiry),
+        partitions_(partitions) {}
 
   //  上传地址（staging 区）：
   //    · `requested_file_id` 为空 → 服务端生成（`NewUuidNoDash()`，与契约 §2.1 样例一致）
@@ -99,6 +105,8 @@ class LocationIssuer {
   std::string self_base_url_;
   //  ★ C10.12：`expiry.default` / `expiry.max` 解析后的基数（默认 = 契约值）
   ExpiryOptions expiry_;
+  //  ★ 阶段 10：可选的租户注册表（见构造函数注释）
+  domain::IPartitionRegistry* partitions_ = nullptr;
 };
 
 }  // namespace fss::app

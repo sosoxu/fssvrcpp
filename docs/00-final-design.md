@@ -275,6 +275,12 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | 2 | 「越界 Range → 416」并把 `bytes=999999999-8388607` 当作用例（ADR-002 §4 / H-1 回归） | 该输入是 **`last < first`（RFC 7233 §2.1 判为语法非法）→ 应忽略该头返回 200 全量**；真正"语法合法但越界"的 `bytes=999999999-` 才 → 416 | H-1 的**不变量**（不得下溢 `Content-Length`）保持不变并在两条输入上都断言；状态码按 RFC 与契约 §1.8 更正 |
 | 3 | 「`Range` 语法非法时返回什么」未记录 | 库在**解析阶段**就把非法 Range 变成 416 并**跳过路由**（与 RFC 7233 §4.4 冲突） | 包装层在错误处理器里重新分发为 200 全量，并记 `malformed_range_ignored_by_wrapper` 警告 |
 
+### 5.w 本轮更正的既有结论（C10.16 续：`storage.posix.*` 细节键与容器名）
+
+| # | 旧结论（记录于） | 现状（依据） | 影响 |
+| --- | --- | --- | --- |
+| 1 | 「`partition.file.{staging_container,persistent_container,storage_driver}` 与 7 个 `storage.posix.*` 细节键**无对应结构体字段可接**，按「不发明字段」如实登记为「已读但无效果」」（`AGENTS.md` §0 阶段 10 行、`docs/04-implementation-plan.md` C10.16、`docs/operations.md` §1.3.3） | **推翻（本轮 / C10.16 续）**：这 10 个键**有真实可接的语义**，缺的只是字段 —— 本轮给 `PosixBlobStoreOptions` 加了 `dir_mode`/`file_mode`/`atomic_write`/`fadvise_random`/`fadvise_dontneed_after_large_read`（+ 可注入 `IFadviseSink` 计数接缝），给 `PartitionConfig` 加了 `staging_container`/`persistent_container`/`storage_driver`，并让 `ObjectKeyPolicy::ContainerFor(IPartitionRegistry&, …)` 统一解析容器名（uploadURL 签发 / 用例 / GC / 启动建目录**同源**） | 5 + 2 个键移入「生效」（驱动层 `stat` 权限位、fadvise 计数接缝、故障注入不留半成品、真实进程目录断言）；`storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 两阶段批提交**确实未实现**）与 `partition.file.opendes.storage_driver`（与顶层驱动冲突）→ 「拒绝启动」。三态：**89 / 21 / 46 = 156**（`docs/operations.md` §1.3） |
+
 ## 6. 最终关键参数（默认值及其依据）
 
 | 参数 | 最终值 | 依据 |
@@ -288,7 +294,7 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | `storage.driver_report_override` | `""`（上报真实驱动） | 上游把所有云硬编码成 `"GCS"`；需要时用开关复刻 |
 | `storage.posix.durability` | **`batch`** | 两阶段批提交；`per_file` 为精确模式 |
 | `storage.io_engine` | **`blocking`** | 默认容器 seccomp 阻断 io_uring（实测 EPERM）；可选 `uring`/`auto` |
-| `storage.posix.group_commit_max_batch` | 500 | 吞吐 vs 崩溃丢失窗口的折中（建议 500–2000） |
+| `storage.posix.group_commit_max_batch` | 500 | 吞吐 vs 崩溃丢失窗口的折中（建议 500–2000）；⚠️ ADR-008 的 P4 两阶段批提交**实现未交付** → 该键（与 `sync_dir_after_batch`）的非默认值在组合根**拒绝启动**（C10.16 续，`operations.md` §1.3.2） |
 | `location.sqlite.synchronous` | **`NORMAL`** | `FULL` 差 **21x** |
 | `location.sqlite.max_write_concurrency` | **8** | 实测 8 线程为峰值，32 线程反而下降 |
 | `metadata.repository` | `sqlite`（single）/ **`postgres`（multi 强制）** | ADR-004 / ADR-009 |
@@ -313,7 +319,7 @@ P6 元数据记录语义完整化（12 步序列 + 回滚 + 版本链 + DMS + De
 P7 gRPC 适配层 + 双协议等价性            ✅ 已完成（C7.1~C7.10；17/17 RPC + 契约 §6 矩阵 + 流式 + 双协议并发；6 测试 / 5378 断言）← 此阶段"双协议"达成
 P8 认证授权与多租户                        ✅ 已完成（C8.1~C8.8；JWT + 路由预检 + 跨租户隔离 + 远端 Entitlements fail-closed + 审计覆盖 + multi 校验 + 时钟偏差；6 测试 / 1323 断言）
 P9 硬化与交付（容量基线 / 故障注入 / GC / 打包 / 定稿 ADR-006） ✅ 已完成（C9.1~C9.13/C9.15/C9.16/C9.25；6 测试 / 466 断言；`run_all_gates.sh` P0~P9 全绿 225 s / 10 阶段）
-P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） 🚧 切片 1（见 `docs/04-implementation-plan.md` 末尾；起因：P9/C9.9 查出 156 个配置键中只有 31 个接通）
+P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3 + C10.16 + C10.16 续（156 键三态 **89/21/46**；见 `docs/04-implementation-plan.md` 末尾）
 ```
 
 **铁律**：门槛未通过 → 不得开始下一阶段。每阶段证据归档到 `docs/test-evidence/phaseN.md`。

@@ -112,6 +112,18 @@ bool CopyFd(int in, int out) {
   }
 }
 
+//  真实的 fadvise 实现：`posix_fadvise` 只会在参数非法时硬失败，提示本身不保证任何
+//  行为，因此与 Linux 习惯一致地忽略返回值（与 ADR-008 的"尽力而为"语义一致）。
+class RealFadviseSink final : public IFadviseSink {
+ public:
+  void Random(int fd) override { (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM); }
+  void DontNeed(int fd) override { (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); }
+};
+
+//  `storage.posix.fadvise_dontneed_after_large_read` 的阈值：**大于** 1 MiB 的读
+//  才丢弃页缓存（小文件重读命中缓存的收益更高）。
+constexpr std::uint64_t kDontNeedThresholdBytes = 1024 * 1024;
+
 }  // namespace
 
 PosixBlobStore::PosixBlobStore(std::string root, const fss::IClock& clock,
@@ -156,7 +168,7 @@ fss::Result<std::string> PosixBlobStore::WritableObjectPath(std::string_view con
   FSS_TRY(path, ObjectPath(container, key));
   const auto slash = path.rfind('/');
   if (slash != std::string::npos) {
-    FSS_TRY(fs::EnsureDir(path.substr(0, slash)));
+    FSS_TRY(fs::EnsureDir(path.substr(0, slash), options_.dir_mode));
   }
   //  建目录后**重新**做真实路径校验（见头文件说明）
   return ObjectPath(container, key);
@@ -194,6 +206,22 @@ IFileSync& PosixBlobStore::FileSync() const {
   return options_.file_sync != nullptr ? *options_.file_sync : real;
 }
 
+IFadviseSink& PosixBlobStore::Fadvise() const {
+  static RealFadviseSink real;
+  return options_.fadvise_sink != nullptr ? *options_.fadvise_sink : real;
+}
+
+void PosixBlobStore::AdviseRandom(int fd) const {
+  if (!options_.fadvise_random) return;
+  Fadvise().Random(fd);
+}
+
+void PosixBlobStore::AdviseDontNeedAfterRead(int fd, std::uint64_t bytes_read) const {
+  if (!options_.fadvise_dontneed_after_large_read) return;
+  if (bytes_read <= kDontNeedThresholdBytes) return;
+  Fadvise().DontNeed(fd);
+}
+
 fss::Result<domain::ObjectStat> PosixBlobStore::ReadSidecar(const std::string& object_path) const {
   FSS_TRY(text, fs::ReadFile(object_path + std::string(kSidecarSuffix)));
   FSS_TRY(parsed, json::ParseObject(text));
@@ -215,7 +243,8 @@ fss::Result<domain::ObjectStat> PosixBlobStore::ReadSidecar(const std::string& o
 
 fss::Result<void> PosixBlobStore::ensure_container(const std::string& container) {
   FSS_TRY(dir, ContainerDir(container));
-  return fs::EnsureDir(dir);
+  //  ★ `storage.posix.dir_mode`：显式权限位（接线前是 `fs::EnsureDir` 的默认 0750）。
+  return fs::EnsureDir(dir, options_.dir_mode);
 }
 
 fss::Result<domain::SignedLocation> PosixBlobStore::presign_put(
@@ -236,14 +265,23 @@ fss::Result<domain::SignedLocation> PosixBlobStore::presign_get(
 fss::Result<void> PosixBlobStore::put(const domain::ObjectRef& ref, bytes::ByteSource& source,
                                       const domain::PutOptions& options) {
   FSS_TRY(path, WritableObjectPath(ref.container, ref.key));
-  const std::string tmp = TempPathFor(path);
-
-  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-  if (fd < 0) return ErrFromErrno("创建临时文件失败");
+  //  ★ `storage.posix.atomic_write=false` → **直接写目标文件**（不做 tmp + rename）。
+  //    代价是"打开即截断"，因此失败路径必须删除目标：宁可"没有文件"，也绝不留下半成品
+  //    （ADR-008 的 R3 不变量在两种模式下都必须成立）。
+  const bool atomic = options_.atomic_write;
+  const std::string tmp = atomic ? TempPathFor(path) : path;
+  const int open_flags = atomic
+                             ? (O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC)
+                             : (O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
+  //  ★ `storage.posix.file_mode`：显式权限位（接线前的默认值是 0644）。
+  const int fd = ::open(tmp.c_str(), open_flags, static_cast<mode_t>(options_.file_mode));
+  if (fd < 0) return ErrFromErrno(atomic ? "创建临时文件失败" : "创建目标文件失败");
   const auto cleanup = [&]() {
     ::close(fd);
-    (void)::unlink(tmp.c_str());
+    (void)::unlink(tmp.c_str());  // 非原子模式下 tmp == path：失败不留半成品
   };
+  //  ★ `storage.posix.fadvise_random`：写入路径的随机访问提示（默认关闭 → no-op）
+  AdviseRandom(fd);
 
   //  边读流、边写盘、边增量算 SHA-256 —— 内存与对象大小无关（C3.4）
   crypto::Sha256Hasher hasher;
@@ -310,7 +348,7 @@ fss::Result<void> PosixBlobStore::put(const domain::ObjectRef& ref, bytes::ByteS
     (void)::unlink(tmp.c_str());
     return error;
   }
-  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+  if (atomic && ::rename(tmp.c_str(), path.c_str()) != 0) {
     const auto error = ErrFromErrno("rename 失败");
     (void)::unlink(tmp.c_str());
     return error;
@@ -340,6 +378,8 @@ fss::Result<void> PosixBlobStore::get(const domain::ObjectRef& ref, bytes::ByteS
     if (errno == ENOENT) return Err(fss::ErrorKind::kNotFound, "对象不存在：" + ref.ToString());
     return ErrFromErrno("打开对象失败");
   }
+  //  ★ `storage.posix.fadvise_random`：读取路径的随机访问提示（默认关闭 → no-op）
+  AdviseRandom(fd);
 
   struct stat info {};
   if (::fstat(fd, &info) != 0) {
@@ -383,6 +423,9 @@ fss::Result<void> PosixBlobStore::get(const domain::ObjectRef& ref, bytes::ByteS
     FSS_TRY(sink.Write(std::string_view(buffer.data(), static_cast<std::size_t>(n))));
     done += static_cast<std::uint64_t>(n);
   }
+  //  ★ `storage.posix.fadvise_dontneed_after_large_read`：读出的字节数 > 1 MiB 时
+  //    丢弃这段页缓存（只对大段读做；区间读不满阈值则不触发）。
+  AdviseDontNeedAfterRead(fd, done);
   ::close(fd);
   FSS_TRY(sink.Close());
   return Ok();
@@ -444,8 +487,11 @@ fss::Result<domain::ObjectStat> PosixBlobStore::copy(const domain::ObjectRef& fr
     if (errno == ENOENT) return Err(fss::ErrorKind::kNotFound, "复制源不存在：" + from.ToString());
     return ErrFromErrno("打开复制源失败");
   }
-  const std::string tmp = TempPathFor(to_path);
-  const int out = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+  const std::string tmp = options_.atomic_write ? TempPathFor(to_path) : to_path;
+  const int out = ::open(tmp.c_str(),
+                         options_.atomic_write ? (O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC)
+                                               : (O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC),
+                         static_cast<mode_t>(options_.file_mode));
   if (out < 0) {
     const auto error = ErrFromErrno("创建复制目标失败");
     ::close(in);
@@ -465,7 +511,7 @@ fss::Result<domain::ObjectStat> PosixBlobStore::copy(const domain::ObjectRef& fr
   }
   if (::close(in) != 0) ok = false;
   if (::close(out) != 0) ok = false;
-  if (!ok || ::rename(tmp.c_str(), to_path.c_str()) != 0) {
+  if (!ok || (options_.atomic_write && ::rename(tmp.c_str(), to_path.c_str()) != 0)) {
     const auto error = ok ? ErrFromErrno("rename 失败")
                           : Err(fss::ErrorKind::kInternal, "复制失败");
     (void)::unlink(tmp.c_str());

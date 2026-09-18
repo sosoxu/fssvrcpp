@@ -35,6 +35,17 @@
 
 namespace fss::infra {
 
+//  ★ 阶段 10（C10.16 续）：把 `storage.posix.fadvise_*` 变成**可断言**的事实。
+//    `posix_fadvise` 是"尽力而为"的提示，没有可依赖的返回值，真实系统调用也无法在单测里
+//    被观察到。因此用一个**可注入的接缝**（与 `IFileSync` 同族）：生产实现调
+//    `::posix_fadvise`，测试注入计数实现 → "配置被读取且该路径被执行"成为硬断言（R15）。
+class IFadviseSink {
+ public:
+  virtual ~IFadviseSink() = default;
+  virtual void Random(int fd) = 0;
+  virtual void DontNeed(int fd) = 0;
+};
+
 struct PosixBlobStoreOptions {
   //  何时真正落盘（ADR-008 的 R1/R2；语义见 `infra/io/file_sync.h`）。
   //  默认 `kAlways`：库层保持最保守的耐久性；部署层按配置选 `kBySize`（默认值见
@@ -45,6 +56,22 @@ struct PosixBlobStoreOptions {
   std::string instance_id = "local";
   //  可注入的落盘接缝（测试用）；null → 真实的 fdatasync/fsync
   IFileSync* file_sync = nullptr;
+
+  //  ---- 阶段 10：`storage.posix.{dir_mode,file_mode,atomic_write,fadvise_*}` ----
+  //  ★ 默认值 = **接线前的行为**（否则直接构造本结构体的既有驱动/契约测试会变）：
+  //    · 目录 0750 与既有 `fs::EnsureDir` 默认逐位一致；
+  //    · 文件 0644 与既有 `::open(..., 0644)` 一致（schema 默认 `0640` 由组合根显式传入）；
+  //    · `atomic_write=true`（tmp + rename）与既有实现一致；
+  //    · 两个 fadvise 默认 `false`（接线前从不下发提示）。
+  unsigned dir_mode = 0750;
+  unsigned file_mode = 0644;
+  //  `false` → **直接写目标文件**（不做 tmp + rename）。失败时删除目标，绝不留下半成品。
+  bool atomic_write = true;
+  bool fadvise_random = false;
+  //  读出的字节数**大于** 1 MiB 阈值时才下发 `POSIX_FADV_DONTNEED`（见 .cpp 的常量）。
+  bool fadvise_dontneed_after_large_read = false;
+  //  可注入的 fadvise 接缝（测试用）；null → 真实 `::posix_fadvise`
+  IFadviseSink* fadvise_sink = nullptr;
 };
 
 class PosixBlobStore final : public domain::IBlobStore {
@@ -92,6 +119,11 @@ class PosixBlobStore final : public domain::IBlobStore {
                                  bool fsync) const;
   fss::Result<domain::ObjectStat> ReadSidecar(const std::string& object_path) const;
   IFileSync& FileSync() const;
+  IFadviseSink& Fadvise() const;
+  //  `fadvise_random=true` 时对打开的 fd 下发一次随机访问提示（配置为 false 时 no-op）
+  void AdviseRandom(int fd) const;
+  //  `fadvise_dontneed_after_large_read=true` 且本次读出 > 阈值时下发 DONTNEED
+  void AdviseDontNeedAfterRead(int fd, std::uint64_t bytes_read) const;
   static bool IsInternalKey(std::string_view relative_key);
   std::string TempPathFor(const std::string& target) const;
 
