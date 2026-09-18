@@ -319,7 +319,7 @@ P6 元数据记录语义完整化（12 步序列 + 回滚 + 版本链 + DMS + De
 P7 gRPC 适配层 + 双协议等价性            ✅ 已完成（C7.1~C7.10；17/17 RPC + 契约 §6 矩阵 + 流式 + 双协议并发；6 测试 / 5378 断言）← 此阶段"双协议"达成
 P8 认证授权与多租户                        ✅ 已完成（C8.1~C8.8；JWT + 路由预检 + 跨租户隔离 + 远端 Entitlements fail-closed + 审计覆盖 + multi 校验 + 时钟偏差；6 测试 / 1323 断言）
 P9 硬化与交付（容量基线 / 故障注入 / GC / 打包 / 定稿 ADR-006） ✅ 已完成（C9.1~C9.13/C9.15/C9.16/C9.25；6 测试 / 466 断言；`run_all_gates.sh` P0~P9 全绿 225 s / 10 阶段）
-P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3/4 + C10.16 + C10.16 续（156 键三态 **93/21/42**；见 `docs/04-implementation-plan.md` 末尾）
+P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3/4/5 + C10.16 + C10.16 续（156 键三态 **96/21/39**；切片 5 = `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 生效；见 `docs/04-implementation-plan.md` 末尾）
 ```
 
 **铁律**：门槛未通过 → 不得开始下一阶段。每阶段证据归档到 `docs/test-evidence/phaseN.md`。

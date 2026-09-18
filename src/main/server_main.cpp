@@ -1078,6 +1078,15 @@ int main(int argc, char** argv) {
   const std::string self_base_url =
       resolver.Str("self_signed.public_base_url",
                    "http://127.0.0.1:" + std::to_string(http_port) + base_path);
+  //  ★ 阶段 10 切片 5：`self_signed.key_id` 与自签分支的 TTL 上界。
+  //    · `key_id` → `HmacTransferTokenCodec`：非空时进**被签名的载荷**，解码侧要求一致
+  //      （fail-closed）。**不打印密钥**；多密钥轮换未交付（只做标识绑定）。
+  //    · `{default,max}_ttl_seconds` → `LocationIssuer` 的**自签分支上界**（`expiry.*` 仍是
+  //      `expiryTime` 参数的解析规则与缺省；见 `SelfSignedTtlOptions` 的理由）。
+  const std::string transfer_key_id = resolver.Str("self_signed.key_id", "k1");
+  const long self_signed_default_ttl_seconds =
+      resolver.Int("self_signed.default_ttl_seconds", 3600);
+  const long self_signed_max_ttl_seconds = resolver.Int("self_signed.max_ttl_seconds", 604800);
 
   //  ---- 有效期（expiry.*，C10.12）----
   //  ★ 判定规则不变（缺省 / 静默夹紧 / 非法固定消息），配置只改**缺省值**与**上限基数**；
@@ -1349,6 +1358,10 @@ int main(int argc, char** argv) {
     return kExitConfigError;
   }
   const app::ExpiryOptions expiry_options{expiry_default.value(), expiry_max.value()};
+  //  ★ 阶段 10 切片 5：自签分支的 TTL 上界（默认值与 `expiry.*` 的 schema 默认相同 ⇒
+  //    默认配置下行为与接线前逐字一致；`expiry.*` 的语义**不变**）。
+  const app::SelfSignedTtlOptions self_signed_ttl_options{
+      self_signed_default_ttl_seconds, self_signed_max_ttl_seconds};
 
   //  ---- 值域/依赖关系校验：任何一条不过 → 拒绝启动（exit 78）----
   if (deployment_mode == "multi") {
@@ -1528,7 +1541,7 @@ int main(int argc, char** argv) {
   //  ★ PG 版 `ILeaseRepository` 未交付（ADR-009），单实例下内存租约语义正确；
   //    `deployment.mode=multi` 在更早处已拒绝启动，因此不存在"以为共享、其实各存一份"。
   infra::InMemoryLeaseRepository lease_repository(clock);
-  HmacTransferTokenCodec token_codec(transfer_secret, clock);
+  HmacTransferTokenCodec token_codec(transfer_secret, clock, transfer_key_id);
 
   //  ---- 认证（P8 / ADR-012）----
   //  `jwt` = 本地 HS256 校验（生产形态）；`disabled` = allow-all（仅开发）。
@@ -1634,7 +1647,7 @@ int main(int argc, char** argv) {
   //    用例/GC 解析出的容器名会不一致（`partition.file.*.staging_container` 只对
   //    一半路径生效，等于没生效）。
   app::LocationIssuer issuer(blob_factory, *location_repository.value(), token_codec, clock, ids,
-                             self_base_url, expiry_options, &partitions);
+                             self_base_url, expiry_options, &partitions, self_signed_ttl_options);
 
   app::UseCasePorts ports{blob_factory,      *location_repository.value(),
                           *metadata_repository_handle.value(),
@@ -1885,6 +1898,10 @@ int main(int argc, char** argv) {
             << "  expiry         : default=" << expiry_default_text << "（"
             << expiry_options.default_seconds << "s）max=" << expiry_max_text << "（"
             << expiry_options.max_seconds << "s）\n"
+            << "  self signed    : key_id=" << transfer_key_id
+            << "（进签名载荷；多密钥轮换未交付）TTL 自签上界 default="
+            << self_signed_default_ttl_seconds << "s max=" << self_signed_max_ttl_seconds
+            << "s（仅 !native_presign 分支；expiry.* 仍是 expiryTime 的解析规则与缺省）\n"
             << "  leases         : 内存租约（单实例；enabled="
             << (leases_enabled ? "true" : "false")
             << " ttl=" << leases_ttl_seconds << "s renew=" << leases_renew_interval_seconds

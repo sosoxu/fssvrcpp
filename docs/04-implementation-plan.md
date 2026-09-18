@@ -992,8 +992,9 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 ## 9. 首个动作（下一步要做什么）
 
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
-切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）与切片 4（数据面 PUT 上限 + SQLite PRAGMA）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态：**生效 93 / 拒绝启动 21 / 已读但无效果 42**（`docs/operations.md` §1.3）。
+切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）、切片 4（数据面 PUT 上限 + SQLite PRAGMA）
+与切片 5（`self_signed` 三键：`key_id` + 自签 TTL 上界）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
+三态：**生效 96 / 拒绝启动 21 / 已读但无效果 39**（`docs/operations.md` §1.3）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
@@ -1067,7 +1068,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（**当前为 生效 93 / 拒绝启动 21 / 已读但无效果 42 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
+  `docs/operations.md` 逐键三态化（**当前为 生效 96 / 拒绝启动 21 / 已读但无效果 39 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1082,6 +1083,12 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 | **C10.14** | **SQLite 调优键接通**：`metadata.sqlite.*` / `location.sqlite.*`（`busy_timeout_ms`/`journal_mode`/`synchronous`/`max_write_concurrency`/`group_commit*`）作用到两个仓储（PRAGMA 与并发闸门要能在真实进程上被观测：例如 `journal_mode` 与 `busy_timeout` 用 `python3 sqlite3` 读回、`synchronous` 与写并发用基准/日志证明） |
 | **C10.15** | **鉴权与 gRPC 面**：`auth.jwt.roles_claim` 与 `auth.local_roles.*` 接通（配置里的"用户 → 角色"表真的决定 403/200）；`server.grpc.enabled` 接通（false → 不开 gRPC 端口，true → 开且 `GetInfo` 可用） |
 | **C10.16** | **分区与存储细节**：`partition.file.<partition>.*`（容器名/`max_file_bytes`/校验算法集合与默认算法）与 `storage.posix.{group_commit_max_batch,sync_dir_after_batch,atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 接通；**超限必须被拒**（上传超过 `max_file_bytes` → 413 或契约规定的错误），非法的校验算法 → 400/拒绝启动（按真实语义断言） |
+
+**切片 5（判据）** —— `self_signed` 的 3 个剩余键
+
+| # | 判据 |
+| --- | --- |
+| **C10.17** | **`self_signed` 三键接通**：① `self_signed.key_id` 进**被签名的 token 载荷**，解码侧在验签通过后要求载荷里的 `key_id` 与当前配置**完全相等**（**缺失也拒绝** → `kUnauthenticated` / HTTP **401**）；真实进程正例（`k1` 签发的 URL PUT/GET 200）+ 反例（以 `k2` 重启后重放同一 URL → 401）；**多密钥轮换未交付**（ADR-009:227 的"多 key 并存"仍是待办，只做标识绑定）。② `self_signed.{default_ttl_seconds,max_ttl_seconds}` 是**自签分支（`!native_presign`）的 TTL 上界**（`ttl = min(ttl, max)`；请求未给 `expiryTime` 时再 `min(ttl, default)`），`expiry.*` 的既定语义（= `expiryTime` 参数的解析规则与缺省，C10.12）**不变**；`native_presign` 分支**完全不受影响**（进程内断言 `PresignOptions.expires_in_seconds` 仍等于 `expiry` 的结果）。若要把语义改成「`self_signed.*` 覆盖 `expiry.default` 作缺省」，必须先推翻 C10.12 并同步契约与测试 |
 
 **状态：✅ 切片 1/2/3 完成（含 C10.16）**。
 * **C10.13**：`observability.audit_fail_closed` 真的决定"审计写入失败是否让请求失败"。
@@ -1117,7 +1124,15 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   `AppliedPragma("synchronous")` 做进程内断言；`journal_mode` 用 `python3 sqlite3` 读回。
   用例：`tests/integration/test_config_wiring.cpp` 的切片 4 三用例 +
   `tests/integration/test_sqlite_{location,metadata}_repository.cpp` 的 `AppliedPragma` 用例。
-* 三态计数：**生效 93 / 拒绝启动 21 / 已读但无效果 42 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* **切片 5（`self_signed` 三键，C10.17）**：`self_signed.key_id` → `HmacTransferTokenCodec`
+  的第 3 个参数（非空时 `Encode` 把它写进**被签名的载荷**，`Decode` 要求完全相等、缺字段也拒绝
+  → 401）；`self_signed.{default_ttl_seconds,max_ttl_seconds}` → `LocationIssuer` 的
+  `SelfSignedTtlOptions`（**仅自签分支**的上界夹紧；`native_presign` 分支逐字不变；
+  `expiry.*` 仍是 `expiryTime` 参数的解析规则与缺省）。用例：`tests/unit/test_transfer_token_key_id.cpp`
+  （codec 边界 4 用例）、`tests/unit/test_location_issuer.cpp` 的 C10.17、`tests/integration/test_config_wiring.cpp`
+  的 C10.17 两用例（真实进程正例 + 换 `key_id` 重启后 401 反例 + TTL 上界）。**未交付**：多密钥轮换
+  （ADR-009:227 的"多 key 并存"）。
+* 三态计数：**生效 96 / 拒绝启动 21 / 已读但无效果 39 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
 
 **未做（本阶段不承诺）**：`events.publisher=webhook`（需新增 L2 webhook 发布器）、`legal/schema.validator=remote`、
 `metadata/location.repository=postgres|remote`、`leader_election.*`/`leases.*` 的 PG 语义、

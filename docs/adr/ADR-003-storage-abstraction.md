@@ -108,7 +108,8 @@ Staging 上传地址请求
 - 当 `native_presign == true`：返回对象存储的原生预签名 URL，`Driver = "s3"`。客户端直连，服务带宽零消耗。
 - 当 `native_presign == false`：返回**本服务自签的传输 URL**，形如
   `https://<self>/v1/transfer/{token}?exp=...&sig=...`，`Driver = "posix"`。
-  `token` 是一个自包含的、HMAC 签名的（`object_ref` + `op` + `exp` + `partition` + `nonce`）载荷，服务端在 `/v1/transfer` 校验签名与过期时间后代理字节。
+  `token` 是一个自包含的、HMAC 签名的（`object_ref` + `op` + `exp` + `partition` + `key_id` + `nonce`）载荷，服务端在 `/v1/transfer` 校验签名与过期时间后代理字节。
+  `key_id` 是**配置的密钥标识**（`self_signed.key_id`）：非空时进被签名载荷，解码侧要求载荷里的值与当前配置**完全相等**（缺失也拒绝，fail-closed）—— 但**多密钥轮换未交付**（见 ADR-009:227 的"多 key 并存"仍为待办），此处只做标识绑定，不存在"按 id 选密钥"。
   签名算法与 S3 SigV4 复用同一套 HMAC-SHA256 基础设施，但**使用独立的密钥域**（不同 key id / 不同签名字符串前缀），避免跨用途密钥复用。
 
 因此**应用层与领域层不存在任何 `if driver == ...` 分支**；差异只体现在 `LocationIssuer` 内部的一次能力查询，以及响应中的 `Driver` 字段值。

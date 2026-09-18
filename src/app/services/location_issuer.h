@@ -43,6 +43,20 @@
 
 namespace fss::app {
 
+//  ★ 阶段 10 切片 5：`self_signed.{default_ttl_seconds,max_ttl_seconds}` 的**上界**语义。
+//  为什么是"上界合成"而不是"让这两个键覆盖 `expiry.default`"：
+//    `expiry.*` 的语义（= `expiryTime` 参数的解析规则与缺省）已由 C10.12 定稿并被
+//    `tests/integration/test_config_wiring.cpp` 的 C10.12 用例锁死。若让 `self_signed.*`
+//    去改写 `expiry.default`，就必须先推翻那条既定语义并同步契约与测试 —— 那不是本切片
+//    的范围。因此这里只做**上界夹紧**（与 `storage.s3.presign_*` 的形态一致）：
+//      · `expiry.*`       → `expiryTime` 参数的**解析规则与缺省**（两条分支共用）；
+//      · `self_signed.*`  → **仅自签分支**的缺省上界 / 绝对上界。
+//  默认值（3600 / 604800）与 `expiry.*` 的 schema 默认相同 ⇒ 默认配置下结果与接线前**逐字一致**。
+struct SelfSignedTtlOptions {
+  std::int64_t default_seconds = 3600;    // 请求**未提供** `expiryTime` 时的上界
+  std::int64_t max_seconds = 604800;      // 自签分支的绝对上界（任何请求都夹紧）
+};
+
 //  颁发结果（领域层表达，**不含** HTTP 细节；DTO 在 P4 的适配层组装）
 struct LocationResult {
   std::string file_id;
@@ -69,7 +83,10 @@ class LocationIssuer {
                  //    partition 时，容器名按 `PartitionConfig` 的
                  //    `staging_container`/`persistent_container` 覆盖解析；否则退回
                  //    `ObjectKeyPolicy` 的默认命名（接线前逐字一致）。
-                 domain::IPartitionRegistry* partitions = nullptr)
+                 domain::IPartitionRegistry* partitions = nullptr,
+                 //  ★ 阶段 10 切片 5：自签分支的 TTL 上界（见 `SelfSignedTtlOptions`）。
+                 //    默认值 = 接线前行为；**native_presign 分支完全不受影响**。
+                 SelfSignedTtlOptions self_signed_ttl = {})
       : blobs_(blobs),
         locations_(locations),
         self_signed_(self_signed),
@@ -77,7 +94,8 @@ class LocationIssuer {
         ids_(ids),
         self_base_url_(std::move(self_base_url)),
         expiry_(expiry),
-        partitions_(partitions) {}
+        partitions_(partitions),
+        self_signed_ttl_(self_signed_ttl) {}
 
   //  上传地址（staging 区）：
   //    · `requested_file_id` 为空 → 服务端生成（`NewUuidNoDash()`，与契约 §2.1 样例一致）
@@ -97,6 +115,13 @@ class LocationIssuer {
                                       std::string_view partition, std::int64_t ttl_seconds,
                                       bool upload);
 
+  //  ★ 阶段 10 切片 5：把 `expiry.*` 解析出的 TTL 按自签上界夹紧。
+  //    `caps.native_presign == true` → **原样返回**（原生预签名分支完全不受这两个键影响）；
+  //    `caps.native_presign == false` → `min(ttl, max_seconds)`，且请求**未提供**
+  //    `expiryTime` 时再 `min(ttl, default_seconds)`。
+  std::int64_t ApplySelfSignedTtl(std::int64_t ttl_seconds, const domain::BlobCapabilities& caps,
+                                  bool expiry_time_provided) const;
+
   domain::IBlobStoreFactory& blobs_;
   domain::IFileLocationRepository& locations_;
   domain::ISelfSignedUrlCodec& self_signed_;
@@ -107,6 +132,8 @@ class LocationIssuer {
   ExpiryOptions expiry_;
   //  ★ 阶段 10：可选的租户注册表（见构造函数注释）
   domain::IPartitionRegistry* partitions_ = nullptr;
+  //  ★ 阶段 10 切片 5：自签分支的 TTL 上界（见 `SelfSignedTtlOptions`）
+  SelfSignedTtlOptions self_signed_ttl_;
 };
 
 }  // namespace fss::app

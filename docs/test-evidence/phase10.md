@@ -3,14 +3,14 @@
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P10（配置面接线） |
-| 状态 | ✅ **切片 1/2/3 全部完成 + C10.16 + C10.16 续**：C10.1~C10.16 满足；**本轮（C10.16 续）**把原先「无字段可接」的 10 个键接通（5 + 2 生效、3 拒绝启动；见 §7） |
+| 状态 | ✅ **切片 1/2/3/4/5 全部完成 + C10.16 + C10.16 续**：C10.1~C10.17 满足；**切片 4** 接通数据面 PUT 上限与 SQLite PRAGMA（见 §9）；**切片 5（C10.17）** 接通 `self_signed` 三键（见 §10） |
 | 门槛命令 | `ctest -L phase10 && scripts/verify_config_wiring.sh` |
 | 退出码 | `0` |
-| 新测试 | `tests/integration/test_config_wiring.cpp`：**29 个 TEST_CASE / 607 断言**（真实 `build/bin/fss_server` + 驱动层；切片 4 新增 3 用例 / 108 断言） |
+| 新测试 | `tests/integration/test_config_wiring.cpp`：**31 个 TEST_CASE / 692 断言**（真实 `build/bin/fss_server` + 驱动层；切片 5 新增 2 用例 / 81 断言，父代理 §10.6 再 +3 断言）+ `tests/unit/test_transfer_token_key_id.cpp`：**4 个 TEST_CASE / 29 断言**（C10.17 codec 边界） |
 | 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
-| 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **76/76** 通过 |
+| 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **77/77** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 93 / 拒绝启动（触发条件）21 / 已读但无效果 42**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 96 / 拒绝启动（触发条件）21 / 已读但无效果 39**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键；**切片 5** 接通 3 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
 | 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
@@ -339,14 +339,15 @@ All tests passed (14 assertions in 1 test case)
 * ADR-008 的 P4（两阶段批提交）**仍未实现** —— 本轮不假装接通，改为对
   `group_commit_max_batch` / `sync_dir_after_batch` 的非默认值**拒绝启动**。
 
-### 7.6 三态计数（C10.16 续 收尾；**该数字已被 §9 的切片 4 取代**）
+### 7.6 三态计数（C10.16 续 收尾；**该数字已被 §9 的切片 4、§10 的切片 5 取代**）
 
-`config/fss.example.json` 的 **156** 个叶子键：**生效 93 / 拒绝启动（触发条件）21 /
-已读但无效果 42**（`93 + 21 + 42 = 156`；由 `tests/unit/test_operations_doc.cpp` 的
+`config/fss.example.json` 的 **156** 个叶子键：生效 **93** 个 / 拒绝启动（触发条件）**21** 个 /
+已读但无效果 **42** 个（**93** + **21** + **42** = 156；由 `tests/unit/test_operations_doc.cpp` 的
 C10.11 用例从 §1.2 的 156 行程序化提取并机械断言，正文声明的数字也一并断言）。
-> 本节的数字是 C10.16 续 收尾时的快照，**已被 §9 的切片 4 取代**（切片 4 把
+> 本节的数字是 C10.16 续 收尾时的**历史快照**，**已被 §9 的切片 4 与 §10 的切片 5 取代**（切片 4 把
 > `server.http.transfer_max_body_bytes`、`metadata.sqlite.{journal_mode,synchronous}`、
-> `location.sqlite.synchronous` 4 键从「已读但无效果」移入「生效」，见 §9）。
+> `location.sqlite.synchronous` 4 键从「已读但无效果」移入「生效」，见 §9；切片 5 把
+> `self_signed` 3 键移入「生效」，见 §10）。
 
 ---
 
@@ -471,7 +472,7 @@ $ ctest --test-dir build -j4
 * 文档：`docs/operations.md`（§1.2 逐键行、§1.3 三态与三个清单、§1.3.3 理由表、§8）、
   `docs/03-api-contract.md`（数据面默认上限行）、`docs/00-final-design.md` §P10、
   `docs/02-design.md` §16、`docs/04-implementation-plan.md` 末、`AGENTS.md`（§0 三态 + §4.3 新增
-  synchronous 陷阱行）、`tests/unit/test_operations_doc.cpp`（期望值 93/21/42）。
+  synchronous 陷阱行）、`tests/unit/test_operations_doc.cpp`（期望值 **93**/**21**/**42**）。
 
 ### 9.3 实测命令与输出摘要
 
@@ -550,8 +551,181 @@ $ ./build/bin/test_sqlite_metadata_repository "★ 切片 4*"  → All tests pas
   413（用例注释里写明了这条）。
 * 未跑 `run_all_gates.sh` 全量（由父代理收尾跑）；上面 6 项与本切片相关的命令全绿。
 
-### 9.6 三态计数（收尾）
+### 9.6 三态计数（切片 4 收尾；**该数字已被 §10 的切片 5 取代**）
 
-`config/fss.example.json` 的 **156** 个叶子键：**生效 93 / 拒绝启动（触发条件）21 /
-已读但无效果 42**（`93 + 21 + 42 = 156`），由 `tests/unit/test_operations_doc.cpp` 的 C10.11
+`config/fss.example.json` 的 **156** 个叶子键：生效 **93** 个 / 拒绝启动（触发条件）**21** 个 /
+已读但无效果 **42** 个（**93** + **21** + **42** = 156），由 `tests/unit/test_operations_doc.cpp` 的 C10.11
 用例从 §1.2 的 156 行程序化提取并机械断言（表格计数 + 正文两处字符串同时断言）。
+> 本节的数字是切片 4 收尾时的**历史快照**，**已被 §10 的切片 5 取代**（切片 5 把
+> `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 3 键移入「生效」，见 §10）。
+
+---
+
+## 10. 切片 5（本轮）：接通 `self_signed` 的 3 个键（C10.17）
+
+**背景**：`docs/operations.md` §1.3.3 的 156 键三态里，`self_signed` 段仍有 3 个键是「已读但无效果」：
+`key_id`（密钥标识）、`default_ttl_seconds`、`max_ttl_seconds`。本轮把这 3 个键接通成**生效**，
+最终三态为 **生效 96 / 拒绝启动 21 / 已读但无效果 39 = 156**。
+
+### 10.1 逐键结论（3 个键）
+
+| 键 | 最终状态 | 判据 / 证据 |
+| --- | --- | --- |
+| `self_signed.key_id` | **生效** | `HmacTransferTokenCodec` 构造函数新增**带默认值**的第 3 个参数 `std::string key_id = {}`；非空时 `Encode` 把 `key_id` 写进**被签名的载荷**（`payload["key_id"]`），`Decode` 在验签通过后要求载荷里的值与配置**完全相等**（**缺字段也拒绝**）→ `kUnauthenticated` → HTTP **401**。配置为空（既有测试夹具）→ 不写也不校验（C7.4/C3.7 逐字不变）。真实进程证据：`key_id=k1` 签发的 URL PUT/GET → **200**（R16 正例）；以 `key_id=k2` 重启（同签名密钥）后重放同一 PUT/GET URL → **401**（实测状态码，不是猜的）。启动横幅打印 `key_id`（**不打印密钥**） |
+| `self_signed.default_ttl_seconds` | **生效** | → `app::LocationIssuer` 的 `SelfSignedTtlOptions.default_seconds`（构造函数**末尾**可选参数，默认值 = 接线前行为）。**仅 `!native_presign`（自签）分支**且请求**未提供** `expiryTime` 时：`ttl = min(ttl, 值)`。真实进程：`default_ttl_seconds=60` 且不带 `expiryTime` → `exp=now+60`；给了 `expiryTime=1M`（60s）→ 仍 60s（证明缺省上界**只在未给 `expiryTime` 时叠加**） |
+| `self_signed.max_ttl_seconds` | **生效** | → `SelfSignedTtlOptions.max_seconds`（**仅自签分支**）：`ttl = min(ttl, 值)`。真实进程：`max_ttl_seconds=120` + `expiryTime=9H`（32400s，远小于 `expiry.max=7D`）→ `exp=now+120`；`expiryTime=1M`（60s）→ 仍 60s（R16：上界不是"常量改写"） |
+
+**语义与 `expiry.*` 的关系（必须一起读）**：`expiry.default`/`expiry.max` 仍是 **`expiryTime` 参数的
+解析规则与缺省**（C10.12 定稿，两条分支共用）；本切片**不**改它，而是对**自签分支**再夹一次上界
+（`native_presign` 分支**完全不受**这两个键影响）。**理由**：C10.12 的语义有测试锁定
+（`expiry.default=5M` + 不带 `expiryTime` → `exp=now+300`），若让 `self_signed.*` 覆盖
+`expiry.default`，就必须先推翻那条既定语义并同步契约与测试 —— 本切片刻意不这么做。
+**若要改成"覆盖作缺省"，必须先推翻 C10.12 并同步契约与测试**（登记在 `docs/operations.md` §1.3.3）。
+
+### 10.2 实现点（可点击）
+
+* `src/domain/ports/ports.h`：`TransferToken` **末尾**新增 `std::string key_id;`（放最后，避免破坏
+  既有聚合初始化）；注释里的 payload 字段列表补上 `key_id`。
+* `src/infra/transfer/transfer_token.h` / `.cpp`：构造函数第 3 参数（带默认值）+ `key_id_` 成员；
+  `Encode` 非空时写入被签名载荷；`Decode` 的 fail-closed 校验（不匹配 / 缺失 → `kUnauthenticated`）。
+* `src/app/services/location_issuer.h` / `.cpp`：新增 `SelfSignedTtlOptions{default_seconds=3600,
+  max_seconds=604800}` 与构造函数末尾可选参数；`ApplySelfSignedTtl()` 只在 `!native_presign` 时夹紧
+  （请求未给 `expiryTime` 才叠加缺省上界）。
+* `src/main/server_main.cpp`：读 `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}`
+  （默认 `k1` / `3600` / `604800`）→ `HmacTransferTokenCodec(secret, clock, key_id)` +
+  `LocationIssuer(..., self_signed_ttl_options)`；横幅新增 `self signed : key_id=... TTL 自签上界 ...`。
+* 文档：`docs/operations.md`（§1.2.5 三行、§1.3 三态与三个清单、§1.3.3 的 `self_signed` 行与"下一步"）、
+  `docs/02-design.md`（T3/T4 载荷字段 + 计数）、`docs/adr/ADR-003-storage-abstraction.md`（token 载荷字段）、
+  `docs/00-final-design.md`、`docs/04-implementation-plan.md`（C10.17 门槛 + 三态计数）、`AGENTS.md`、
+  `tests/unit/test_operations_doc.cpp`（期望值 96/21/39）。
+
+### 10.3 实测命令与输出摘要
+
+```
+$ cmake --build build -j4
+[100%] Built target test_dual_protocol_concurrency        # 0 error（★ 用 -j4，AGENTS §4.3 的 OOM 陷阱）
+$ ctest --test-dir build -j4
+100% tests passed, 0 tests failed out of 77                # 新增 test_transfer_token_key_id → 76 → 77
+$ ctest --test-dir build -L phase10 --output-on-failure
+100% tests passed, 0 tests failed out of 2
+$ ./build/bin/test_config_wiring
+All tests passed (689 assertions in 31 test cases)
+$ ./build/bin/test_transfer_token_key_id
+All tests passed (29 assertions in 4 test cases)
+$ ./scripts/check_docs.sh --selftest
+  ✓ 自证：D1/D2/D4/D5 都能检出注入的错误（检查器有效）
+  全部检查通过（D1~D5）                                   # 含 C10.17（D5 连续无断号）
+$ ./scripts/verify_config_wiring.sh
+配置面接线：全部通过（54 条断言）
+```
+
+**父代理独立复核 + 两处加固**（在切片实现之上，见 §10.6）：最终
+`test_config_wiring` = **692 断言 / 31 用例**（+3 断言）、`test_transfer_token_key_id` = 29/4、
+`test_operations_doc` = 24/2、`ctest` **77/77**、`check_docs.sh --selftest` 通过、
+`R1-INJECT` 无残留。
+
+### 10.4 R1 自证（注入 → 用例失败 → 还原 → 实测输出）
+
+3 个键**各**注入一次"错误实现"，都让对应用例失败；随后**完整还原**，
+`grep -rn "R1-INJECT" src/` 无输出：
+
+1. **把 `Decode` 的 `key_id` 校验去掉**（`if (!key_id_.empty())` → `if (false)`）→ 负例必须失败：
+```
+$ ./build/bin/test_config_wiring "★ C10.17*"
+tests/integration/test_config_wiring.cpp:1989: FAILED:
+  REQUIRE( replay_put.status == 401 )
+with expansion:
+  200 == 401 (0x191)
+test cases:  1 |  0 passed | 1 failed      # 仅 .key_id 用例；另 1 个用例通过
+assertions: 48 | 47 passed | 1 failed
+$ ./build/bin/test_transfer_token_key_id
+tests/unit/test_transfer_token_key_id.cpp:130: FAILED:  REQUIRE_FALSE( decoded.ok() )
+tests/unit/test_transfer_token_key_id.cpp:147: FAILED:  REQUIRE_FALSE( decoded.ok() )
+test cases:  4 |  2 passed | 2 failed
+assertions: 25 | 23 passed | 2 failed
+```
+2. **把自签 TTL 上界整段变成"不生效"**（`ApplySelfSignedTtl` 里改成无条件 `return ttl_seconds;`）
+   → 真实进程上界用例与进程内自签上界用例都必须失败：
+```
+$ ./build/bin/test_config_wiring "★ C10.17*"
+tests/integration/test_config_wiring.cpp:2034: FAILED:  REQUIRE( exp <= now + 125 )
+with expansion:
+  1789773976 <= 1789741701            # = ExpiryPolicy 的 9H=32400s，未被 120s 夹紧
+tests/integration/test_config_wiring.cpp:2054: FAILED:  REQUIRE( exp <= now + 65 )
+with expansion:
+  1789745176 <= 1789741641            # = expiry.default 1H=3600s，未被 60s 夹紧
+test cases:  2 |  1 passed | 1 failed
+assertions: 76 | 74 passed | 2 failed
+$ ./build/bin/test_location_issuer "★ C10.17*"
+tests/unit/test_location_issuer.cpp:297: FAILED:
+  REQUIRE( defaulted.value().expires_at_epoch_seconds == now + 60 )
+with expansion:
+  1700003600 == 1700000060            # 3600（expiry.default）而不是 60（自签缺省上界）
+test cases:  1 |  0 passed | 1 failed
+assertions: 11 | 10 passed | 1 failed
+```
+3. **把 `default` 上界那一步删掉**（保留 `max` 的 `min`，去掉 `if (!expiry_time_provided) …`）→
+   "请求不带 `expiryTime` → now+60"必须失败：
+```
+$ ./build/bin/test_config_wiring "★ C10.17*"
+tests/integration/test_config_wiring.cpp:2054: FAILED:  REQUIRE( exp <= now + 65 )
+with expansion:
+  1789745191 <= 1789741656            # 缺省上界没叠加 → 仍是 expiry.default 1H
+test cases:  2 |  1 passed | 1 failed
+assertions: 79 | 78 passed | 1 failed
+$ ./build/bin/test_location_issuer "★ C10.17*"
+tests/unit/test_location_issuer.cpp:297: FAILED:
+  REQUIRE( defaulted.value().expires_at_epoch_seconds == now + 60 )
+with expansion:
+  1700000120 == 1700000060            # 120（max 上界）而不是 60（default 上界）
+test cases:  1 |  0 passed | 1 failed
+assertions: 11 | 10 passed | 1 failed
+```
+还原后的实测：
+```
+$ grep -rn "R1-INJECT" src/                              # 无输出（rc=1）
+$ ./build/bin/test_config_wiring "★ C10.17*"             → All tests passed (82 assertions in 2 test cases)
+$ ./build/bin/test_transfer_token_key_id                 → All tests passed (29 assertions in 4 test cases)
+$ ./build/bin/test_location_issuer "★ C10.17*"           → All tests passed (17 assertions in 1 test case)
+```
+**另记一处测试自身的缺陷（本轮抓到并修掉）**：`key_id` 真实进程用例最初让 k1/k2 两个顺序进程
+**共用同一对 SQLite 库文件**，第二个进程偶发在启动期报 `PRAGMA synchronous 失败：database is locked`
+→ 用例变成 flaky（实测 12 次里失败 1 次）。修法：两次启动用**各自独立**的库路径（负例判据在
+`Decode` 阶段，不需要读位置记录），并**轮询**第一个进程真正退出（`kill -0` 失败）后才启动第二个 ——
+"轮询实际条件"而非固定 sleep（AGENTS §4.3）。修后 15 次连跑全绿。
+
+### 10.5 未做 / 降级（如实登记）
+
+* **多密钥轮换未交付**（ADR-009:227 的"多 key 并存"）：`key_id` 只是"绑定进签名载荷 + 解码侧拒绝
+  不匹配"，**没有**"按 id 选密钥"；换 `key_id` = 旧 URL 全量作废。要做轮换必须把 `key_id → 密钥`
+  表引入 codec 并同步契约/文档/测试。
+* `self_signed.*` **不覆盖** `expiry.default`（见 §10.1 的理由）；若要改，先推翻 C10.12。
+* 组合根**未**加 `default_ttl_seconds > max_ttl_seconds` 的跨字段拒绝（父代理定的语义是纯 `min`
+  合成，绝对上界胜出；加了会与 `max_ttl_seconds=120`（default 仍为 3600）的必测场景冲突）。
+* 未跑 `run_all_gates.sh` 全量（由父代理收尾跑）；上面与本切片相关的命令全绿。
+
+### 10.6 父代理复核时发现并自己修掉的两个问题
+
+复核 diff 时发现两处"判据不够严 / 语义不一致"，在提交前修掉（都属于**收紧**，没有放宽任何检查）：
+
+**① `?expiryTime=`（空串）能绕过 `self_signed.default_ttl_seconds`** —— 实现用
+`expiry_time.has_value()` 判断"客户端给了参数"，但契约 §1.4 与 `ExpiryPolicy` 的既定语义是
+**空串按"未提供"处理**。于是一个空参数就能跳过缺省上界：
+
+```
+修前：ttl_seconds = ApplySelfSignedTtl(ttl_seconds, caps, expiry_time.has_value());
+修后：ttl_seconds = ApplySelfSignedTtl(ttl_seconds, caps,
+                                      expiry_time.has_value() && !expiry_time->empty());
+（两处调用点同改：IssueUploadLocation / IssueDownloadLocation；注释写明理由）
+```
+并补一条真实进程断言（`C10.17` 的 TTL 用例）：`self_signed.default_ttl_seconds=60` +
+`?expiryTime=`（空）→ `exp=now+60`（**仍受缺省上界夹紧**）。同一路径上"空串"只允许一种含义。
+
+**② "不叠加缺省上界"那条断言原本恒真** —— 原断言用 `?expiryTime=1M`（60s）而缺省上界也是
+60s，"叠加"与"不叠加"都能过（R16 的反面：判据无法区分两种实现）。改成 `?expiryTime=2M`
+（120s > 缺省上界 60s，且 < 绝对上界 604800s）→ 必须原样保留 120s，才真正证明"缺省上界只在
+未给 `expiryTime` 时生效"。
+
+修后实测：`./build/bin/test_config_wiring "★ C10.17*"` → **All tests passed (85 assertions in 2 test cases)**；
+`"★ C10.12*"` → **All tests passed (19 assertions in 1 test case)**（C10.12 用例体仍未改）；
+`ctest` **77/77**；`./build/bin/test_config_wiring` 全量 **692 断言 / 31 用例**。

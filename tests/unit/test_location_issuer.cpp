@@ -47,7 +47,9 @@ struct Harness {
   std::unique_ptr<LocationIssuer> issuer;
 
   Harness(bool native_presign, std::string driver_name,
-          std::string presign_prefix = "https://storage.invalid")
+          std::string presign_prefix = "https://storage.invalid",
+          //  ★ C10.17：自签分支的 TTL 上界（默认 = 接线前行为）
+          fss::app::SelfSignedTtlOptions self_signed_ttl = {})
       : clock(1700000000) {
     BlobCapabilities caps;
     caps.native_presign = native_presign;
@@ -59,7 +61,8 @@ struct Harness {
                                                                     std::move(presign_prefix));
     factory = std::make_unique<fss::test::FakeBlobStoreFactory>(*store);
     issuer = std::make_unique<LocationIssuer>(*factory, locations, codec, clock, ids,
-                                             "https://self.invalid");
+                                             "https://self.invalid", fss::app::ExpiryOptions{},
+                                             nullptr, self_signed_ttl);
   }
 };
 
@@ -242,4 +245,67 @@ TEST_CASE("LocationIssuer：自签 codec 失败时传播错误（不返回半成
   const auto r = h.issuer->IssueUploadLocation("opendes", "u", std::nullopt, "1H");
   REQUIRE_FALSE(r.ok());
   REQUIRE(r.error().kind() == fss::ErrorKind::kInternal);
+}
+
+// =============================================================================
+//  C10.17（阶段 10 切片 5）：`self_signed.{default,max}_ttl_seconds` = **自签分支**的 TTL 上界
+// =============================================================================
+//  两条分支必须互不干扰：
+//    · `native_presign == true`（S3 SigV4）：传给 `store->presign_*` 的
+//      `PresignOptions.expires_in_seconds` **必须仍是 `expiry.*` 的结果** —— 把自签上界设成
+//      1 秒也不得改变它（S3 的 TTL 语义由 `storage.s3.presign_*` 表达）。
+//    · `native_presign == false`（自签）：上界夹紧真的发生（含"请求未给 expiryTime 才叠加
+//      缺省上界"这一条），且小于上界的请求值**逐字保留**（R16：上界不是"常量改写"）。
+// =============================================================================
+TEST_CASE("★ C10.17 self_signed 的 TTL 上界只作用于自签分支（native 分支逐字不变）",
+          "[phase10][location][c10.17]") {
+  const auto tiny = fss::app::SelfSignedTtlOptions{1, 1};
+
+  SECTION("native presign：自签上界设成 1s，presign TTL 仍是 expiry.* 的结果") {
+    Harness h(/*native_presign=*/true, "s3", "https://storage.invalid", tiny);
+    const std::int64_t now = h.clock.NowEpochSeconds();
+
+    const auto upload = h.issuer->IssueUploadLocation("opendes", "u", std::nullopt, "1H");
+    REQUIRE(upload.ok());
+    REQUIRE(upload.value().native_presign);
+    REQUIRE(upload.value().expires_at_epoch_seconds == now + 3600);
+    REQUIRE(h.store->last_presign_options().expires_in_seconds == 3600);
+
+    // 未提供 expiryTime → 仍是 expiry.default（1H），不是自签缺省上界 1s
+    const auto defaulted =
+        h.issuer->IssueUploadLocation("opendes", "u2", std::nullopt, std::nullopt);
+    REQUIRE(defaulted.ok());
+    REQUIRE(h.store->last_presign_options().expires_in_seconds == 3600);
+
+    const auto download = h.issuer->IssueDownloadLocation("opendes", upload.value().file_id, "2H");
+    REQUIRE(download.ok());
+    REQUIRE(h.store->last_presign_options().expires_in_seconds == 7200);
+
+    // 原生分支**从不**触碰自签 codec
+    REQUIRE(h.codec.encode_calls == 0);
+  }
+
+  SECTION("自签分支：default=60 / max=120 真的夹紧，且小于上界的请求值逐字保留") {
+    Harness h(/*native_presign=*/false, "posix", "https://storage.invalid",
+              fss::app::SelfSignedTtlOptions{60, 120});
+    const std::int64_t now = h.clock.NowEpochSeconds();
+
+    // 未提供 expiryTime → min(expiry.default=3600, max=120) 再 min(default 上界 60) = 60
+    const auto defaulted =
+        h.issuer->IssueUploadLocation("opendes", "u", std::nullopt, std::nullopt);
+    REQUIRE(defaulted.ok());
+    REQUIRE(defaulted.value().expires_at_epoch_seconds == now + 60);
+    REQUIRE(h.codec.last_token.expires_at_epoch_seconds == now + 60);
+
+    // 9H（32400s）远小于 expiry.max（7D）→ 被自签绝对上界压到 120
+    const auto capped = h.issuer->IssueUploadLocation("opendes", "u2", std::nullopt, "9H");
+    REQUIRE(capped.ok());
+    REQUIRE(capped.value().expires_at_epoch_seconds == now + 120);
+    REQUIRE(h.codec.last_token.expires_at_epoch_seconds == now + 120);
+
+    // R16 正例：请求值 1M（60s）**小于**两个上界 → 逐字保留（不是被改写成 120）
+    const auto small = h.issuer->IssueUploadLocation("opendes", "u3", std::nullopt, "1M");
+    REQUIRE(small.ok());
+    REQUIRE(small.value().expires_at_epoch_seconds == now + 60);
+  }
 }

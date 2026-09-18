@@ -3,6 +3,7 @@
 
 #include "app/services/object_key_policy.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace fss::app {
@@ -14,6 +15,20 @@ fss::Error Invalid(const std::string& message) {
 }
 
 }  // namespace
+
+std::int64_t LocationIssuer::ApplySelfSignedTtl(std::int64_t ttl_seconds,
+                                                const domain::BlobCapabilities& caps,
+                                                bool expiry_time_provided) const {
+  //  ★ 阶段 10 切片 5：**只在自签分支**夹紧。原生预签名（S3 SigV4）的 TTL 语义由
+  //    `storage.s3.presign_default_seconds` / `presign_max_seconds` 表达，这两个键
+  //    不得越权影响它 —— 否则同一份配置会改变两条完全不同的数据面。
+  if (caps.native_presign) return ttl_seconds;
+  std::int64_t bounded = std::min(ttl_seconds, self_signed_ttl_.max_seconds);
+  if (!expiry_time_provided) {
+    bounded = std::min(bounded, self_signed_ttl_.default_seconds);
+  }
+  return bounded;
+}
 
 fss::Result<LocationResult> LocationIssuer::IssueUploadLocation(
     std::string_view partition, std::string_view user_id,
@@ -73,6 +88,13 @@ fss::Result<LocationResult> LocationIssuer::IssueUploadLocation(
 
   //  ⑤ 位置记录（先登记，后续 metadata 才能查到；物理引用见头文件的说明）
   const auto caps = store->capabilities();   // ★ 能力分支点的输入（C2.7 白名单调用点）
+  //  ★ 阶段 10 切片 5：自签分支的 TTL 上界（native_presign 分支逐字不变）。
+  //  ⚠️ "给了参数"的判据必须是 `has_value() && !empty()`：契约 §1.4 与 `ExpiryPolicy`
+  //     把**空串**（`?expiryTime=`）按"未提供"处理。若这里用 `has_value()`，客户端只要
+  //     带一个空的 `expiryTime=` 就能绕过 `self_signed.default_ttl_seconds`（同一条路径上
+  //     对"空串"出现两种含义 —— AGENTS §4.3 的同类陷阱）。
+  ttl_seconds = ApplySelfSignedTtl(ttl_seconds, caps,
+                                   expiry_time.has_value() && !expiry_time->empty());
   domain::FileLocation location;
   location.file_id = file_id;
   location.zone = zone;
@@ -115,6 +137,10 @@ fss::Result<LocationResult> LocationIssuer::IssueDownloadLocation(
 
   FSS_TRY(store, blobs_.ForPartition(partition, location.zone));
   const auto caps = store->capabilities();   // ★ 白名单调用点
+  //  ★ 阶段 10 切片 5：自签分支的 TTL 上界（native_presign 分支逐字不变）。
+  //  空串按"未提供"处理，理由同 `IssueUploadLocation` 的同一处注释（契约 §1.4）。
+  ttl_seconds = ApplySelfSignedTtl(ttl_seconds, caps,
+                                   expiry_time.has_value() && !expiry_time->empty());
   return SignAndShape(*store, ref, location, caps, partition, ttl_seconds, /*upload=*/false);
 }
 

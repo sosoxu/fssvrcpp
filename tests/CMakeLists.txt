@@ -259,6 +259,12 @@ fss_add_test(test_transfer_endpoint
   LIBS    fss_transfer fss_blob_memory fss_crypto
   LABELS  phase3 integration)
 
+# C10.17（阶段 10 切片 5）：self_signed.key_id 的编码/解码边界（进程内 codec 单测）
+fss_add_test(test_transfer_token_key_id
+  SOURCES unit/test_transfer_token_key_id.cpp
+  LIBS    fss_transfer fss_crypto
+  LABELS  phase10 unit)
+
 # C3.4：≥1 GiB 流式写读的 RSS 峰值（规模与上限可用环境变量缩小，见 framework/big_file.h）
 fss_add_test(test_posix_large_file
   SOURCES integration/test_posix_large_file.cpp

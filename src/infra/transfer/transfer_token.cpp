@@ -63,6 +63,9 @@ fss::Result<std::string> HmacTransferTokenCodec::Encode(const domain::TransferTo
   payload["zone"] = std::string(domain::StorageZoneName(token.zone));
   payload["op"] = token.op;
   payload["exp"] = token.expires_at_epoch_seconds;
+  //  ★ 阶段 10 切片 5：`self_signed.key_id` 进**被签名的载荷**（非空才写）。
+  //    写在这里而不是只写进 URL 查询串：查询串不受签名之外的保护，且"绑定"必须可验。
+  if (!key_id_.empty()) payload["key_id"] = key_id_;
   //  nonce 只为将来的重放防护预留（默认不强制单次使用，见头文件）
   payload["nonce"] = crypto::RandomHex(8);
 
@@ -116,6 +119,22 @@ fss::Result<domain::TransferToken> HmacTransferTokenCodec::Decode(
     return Unauthenticated("transfer token 的 op 非法");
   }
   (void)require_string("file_id", out.file_id);
+
+  //  ★ 阶段 10 切片 5：`key_id` 绑定校验（fail-closed）。
+  //    · 配置为空 → **不校验**（既有夹具/测试逐字不变）；
+  //    · 配置非空 → 载荷必须带 `key_id` 且与配置**完全相等**。"缺失"绝不当作"匹配"。
+  const auto key_it = value.find("key_id");
+  const bool has_key_id = key_it != value.end() && key_it->is_string();
+  if (has_key_id) out.key_id = key_it->get<std::string>();
+  if (!key_id_.empty()) {
+    if (!has_key_id) {
+      return Unauthenticated("transfer token 缺少 key_id（当前配置 key_id=" + key_id_ + "）");
+    }
+    if (out.key_id != key_id_) {
+      return Unauthenticated("transfer token 的 key_id 与当前配置不匹配（载荷 " + out.key_id +
+                             " / 配置 " + key_id_ + "）");
+    }
+  }
 
   const auto zone_it = value.find("zone");
   if (zone_it == value.end() || !zone_it->is_string()) {

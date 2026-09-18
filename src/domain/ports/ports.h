@@ -356,12 +356,18 @@ struct TransferToken {
   std::string file_id;
   //  ★ 物理容器必须进 token：`/v1/transfer` 内核是 L2，**不能**依赖 L4 的
   //    `ObjectKeyPolicy::ContainerFor` 去反推容器名（否则 L2→L4 越层）。
-  //    这也正是计划里 payload = `{op, container, key, partition, exp, nonce}` 的原因。
+  //    这也正是计划里 payload = `{op, container, key, partition, exp, key_id, nonce}` 的原因。
   std::string container;
   std::string object_key;
   StorageZone zone = StorageZone::kStaging;
   std::string op;  // "put" / "get"
   std::int64_t expires_at_epoch_seconds = 0;
+  //  ★ 阶段 10 切片 5：`self_signed.key_id` 绑定。codec 在**配置了非空 key_id** 时把它写进
+  //    被签名的载荷；解码侧要求载荷里的 `key_id` 与当前配置**完全相等**（缺失也拒绝，
+  //    fail-closed）。字段放在**末尾**以免破坏既有聚合初始化。
+  //    ⚠️ **多密钥轮换未交付**（ADR-009:227 的"多 key 并存"仍未做）：这里只是"把 id 绑进
+  //    签名载荷并在解码侧拒绝不匹配"，不存在"按 id 选密钥"的能力。
+  std::string key_id;
 };
 
 class ISelfSignedUrlCodec {

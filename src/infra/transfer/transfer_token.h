@@ -34,8 +34,14 @@ namespace fss::infra {
 
 class HmacTransferTokenCodec final : public domain::ISelfSignedUrlCodec {
  public:
-  HmacTransferTokenCodec(std::string secret, const fss::IClock& clock)
-      : secret_(std::move(secret)), clock_(clock) {}
+  //  `key_id`（第 3 个参数，默认空）：
+  //    · 非空 → `Encode` 把 `key_id` 写进**被签名的载荷**；`Decode` 在验签通过后要求
+  //      载荷里的 `key_id` 与它**完全相等**（缺字段也算不匹配）→ 否则 `kUnauthenticated`。
+  //      这让"用旧 key_id 签发的 URL 在换 id 后作废"成为可配置行为。
+  //    · 空（默认，既有测试夹具的用法）→ 既不写也不校验，行为与接线前逐字一致。
+  //  ⚠️ 这只是**标识绑定**，不是密钥轮换：签名密钥仍由 `secret` 决定（多 key 并存未交付）。
+  HmacTransferTokenCodec(std::string secret, const fss::IClock& clock, std::string key_id = {})
+      : secret_(std::move(secret)), clock_(clock), key_id_(std::move(key_id)) {}
 
   //  产出 `<base_url>/v1/transfer/{token}?exp=<epoch>&sig=<sig>`
   fss::Result<std::string> Encode(const domain::TransferToken& token,
@@ -54,6 +60,8 @@ class HmacTransferTokenCodec final : public domain::ISelfSignedUrlCodec {
 
   std::string secret_;
   const fss::IClock& clock_;
+  //  ★ 阶段 10 切片 5：`self_signed.key_id`（空 = 不绑定，见构造函数注释）
+  std::string key_id_;
 };
 
 }  // namespace fss::infra

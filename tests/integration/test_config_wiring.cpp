@@ -1882,3 +1882,189 @@ TEST_CASE("★ C10.16 续：非法容器名 / 分区级驱动冲突 / 非法权�
     REQUIRE(outcome2.output.find("批提交协议未实现") != std::string::npos);
   }
 }
+
+// =============================================================================
+//  阶段 10 切片 5（C10.17）：`self_signed` 的 3 个键
+// =============================================================================
+//  ★ `key_id`：进**被签名的载荷**，解码侧要求与当前配置一致（缺失也算不匹配）→ 换 id
+//    重启后旧 URL 必须被拒。用**真实进程**做正反两侧：先 k1 签发并 PUT/GET 200，再以
+//    k2 重启同一个存储根/同一签名密钥，重放同一个 URL → 必须 401（实测为准，不是猜的）。
+//  ★ `{default,max}_ttl_seconds`：**自签分支**的 TTL 上界（`expiry.*` 仍是 `expiryTime`
+//    参数的解析规则与缺省，见 `SelfSignedTtlOptions` 的理由）。"只设 `expiry.*` 时结论
+//    不变"由**本文件未被修改的 C10.12 用例**继续锁定（`expiry.default=5M` + 不带
+//    `expiryTime` → `exp=now+300`）。
+// =============================================================================
+
+TEST_CASE("★ C10.17：self_signed.key_id 进签名载荷；换 key_id 重启后旧 URL 必须被拒（真实进程）",
+          "[phase10][config][c10.17]") {
+  TempDir data_dir("c10s5_keyid");
+  //  ★ 两次启动**共用**同一个存储根（对象真的还在），但**各自独立**的 SQLite 库：
+  //    顺序重启时第一个进程的退出与第二个进程的打开会抢库锁（实测 `PRAGMA synchronous`
+  //    报 `database is locked` → 拒绝启动，把用例变成 flaky）。负例的判据在 Decode 阶段，
+  //    根本不需要读位置记录，因此独立库不影响结论。下面还会**轮询**第一个进程真正退出。
+  const auto write_cfg = [&](const std::string& tag, int port, const std::string& key_id) {
+    return WriteFile(
+        data_dir, tag + ".json",
+        "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(port) +
+            ", \"bind\": \"127.0.0.1\"}},\n"
+            "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child("store") + "\"}},\n"
+            "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-loc.db") +
+            "\"}},\n"
+            "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-meta.db") +
+            "\"}},\n"
+            "  \"self_signed\": {\"signing_key\": \"c10s5-secret\", \"key_id\": \"" + key_id +
+            "\"},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  };
+  //  等一个后台进程真正退出（`kill -0` 失败），不要用固定 sleep（AGENTS §4.3）
+  const auto wait_gone = [](const std::string& pid) {
+    for (int i = 0; i < 400; ++i) {
+      if (std::system(("kill -0 " + pid + " 2>/dev/null").c_str()) != 0) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return false;
+  };
+  //  签发一对 PUT / GET URL，并返回 file_id
+  const auto issue = [](int port, std::string& put_url, std::string& get_url) -> std::string {
+    const auto upload = HttpGet(port, "/api/file/v2/files/uploadURL", Authed());
+    REQUIRE(upload.status == 200);
+    const auto upload_json = fss::json::Parse(upload.body);
+    REQUIRE(upload_json.ok());
+    const std::string file_id = upload_json.value()["FileID"].get<std::string>();
+    put_url = fss::test::TargetOf(upload_json.value()["Location"]["SignedURL"].get<std::string>());
+    const auto download =
+        HttpGet(port, "/api/file/v2/files/" + file_id + "/downloadURL", Authed());
+    REQUIRE(download.status == 200);
+    const auto download_json = fss::json::Parse(download.body);
+    REQUIRE(download_json.ok());
+    get_url = fss::test::TargetOf(download_json.value()["SignedUrl"].get<std::string>());
+    return file_id;
+  };
+
+  const int k1_port = FreePort();
+  const int k2_port = FreePort();
+  std::string put_url;
+  std::string get_url;
+  std::string k1_pid;
+
+  //  ---- ① key_id=k1：签发的 URL 必须可用（R16 正例，证明后续的 401 不是"恒拒"）----
+  {
+    ServerProcess server(SelfContainedOptions({"--config", write_cfg("k1", k1_port, "k1")}));
+    REQUIRE(server.http_port() == k1_port);
+    REQUIRE(WaitReady(k1_port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("self signed    : key_id=k1") != std::string::npos);
+
+    issue(k1_port, put_url, get_url);
+    const auto put = fss::test::HttpDo(k1_port, "PUT", put_url, {}, "k1-payload");
+    CAPTURE(put.status, put.body);
+    REQUIRE(put.status == 200);
+    const auto got = fss::test::HttpDo(k1_port, "GET", get_url, {});
+    CAPTURE(got.status, got.body);
+    REQUIRE(got.status == 200);
+    REQUIRE(got.body == "k1-payload");
+    k1_pid = server.pid();
+  }
+  REQUIRE(wait_gone(k1_pid));  // R9：显式前置条件（旧进程退出）后才启动新进程
+
+  //  ---- ② 以 key_id=k2 重启（同签名密钥 + 同存储根）→ 重放 k1 的 URL 必须被拒 ----
+  {
+    ServerProcess server(SelfContainedOptions({"--config", write_cfg("k2", k2_port, "k2")}));
+    REQUIRE(server.http_port() == k2_port);
+    REQUIRE(WaitReady(k2_port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("self signed    : key_id=k2") != std::string::npos);
+
+    //  目标对象仍在（同一存储根）：先证明"路径本身没问题"——k2 新签发的 PUT 能 200。
+    std::string k2_put;
+    std::string k2_get;
+    issue(k2_port, k2_put, k2_get);
+    const auto fresh = fss::test::HttpDo(k2_port, "PUT", k2_put, {}, "k2-payload");
+    CAPTURE(fresh.status, fresh.body);
+    REQUIRE(fresh.status == 200);
+
+    //  重放 k1 的 URL：签名仍然有效（密钥/载荷都没变），被拒的**只能是 key_id 不匹配**。
+    const auto replay_put = fss::test::HttpDo(k2_port, "PUT", put_url, {}, "replay");
+    CAPTURE(replay_put.status, replay_put.body);
+    REQUIRE(replay_put.status == 401);
+    REQUIRE(replay_put.body.find("key_id") != std::string::npos);
+
+    const auto replay_get = fss::test::HttpDo(k2_port, "GET", get_url, {});
+    CAPTURE(replay_get.status, replay_get.body);
+    REQUIRE(replay_get.status == 401);
+    REQUIRE(replay_get.body.find("key_id") != std::string::npos);
+  }
+}
+
+TEST_CASE("★ C10.17：self_signed.{default,max}_ttl_seconds 是自签分支的 TTL 上界（真实进程）",
+          "[phase10][config][c10.17]") {
+  TempDir data_dir("c10s5_ttl");
+  const auto write_cfg = [&](const std::string& tag, int port, const std::string& self_extra) {
+    return WriteFile(
+        data_dir, tag + ".json",
+        "{\n  \"server\": {\"http\": {\"port\": " + std::to_string(port) +
+            ", \"bind\": \"127.0.0.1\"}},\n"
+            "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child(tag + "-data") + "\"}},\n"
+            "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-loc.db") +
+            "\"}},\n"
+            "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child(tag + "-meta.db") +
+            "\"}},\n"
+            "  \"self_signed\": {\"signing_key\": \"c10s5-ttl\"" + self_extra + "},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+  };
+  const auto upload_exp = [](int port, const std::string& query) -> std::int64_t {
+    const auto reply = HttpGet(port, "/api/file/v2/files/uploadURL" + query, Authed());
+    CAPTURE(reply.status, reply.body);
+    REQUIRE(reply.status == 200);
+    return ExpiresOf(reply.body);
+  };
+
+  SECTION("max_ttl_seconds=120 + expiryTime=9H（远小于 expiry.max=7D）→ exp=now+120") {
+    const int port = FreePort();
+    ServerProcess server(
+        SelfContainedOptions({"--config", write_cfg("max120", port, ", \"max_ttl_seconds\": 120")}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("TTL 自签上界 default=3600s max=120s") != std::string::npos);
+
+    const auto now = static_cast<std::int64_t>(::time(nullptr));
+    const std::int64_t exp = upload_exp(port, "?expiryTime=9H");
+    CAPTURE(now, exp);
+    REQUIRE(exp >= now + 115);
+    REQUIRE(exp <= now + 125);
+
+    //  R16 正例：请求值 1M（60s）**小于**绝对上界 → 逐字保留（上界不是"常量改写"）。
+    const std::int64_t small = upload_exp(port, "?expiryTime=1M");
+    REQUIRE(small >= now + 55);
+    REQUIRE(small <= now + 65);
+  }
+
+  SECTION("default_ttl_seconds=60 且请求不带 expiryTime → exp=now+60（expiry.default 仍是 1H）") {
+    const int port = FreePort();
+    ServerProcess server(SelfContainedOptions(
+        {"--config", write_cfg("default60", port, ", \"default_ttl_seconds\": 60")}));
+    REQUIRE(WaitReady(port));
+    CAPTURE(server.DumpLog());
+    REQUIRE(server.DumpLog().find("TTL 自签上界 default=60s max=604800s") != std::string::npos);
+
+    const auto now = static_cast<std::int64_t>(::time(nullptr));
+    const std::int64_t exp = upload_exp(port, "");
+    CAPTURE(now, exp);
+    REQUIRE(exp >= now + 55);
+    REQUIRE(exp <= now + 65);
+
+    //  给了 expiryTime 时**不叠加**缺省上界：只有绝对上界 604800s 会夹紧。
+    //  ★ 用 2M（120s）而不是 1M（60s）：60s 与缺省上界**恰好同值**，那样这条断言
+    //    "叠加与不叠加都能过"（恒真）。120s > 缺省上界 60s 且 < 绝对上界 → 必须原样保留。
+    const std::int64_t with_query = upload_exp(port, "?expiryTime=2M");
+    REQUIRE(with_query >= now + 115);
+    REQUIRE(with_query <= now + 125);
+
+    //  ★ 空串 `?expiryTime=` 必须按"未提供"处理（契约 §1.4 与 ExpiryPolicy 的既定语义），
+    //    因此**仍受**缺省上界 60s 夹紧 —— 否则带一个空参数就能绕过该键。
+    const std::int64_t empty_query = upload_exp(port, "?expiryTime=");
+    REQUIRE(empty_query >= now + 55);
+    REQUIRE(empty_query <= now + 65);
+  }
+}
+

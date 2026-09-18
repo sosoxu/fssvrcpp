@@ -1180,8 +1180,8 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 | --- | --- | --- | --- |
 | T1 | 路径穿越（`..`、绝对路径）写入 POSIX 存储 | `ObjectKeyPolicy` 只生成规范化键；`PosixBlobStore` 逐段校验 + `openat`/`O_NOFOLLOW` + 解析后校验仍在 `root` 内 | 专项单元测试（≥10 个恶意键） |
 | T2 | 符号链接逃逸 | 拒绝 `O_NOFOLLOW` 打开失败；容器目录创建时校验非符号链接 | 集成测试（预置符号链接） |
-| T3 | 自签传输 URL 伪造/篡改 | HMAC-SHA256 + 常量时间比较；载荷含 `op`+`ref`+`exp`+`partition`+`nonce` | 单元测试：篡改任一字段必须失败 |
-| T4 | 自签 URL 重放（跨操作/跨租户/过期） | 载荷绑定 `op` 与 `partition`；强制 `exp` 校验；`nonce` 支持一次性使用（可选，默认关闭以支持大文件续传） | 集成测试：GET token 用于 PUT、越租户、过期后使用 → 全部拒绝 |
+| T3 | 自签传输 URL 伪造/篡改 | HMAC-SHA256 + 常量时间比较；载荷含 `op`+`ref`+`exp`+`partition`+`key_id`+`nonce` | 单元测试：篡改任一字段必须失败 |
+| T4 | 自签 URL 重放（跨操作/跨租户/过期/**跨 key_id**） | 载荷绑定 `op` 与 `partition`；强制 `exp` 校验；`key_id` 绑定（`self_signed.key_id` 非空时载荷必须带且相等，缺字段也拒绝 → 401）；`nonce` 支持一次性使用（可选，默认关闭以支持大文件续传）。⚠️ **多密钥轮换未交付**（ADR-009:227 的"多 key 并存"）：`key_id` 只做"标识绑定 + 解码侧拒绝不匹配"，**不能**按 id 选密钥 | 集成测试：GET token 用于 PUT、越租户、过期后使用 → 全部拒绝；`key_id=k1` 签发的 URL 在 `key_id=k2` 重启后重放 → **401** |
 | T5 | 密钥泄漏（S3 secret / 签名密钥） | 配置支持 `${ENV:VAR}` 引用；日志脱敏（`access_key`/`secret_key`/`token`/`sig` 一律打码）；`/v2/info` 不输出密钥 | 单元测试：日志与 info 输出中不出现密钥明文 |
 | T6 | 越权访问他人记录 | 所有仓储方法强制 `partition_id`；路由级鉴权预检 + 用例入口 `IAuthorizer`；**租户绑定**：token 的 `data-partition-id` claim 必须等于请求头（ADR-012 §3） | `test_jwt_authorizer`（A 的 token + B 的头 → 403）+ `test_auth_matrix`（端点 × 角色矩阵）+ P3/P6 的分区隔离契约 |
 | T7 | 认证绕过 | ADR-012：默认 `auth.mode=jwt`（HS256 本地校验）；`alg` 白名单（拒绝 `none`）；`exp` 必需；密钥/claim 缺失一律拒绝（fail-closed）；production 禁止 `disabled`/关验签/无密钥；`disabled` 打印显著告警且 `/v2/info` 暴露 `authMode`；`remote-entitlements`/JWKS 未实现时**拒绝启动** | `test_unit/test_jwt_authorizer`（9 类越权/畸形 token 全 401）+ `test_config`（production 三条拒绝 + 一条正例）+ `test_auth_matrix` |
@@ -1253,9 +1253,9 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
 exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、`expiry.*` 接进组合根，
 并把 16 个未实现键改为"非默认值 → 拒绝启动"（后续切片与 C10.16 / C10.16 续 继续收敛，当前三态为
-**生效 93 / 拒绝启动 21 / 已读但无效果 42**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
+**生效 96 / 拒绝启动 21 / 已读但无效果 39**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
 ② 多实例相关的 `shared_mount_required`/`one_filesystem_per_partition` 仍不可配（在 §1.3 的
-42 个"已读但无效果"键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
+39 个"已读但无效果"键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
 实现（ADR-006 §6 的门槛）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
 
 ---
