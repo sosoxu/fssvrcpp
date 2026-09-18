@@ -557,3 +557,12 @@ fss_add_test(test_operations_doc
   SOURCES unit/test_operations_doc.cpp
   LIBS    fss_config fss_json
   LABELS  "phase9;docs")
+
+# =============================================================================
+#  阶段 10 切片 1：配置面接线（C10.1~C10.8）—— 全部在**真实二进制**上断言
+#    server_process.h 负责拉起 build/bin/fss_server（可传 --config/--set/环境变量），
+#    反向用例用 RunServerForExit() 拿退出码与输出。
+# =============================================================================
+fss_add_test(test_config_wiring
+  SOURCES integration/test_config_wiring.cpp
+  LABELS  "phase10;integration")

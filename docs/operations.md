@@ -5,17 +5,32 @@
 > [`tests/unit/test_operations_doc.cpp`](../tests/unit/test_operations_doc.cpp) 自动比对
 > （`ctest -L phase9` 会跑）：缺一个键、或写了一个不存在的键，测试都会失败并一次性列出全部差异。
 >
-> ★ **先读 §1.1**：组合根（[`src/main/server_main.cpp`](../src/main/server_main.cpp)）目前
-> **只读环境变量**，**不读** `config/fss.example.json`。因此本手册对每个键都明确标注
-> "组合根当前读取方式"：能接通的给出真实 `FSS_*` 环境变量名，接不通的写
-> **未接通（登记为未实现）**，并在 §1.3 单独成表。这是一条**如实登记**，不是设计意图。
+> ★ **先读 §1.1**：阶段 10 切片 1 起，组合根
+> （[`src/main/server_main.cpp`](../src/main/server_main.cpp)）**加载配置面**：
+> 命令行 `--set` > 环境变量（通用名 / 旧别名）> `--config`/`FSS_CONFIG` 指向的
+> 带注释 JSON > 组合根历史默认值。因此本手册对每个键都明确标注
+> "组合根当前读取方式"：**已接通**的给出真实来源（配置路径 + 环境变量名 + 来源标记），
+> 未接通的写 **未接通（登记为未实现）**，并在 §1.3 单独成表。这是一条**如实登记**。
+> 配置非法（未知键 / 类型不符 / 越界 / 跨字段冲突 / 生产强校验不过）→ 打印全部问题并
+> **以退出码 78（EX_CONFIG）拒绝启动**。
 
 ---
 
 ## 0. 一分钟速查
 
 ```bash
-# 启动（组合根只认环境变量；示例里的 JSON 目前不会被读取）
+# 启动：推荐用配置文件（带注释的 JSON）；环境变量仍可作为覆盖层
+# ⚠️ config/fss.example.json 里 7 个密文键写成了 ${ENV:VAR}：**这些变量必须先注入**，
+#    否则加载器会把"引用未解析"计为配置问题并拒绝启动（exit 78）—— 这是 fail-closed 的有意行为。
+./build/bin/fss_server --config config/fss.example.json
+
+# 只看"这次到底用了什么配置"（脱敏 + 每项来源），不启动服务
+./build/bin/fss_server --config config/fss.example.json --print-config
+
+# 命令行覆盖单个键（可重复；优先级最高）
+./build/bin/fss_server --config config/fss.example.json --set server.http.port=9090
+
+# 等价的环境变量启动（通用名 / 旧别名都支持）
 FSS_STORAGE_DRIVER=posix \
 FSS_STORAGE_ROOT=/var/lib/fss/data \
 FSS_SQLITE_PATH=/var/lib/fss/location.db \
@@ -35,13 +50,14 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 | 项 | 值 |
 | --- | --- |
-| REST base path | `/api/file`（契约 §1.1；组合根硬编码 `kDefaultBasePath`，**不可配**） |
-| 默认 HTTP 端口 | `8080`（`FSS_HTTP_PORT`） |
-| 默认 gRPC 端口 | **关闭**（`FSS_GRPC_PORT=0`；`-1` = 系统分配） |
-| 指标端点 | `/metrics`（**不在** base path 之下，契约 §7） |
-| 数据面 | `/api/file/v1/transfer/{token}`（仅 POSIX 驱动注册） |
-| 默认存储驱动 | `posix`（`FSS_STORAGE_DRIVER`） |
-| 默认鉴权 | 组合根默认 `disabled`（`FSS_AUTH_MODE`）；**示例文件与 schema 默认是 `jwt`** —— 见 §7 |
+| REST base path | `/api/file`（契约 §1.1；`server.http.base_path`，默认 `/api/file`） |
+| 默认 HTTP 端口 | `8080`（`server.http.port` / `FSS_HTTP_PORT`） |
+| 默认 gRPC 端口 | **关闭**（`server.grpc.port=0`；`-1` = 系统分配） |
+| 指标端点 | `/metrics`（`observability.metrics_path`；**不在** base path 之下，契约 §7） |
+| 数据面 | `/api/file/v1/transfer/{token}`（仅 POSIX 驱动 + `self_signed.enabled=true`） |
+| 默认存储驱动 | `posix`（`storage.driver` / `FSS_STORAGE_DRIVER`） |
+| 默认鉴权 | 组合根默认 `disabled`（`auth.mode`，**与 schema 默认 `jwt` 不同** —— 见 §1.4）；生产必须 `jwt` |
+| 配置非法 | 打印全部问题 + **退出码 78（EX_CONFIG）** |
 
 ---
 
@@ -49,54 +65,66 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 ### 1.1 组合根当前如何读配置（★ 必读）
 
-* **来源**：只有环境变量。`main()` 里没有命令行解析，也没有加载 `config/fss.example.json`
-  （文件头的"命令行 > 环境变量 > 文件 > 内置默认值"目前**只有第二级可用**）。
-* **每个键的命名规律**（`config/fss.example.json` 头部注释里的约定）：
-  JSON 路径大写、点换下划线、加前缀 `FSS_`。例如 `storage.driver` → `FSS_STORAGE_DRIVER`。
-  ⚠️ 这个规律**没有被组合根普遍执行**：下面表格的"组合根读取方式"列给的是
-  `server_main.cpp` 里**实际出现**的字符串；凡是实际名字与该规律不同的，都单独标注。
-* **`${ENV:VAR}` 引用**：示例文件里 7 个密文键写成了 `${ENV:VAR_NAME}`。它属于
-  `fss::config` 加载器的能力（[`tests/unit/test_config.cpp`](../tests/unit/test_config.cpp) 有用例），
-  但组合根不经过加载器，所以这 7 个引用**当前不生效**；生效的是组合根自己读的环境变量。
-* 示例文件里的内嵌 `${ENV:...}` 名与组合根实际读的名字**不一致**的有 3 处，见 §1.4。
+**来源与优先级（高 → 低）**
+
+| 优先级 | 来源 | 写法 | 备注 |
+| --- | --- | --- | --- |
+| 1 | 命令行覆盖 | `--set <json.path>=<值>`（可重复） | 合法路径/类型仍由 schema 校验；未知路径 → 拒绝启动 |
+| 2 | 环境变量（通用名） | `FSS_` + 路径大写、`.`→`_`（如 `server.http.port` → `FSS_SERVER_HTTP_PORT`） | 由 `fss::config::Load` 直接映射 |
+| 3 | 环境变量（旧别名，deprecated） | `FSS_HTTP_PORT` / `FSS_STORAGE_ROOT` / `FSS_POSIX_DURABILITY` / … | 现有脚本/镜像在用；见 §1.4 别名表。**通用名与别名同时存在时通用名胜出**，并在启动横幅/日志里给出告警 |
+| 4 | 配置文件 | `--config <path>`（等价 `FSS_CONFIG`）；**带注释的 JSON** | 未知键/类型不符/越界/跨字段冲突 → 拒绝启动 |
+| 5 | 组合根历史默认值 | —— | 与 schema 默认值不同的键逐个登记在 §1.4；保证"不提供配置时行为与接线前一致" |
+
+* **命令行**：`--config <path>`、`--set <path>=<value>`、`--print-config`、`--help`。
+  未知参数 → 打印用法并拒绝启动（退出码 2）。`--print-config` 打印**脱敏后**的完整有效配置
+  与每项来源（`cli` / `env` / `file` / `default`，旧别名额外标注 `别名 FSS_XXX`），随后退出 0。
+* **失败语义**：配置非法 → 一次性打印**全部**问题（`path + 原因 + 来源`）→ **退出码 78（EX_CONFIG）**。
+  这条对运维很重要：只报第一个问题会导致"改一个、重启、再发现一个"的迭代。
+* **`${ENV:VAR}` 引用**：示例文件里的密文键写成 `${ENV:VAR_NAME}` —— 现在由
+  `fss::config` 加载器解析（组合根走的就是加载器），因此这些引用**已生效**。
+* 示例文件里的内嵌 `${ENV:...}` 名与组合根支持的别名**不完全一致**（3 处），见 §1.4 的别名表。
+* **启动横幅**：`stdout` 的**第一行**给出配置来源（文件路径，或"无配置文件（仅环境变量）"），
+  随后逐键打印**已接通**键的来源缩写。
 
 ### 1.2 逐键参考表（156 个叶子键）
 
 > 读法：**示例值**取自 `config/fss.example.json`（它是"给人抄的样例"，不等于 schema 默认值）；
 > **取值约束**取自 `fss::config::CoreSchema()`（[`src/common/config/core_schema.cpp`](../src/common/config/core_schema.cpp)）；
-> 两者不一致处已显式标注。
+> 两者不一致处已显式标注。**组合根读取方式**列写"已接通"时，给出可用的来源（配置路径 +
+> 通用环境变量名 + 旧别名）；写"未接通"的键在 §1.3 单独成表（共 **90** 个）。
+
 
 #### 1.2.1 `deployment`
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `deployment.environment` | 部署环境；`production` 触发更严格校验（禁 `disabled`、必须验签、jwt 必须有密钥） | `development` | enum `development` / `production`；默认 `development` | 未接通（登记为未实现；生产校验在 CoreSchema 跨字段规则里，组合根未加载 schema） |
-| `deployment.max_clock_skew_seconds` | 本地钟与参考钟允许偏差（秒） | `5` | int 0..300；`multi` 时要求 `0 < 值 <= 60` | `FSS_MAX_CLOCK_SKEW_SECONDS`（**只在 `FSS_AUTH_MODE=jwt` 时读取**；缺省 5，赋给 `LocalJwtOptions.clock_skew_seconds`） |
-| `deployment.mode` | 单实例 / 多实例 | `single` | enum `single` / `multi`；`multi` 触发 5 条强制校验 | `FSS_DEPLOYMENT_MODE`（默认 `single`；`multi` → **明确拒绝启动**，见 §8） |
-| `deployment.instance_id` | 实例标识（K8s 建议注入 `POD_NAME`） | `""` | string | 未接通（登记为未实现；POSIX 临时名里的实例标识固定为 `local`） |
+| `deployment.environment` | 部署环境；`production` 触发更严格校验（禁 `disabled`、必须验签、jwt 必须有密钥） | `development` | enum `development` / `production`；默认 `development` | 已接通（`--config`/`--set`/`FSS_DEPLOYMENT_ENVIRONMENT`）。`production` 时：`auth.mode` 必须 `jwt`、`auth.jwt.verify_signature` 必须 true、`auth.jwt.hmac_secret` 必须非空，否则 **exit 78** |
+| `deployment.max_clock_skew_seconds` | 本地钟与参考钟允许偏差（秒） | `5` | int 0..300；`multi` 时要求 `0 < 值 <= 60` | 已接通（`deployment.max_clock_skew_seconds`；旧别名 `FSS_MAX_CLOCK_SKEW_SECONDS`）。赋值给 `LocalJwtOptions.clock_skew_seconds`（仅 `auth.mode=jwt` 时有意义） |
+| `deployment.mode` | 单实例 / 多实例 | `single` | enum `single` / `multi`；`multi` 触发 5 条强制校验 | 已接通（`deployment.mode` / 通用名 `FSS_DEPLOYMENT_MODE`）；`multi` → **明确拒绝启动**（exit 78），见 §8 |
+| `deployment.instance_id` | 实例标识（K8s 建议注入 `POD_NAME`） | `""` | string | 已接通（`deployment.instance_id`）→ `PosixBlobStoreOptions.instance_id`（临时文件名 `<key>.tmp.<instance_id>.<pid>.<counter>`）；默认 `local` |
 | `deployment.clock_skew_tolerance_seconds` | 与数据库 `now()` 的偏移容忍（秒） | `60` | int 0..86400 | 未接通（登记为未实现） |
 
 #### 1.2.2 server.http 子树
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `server.http.base_path` | REST context path，必须与上游一致 | `/api/file` | string，Required；默认 `/api/file` | 未接通（组合根硬编码 `/api/file`） |
-| `server.http.bind` | 监听地址 | `0.0.0.0` | string；默认 `0.0.0.0` | `FSS_BIND_ADDRESS`（默认 `0.0.0.0`；**HTTP 与 gRPC 共用**） |
-| `server.http.port` | HTTP 端口 | `8080` | int 1..65535；默认 `8080` | `FSS_HTTP_PORT`（默认 `8080`） |
-| `server.http.max_header_bytes` | 单请求头上限 | `16384` | int 1024..1048576；默认 `16384` | 未接通（登记为未实现；实现内有固定上限） |
-| `server.http.max_uri_bytes` | 请求行/target 上限 | `8192` | int 128..1048576；默认 `8192` | 未接通（登记为未实现） |
-| `server.http.max_body_bytes` | JSON 端点请求体上限 | `10485760` | int 1..1073741824；默认 `10485760`（10 MiB） | 未接通（登记为未实现；适配层用固定 10 MiB / 256 KiB 两档） |
-| `server.http.tcp_nodelay` | 小请求必须开启，否则 ~40 ms delayed-ACK 停顿（实测 950 倍） | `true` | bool；默认 `true` | 未接通（实现内**强制** `true`，不可关） |
-| `server.http.worker_threads` | 并发连接上限（一条 keep-alive 连接占一个线程直到结束） | `0` | int 0..65536；0 = 按公式推导 | 未接通（实现内固定公式：`max(16, 4×核数)`；本机 16 核 → **64**）。⚠️ 示例文件注释写的是 `max(64, 2×核数)`，与代码不一致，以代码为准 |
-| `server.http.max_connections` | 在途请求上限（超过 → 503 + `Retry-After`） | `0` | int 0..65536；0 = 等于 worker_threads | 未接通（登记为未实现；实现内 0 → = worker_threads） |
+| `server.http.base_path` | REST context path，必须与上游一致 | `/api/file` | string，Required；默认 `/api/file` | 已接通（`server.http.base_path`）→ `RouterOptions.base_path`；也是自签 URL 基址的默认组成部分 |
+| `server.http.bind` | 监听地址 | `0.0.0.0` | string；默认 `0.0.0.0` | 已接通（`server.http.bind`；旧别名 `FSS_BIND_ADDRESS`，**HTTP 与 gRPC 共用**） |
+| `server.http.port` | HTTP 端口 | `8080` | int 1..65535；默认 `8080` | 已接通（`server.http.port`；旧别名 `FSS_HTTP_PORT`，允许 `0` = 系统分配） |
+| `server.http.max_header_bytes` | 单请求头上限 | `16384` | int 1024..1048576；默认 `16384` | 已接通（`server.http.max_header_bytes`）→ `http::ServerOptions.max_header_bytes` |
+| `server.http.max_uri_bytes` | 请求行/target 上限 | `8192` | int 128..1048576；默认 `8192` | 已接通（`server.http.max_uri_bytes`）→ `http::ServerOptions.max_uri_bytes` |
+| `server.http.max_body_bytes` | JSON 端点请求体上限 | `10485760` | int 1..1073741824；默认 `10485760`（10 MiB） | 已接通（`server.http.max_body_bytes`）→ `RouterOptions.json_body_limit_bytes` |
+| `server.http.tcp_nodelay` | 小请求必须开启，否则 ~40 ms delayed-ACK 停顿（实测 950 倍） | `true` | bool；默认 `true` | 已接通（`server.http.tcp_nodelay`）→ `http::ServerOptions.tcp_nodelay` |
+| `server.http.worker_threads` | 并发连接上限（一条 keep-alive 连接占一个线程直到结束） | `0` | int 0..65536；0 = 按公式推导 | 已接通（`server.http.worker_threads`）；`0` → 实现公式 `max(16, 4×核数)`（本机 16 核 → 64），可在 `/metrics` 的 `fss_http_worker_threads` 上看到实际值 |
+| `server.http.max_connections` | 在途请求上限（超过 → 503 + `Retry-After`） | `0` | int 0..65536；0 = 等于 worker_threads | 已接通（`server.http.max_connections`）；`0` → = worker_threads；**大于 worker_threads → 拒绝启动**（否则背压静默失效） |
 | `server.http.max_connections_per_partition` | 每租户并发上限 | `0` | int 0..65536 | 未接通（登记为未实现） |
-| `server.http.idle_timeout_seconds` | 普通路由空闲读超时 | `60` | int 1..86400；默认 `60` | 未接通（实现内固定 60 s） |
-| `server.http.json_request_timeout_seconds` | 普通路由**整体**超时 | `15` | int 1..86400；默认 `15` | 未接通（实现内固定 15 s） |
-| `server.http.transfer_idle_timeout_seconds` | 数据面**空闲**超时（**没有**整体超时） | `120` | int 1..86400；默认 `120` | 未接通（实现内固定 120 s） |
-| `server.http.transfer_max_body_bytes` | 数据面请求体上限 | `0` | int 只能是 `0`（0 = 不限） | 未接通（登记为未实现） |
-| `server.http.transfer_buffer_bytes` | 数据面单块缓冲 | `262144` | int 4096..67108864；默认 `262144` | 未接通（登记为未实现） |
-| `server.http.transfer_memory_budget_bytes` | 传输内存预算；`并发 × 缓冲 > 该值` → 拒绝启动 | `268435456` | int ≥1048576；跨字段：`worker_threads > 0` 时 `buffer × workers <= budget` | 未接通（登记为未实现；schema 的跨字段规则不在启动路径上） |
-| `server.http.large_file_plane.enabled` | ADR-006 独立大文件数据面（`sendfile`）开关 | `false` | bool；默认 `false` | 未接通（登记为未实现；实现未交付，默认走 httplib） |
+| `server.http.idle_timeout_seconds` | 普通路由空闲读超时 | `60` | int 1..86400；默认 `60` | 已接通（`server.http.idle_timeout_seconds`）→ `http::ServerOptions.read_timeout_sec` |
+| `server.http.json_request_timeout_seconds` | 普通路由**整体**超时 | `15` | int 1..86400；默认 `15` | 已接通（`server.http.json_request_timeout_seconds`）→ `http::ServerOptions.json_request_timeout_sec` |
+| `server.http.transfer_idle_timeout_seconds` | 数据面**空闲**超时（**没有**整体超时） | `120` | int 1..86400；默认 `120` | 已接通（`server.http.transfer_idle_timeout_seconds`）→ `http::ServerOptions.transfer_idle_timeout_sec`（同时赋给 `S3Options.transfer_idle_timeout_seconds`） |
+| `server.http.transfer_max_body_bytes` | 数据面请求体上限 | `0` | int 只能是 `0`（0 = 不限） | 未接通（登记为未实现；数据面路由本来就按"不限"注册） |
+| `server.http.transfer_buffer_bytes` | 数据面单块缓冲 | `262144` | int 4096..67108864；默认 `262144` | 已接通（`server.http.transfer_buffer_bytes`）→ `http::ServerOptions.transfer_buffer_bytes` |
+| `server.http.transfer_memory_budget_bytes` | 传输内存预算；`并发 × 缓冲 > 该值` → 拒绝启动 | `268435456` | int ≥1048576；跨字段：`worker_threads > 0` 时 `buffer × workers <= budget` | 已接通（`server.http.transfer_memory_budget_bytes`）→ `http::ServerOptions.transfer_memory_budget_bytes`；schema 跨字段 + `http::ValidateOptions` 双重校验，违反 → **exit 78** |
+| `server.http.large_file_plane.enabled` | ADR-006 独立大文件数据面（`sendfile`）开关 | `false` | bool；默认 `false` | 未接通（登记为未实现；sendfile 数据面未交付，默认走 httplib） |
 | `server.http.large_file_plane.bind` | 大文件数据面监听地址 | `0.0.0.0` | string；默认 `0.0.0.0` | 未接通（登记为未实现） |
 | `server.http.large_file_plane.port` | 大文件数据面端口 | `8081` | int 1..65535；默认 `8081` | 未接通（登记为未实现） |
 | `server.http.large_file_plane.use_sendfile` | 是否用 `sendfile` | `true` | bool；默认 `true` | 未接通（登记为未实现） |
@@ -108,9 +136,9 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `server.grpc.enabled` | gRPC 面开关（平台外扩展，ADR-001） | `true` | bool；默认 `true` | 未接通（组合根用 `FSS_GRPC_PORT=0` 表达"关闭"） |
-| `server.grpc.bind` | gRPC 监听地址 | `0.0.0.0` | string；默认 `0.0.0.0` | `FSS_BIND_ADDRESS`（与 HTTP 共用同一个变量） |
-| `server.grpc.port` | gRPC 端口 | `50051` | int 1..65535；默认 `50051` | `FSS_GRPC_PORT`（默认 `0` = 关闭；`-1` = 系统分配） |
+| `server.grpc.enabled` | gRPC 面开关（平台外扩展，ADR-001） | `true` | bool；默认 `true` | 未接通（组合根用 `server.grpc.port=0` / `FSS_GRPC_PORT=0` 表达"关闭"；该键本身不参与判定） |
+| `server.grpc.bind` | gRPC 监听地址 | `0.0.0.0` | string；默认 `0.0.0.0` | 已接通（`server.grpc.bind`；旧别名 `FSS_BIND_ADDRESS`，与 HTTP 共用同一个变量） |
+| `server.grpc.port` | gRPC 端口 | `50051` | int 1..65535；默认 `50051` | 已接通（`server.grpc.port`；旧别名 `FSS_GRPC_PORT`，允许 `0`=关闭 / `-1`=系统分配 —— 旧别名的值域比 schema 更宽，见 §1.4） |
 | `server.grpc.max_message_bytes` | 单条消息上限 | `4194304` | int ≥1024；默认 `4194304` | 未接通（登记为未实现） |
 | `server.grpc.streaming_chunk_bytes` | 流式分块 | `262144` | int ≥4096；默认 `262144` | 未接通（登记为未实现） |
 
@@ -118,43 +146,43 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `storage.driver` | 存储驱动 | `posix` | enum `posix` / `s3`；默认 `posix` | `FSS_STORAGE_DRIVER`（默认 `posix`；非法值拒绝启动） |
-| `storage.proxy_mode` | `auto` = 按驱动能力决定地址形态；`always` = 强制服务代理字节 | `auto` | enum `auto` / `always`；默认 `auto` | 未接通（登记为未实现） |
-| `storage.driver_report_override` | 覆盖上报的 Driver（上游硬编码 `GCS`） | `""` | string；默认 `""` | 未接通（登记为未实现） |
-| `storage.provider_key_override` | 覆盖 DMS 的 `providerKey` | `""` | string；默认 `""` | 未接通（登记为未实现） |
-| `storage.io_engine` | I/O 引擎（ADR-010） | `blocking` | enum `blocking` / `uring` / `auto`；默认 `blocking` | 未接通（登记为未实现；实现只有 blocking 路径） |
-| `storage.io_uring.queue_depth` | io_uring 队列深度 | `64` | int 1..4096；默认 `64` | 未接通（登记为未实现） |
-| `storage.io_uring.register_files` | io_uring 注册文件表 | `false` | bool；默认 `false` | 未接通（登记为未实现） |
-| `storage.posix.root` | 集中存储根目录 | `/var/lib/fss/data` | string，Required；默认 `/var/lib/fss/data` | `FSS_STORAGE_ROOT`（默认 `/tmp/fss-data`；对象落在 `<root>/blobs`） |
-| `storage.posix.durability` | 落盘档位 | `batch` | enum `batch` / `per_file`（★ **schema 未含 `never`**）；默认 `batch` | `FSS_POSIX_DURABILITY`（默认 `per_file`；接受 `per_file`/`batch`/`never`，见 §5） |
+| `storage.driver` | 存储驱动 | `posix` | enum `posix` / `s3`；默认 `posix` | 已接通（`storage.driver` / 通用名 `FSS_STORAGE_DRIVER`；非法值 → exit 78） |
+| `storage.proxy_mode` | `auto` = 按驱动能力决定地址形态；`always` = 强制服务代理字节 | `auto` | enum `auto` / `always`；默认 `auto` | 未接通（登记为未实现；当前按驱动能力固定行为） |
+| `storage.driver_report_override` | 覆盖上报的 Driver（上游硬编码 `GCS`） | `""` | string；默认 `""` | 已接通（`storage.driver_report_override`）→ `S3Options.driver_report_override` |
+| `storage.provider_key_override` | 覆盖 DMS 的 `providerKey` | `""` | string；默认 `""` | 已接通（`storage.provider_key_override`）→ `S3Options.provider_key_override` |
+| `storage.io_engine` | I/O 引擎（ADR-010） | `blocking` | enum `blocking` / `uring` / `auto`；默认 `blocking` | 已接通（`storage.io_engine`）：探测 + 决策在组合根执行；`uring` 不可用 → **exit 78**（提示 `scripts/check_io_uring.sh`）；`auto` → 回退 blocking，且**横幅与 `/metrics` 的 `fss_io_engine` 可见**。当前 `UringIoEngine::enabled()=false`（ADR-010 U1~U4），故实际生效恒为 blocking |
+| `storage.io_uring.queue_depth` | io_uring 队列深度 | `64` | int 1..4096；默认 `64` | 已接通（`storage.io_uring.queue_depth`）→ `sys::ProbeIoUring(entries)` |
+| `storage.io_uring.register_files` | io_uring 注册文件表 | `false` | bool；默认 `false` | 未接通（登记为未实现；引擎本身未启用） |
+| `storage.posix.root` | 集中存储根目录 | `/var/lib/fss/data` | string，Required；默认 `/var/lib/fss/data` | 已接通（`storage.posix.root`；旧别名 `FSS_STORAGE_ROOT`；**组合根历史默认 `/tmp/fss-data`**）；对象落在 `<root>/blobs` |
+| `storage.posix.durability` | 落盘档位 | `batch` | enum `batch` / `per_file`（★ **schema 未含 `never`**）；默认 `batch` | 已接通（`storage.posix.durability`；旧别名 `FSS_POSIX_DURABILITY`，**接受 `never`**）。映射见 §5；**组合根历史默认 `per_file`** |
 | `storage.posix.group_commit_max_batch` | 批提交最大批大小 | `500` | int 1..100000；默认 `500` | 未接通（登记为未实现） |
-| `storage.posix.sync_dir_after_batch` | 批末 `fsync(dir)`（ADR-008 的 R2 不变量） | `true` | bool；默认 `true` | 未接通（登记为未实现） |
-| `storage.posix.fsync_threshold_bytes` | 大于该值的对象强制 per-file 落盘 | `0` | int；★ schema 只允许 `0` | `FSS_POSIX_FSYNC_THRESHOLD_BYTES`（默认 `1048576`，即 1 MiB；**只在 durability=batch 时生效**） |
-| `storage.posix.atomic_write` | tmp + rename 原子写 | `true` | bool；默认 `true` | 未接通（实现内固定开启） |
+| `storage.posix.sync_dir_after_batch` | 批末 `fsync(dir)`（ADR-008 的 R2 不变量） | `true` | bool；默认 `true` | 未接通（登记为未实现；实现内固定按 R2 执行） |
+| `storage.posix.fsync_threshold_bytes` | ≥ 该值的对象强制 per-file 落盘（只对 `batch` 生效） | `1048576` | int 0..1099511627776；默认 `0`（0 = 所有对象都必须 fsync） | 已接通（`storage.posix.fsync_threshold_bytes`；旧别名 `FSS_POSIX_FSYNC_THRESHOLD_BYTES`）。**只在 durability=batch 时生效**；组合根历史默认 1 MiB（1048576）。⚠️ 阈值 `0` 会让 batch 退化成 per_file 的耐久性与速度（见 §5.1） |
+| `storage.posix.atomic_write` | tmp + rename 原子写 | `true` | bool；默认 `true` | 未接通（实现内固定开启，不可关） |
 | `storage.posix.dir_mode` | 目录权限 | `0750` | string；默认 `0750` | 未接通（登记为未实现） |
 | `storage.posix.file_mode` | 文件权限 | `0640` | string；默认 `0640` | 未接通（登记为未实现） |
 | `storage.posix.fadvise_random` | 随机读提示 | `true` | bool；默认 `true` | 未接通（登记为未实现） |
 | `storage.posix.fadvise_dontneed_after_large_read` | 大段读后 `DONTNEED` | `false` | bool；默认 `false` | 未接通（登记为未实现） |
 | `storage.posix.shared_mount_required` | `multi` 下必须 true（共享挂载探针） | `false` | bool；默认 `false`；`multi` 必须 true | 未接通（登记为未实现；`multi` 本身拒绝启动） |
 | `storage.posix.one_filesystem_per_partition` | 每 partition 独占文件系统（`syncfs` 隔离） | `false` | bool；默认 `false` | 未接通（登记为未实现） |
-| `storage.s3.endpoint` | S3 端点 | `http://127.0.0.1:9000` | string；默认 `http://127.0.0.1:9000` | `FSS_STORAGE_S3_ENDPOINT`（无默认，空值 + `driver=s3` → 拒绝启动） |
-| `storage.s3.region` | 区域 | `us-east-1` | string；默认 `us-east-1` | `FSS_STORAGE_S3_REGION`（默认 `us-east-1`） |
-| `storage.s3.access_key` | Access Key（密文） | `${ENV:FSS_S3_ACCESS_KEY}` | string，secret；默认 `""` | `FSS_STORAGE_S3_ACCESS_KEY`（★ 内嵌 `${ENV:}` 名与实际变量名**不同**） |
-| `storage.s3.secret_key` | Secret Key（密文） | `${ENV:FSS_S3_SECRET_KEY}` | string，secret；默认 `""` | `FSS_STORAGE_S3_SECRET_KEY`（★ 内嵌 `${ENV:}` 名与实际变量名**不同**） |
-| `storage.s3.force_path_style` | MinIO/Ceph/SeaweedFS 需要 true | `true` | bool；默认 `true` | `FSS_STORAGE_S3_FORCE_PATH_STYLE`（默认 `true`；**只有字面 `false` 才关**） |
-| `storage.s3.verify_tls` | 校验 TLS 证书 | `true` | bool；默认 `true` | `FSS_STORAGE_S3_VERIFY_TLS`（默认 `true`；只有字面 `false` 才关） |
-| `storage.s3.connect_timeout_ms` | 连接超时 | `3000` | int 1..600000；默认 `3000` | 未接通（登记为未实现） |
-| `storage.s3.total_timeout_ms` | 总超时 | `30000` | int 1..3600000；默认 `30000` | 未接通（登记为未实现） |
-| `storage.s3.presign_default_seconds` | 预签名默认有效期 | `3600` | int 1..604800；默认 `3600` | 未接通（登记为未实现） |
-| `storage.s3.presign_max_seconds` | 预签名最长有效期（对齐 OSDU 上限 7 天） | `604800` | int 1..604800；默认 `604800` | 未接通（登记为未实现） |
+| `storage.s3.endpoint` | S3 端点 | `http://127.0.0.1:9000` | string；默认 `http://127.0.0.1:9000` | 已接通（`storage.s3.endpoint` / 通用名 `FSS_STORAGE_S3_ENDPOINT`）；**组合根历史默认为空**，空值 + `driver=s3` → exit 78 |
+| `storage.s3.region` | 区域 | `us-east-1` | string；默认 `us-east-1` | 已接通（`storage.s3.region` / `FSS_STORAGE_S3_REGION`）→ `S3Options.region` |
+| `storage.s3.access_key` | Access Key（密文） | `${ENV:FSS_S3_ACCESS_KEY}` | string，secret；默认 `""` | 已接通（`storage.s3.access_key`；通用名 `FSS_STORAGE_S3_ACCESS_KEY`，旧别名 `FSS_S3_ACCESS_KEY`）→ `S3Options.credentials` |
+| `storage.s3.secret_key` | Secret Key（密文） | `${ENV:FSS_S3_SECRET_KEY}` | string，secret；默认 `""` | 已接通（`storage.s3.secret_key`；通用名 `FSS_STORAGE_S3_SECRET_KEY`，旧别名 `FSS_S3_SECRET_KEY`）→ `S3Options.credentials` |
+| `storage.s3.force_path_style` | MinIO/Ceph/SeaweedFS 需要 true | `true` | bool；默认 `true` | 已接通（`storage.s3.force_path_style` / `FSS_STORAGE_S3_FORCE_PATH_STYLE`）→ `S3Options.force_path_style` |
+| `storage.s3.verify_tls` | 校验 TLS 证书 | `true` | bool；默认 `true` | 已接通（`storage.s3.verify_tls` / `FSS_STORAGE_S3_VERIFY_TLS`）→ `S3Options.verify_tls` |
+| `storage.s3.connect_timeout_ms` | 连接超时 | `3000` | int 1..600000；默认 `3000` | 已接通（`storage.s3.connect_timeout_ms`）→ `S3Options.connect_timeout_ms` |
+| `storage.s3.total_timeout_ms` | 总超时 | `30000` | int 1..3600000；默认 `30000` | 已接通（`storage.s3.total_timeout_ms`）→ `S3Options.total_timeout_ms` |
+| `storage.s3.presign_default_seconds` | 预签名默认有效期 | `3600` | int 1..604800；默认 `3600` | 已接通（`storage.s3.presign_default_seconds`）→ `S3Options.presign_default_seconds` |
+| `storage.s3.presign_max_seconds` | 预签名最长有效期（对齐 OSDU 上限 7 天） | `604800` | int 1..604800；默认 `604800` | 已接通（`storage.s3.presign_max_seconds`）→ `S3Options.presign_max_seconds` |
 
 #### 1.2.5 `self_signed`（集中存储数据面的自签 URL）
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `self_signed.enabled` | 自签数据面开关 | `true` | bool；默认 `true` | 未接通（登记为未实现；POSIX 模式下数据面总是注册） |
-| `self_signed.public_base_url` | 对外可达基址（反向代理后填外部地址） | `http://127.0.0.1:8080` | string；默认 `http://127.0.0.1:8080` | `FSS_SELF_BASE_URL`（默认 `http://127.0.0.1:<port>/api/file`；**必须含 base path**） |
-| `self_signed.signing_key` | HMAC 签名密钥；所有实例必须共享（密文） | `${ENV:FSS_TRANSFER_SIGNING_KEY}` | string，secret；默认 `""` | `FSS_TRANSFER_SECRET`（默认 `dev-secret-change-me` —— **生产必须改**） |
+| `self_signed.enabled` | 自签数据面开关 | `true` | bool；默认 `true` | 已接通（`self_signed.enabled`）：`false` 时**不注册** `/v1/transfer` 数据面路由 |
+| `self_signed.public_base_url` | 对外可达基址（反向代理后填外部地址） | `http://127.0.0.1:8080` | string；默认 `http://127.0.0.1:8080` | 已接通（`self_signed.public_base_url`；旧别名 `FSS_SELF_BASE_URL`）；组合根历史默认 `http://127.0.0.1:<port>/api/file`（**必须含 base path**） |
+| `self_signed.signing_key` | HMAC 签名密钥；所有实例必须共享（密文） | `${ENV:FSS_TRANSFER_SIGNING_KEY}` | string，secret；默认 `""` | 已接通（`self_signed.signing_key`；旧别名 `FSS_TRANSFER_SECRET`、`FSS_TRANSFER_SIGNING_KEY`）→ `HmacTransferTokenCodec`；组合根历史默认 `dev-secret-change-me`（**生产必须改**） |
 | `self_signed.key_id` | 密钥标识 | `k1` | string；默认 `k1` | 未接通（登记为未实现） |
 | `self_signed.default_ttl_seconds` | 默认有效期 | `3600` | int 1..604800；默认 `3600` | 未接通（登记为未实现） |
 | `self_signed.max_ttl_seconds` | 最长有效期 | `604800` | int 1..604800；默认 `604800` | 未接通（登记为未实现） |
@@ -165,16 +193,16 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `expiry.default` | `expiryTime` 缺省有效期 | `1H` | string；默认 `1H` | 未接通（登记为未实现） |
+| `expiry.default` | `expiryTime` 缺省有效期 | `1H` | string；默认 `1H` | 未接通（登记为未实现；`ExpiryPolicy` 用内置默认） |
 | `expiry.max` | `expiryTime` 上限（超限静默截断） | `7D` | string；默认 `7D` | 未接通（登记为未实现） |
-| `http.error_format` | 错误体格式 | `apperror` | enum `apperror` / `legacy` / `api_error`；默认 `apperror` | 未接通（组合根硬编码 `apperror`） |
+| `http.error_format` | 错误体格式 | `apperror` | enum `apperror` / `legacy` / `api_error`；默认 `apperror` | 已接通（`http.error_format`）→ `RouterOptions.error_format` 与 `http::ServerOptions.error_format`；非法值 → exit 78 |
 
 #### 1.2.7 `metadata`
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `metadata.repository` | 元数据仓储实现 | `sqlite` | enum `sqlite` / `postgres` / `remote`；默认 `sqlite` | 未接通（组合根**总是**创建 SQLite 元数据仓储） |
-| `metadata.sqlite.path` | 元数据库路径 | `/var/lib/fss/meta.db` | string；默认 `/var/lib/fss/meta.db` | `FSS_METADATA_SQLITE_PATH`（默认 `<storage_root>/metadata.db`） |
+| `metadata.repository` | 元数据仓储实现 | `sqlite` | enum `sqlite` / `postgres` / `remote`；默认 `sqlite` | 已接通（`metadata.repository`）：`sqlite` → 内置 SQLite；**非 `sqlite` → exit 78**（postgres/remote 实现未交付，拒绝静默降级） |
+| `metadata.sqlite.path` | 元数据库路径 | `/var/lib/fss/meta.db` | string；默认 `/var/lib/fss/meta.db` | 已接通（`metadata.sqlite.path`；旧别名 `FSS_METADATA_SQLITE_PATH`）→ `SqliteMetadataRepository::Open`；组合根历史默认 `<storage_root>/metadata.db` |
 | `metadata.sqlite.busy_timeout_ms` | SQLite busy 超时 | `5000` | int 0..600000；默认 `5000` | 未接通（登记为未实现） |
 | `metadata.sqlite.journal_mode` | SQLite journal 模式 | `WAL` | enum `WAL` / `DELETE` / `TRUNCATE`；默认 `WAL` | 未接通（登记为未实现） |
 | `metadata.sqlite.synchronous` | SQLite 同步级别 | `NORMAL` | enum `NORMAL` / `FULL` / `OFF`；默认 `NORMAL` | 未接通（登记为未实现） |
@@ -195,8 +223,8 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `location.repository` | 位置仓储实现 | `sqlite` | enum `sqlite` / `postgres`；默认 `sqlite` | 未接通（组合根**总是**创建 SQLite 位置仓储） |
-| `location.sqlite.path` | 位置数据库路径 | `/var/lib/fss/location.db` | string；默认 `/var/lib/fss/location.db` | `FSS_SQLITE_PATH`（默认 `<storage_root>/location.db`） |
+| `location.repository` | 位置仓储实现 | `sqlite` | enum `sqlite` / `postgres`；默认 `sqlite` | 已接通（`location.repository`）：`sqlite` → 内置 SQLite；**非 `sqlite` → exit 78**（postgres 未交付） |
+| `location.sqlite.path` | 位置数据库路径 | `/var/lib/fss/location.db` | string；默认 `/var/lib/fss/location.db` | 已接通（`location.sqlite.path`；旧别名 `FSS_SQLITE_PATH`）→ `SqliteLocationRepository::Open`；组合根历史默认 `<storage_root>/location.db` |
 | `location.sqlite.busy_timeout_ms` | SQLite busy 超时 | `10000` | int 0..600000；默认 `10000` | 未接通（登记为未实现） |
 | `location.sqlite.journal_mode` | journal 模式 | `WAL` | enum `WAL` / `DELETE` / `TRUNCATE`；默认 `WAL` | 未接通（登记为未实现） |
 | `location.sqlite.synchronous` | 同步级别 | `NORMAL` | enum `NORMAL` / `FULL` / `OFF`；默认 `NORMAL` | 未接通（登记为未实现） |
@@ -223,24 +251,24 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `auth.mode` | 鉴权模式 | `jwt` | enum `jwt` / `remote-entitlements` / `disabled`；schema 默认 `jwt` | `FSS_AUTH_MODE`（**组合根默认 `disabled`**；非法值拒绝启动） |
-| `auth.jwt.jwks_url` | RS256/JWKS 地址（**未实现**） | `""` | string；默认 `""`；非空 → 拒绝启动 | 未接通（登记为未实现；schema 直接拒绝非空值） |
-| `auth.jwt.issuer` | 必须匹配的 `iss` | `""` | string；默认 `""` | `FSS_JWT_ISSUER`（默认空 = 不校验 `iss`） |
-| `auth.jwt.audience` | 必须包含的 `aud` | `""` | string；默认 `""` | `FSS_JWT_AUDIENCE`（默认空 = 不校验 `aud`） |
-| `auth.jwt.verify_signature` | 是否验签 | `true` | bool；默认 `true`；production 必须 true | `FSS_JWT_VERIFY_SIGNATURE`（默认 `true`；只有字面 `false` 才关） |
+| `auth.mode` | 鉴权模式 | `jwt` | enum `jwt` / `remote-entitlements` / `disabled`；schema 默认 `jwt` | 已接通（`auth.mode` / 通用名 `FSS_AUTH_MODE`；**组合根历史默认 `disabled`**；非法值 → exit 78）。`deployment.environment=production` 时必须是 `jwt` |
+| `auth.jwt.jwks_url` | RS256/JWKS 地址（**未实现**） | `""` | string；默认 `""`；非空 → 拒绝启动 | 未接通（schema 直接拒绝非空值；组合根不读） |
+| `auth.jwt.issuer` | 必须匹配的 `iss` | `""` | string；默认 `""` | 已接通（`auth.jwt.issuer`；旧别名 `FSS_JWT_ISSUER`）→ `LocalJwtOptions.issuer` |
+| `auth.jwt.audience` | 必须包含的 `aud` | `""` | string；默认 `""` | 已接通（`auth.jwt.audience`；旧别名 `FSS_JWT_AUDIENCE`）→ `LocalJwtOptions.audience` |
+| `auth.jwt.verify_signature` | 是否验签 | `true` | bool；默认 `true`；production 必须 true | 已接通（`auth.jwt.verify_signature`；旧别名 `FSS_JWT_VERIFY_SIGNATURE`，旧语义"只有字面 `false` 才关"）→ `LocalJwtOptions.verify_signature` |
 | `auth.jwt.roles_claim` | 角色 claim 名 | `roles` | string；默认 `roles` | 未接通（登记为未实现；实现内固定默认值 `roles`） |
-| `auth.jwt.user_id_claim` | 用户 claim 名 | `email` | string；默认 `email` | `FSS_JWT_USER_ID_CLAIM`（默认 `email`） |
-| `auth.jwt.hmac_secret` | HS256 共享密钥（密文） | `${ENV:FSS_JWT_HMAC_SECRET}` | string，secret；默认 `""` | `FSS_JWT_HMAC_SECRET`（默认空；`auth.mode=jwt` 且为空 → **拒绝启动**） |
-| `auth.jwt.partition_claim` | 租户绑定 claim 名 | `data-partition-id` | string；默认 `data-partition-id` | `FSS_JWT_PARTITION_CLAIM`（默认 `data-partition-id`） |
-| `auth.jwt.require_partition_claim` | 是否强制租户 claim | `true` | bool；默认 `true` | `FSS_JWT_REQUIRE_PARTITION_CLAIM`（默认 `true`；只有字面 `false` 才关） |
+| `auth.jwt.user_id_claim` | 用户 claim 名 | `email` | string；默认 `email` | 已接通（`auth.jwt.user_id_claim`；旧别名 `FSS_JWT_USER_ID_CLAIM`）→ `LocalJwtOptions.user_id_claim` |
+| `auth.jwt.hmac_secret` | HS256 共享密钥（密文） | `${ENV:FSS_JWT_HMAC_SECRET}` | string，secret；默认 `""` | 已接通（`auth.jwt.hmac_secret`；旧别名 `FSS_JWT_HMAC_SECRET`）→ `LocalJwtOptions.hmac_secret` / `HmacTransferTokenCodec` 无关。空且 `auth.mode=jwt` → **exit 78** |
+| `auth.jwt.partition_claim` | 租户绑定 claim 名 | `data-partition-id` | string；默认 `data-partition-id` | 已接通（`auth.jwt.partition_claim`；旧别名 `FSS_JWT_PARTITION_CLAIM`）→ `LocalJwtOptions.partition_claim` |
+| `auth.jwt.require_partition_claim` | 是否强制租户 claim | `true` | bool；默认 `true` | 已接通（`auth.jwt.require_partition_claim`；旧别名 `FSS_JWT_REQUIRE_PARTITION_CLAIM`）→ `LocalJwtOptions.require_partition_claim` |
 | `auth.local_roles.admin@example.com` | 静态角色表（用户 → 角色数组） | 8 个 `service.*` 角色 | 动态子树（`auth.local_roles` 前缀），无逐键约束 | 未接通（登记为未实现；组合根不装配静态角色表） |
 | `auth.local_roles.editor@example.com` | 静态角色表项 | `["service.file.editors","service.file.viewers"]` | 同上 | 未接通（登记为未实现） |
 | `auth.local_roles.viewer@example.com` | 静态角色表项 | `["service.file.viewers"]` | 同上 | 未接通（登记为未实现） |
-| `auth.remote_entitlements.base_url` | 远端 Entitlements 地址 | `""` | string；默认 `""`；`remote-entitlements` 时必须非空 | `FSS_ENTITLEMENTS_URL`（默认空；非空校验在 schema，组合根用 `Ready()` 判空并拒绝启动） |
-| `auth.remote_entitlements.authorize_path` | authorizeAny 路径 | `/api/entitlements/v2/authorizeAny` | string；默认 `/api/entitlements/v2/authorizeAny` | `FSS_ENTITLEMENTS_AUTHORIZE_PATH`（默认同示例值） |
-| `auth.remote_entitlements.connect_timeout_ms` | 连接超时 | `1000` | int 1..600000；默认 `1000` | 未接通（登记为未实现；实现内固定默认 1000 ms） |
-| `auth.remote_entitlements.timeout_ms` | 整体超时 | `3000` | int 1..600000；默认 `3000` | `FSS_ENTITLEMENTS_TIMEOUT_MS`（默认 3000 ms） |
-| `auth.remote_entitlements.fail_closed` | 依赖不可用不得降级为放行 | `true` | bool；默认 `true`；必须 true | 未接通（实现内**恒为** fail-closed，不可关） |
+| `auth.remote_entitlements.base_url` | 远端 Entitlements 地址 | `""` | string；默认 `""`；`remote-entitlements` 时必须非空 | 已接通（`auth.remote_entitlements.base_url`；旧别名 `FSS_ENTITLEMENTS_URL`）→ `RemoteEntitlementsOptions.base_url`；空值 + `remote-entitlements` → exit 78 |
+| `auth.remote_entitlements.authorize_path` | authorizeAny 路径 | `/api/entitlements/v2/authorizeAny` | string；默认 `/api/entitlements/v2/authorizeAny` | 已接通（`auth.remote_entitlements.authorize_path`；旧别名 `FSS_ENTITLEMENTS_AUTHORIZE_PATH`） |
+| `auth.remote_entitlements.connect_timeout_ms` | 连接超时 | `1000` | int 1..600000；默认 `1000` | 已接通（`auth.remote_entitlements.connect_timeout_ms`）→ `RemoteEntitlementsOptions.connect_timeout_ms` |
+| `auth.remote_entitlements.timeout_ms` | 整体超时 | `3000` | int 1..600000；默认 `3000` | 已接通（`auth.remote_entitlements.timeout_ms`；旧别名 `FSS_ENTITLEMENTS_TIMEOUT_MS`）→ `RemoteEntitlementsOptions.timeout_ms` |
+| `auth.remote_entitlements.fail_closed` | 依赖不可用不得降级为放行 | `true` | bool；默认 `true`；必须 true | 已接通（读取并校验：remote 模式下必须 true，否则 exit 78）；实现内**恒为** fail-closed，该键不产生分支 |
 
 #### 1.2.11 `legal` / `schema` / `events`
 
@@ -284,96 +312,117 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 组合根当前读取方式 |
 | --- | --- | --- | --- | --- |
-| `observability.log_level` | 最低日志级别 | `info` | enum `debug` / `info` / `warn` / `error`；默认 `info` | 未接通（实现内固定 `info`） |
-| `observability.log_format` | 日志格式 | `json` | enum `json` / `text`；默认 `json` | 未接通（实现内固定 `json`） |
-| `observability.audit_enabled` | 审计开关 | `true` | bool；默认 `true` | 未接通（实现内固定开启审计记录） |
-| `observability.audit_fail_closed` | 审计失败是否影响操作结果 | `false` | bool；默认 `false` | 未接通（登记为未实现） |
-| `observability.metrics_enabled` | 指标端点开关 | `true` | bool；默认 `true` | 未接通（`/metrics` 恒开） |
-| `observability.metrics_path` | 指标端点路径 | `/metrics` | string；默认 `/metrics` | 未接通（实现内固定 `/metrics`） |
-| `observability.redact_keys` | 日志/诊断输出要打码的键名（子串匹配，忽略大小写与 `_`/`-`） | 11 个键名 | list；默认 `secret_key,access_key,token,sig,signature,authorization,x-amz-signature,password,signing_key,dsn,static_token` | 未接通（登记为未实现）。⚠️ 组合根用 `LogOptions{}` 构造 logger → `redact_keys` 为空 → **真实进程当前不做任何打码**；加载器侧桥接函数 `logging::OptionsFromConfig` 已存在但未被调用 |
+| `observability.log_level` | 最低日志级别 | `info` | enum `debug` / `info` / `warn` / `error`；默认 `info` | 已接通（`observability.log_level`；旧别名 `FSS_LOG_LEVEL`）→ `logging::OptionsFromConfig` 的 `min_level` |
+| `observability.log_format` | 日志格式 | `json` | enum `json` / `text`；默认 `json` | 已接通（`observability.log_format`；旧别名 `FSS_LOG_FORMAT`）→ `LogOptions.format` |
+| `observability.audit_enabled` | 审计开关 | `true` | bool；默认 `true` | 已接通（`observability.audit_enabled`）：`false` → 审计器换成 **no-op**（端口仍有实现，只是不记录） |
+| `observability.audit_fail_closed` | 审计失败是否影响操作结果 | `false` | bool；默认 `false` | **已读取但行为未实现**：组合根读该键并打印来源，但用例层 `RecordAudit()` 丢弃 `IAuditLogger::Record` 的结果，**没有"致命审计"路径**（见 §8）。写入 `true` 不会让审计失败变成致命 |
+| `observability.metrics_enabled` | 指标端点开关 | `true` | bool；默认 `true` | 已接通（`observability.metrics_enabled`）→ `RouterOptions.metrics_enabled`；`false` 时**不注册** `/metrics` 路由 |
+| `observability.metrics_path` | 指标端点路径 | `/metrics` | string；默认 `/metrics` | 已接通（`observability.metrics_path`）→ `RouterOptions.metrics_path`；必须以 `/` 开头，否则 exit 78 |
+| `observability.redact_keys` | 日志/诊断输出要打码的键名（子串匹配，忽略大小写与 `_`/`-`） | 11 个键名 | list；默认 `secret_key,access_key,token,sig,signature,authorization,x-amz-signature,password,signing_key,dsn,static_token` | 已接通（`observability.redact_keys`；旧别名 `FSS_LOG_REDACT_KEYS`，逗号分隔）→ `LogOptions.redact_keys`（经 `logging::OptionsFromConfig`）；启动横幅打印实际键数 |
 
 ### 1.3 未接通清单（单独成表）
 
-> 口径：**组合根没有读取**该键（既无 JSON 加载，也无对应 `FSS_*`）。
+> 口径：**组合根没有读取**该键（既无 `--config`/`--set` 加载，也无任何环境变量/别名）。
 > 它们目前只有在 `tests/` 里被直接构造的对象读取（或根本没有实现），因此**运维改它们不生效**。
-> 共 **125** 个键；能接通的 31 个见 §1.2 各表（下文 §1.4 归纳）。
+> 共 **90** 个键；已接通的 **66** 个见 §1.2 各表（下文 §1.4 归纳）。
 
 | 前缀 | 键数 | 键 |
 | --- | --- | --- |
-| `deployment` | 3 | `deployment.environment`、`deployment.instance_id`、`deployment.clock_skew_tolerance_seconds` |
-| server.http | 21 | `server.http.base_path`、`server.http.max_header_bytes`、`server.http.max_uri_bytes`、`server.http.max_body_bytes`、`server.http.tcp_nodelay`、`server.http.worker_threads`、`server.http.max_connections`、`server.http.max_connections_per_partition`、`server.http.idle_timeout_seconds`、`server.http.json_request_timeout_seconds`、`server.http.transfer_idle_timeout_seconds`、`server.http.transfer_max_body_bytes`、`server.http.transfer_buffer_bytes`、`server.http.transfer_memory_budget_bytes`、`server.http.large_file_plane.enabled`、`server.http.large_file_plane.bind`、`server.http.large_file_plane.port`、`server.http.large_file_plane.use_sendfile`、`server.http.large_file_plane.sendfile_chunk_bytes`、`server.http.large_file_plane.workers`、`server.http.large_file_plane.max_connections` |
+| `deployment` | 1 | `deployment.clock_skew_tolerance_seconds` |
+| server.http | 9 | `server.http.max_connections_per_partition`、`server.http.transfer_max_body_bytes`、`server.http.large_file_plane.enabled`、`server.http.large_file_plane.bind`、`server.http.large_file_plane.port`、`server.http.large_file_plane.use_sendfile`、`server.http.large_file_plane.sendfile_chunk_bytes`、`server.http.large_file_plane.workers`、`server.http.large_file_plane.max_connections` |
 | server.grpc | 3 | `server.grpc.enabled`、`server.grpc.max_message_bytes`、`server.grpc.streaming_chunk_bytes` |
-| `storage` | 19 | `storage.proxy_mode`、`storage.driver_report_override`、`storage.provider_key_override`、`storage.io_engine`、`storage.io_uring.queue_depth`、`storage.io_uring.register_files`、`storage.posix.group_commit_max_batch`、`storage.posix.sync_dir_after_batch`、`storage.posix.atomic_write`、`storage.posix.dir_mode`、`storage.posix.file_mode`、`storage.posix.fadvise_random`、`storage.posix.fadvise_dontneed_after_large_read`、`storage.posix.shared_mount_required`、`storage.posix.one_filesystem_per_partition`、`storage.s3.connect_timeout_ms`、`storage.s3.total_timeout_ms`、`storage.s3.presign_default_seconds`、`storage.s3.presign_max_seconds` |
-| `self_signed` | 6 | `self_signed.enabled`、`self_signed.key_id`、`self_signed.default_ttl_seconds`、`self_signed.max_ttl_seconds`、`self_signed.single_use_nonce`、`self_signed.nonce_store` |
+| `storage` | 11 | `storage.proxy_mode`、`storage.io_uring.register_files`、`storage.posix.group_commit_max_batch`、`storage.posix.sync_dir_after_batch`、`storage.posix.atomic_write`、`storage.posix.dir_mode`、`storage.posix.file_mode`、`storage.posix.fadvise_random`、`storage.posix.fadvise_dontneed_after_large_read`、`storage.posix.shared_mount_required`、`storage.posix.one_filesystem_per_partition` |
+| `self_signed` | 5 | `self_signed.key_id`、`self_signed.default_ttl_seconds`、`self_signed.max_ttl_seconds`、`self_signed.single_use_nonce`、`self_signed.nonce_store` |
 | `expiry` | 2 | `expiry.default`、`expiry.max` |
-| `http` | 1 | `http.error_format` |
-| `metadata` | 16 | `metadata.repository`、`metadata.sqlite.busy_timeout_ms`、`metadata.sqlite.journal_mode`、`metadata.sqlite.synchronous`、`metadata.sqlite.max_write_concurrency`、`metadata.sqlite.group_commit`、`metadata.sqlite.group_commit_max_wait_ms`、`metadata.sqlite.group_commit_max_batch`、`metadata.postgres.dsn`、`metadata.postgres.max_connections`、`metadata.postgres.statement_timeout_ms`、`metadata.postgres.schema_version_check`、`metadata.remote.base_url`、`metadata.remote.token_provider`、`metadata.remote.static_token`、`metadata.remote.timeout_ms` |
-| `location` | 10 | `location.repository`、`location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`、`location.sqlite.synchronous`、`location.sqlite.max_write_concurrency`、`location.sqlite.group_commit`、`location.sqlite.group_commit_max_wait_ms`、`location.sqlite.group_commit_max_batch`、`location.postgres.dsn`、`location.postgres.max_connections` |
+| `http` | 0 | （已全部接通） |
+| `metadata` | 15 | `metadata.sqlite.busy_timeout_ms`、`metadata.sqlite.journal_mode`、`metadata.sqlite.synchronous`、`metadata.sqlite.max_write_concurrency`、`metadata.sqlite.group_commit`、`metadata.sqlite.group_commit_max_wait_ms`、`metadata.sqlite.group_commit_max_batch`、`metadata.postgres.dsn`、`metadata.postgres.max_connections`、`metadata.postgres.statement_timeout_ms`、`metadata.postgres.schema_version_check`、`metadata.remote.base_url`、`metadata.remote.token_provider`、`metadata.remote.static_token`、`metadata.remote.timeout_ms` |
+| `location` | 9 | `location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`、`location.sqlite.synchronous`、`location.sqlite.max_write_concurrency`、`location.sqlite.group_commit`、`location.sqlite.group_commit_max_wait_ms`、`location.sqlite.group_commit_max_batch`、`location.postgres.dsn`、`location.postgres.max_connections` |
 | `leases` | 4 | `leases.enabled`、`leases.ttl_seconds`、`leases.renew_interval_seconds`、`leases.time_source` |
 | `leader_election` | 3 | `leader_election.enabled`、`leader_election.backend`、`leader_election.lock_key` |
-| `auth` | 7 | `auth.jwt.jwks_url`、`auth.jwt.roles_claim`、`auth.local_roles.admin@example.com`、`auth.local_roles.editor@example.com`、`auth.local_roles.viewer@example.com`、`auth.remote_entitlements.connect_timeout_ms`、`auth.remote_entitlements.fail_closed` |
+| `auth` | 5 | `auth.jwt.jwks_url`、`auth.jwt.roles_claim`、`auth.local_roles.admin@example.com`、`auth.local_roles.editor@example.com`、`auth.local_roles.viewer@example.com` |
 | `legal` | 3 | `legal.validator`、`legal.remote.base_url`、`legal.remote.timeout_ms` |
 | `schema` | 3 | `schema.validator`、`schema.remote.base_url`、`schema.remote.timeout_ms` |
 | `events` | 4 | `events.publisher`、`events.webhook.url`、`events.webhook.timeout_ms`、`events.webhook.topic` |
 | `partition` | 7 | `partition.registry`、`partition.file.opendes.staging_container`、`partition.file.opendes.persistent_container`、`partition.file.opendes.storage_driver`、`partition.file.opendes.max_file_bytes`、`partition.file.opendes.allowed_checksum_algorithms`、`partition.file.opendes.default_checksum_algorithm` |
 | `gc` | 6 | `gc.enabled`、`gc.dry_run`、`gc.require_lease_expiry`、`gc.staging_ttl_hours`、`gc.orphan_grace_hours`、`gc.interval_seconds` |
-| `observability` | 7 | `observability.log_level`、`observability.log_format`、`observability.audit_enabled`、`observability.audit_fail_closed`、`observability.metrics_enabled`、`observability.metrics_path`、`observability.redact_keys` |
+| `observability` | 0 | （已全部接通；`observability.audit_fail_closed` 为"已读但行为未实现"，见 §8） |
 
-### 1.4 已接通清单（31 个键）与命名不一致
+### 1.4 已接通清单（66 个键）+ 旧别名 + 默认值分歧
 
-已接通（组合根会读 `FSS_*`）：
+**已接通（组合根把值读到对象上）** —— 共 66 个键：
 
-| JSON 路径 | 实际环境变量 | 组合根默认 |
+| 前缀 | 键数 | 键（都可以用 `--config` / `--set` / 通用环境变量给出） |
 | --- | --- | --- |
-| `deployment.max_clock_skew_seconds` | `FSS_MAX_CLOCK_SKEW_SECONDS` | 5（仅 jwt 模式读取） |
-| `deployment.mode` | `FSS_DEPLOYMENT_MODE` | `single` |
-| `server.http.bind` | `FSS_BIND_ADDRESS` | `0.0.0.0` |
-| `server.http.port` | `FSS_HTTP_PORT` | `8080` |
-| `server.grpc.bind` | `FSS_BIND_ADDRESS` | `0.0.0.0`（与 HTTP 共用） |
-| `server.grpc.port` | `FSS_GRPC_PORT` | `0`（关闭） |
-| `storage.driver` | `FSS_STORAGE_DRIVER` | `posix` |
-| `storage.posix.root` | `FSS_STORAGE_ROOT` | `/tmp/fss-data` |
-| `storage.posix.durability` | `FSS_POSIX_DURABILITY` | `per_file` |
-| `storage.posix.fsync_threshold_bytes` | `FSS_POSIX_FSYNC_THRESHOLD_BYTES` | `1048576` |
-| `storage.s3.endpoint` | `FSS_STORAGE_S3_ENDPOINT` | `""` |
-| `storage.s3.region` | `FSS_STORAGE_S3_REGION` | `us-east-1` |
-| `storage.s3.access_key` | `FSS_STORAGE_S3_ACCESS_KEY` | `""` |
-| `storage.s3.secret_key` | `FSS_STORAGE_S3_SECRET_KEY` | `""` |
-| `storage.s3.force_path_style` | `FSS_STORAGE_S3_FORCE_PATH_STYLE` | `true` |
-| `storage.s3.verify_tls` | `FSS_STORAGE_S3_VERIFY_TLS` | `true` |
-| `self_signed.public_base_url` | `FSS_SELF_BASE_URL` | `http://127.0.0.1:<port>/api/file` |
-| `self_signed.signing_key` | `FSS_TRANSFER_SECRET` | `dev-secret-change-me`（生产必须替换） |
-| `metadata.sqlite.path` | `FSS_METADATA_SQLITE_PATH` | `<storage_root>/metadata.db` |
-| `location.sqlite.path` | `FSS_SQLITE_PATH` | `<storage_root>/location.db` |
-| `auth.mode` | `FSS_AUTH_MODE` | `disabled`（★ 与 schema 默认 `jwt` 不同） |
-| `auth.jwt.issuer` | `FSS_JWT_ISSUER` | `""` |
-| `auth.jwt.audience` | `FSS_JWT_AUDIENCE` | `""` |
-| `auth.jwt.verify_signature` | `FSS_JWT_VERIFY_SIGNATURE` | `true` |
-| `auth.jwt.user_id_claim` | `FSS_JWT_USER_ID_CLAIM` | `email` |
-| `auth.jwt.hmac_secret` | `FSS_JWT_HMAC_SECRET` | `""` |
-| `auth.jwt.partition_claim` | `FSS_JWT_PARTITION_CLAIM` | `data-partition-id` |
-| `auth.jwt.require_partition_claim` | `FSS_JWT_REQUIRE_PARTITION_CLAIM` | `true` |
-| `auth.remote_entitlements.base_url` | `FSS_ENTITLEMENTS_URL` | `""` |
-| `auth.remote_entitlements.authorize_path` | `FSS_ENTITLEMENTS_AUTHORIZE_PATH` | `/api/entitlements/v2/authorizeAny` |
-| `auth.remote_entitlements.timeout_ms` | `FSS_ENTITLEMENTS_TIMEOUT_MS` | `3000` |
+| `deployment` | 4 | `deployment.environment`、`deployment.max_clock_skew_seconds`、`deployment.mode`、`deployment.instance_id` |
+| server.http | 14 | `server.http.base_path`、`server.http.bind`、`server.http.port`、`server.http.max_header_bytes`、`server.http.max_uri_bytes`、`server.http.max_body_bytes`、`server.http.tcp_nodelay`、`server.http.worker_threads`、`server.http.max_connections`、`server.http.idle_timeout_seconds`、`server.http.json_request_timeout_seconds`、`server.http.transfer_idle_timeout_seconds`、`server.http.transfer_buffer_bytes`、`server.http.transfer_memory_budget_bytes` |
+| server.grpc | 2 | `server.grpc.bind`、`server.grpc.port` |
+| `storage` | 18 | `storage.driver`、`storage.driver_report_override`、`storage.provider_key_override`、`storage.io_engine`、`storage.io_uring.queue_depth`、`storage.posix.root`、`storage.posix.durability`、`storage.posix.fsync_threshold_bytes`、`storage.s3.endpoint`、`storage.s3.region`、`storage.s3.access_key`、`storage.s3.secret_key`、`storage.s3.force_path_style`、`storage.s3.verify_tls`、`storage.s3.connect_timeout_ms`、`storage.s3.total_timeout_ms`、`storage.s3.presign_default_seconds`、`storage.s3.presign_max_seconds` |
+| `self_signed` | 3 | `self_signed.enabled`、`self_signed.public_base_url`、`self_signed.signing_key` |
+| `http` | 1 | `http.error_format` |
+| `metadata` | 2 | `metadata.repository`、`metadata.sqlite.path` |
+| `location` | 2 | `location.repository`、`location.sqlite.path` |
+| `auth` | 13 | `auth.mode`、`auth.jwt.issuer`、`auth.jwt.audience`、`auth.jwt.verify_signature`、`auth.jwt.user_id_claim`、`auth.jwt.hmac_secret`、`auth.jwt.partition_claim`、`auth.jwt.require_partition_claim`、`auth.remote_entitlements.base_url`、`auth.remote_entitlements.authorize_path`、`auth.remote_entitlements.connect_timeout_ms`、`auth.remote_entitlements.timeout_ms`、`auth.remote_entitlements.fail_closed` |
+| `observability` | 7 | `observability.log_level`、`observability.log_format`、`observability.redact_keys`、`observability.audit_enabled`、`observability.audit_fail_closed`、`observability.metrics_enabled`、`observability.metrics_path` |
 
-**命名不一致（容易配错，务必注意）**
+> 另有 **两个不在 schema 内** 的组合根专用环境变量（示例文件里没有对应键）：
+> `FSS_LOG_SERVICE`（日志 `service` 字段，默认 `file-service`）与
+> `FSS_CONFIG`（等价 `--config`，命令行优先）。
 
-| JSON 键 | 示例文件内嵌的 `${ENV:...}` | 组合根实际读的 | 结论 |
+**旧环境变量别名（deprecated，继续可用）** —— 通用名优先级更高；两者同时给出时**通用名胜出**，
+并在启动日志里打印一条告警（避免"到底以谁为准"的歧义）：
+
+| 旧环境变量 | 映射到的配置路径 | 备注 |
+| --- | --- | --- |
+| `FSS_STORAGE_ROOT` | `storage.posix.root` | |
+| `FSS_SQLITE_PATH` | `location.sqlite.path` | |
+| `FSS_METADATA_SQLITE_PATH` | `metadata.sqlite.path` | 与通用名**同字**（不算歧义） |
+| `FSS_POSIX_DURABILITY` | `storage.posix.durability` | 值域比 schema 宽：额外接受 `never` |
+| `FSS_POSIX_FSYNC_THRESHOLD_BYTES` | `storage.posix.fsync_threshold_bytes` | 通用名 `FSS_STORAGE_POSIX_FSYNC_THRESHOLD_BYTES` 优先 |
+| `FSS_HTTP_PORT` | `server.http.port` | 额外接受 `0` = 系统分配 |
+| `FSS_GRPC_PORT` | `server.grpc.port` | 额外接受 `0`=关闭 / `-1`=系统分配 |
+| `FSS_BIND_ADDRESS` | `server.http.bind`、`server.grpc.bind` | 一个变量同时喂两个键（HTTP 与 gRPC 共用） |
+| `FSS_SELF_BASE_URL` | `self_signed.public_base_url` | |
+| `FSS_TRANSFER_SECRET` | `self_signed.signing_key` | **生产必须替换** |
+| `FSS_TRANSFER_SIGNING_KEY` | `self_signed.signing_key` | 示例文件内嵌名；`FSS_TRANSFER_SECRET` 优先 |
+| `FSS_S3_ACCESS_KEY` | `storage.s3.access_key` | 示例文件内嵌名；通用名 `FSS_STORAGE_S3_ACCESS_KEY` 优先 |
+| `FSS_S3_SECRET_KEY` | `storage.s3.secret_key` | 同上 |
+| `FSS_MAX_CLOCK_SKEW_SECONDS` | `deployment.max_clock_skew_seconds` | |
+| `FSS_JWT_HMAC_SECRET` | `auth.jwt.hmac_secret` | |
+| `FSS_JWT_ISSUER` | `auth.jwt.issuer` | |
+| `FSS_JWT_AUDIENCE` | `auth.jwt.audience` | |
+| `FSS_JWT_VERIFY_SIGNATURE` | `auth.jwt.verify_signature` | 沿用旧语义：只有字面 `false` 才关 |
+| `FSS_JWT_USER_ID_CLAIM` | `auth.jwt.user_id_claim` | |
+| `FSS_JWT_PARTITION_CLAIM` | `auth.jwt.partition_claim` | |
+| `FSS_JWT_REQUIRE_PARTITION_CLAIM` | `auth.jwt.require_partition_claim` | 同上（只有字面 `false` 才关） |
+| `FSS_ENTITLEMENTS_URL` | `auth.remote_entitlements.base_url` | |
+| `FSS_ENTITLEMENTS_AUTHORIZE_PATH` | `auth.remote_entitlements.authorize_path` | |
+| `FSS_ENTITLEMENTS_TIMEOUT_MS` | `auth.remote_entitlements.timeout_ms` | |
+| `FSS_LOG_LEVEL` | `observability.log_level` | |
+| `FSS_LOG_FORMAT` | `observability.log_format` | |
+| `FSS_LOG_REDACT_KEYS` | `observability.redact_keys` | 逗号分隔 |
+
+**默认值分歧（组合根历史默认 ≠ schema 默认；以组合根为准）**
+
+| JSON 键 | schema 默认 | 组合根在"无任何来源"时的默认 | 为什么保留 |
 | --- | --- | --- | --- |
-| `storage.s3.access_key` | `FSS_S3_ACCESS_KEY` | `FSS_STORAGE_S3_ACCESS_KEY` | 名字不同；按**组合根**的名字注入 |
-| `storage.s3.secret_key` | `FSS_S3_SECRET_KEY` | `FSS_STORAGE_S3_SECRET_KEY` | 同上 |
-| `self_signed.signing_key` | `FSS_TRANSFER_SIGNING_KEY` | `FSS_TRANSFER_SECRET` | 同上 |
-| `auth.jwt.hmac_secret` | `FSS_JWT_HMAC_SECRET` | `FSS_JWT_HMAC_SECRET` | 一致 |
-| `metadata.postgres.dsn` | `FSS_PG_DSN` | 无（未接通） | 目前不生效 |
-| `location.postgres.dsn` | `FSS_PG_DSN` | 无（未接通） | 目前不生效 |
-| `metadata.remote.static_token` | `FSS_STORAGE_TOKEN` | 无（未接通） | 目前不生效 |
+| `auth.mode` | `jwt` | `disabled` | 接线前就是 `disabled`；改成 `jwt` 会让所有开发/测试脚本因"空密钥"拒绝启动（**破坏既有行为**）。生产用 `deployment.environment=production` 强制 `jwt` |
+| `storage.posix.durability` | `batch` | `per_file` | 接线前的默认；改成 `batch` 会改变未配置部署的持久化语义 |
+| `storage.posix.fsync_threshold_bytes` | `0`（0 = 所有对象都 fsync） | `1048576`（1 MiB） | `bench_baseline.sh` 等脚本按 1 MiB 测过；`0` 会让 `batch` 退化成 per_file 的耐久性/速度 |
+| `storage.posix.root` | `/var/lib/fss/data` | `/tmp/fss-data` | 接线前的默认（容器镜像另行注入 `/data`） |
+| `metadata.sqlite.path` | `/var/lib/fss/meta.db` | `<storage_root>/metadata.db` | 接线前的默认（跟随存储根，便于本地/测试） |
+| `location.sqlite.path` | `/var/lib/fss/location.db` | `<storage_root>/location.db` | 同上 |
+| `self_signed.public_base_url` | `http://127.0.0.1:8080` | `http://127.0.0.1:<实际端口>/api/file` | 必须**含 base path**，否则发出去的上传地址 404（P4-D04） |
+| `self_signed.signing_key` | `""` | `dev-secret-change-me` | 接线前的默认（生产必须替换） |
+| `storage.s3.endpoint` | `http://127.0.0.1:9000` | `""` | 接线前为空；`driver=s3` 且为空 → 拒绝启动（不静默指向本机 9000） |
+| `server.grpc.port` | `50051` | `0`（关闭） | 接线前默认关闭（ADR-001：RPC 是平台外扩展） |
 
-**两处默认值分歧（以组合根为准）**：`auth.mode`（组合根 `disabled` vs schema `jwt`）、
-`storage.posix.durability`（组合根 `per_file` vs schema `batch`）与
-`storage.posix.fsync_threshold_bytes`（组合根 1 MiB vs schema 只允许 0）。
-这意味着**不设任何环境变量启动 = 无鉴权 + 每文件 fsync**；生产必须显式设置
-`FSS_AUTH_MODE=jwt`、`FSS_JWT_HMAC_SECRET`、`FSS_POSIX_DURABILITY=batch`。
+**`${ENV:...}` 引用**：示例文件里的密文键写成 `${ENV:VAR_NAME}`（如
+`storage.s3.access_key` 内嵌 `FSS_S3_ACCESS_KEY`）。这些引用现在**由加载器解析并生效**；
+上表的旧别名与之**兼容**（示例文件写什么名就注入什么名，两个名字都能工作）。
+
+这意味着**不提供任何配置与环境变量启动 = 无鉴权 + 每文件 fsync**（与接线前一致）；
+生产必须显式设置 `deployment.environment=production` + `auth.mode=jwt` +
+`auth.jwt.hmac_secret`，否则进程**拒绝启动**（exit 78）。
 
 ---
 
@@ -381,21 +430,33 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 ### 2.1 启动
 
-`./build/bin/fss_server`（无命令行参数）。启动横幅会打印实际 `bind`、`grpc bind`、
-`base path`、`storage driver`、`storage root`、`sqlite path`、`error format`、`auth`。
-任何配置错误在**启动时**以非零退出码失败，并打印一行原因（stderr）：
+```bash
+./build/bin/fss_server --config config/fss.example.json            # 推荐
+./build/bin/fss_server --config /etc/fss/config.json --set server.http.port=9090
+./build/bin/fss_server --print-config --config /etc/fss/config.json  # 只看生效值（不启动）
+```
 
-| stderr 前缀 | 含义 |
+启动横幅**第一行**是配置来源（文件路径或"无配置文件（仅环境变量）"），随后打印实际
+`bind`、`grpc bind`、`base path`、`storage driver`、`storage root`、`sqlite path`、
+`metadata path`、`io engine`、`error format`、`log`、`metrics`、`audit`、`auth`、
+`environment`，最后逐键列出**已接通**键的来源缩写（`cli`/`env`/`file`/`default`）。
+任何配置错误在**启动时**以 **退出码 78（EX_CONFIG）** 失败，并**一次性**打印全部问题
+（`path + 原因 + 来源`）：
+
+| stderr 内容 | 含义 |
 | --- | --- |
+| `配置校验失败，共 N 个问题：` | 加载器汇总（未知键 / 类型 / 范围 / 枚举 / 跨字段 / 生产强校验） |
+| `拒绝启动（exit 78，EX_CONFIG）` | 上面的问题导致拒绝启动 |
 | `拒绝启动：deployment.mode=multi ...` | 多实例运行形态未交付 |
-| `拒绝启动：<原因>`（jwt 分支） | `auth.mode=jwt` 但 `FSS_JWT_HMAC_SECRET` 为空 |
-| `拒绝启动：<原因>`（远端分支） | `auth.mode=remote-entitlements` 但未配 `FSS_ENTITLEMENTS_URL` |
-| `未知的 storage.driver: ...` | 只接受 `posix` / `s3` |
-| `未知的 storage.posix.durability: ...` | 只接受 `per_file` / `batch` / `never` |
-| `未知的 auth.mode: ...` | 只接受 `jwt` / `remote-entitlements` / `disabled` |
-| `storage.driver=s3 需要 FSS_STORAGE_S3_ENDPOINT / _ACCESS_KEY / _SECRET_KEY` | S3 三要素缺失 |
+| `拒绝启动：storage.io_engine=uring ... scripts/check_io_uring.sh` | io_uring 不可用（ADR-010） |
+| `拒绝启动：server.http.* 配置非法：...` | `http::ValidateOptions`（如 `max_connections > worker_threads`） |
+| `拒绝启动：仅支持 metadata.repository=sqlite 且 location.repository=sqlite` | PG/remote 仓储未交付 |
+| `拒绝启动：<原因>`（jwt 分支） | `auth.mode=jwt` 但 `auth.jwt.hmac_secret` 为空 |
+| `拒绝启动：<原因>`（远端分支） | `auth.mode=remote-entitlements` 但未配 `auth.remote_entitlements.base_url` |
+| `拒绝启动：storage.driver=s3 需要 ...` | S3 三要素缺失 |
 | `打开位置仓储失败: ...` / `打开元数据仓储失败: ...` | SQLite 打不开（见 §6.2） |
 | `监听失败: ...` | 端口被占用/无权限 |
+| `参数错误：未知参数：...` | 命令行用法错误（退出码 2） |
 
 ### 2.2 探活端点（都在 base path 下，免鉴权）
 
@@ -451,6 +512,7 @@ for i in $(seq 1 30); do ss -ltn | grep -q ':8080 ' || break; sleep 1; done
 | --- | --- | --- | --- |
 | `fss_storage_operations_total` | counter | `driver`、`op`、`outcome` ∈ `ok` / `error` | 存储操作次数。`op` ∈ `ensure_container`、`presign_put`、`presign_get`、`put`、`get`、`stat`、`remove`、`copy`、`list`、`remove_temp_files` |
 | `fss_storage_bytes_total` | counter | `direction` ∈ `in` / `out` | 流经存储的字节数（`in` = PUT 入流量，`out` = GET 出流量） |
+| `fss_io_engine` | gauge | `engine`（实际生效）、`requested`（`storage.io_engine` 的配置值） | 恒为 `1`；用来回答"`auto` 到底选了哪个引擎"（R11：探测与回退结果必须可见） |
 
 **GC 层（`GcTask`）**
 
@@ -487,9 +549,12 @@ curl -sS http://127.0.0.1:8080/metrics | grep 'fss_http_rejected_total{reason="b
 * **脱敏** `observability.redact_keys`：列表语义，**子串**匹配、大小写不敏感、忽略 `_` 与 `-`
   （`secret_key` / `secretKey` / `SECRET-KEY` 等效）；命中后结构化字段整值替换为 `***`，
   自由文本里 `key: value` / `key=value` 的值也会被打码（宁可多打码）。
-  ⚠️ **未接通**：组合根用空 options 构造 logger，**当前真实进程没有任何打码规则**（见 §1.2.14）。
-  排障时不要用日志打印 `Authorization` / `X-Amz-Signature` 等头——目前不会被自动遮盖。
-* **级别/格式未接通**：真实进程固定 `info` + `json`；改 `observability.log_level` 不生效。
+  **已接通**：组合根用 `logging::OptionsFromConfig` 构造 logger，默认 11 个键与示例文件一致；
+  可用 `observability.redact_keys`（或旧别名 `FSS_LOG_REDACT_KEYS`）覆盖；启动横幅打印实际键数。
+  排障时仍不要把 `Authorization` / `X-Amz-Signature` 之外的自定义密钥名写进日志。
+* **级别/格式已接通**：`observability.log_level` / `observability.log_format`（旧别名
+  `FSS_LOG_LEVEL` / `FSS_LOG_FORMAT`）生效；日志 `service` 字段用组合根专用环境变量
+  `FSS_LOG_SERVICE`（不在 schema 内，默认 `file-service`）。
 
 **排查用的日志检索**
 
@@ -535,18 +600,21 @@ scripts/bench_baseline.sh --check         # 回归 >20% → 退出码 1（门禁
 
 ### 5.1 `storage.posix.durability` 三档与 `FSS_POSIX_DURABILITY` 映射
 
-组合根（`src/main/server_main.cpp`）把环境变量映射到 `PosixBlobStoreOptions`：
+组合根（`src/main/server_main.cpp`）把配置映射到 `PosixBlobStoreOptions`：
 
-| `FSS_POSIX_DURABILITY` | 映射到 | 语义 | 示例文件对应值 |
+| 取值（`storage.posix.durability` / 旧别名 `FSS_POSIX_DURABILITY`） | 映射到 | 语义 | 阈值来源 |
 | --- | --- | --- | --- |
-| `per_file` | `FsyncPolicy::kAlways` | 每个对象都 `fdatasync` + `fsync(dir)`：精确但慢 | `per_file`（schema 允许） |
-| `batch` | `FsyncPolicy::kBySize` + 阈值 | 小于 `FSS_POSIX_FSYNC_THRESHOLD_BYTES` 的对象不单独 fsync，靠批提交/调用方摊销 | `batch`（**schema 默认**） |
-| `never` | `FsyncPolicy::kNever` | 完全不 fsync；**只允许用于可重建数据**，进程崩溃可能丢已确认的写入 | ★ **schema 的 enum 未包含 `never`**，所以 `storage.posix.durability` 写 `never` 过不了配置校验；目前只能通过环境变量 `FSS_POSIX_DURABILITY=never` 打开 |
+| `per_file` | `FsyncPolicy::kAlways` | 每个对象都 `fdatasync` + `fsync(dir)`：精确但慢 | 不使用 |
+| `batch` | `FsyncPolicy::kBySize` + `storage.posix.fsync_threshold_bytes` | **≥ 阈值**的对象单独 `fdatasync`；更小的靠批次末 `syncfs` 摊销（`docs/adr/ADR-008`） | 配置键（默认 0）或旧别名（历史默认 1 MiB） |
+| `never` | `FsyncPolicy::kNever` | 完全不 fsync；**只允许用于可重建数据**，进程崩溃可能丢已确认的写入 | 不使用 |
 
 其他要点：
 
-* 组合根默认值是 **`per_file`**（不是 schema/示例的 `batch`），且 `batch` 档的阈值默认 **1 MiB**。
-* 取值为未知字符串 → **拒绝启动**并提示可选三档。
+* 组合根默认值是 **`per_file`**（不是 schema 默认的 `batch`），且 `batch` 档的阈值默认 **1 MiB**。
+* ⚠️ **阈值 `0` 的语义是"所有对象都必须 fsync"**（`ShouldFsync` 对 `threshold<=0` 一律返回 true），
+  即 `batch` + 阈值 0 = per_file 的耐久性，但**没有 per_file 的速度**。示例文件已写成 1 MiB。
+* `storage.posix.durability` 的 schema enum 未包含 `never`（只有旧别名能表达 `never`）。
+* 取值为未知字符串 → **拒绝启动**（exit 78）并提示可选三档。
 * `never` 启动时会在 stderr 打印显式告警，**不做静默降级**。
 
 ### 5.2 实测吞吐差异（同一次运行内 3 次取中位数）
@@ -776,26 +844,29 @@ find /var/lib/fss/data/blobs -name '*.tmp.*' -mmin +1440 -delete
 | `remote-entitlements` | 调远端 entitlements authorizeAny；依赖不可用（超时/5xx/坏 JSON/连不上/未配地址）**一律 503**，绝不降级放行 | 需要与平台 Entitlements 联调时 |
 
 **生产硬要求**（由 schema 跨字段规则定义，见 `tests/unit/test_config.cpp` 的 C8.5 用例）：
-`deployment.environment=production` 时 ① 禁止 `auth.mode=disabled`；② 禁止
-`auth.jwt.verify_signature=false`；③ `auth.mode=jwt` 必须有非空 `auth.jwt.hmac_secret`。
-⚠️ 这三条校验目前**不在组合根启动路径上**（组合根不加载 schema），只是"文档与配置层的规则"——
-所以生产上必须靠环境变量注入正确值 + 外部检查 `authMode`。
+`deployment.environment=production` 时 ① `auth.mode` 必须是 `jwt`（`disabled` 与
+`remote-entitlements` 都不接受）；② `auth.jwt.verify_signature` 必须为 true；
+③ `auth.jwt.hmac_secret` 必须非空。
+★ 这三条校验**现在就在组合根启动路径上**（`Load` 之后 `config.ok()==false` →
+打印全部问题 → **exit 78**），因此"忘了开鉴权就上生产"不再可能。
 
 ### 7.2 密钥注入
 
-* **只走环境变量，不入镜像**：`FSS_JWT_HMAC_SECRET`、`FSS_TRANSFER_SECRET`、
-  `FSS_STORAGE_S3_ACCESS_KEY` / `FSS_STORAGE_S3_SECRET_KEY`。
+* **只走环境变量或 `${ENV:...}` 引用，不入镜像**：`auth.jwt.hmac_secret`、
+  `self_signed.signing_key`、`storage.s3.access_key` / `secret_key`。
   容器平台用 Secret → 环境变量（或 `*_FILE` 包装）注入，**不要**把明文写进镜像层或 JSON 样例。
-* `auth.mode=jwt` 且 `FSS_JWT_HMAC_SECRET` 为空 → **拒绝启动**（不是"起来但拒绝所有 token"）。
-* `self_signed.signing_key` 的示例值是 `dev-secret-change-me` —— **生产必须替换**。
+  配置文件里推荐写 `${ENV:FSS_JWT_HMAC_SECRET}` 这类引用（加载器会展开）。
+* `auth.mode=jwt` 且 `auth.jwt.hmac_secret` 为空 → **拒绝启动**（不是"起来但拒绝所有 token"）。
+* `self_signed.signing_key` 的组合根默认是 `dev-secret-change-me` —— **生产必须替换**。
 * 多副本必须共享同一签名密钥与 JWT 密钥，否则 A 签发的 URL/token 到 B 会被拒。
-* `/v2/info` 不输出任何密钥；日志脱敏依赖 `observability.redact_keys`（**当前未接通**，见 §3.2）。
+* `/v2/info` 不输出任何密钥；`--print-config` 与日志都按 schema 的 secret 标记打码
+  （`***`），日志脱敏键来自 `observability.redact_keys`（已接通，见 §3.2）。
 
 ### 7.3 `deployment.mode=multi` 当前**拒绝启动**
 
-组合根在 `FSS_DEPLOYMENT_MODE=multi` 时打印
-`拒绝启动：deployment.mode=multi 需要 PG 仓储 + PG 租约 + 数据库时钟（ADR-009），本版本尚未交付（计划 P9）。`
-并返回退出码 1。这是**有意的**：多实例所需的状态外置（PG 仓储/租约/数据库时钟）未交付，
+组合根在 `deployment.mode=multi`（或 `FSS_DEPLOYMENT_MODE=multi`）时打印
+`拒绝启动：deployment.mode=multi 需要 PG 仓储 + PG 租约 + 数据库时钟（ADR-009），本版本尚未交付。`
+并返回**退出码 78**。这是**有意的**：多实例所需的状态外置（PG 仓储/租约/数据库时钟）未交付，
 静默"以单实例状态跑在多实例里"会让各实例状态发散。见
 [`docs/adr/ADR-009-multi-instance-consistency.md`](adr/ADR-009-multi-instance-consistency.md)。
 
@@ -805,7 +876,10 @@ find /var/lib/fss/data/blobs -name '*.tmp.*' -mmin +1440 -delete
 
 | 项 | 状态 | 说明 / 证据 |
 | --- | --- | --- |
-| 组合根接 `config/fss.example.json` | **未接通** | 只读环境变量；§1.3 的 125 个键不可配 |
+| 组合根接 `config/fss.example.json` | **切片 1 已接通** | `--config`/`FSS_CONFIG` + `--set` + 环境变量；156 键中 **66 个已接通**，**90 个仍未接通**（逐键见 §1.3） |
+| `observability.audit_fail_closed` | **已读但行为未实现** | 组合根读取该键并打印来源，但用例层 `RecordAudit()` 丢弃 `IAuditLogger::Record` 的结果 → **没有"致命审计"路径**；写 `true` 不会让审计失败影响操作结果 |
+| `storage.io_engine=uring` | **不可用（引擎未启用）** | 组合根会真实探测（`sys::ProbeIoUring`）并按 ADR-010 拒绝/回退；但 `UringIoEngine::enabled()=false`（U1~U4 未满足）→ 显式要求 `uring` 一律 **exit 78**，`auto` 回退 blocking（横幅 + `fss_io_engine` 可见） |
+| `metadata.repository`/`location.repository` 的 `postgres`/`remote` | **未实现（显式拒绝）** | 配成非 `sqlite` → **exit 78**，绝不静默降级为 SQLite |
 | PG 仓储 / PG 租约 / 数据库时钟 | **未实现** | `deployment.mode=multi` 运行形态不存在，组合根拒绝启动（ADR-009） |
 | 多实例运行形态 | **未验证** | 无 PG 版仓储与租约；`leases.*`、`leader_election.*` 全部未接通 |
 | 远端 Storage Service 仓储（`metadata.repository=remote`） | **未实现** | ADR-004 列为可选 |
@@ -816,7 +890,8 @@ find /var/lib/fss/data/blobs -name '*.tmp.*' -mmin +1440 -delete
 | 真实 NFS / 多客户端共享挂载语义 | **未验证** | ADR-009 登记为**上生产硬前提**（C9.27 未验证）；实现不依赖 NFS 文件锁 |
 | 容器镜像 | **见 P9 证据** | 本仓库当前没有 `docs/test-evidence/phase9-image.md`；镜像相关结论见 [`docs/test-evidence/phase9.md`](test-evidence/phase9.md) |
 | sendfile 大文件数据面 | **方向已定稿、实现未交付** | ADR-006 受控复核 2.12x ≥ 1.5x；默认仍走 httplib 内容提供者 |
-| 组合根装配指标注册表 / `MeteredBlobStore` / `GcTask` | **未接通** | 真实进程 `/metrics` 只有 HTTP 族；存储/GC 族在 `tests/hardening/test_metrics_and_gc.cpp` 上验证 |
+| 组合根装配指标注册表 / `MeteredBlobStore` | **已接通（P9-D10）** | 真实进程 `/metrics` 含 HTTP 族 + 存储计量族 + `fss_io_engine` 仪表 |
+| 组合根装配 `GcTask`（GC 调度/端点） | **未接通** | `gc.*` 6 个键仍未接通（§1.3）；`GcTask` 只在 `tests/hardening/test_metrics_and_gc.cpp` 上被直接构造 |
 | 磁盘水位 / 存储可达性 readiness 细化 | **未实现** | readiness 只探元数据仓储 |
 | `X-FSS-Dependencies` 响应头 | **未实现** | 契约 §7 列为扩展，但当前代码没有该头（登记为未实现） |
 | 生产容量（真实硬件/网卡） | **未验证** | C9.14；本机为 WSL2 虚拟盘 |
@@ -836,11 +911,13 @@ find /var/lib/fss/data/blobs -name '*.tmp.*' -mmin +1440 -delete
 | I/O 引擎选择 | [`docs/adr/ADR-010-io-engine-choice.md`](adr/ADR-010-io-engine-choice.md) |
 | 大文件数据面 | [`docs/adr/ADR-006-large-file-data-plane.md`](adr/ADR-006-large-file-data-plane.md) |
 | P9 测试证据 | [`docs/test-evidence/phase9.md`](test-evidence/phase9.md)、[`docs/test-evidence/phase9-adr006.md`](test-evidence/phase9-adr006.md) |
+| 配置面接线（阶段 10 切片 1）的证据 | `ctest -L phase10`（`tests/integration/test_config_wiring.cpp`）+ [`scripts/verify_config_wiring.sh`](../scripts/verify_config_wiring.sh) |
 | 开发环境与构建 | [`docs/development.md`](development.md) |
 
 机械检查：
 
 ```bash
 cmake --build build --target test_operations_doc -j"$(nproc)" && ./build/bin/test_operations_doc
-./scripts/check_docs.sh      # D1 链接 / D2 作废数字 / D3 ADR 索引 / D4 阶段表 / D5 门槛编号
+./scripts/check_docs.sh              # D1 链接 / D2 作废数字 / D3 ADR 索引 / D4 阶段表 / D5 门槛编号
+./scripts/verify_config_wiring.sh    # 真实二进制：配置生效 + 非法配置拒绝启动（exit 78）
 ```

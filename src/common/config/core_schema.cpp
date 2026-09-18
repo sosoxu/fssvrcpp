@@ -116,7 +116,13 @@ Schema CoreSchema() {
           .Enum({"batch", "per_file"}).Default("batch"));
   s.Add(FieldSpec{"storage.posix.group_commit_max_batch"}.Int(1, 100000).Default("500"));
   s.Add(FieldSpec{"storage.posix.sync_dir_after_batch"}.Bool("R2 不变量：必须 true").Default("true"));
-  s.Add(FieldSpec{"storage.posix.fsync_threshold_bytes"}.Int(0, 0, ">0 时大于该值的文件强制 per_file").Default("0"));
+  //  ★ 阶段 10 切片 1 放宽了范围：原先 `Int(0, 0)` 只允许 0，而组合根把 `durability=batch`
+  //    映射成"按大小落盘"（kBySize）—— 阈值 0 的语义是"所有对象都必须 fsync"，
+  //    于是"配置面"唯一能表达的 batch 恰好退化成了 per_file，且示例文件也踩在这上面。
+  //    现在 >0 的语义与实现一致：**≥ 阈值的对象强制单独 fdatasync**（小于阈值的靠批提交摊销）。
+  s.Add(FieldSpec{"storage.posix.fsync_threshold_bytes"}
+            .Int(0, 1L << 40, ">0 时 ≥ 该值的对象强制 per_file 落盘；0 = 所有对象都必须 fsync（等价 per_file 的耐久性）")
+            .Default("0"));
   s.Add(FieldSpec{"storage.posix.atomic_write"}.Bool().Default("true"));
   s.Add(FieldSpec{"storage.posix.dir_mode"}.Str().Default("0750"));
   s.Add(FieldSpec{"storage.posix.file_mode"}.Str().Default("0640"));
@@ -201,8 +207,11 @@ Schema CoreSchema() {
   s.Add(FieldSpec{"auth.jwt.roles_claim"}.Str().Default("roles"));
   s.Add(FieldSpec{"auth.jwt.user_id_claim"}.Str().Default("email"));
   //  HS256 共享密钥（ADR-012 §5.1）。verify_signature=true 时为空 → 实例**拒绝所有 token**
+  //  ★ 标为 secret：共享密钥绝不能出现在 `--print-config` / 诊断输出里（P1-D10 的
+  //    同一族教训：一个没登记为 secret 的密钥字段会**静默**明文泄漏）。
   s.Add(FieldSpec{"auth.jwt.hmac_secret"}
             .Str("HS256 共享密钥；为空且开启验签时本实例拒绝一切 token（fail-closed）")
+            .Secret()
             .Default(""));
   //  租户绑定：token 里必须带这个 claim，且与请求头 `data-partition-id` 一致（ADR-012 §3）
   s.Add(FieldSpec{"auth.jwt.partition_claim"}.Str("租户 claim 名").Default("data-partition-id"));
@@ -287,6 +296,12 @@ Schema CoreSchema() {
         if (environment == "production" && auth_mode == "disabled") {
           problems.emplace_back("auth.mode",
                                 "production 环境不允许 disabled（那等于没有鉴权）");
+        } else if (environment == "production" && auth_mode != "jwt") {
+          //  ★ C10.5：production 只允许 `jwt`（`remote-entitlements` 依赖外部服务，
+          //    未纳入本轮生产形态）。与"必须有密钥/必须验签"合起来，构成
+          //    "生产不可误配成无鉴权"的完整判据。
+          problems.emplace_back("auth.mode",
+                                "production 环境要求 auth.mode=jwt（当前='" + auth_mode + "'）");
         }
         if (environment == "production" && verify_signature != "true") {
           problems.emplace_back("auth.jwt.verify_signature",

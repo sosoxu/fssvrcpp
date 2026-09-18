@@ -119,6 +119,10 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build -L phase0 --output-on-failure
 ```
 
+> 运行服务端 `./build/bin/fss_server` 时的**配置来源与优先级**
+> （`--config` / `--set` / 环境变量 / 配置文件，以及每个键是否已接通）
+> 见 [`docs/operations.md`](docs/operations.md) §1。
+
 期望输出：
 
 ```

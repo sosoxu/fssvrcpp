@@ -20,8 +20,9 @@
 | **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | ✅ **已完成（C7.1~C7.10 全部满足；17/17 RPC；6 测试 / 5378 断言）** |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ✅ **已完成（C8.1~C8.8 全部满足；C8.9 配置级 + C8.10 机制级完成；6 测试 / 1323 断言）** |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ✅ **已完成（C9.1~C9.13、C9.15、C9.16、C9.25 满足；C9.8/C9.12 有独立证据文件；环境不具备的判据登记为未验证）** |
+| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | 🚧 **切片 1 完成**（C10.1~C10.8：156 键中 66 键接通、90 键如实登记；退出码 78 失败语义；真实二进制证据） |
 
-**全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P9 并全绿。
+**全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P10 并全绿。
 任何阶段的门槛脚本一旦被加入，后续阶段不得使其退化。
 
 ---
@@ -990,12 +991,58 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 
 ## 9. 首个动作（下一步要做什么）
 
-P0 已完成并通过。**下一步 = 阶段 1**，具体顺序：
+P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）已完成**（见文末「阶段 10」）。
+**下一步 = 阶段 10 的后续切片**，按 `docs/operations.md` §1.3 的未接通清单收敛：
 
-1. 建立完整 CMake 目标图（含 `fss_domain`/`fss_app` 空目标），**立刻**写 `tests/unit/test_layering_guard.cpp` 并确认它当前通过（因为还没违规代码）。
-2. 写 `scripts/verify_guard.sh`：临时插入违规 include → 期望构建失败 → 移除 → 期望恢复。**先让这个脚本可用**，它是后续所有"低耦合"承诺的机械保证。
-3. 实现 `common/result`（`Result<T>`/`Error`/`ErrorKind`/`FSS_TRY`）+ 测试。
-4. 实现 `common/crypto`（复用 P0 已固化的 HMAC 链式派生实现与向量）+ 测试。
-5. 实现 `common/json`、`common/ids`、`common/time`、`common/fs`、`common/bytes`、`common/net`、`common/logging`、`common/config` + 各自测试。
-6. 实现 `common/http` 解析器 → 路由 → 中间件 → 数据面原语，按 ADR-002 的"拒绝优先"规则逐条写测试。
-7. 跑 `ctest -L phase1`，满足 C1.1–C1.7，写 `docs/test-evidence/phase1.md`，然后才进入阶段 2。
+1. `observability.audit_fail_closed` 的"致命审计"路径（当前 `RecordAudit()` 丢弃结果）；
+2. `gc.*`（调度器 + GC 端点）接入组合根；
+3. `storage.proxy_mode` / 远端 Storage Service（`metadata.repository=remote`）；
+4. PG 仓储/租约 + `deployment.mode=multi` 运行形态（ADR-009）；
+5. `server.http.large_file_plane.*` 与 sendfile 数据面（ADR-006 §6）。
+
+---
+
+## 阶段 10：配置面接线（把"文档里有的配置"变成"产品里生效的配置"）
+
+> **为什么需要这个阶段**：P9 的 C9.9 逐键核对了 `config/fss.example.json` ——
+> **156 个叶子键中只有 31 个接通**（组合根只读环境变量），**125 个未接通**。
+> 这等于"文档写了、产品没有"，属于 R13/R15 明确禁止的状态；
+> 同时它带来真实的运维/安全后果：不设环境变量启动 = **无鉴权** + **每文件 fsync**。
+> P9 无法在本轮完成接线，故单列一个阶段，并按切片交付。
+
+**目标**：让 `config/fss.example.json`（带注释的 JSON）成为**真配置源**，
+优先级 **CLI > 环境变量 > 配置文件 > schema 默认值**（`fss::config::Load` 已实现该语义），
+并把 P9 登记的"未接通"清单收敛到可证实的小集合。
+
+**切片与判据**
+
+| # | 判据 |
+| --- | --- |
+| **C10.1** | 组合根支持 `--config <path>`（等价 `FSS_CONFIG`）：加载带注释的 JSON，未知键/非法值/类型不符 → **拒绝启动**并逐条打印 `path + 原因 + 来源`；`--print-config` 打印**脱敏后**的有效配置与每项来源 |
+| **C10.2** | 优先级与来源可见：同一键同时由 CLI/环境/文件给出时按 **CLI > env > file > default** 生效，且 `SourceOf(path)` 与启动横幅一致（有测试/脚本断言） |
+| **C10.3** | **server.http.\*** 接通：`bind_address`、`port`、`worker_threads`、`max_connections`、`base_path`、`idle_timeout_seconds`、`json_request_timeout_seconds`、`transfer_idle_timeout_seconds`、`transfer_buffer_bytes`、`transfer_memory_budget_bytes`、`max_*_bytes` —— 生效且有"非法值拒绝启动"的反向测试 |
+| **C10.4** | **storage.\*** 接通：`driver`、`posix.root`、`posix.durability`、`posix.fsync_threshold_bytes`、`posix.instance_id`（→ 临时文件命名）、`io_engine`（`blocking|uring|auto`，按 ADR-010 探测与回退/拒绝）、`s3.*` 超时与预签名时长 |
+| **C10.5** | **auth.\*** 接通 + **生产强校验**：`deployment.environment=production` 时 `auth.mode` **必须** `jwt`、`jwt.hmac_secret` 必须非空、`verify_signature` 必须为真 —— 否则**拒绝启动**（把 P9 登记的"默认无鉴权"变成不可误配） |
+| **C10.6** | **observability.\*** 接通：`log_level`、`log_format`、`log_service`、`redact_keys`、`audit_enabled`、`audit_fail_closed`、`metrics_enabled`、`metrics_path` |
+| **C10.7** | **未接通清单收敛并机械化**：`docs/operations.md` 的"接通状态"列必须与实现一致；新增测试断言"**声明接通的键**在真实进程上确实生效"（覆盖 C10.3~C10.6 的键），未接通项必须显式列出（不得沉默） |
+| **C10.8** | 自证（R1）：把配置加载**去掉**（退回只读环境变量）→ 新测试必须失败；恢复 → 通过。并保留一条"环境变量仍可覆盖文件"的正例 |
+
+**门槛命令**：`ctest -L phase10 && scripts/verify_config_wiring.sh`（后者用**真实二进制** +
+临时配置文件断言生效与拒绝启动两侧）。
+
+**交付物**：`src/main/server_main.cpp`（接线）、`tests/*`（配置生效/拒绝的用例）、
+`scripts/verify_config_wiring.sh`、`docs/operations.md`（接通状态列更新）、
+`config/fss.example.json`（如有键需要与 schema 对齐）。
+
+**状态：🚧 切片 1（配置面接线）完成**。C10.1~C10.8 全部满足：
+`--config` / `--set` / `--print-config`（脱敏 + 来源）+ **exit 78（EX_CONFIG）** 失败语义；
+组合根接入 `fss::config::Load`；旧环境变量别名（`FSS_HTTP_PORT` / `FSS_STORAGE_ROOT` /
+`FSS_POSIX_DURABILITY` / `FSS_TRANSFER_SECRET` / `FSS_S3_ACCESS_KEY` …）逐条保留；
+**156 键中 66 键已接通**（`docs/operations.md` §1.3/§1.4 逐键登记，90 键仍未接通）；
+证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，真实二进制）+
+`scripts/verify_config_wiring.sh`；自证（R1）：去掉组合根的配置文件层后新用例失败。
+
+**未做（本阶段不承诺）**：`gc.*` 的调度与端点（P9 登记的"GC 未接入组合根"）、
+PG 仓储/租约与 `mode=multi` 运行形态、`storage.proxy_mode`/远端 Storage Service、
+`leader_election.*`/`leases.*`（依赖 PG）、sendfile 数据面（ADR-006 §6）、
+`observability.audit_fail_closed` 的"致命审计"行为（已读但行为未实现，见 `operations.md` §8）。

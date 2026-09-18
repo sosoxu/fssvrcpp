@@ -29,7 +29,7 @@ JOBS="${JOBS:-$(nproc)}"
 cd "${REPO_ROOT}"
 
 # 已实现阶段的前缀（新增阶段时把编号加进来；未列入的会被跳过并提示）
-IMPLEMENTED_PHASES=(0 1 2 3 4 5 6 7 8 9)
+IMPLEMENTED_PHASES=(0 1 2 3 4 5 6 7 8 9 10)
 
 WANT=("$@")
 
@@ -130,7 +130,7 @@ if [[ "${FSS_GATES_WITH_PG:-0}" == "1" ]]; then
   hr
 fi
 
-for p in 0 1 2 3 4 5 6 7 8 9; do
+for p in 0 1 2 3 4 5 6 7 8 9 10; do
   stage_enabled "$p" || continue
 
   if ! phase_implemented "$p"; then
@@ -218,6 +218,18 @@ for p in 0 1 2 3 4 5 6 7 8 9; do
     else
       echo "==> [phase4] ❌ 组合根护栏自证失败 —— 护栏的'通过'不可信"
       FAILED+=("phase4-composition-root")
+      break
+    fi
+  fi
+
+  # C10.x：配置面接线（真实二进制 + 临时配置文件；"配置生效"与"拒绝启动"两侧）
+  if [[ "${p}" == "10" ]]; then
+    echo "==> [phase10] scripts/verify_config_wiring.sh（C10.1~C10.8：配置面接线）"
+    if ./scripts/verify_config_wiring.sh "${BUILD_DIR}"; then
+      echo "==> [phase10] ✅ 配置面接线验证通过"
+    else
+      echo "==> [phase10] ❌ 配置面接线验证失败"
+      FAILED+=("phase10-config-wiring")
       break
     fi
   fi

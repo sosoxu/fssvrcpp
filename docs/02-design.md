@@ -1249,11 +1249,12 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 | R-28 多实例 `syncfs` 干扰 | 🟡 | 部署建议"按 partition 分盘"；配置键 `shared_mount_required` / `one_filesystem_per_partition` 已在 schema 与示例中 | 干扰量级**未测**（C9.24 未验证）；组合根**未接**这两个键 → 目前只能靠部署纪律 |
 | R-29 io_uring 当必需依赖 | 🟡 | 默认 `blocking`（ADR-010）+ `scripts/check_io_uring.sh`（0/1/**2=无结论**）+ 探测失败按配置回退 | `/v2/info` 暴露 `ioEngine`/`ioUringAvailable` 未做（C9.30 未验证）；seccomp 阻断已实测 `EPERM` |
 
-**P9 遗留（如实登记，不阻塞 C9.1~C9.10）**：① 组合根仍**只读环境变量**、未接 `config/fss.example.json`
-（schema 与示例已就绪，逐键映射见 `docs/operations.md`）；② 第 ② 条带来的后果是多实例相关的
-`shared_mount_required`/`one_filesystem_per_partition` 目前不可配；③ PG 仓储/租约与
-`deployment.mode=multi` 运行形态；④ sendfile 数据面实现（ADR-006 §6 的门槛）；
-⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
+**P9 遗留（如实登记，不阻塞 C9.1~C9.10）**：① 组合根当时仍**只读环境变量**、未接
+`config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
+exit 78 失败语义；156 键中 66 键接通、90 键逐项登记在 `docs/operations.md` §1.3）；
+② 多实例相关的 `shared_mount_required`/`one_filesystem_per_partition` 仍不可配（在 §1.3 的
+90 个未接通键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
+实现（ADR-006 §6 的门槛）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
 
 ---
 

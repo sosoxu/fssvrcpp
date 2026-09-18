@@ -107,12 +107,13 @@ RUN set -eux; \
 
 COPY --from=builder /src/build/bin/fss_server /usr/local/bin/fss_server
 # 随镜像提供一份**带注释的**参考配置（人类可读的文档/排障参照）。
-# ★ 组合根当前**只读环境变量**，不解析任何 JSON 配置文件（AGENTS.md §0「阶段 4 后续」），
-#   因此这份文件不会改变进程行为；生效的是下面 ENTRYPOINT 里的 `FSS_*` 环境变量。
+# ★ 阶段 10 切片 1 起组合根**会读取** `--config`/`FSS_CONFIG` 指向的配置文件；
+#   但本镜像的 ENTRYPOINT **不传 --config**，因此生效的仍是下面的 `FSS_*` 环境变量
+#   （等价于显式覆盖每一层）。要改用文件，覆盖 entrypoint 时加 `--config /etc/fss/...`。
 COPY --chown=fss:fss config/fss.example.json /etc/fss/fss.example.json
 
 # -----------------------------------------------------------------------------
-#  production 配置：进程内生效的是环境变量（组合根只读 env）
+#  production 配置：本镜像内**生效的是环境变量**（ENTRYPOINT 不传 --config）
 # -----------------------------------------------------------------------------
 #  ★ auth.mode=jwt **强制**。这里用 ENV 设默认值，并由 ENTRYPOINT 拒绝任何降级尝试
 #    （见 /usr/local/bin/entrypoint.sh 里的「production 形态：强制 auth.mode=jwt」校验）

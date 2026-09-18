@@ -116,7 +116,11 @@
       "durability": "batch",
       "group_commit_max_batch": 500,
       "sync_dir_after_batch": true,
-      "fsync_threshold_bytes": 0,
+      //  ★ 只对 durability=batch 生效：**≥ 该字节数的对象强制单独 fdatasync**，
+      //    更小的对象靠批次末的 syncfs 摊销（这正是 batch 快 4.3x 的来源）。
+      //    ⚠️ 阈值 0 的语义是"所有对象都必须 fsync" —— 那等于 per_file 的耐久性
+      //    与 per_file 的速度；要摊销就必须给一个正数（默认 1 MiB）。
+      "fsync_threshold_bytes": 1048576,
       "atomic_write": true,
       "dir_mode": "0750",
       "file_mode": "0640",
