@@ -11,14 +11,20 @@
 #         （例如已作废的 58,741；出现处必须带作废标记）
 #    D3 ADR 索引完整：无孤儿 ADR；被引用的 ADR 文件存在（待定稿的需显式标注）
 #    D4 阶段状态一致：实现计划里的完成标记 ⇄ run_all_gates.sh 的 IMPLEMENTED_PHASES
+#    D5 门槛编号完整性：同一阶段内 C<阶段>.<序号> 连续无断号、无重复
 #
 #  用法：scripts/check_docs.sh [--quiet] [--selftest]
 #  退出码：0 = 全部通过；1 = 有问题（逐条列出，并给出修复提示）
 #
 #  ⚠️ D2 是**启发式**检查，不是证明：它只在"值出现的 ±3 行窗口内找不到任何作废标记词"
 #     时报错。因此存在漏报（窗口外有标记）与误报（窗口内恰好出现标记词）的可能。
-#     `--selftest` 通过注入一个**故意不合作**的临时文件来验证 D1/D2 确实能失败
+#     `--selftest` 通过注入**故意不合作**的内容来验证 D1/D2/D4/D5 确实能失败
 #     —— 按 AGENTS.md 铁律 R1，检查器自身也必须自证。
+#
+#  ⚠️ 阶段/门槛编号**必须按多位数解析**（P10、C10.1…）：早前 D4/D5 用 `P(\d)` /
+#     `C(\d)\.` 只认一位数，于是阶段 10 的行与全部 16 条 C10.* 门槛对检查器**根本不存在**
+#     —— 门槛"全绿"其实是空集合（与 P2-D07 的 `phase012` 同类）。现已改为 `\d+`，
+#     并在 `--selftest` 里用 **P99 / C10.16 注入**锁住这个回归。
 # =============================================================================
 set -euo pipefail
 
@@ -41,29 +47,46 @@ info() { [[ ${QUIET} -eq 1 ]] || printf '%s\n' "${C_DIM}  ·${C_OFF} $*"; }
 FAILURES=0
 
 # -----------------------------------------------------------------------------
-#  自证（AGENTS.md 铁律 R1）：证明 D1/D2 确实能检出问题
+#  自证（AGENTS.md 铁律 R1）：证明 D1/D2/D4/D5 确实能检出问题
 #  注入的文件**不能包含任何作废标记词**，否则 D2 会被自己的文字骗过去
 # -----------------------------------------------------------------------------
 if [[ ${SELFTEST} -eq 1 ]]; then
   TMP_MD="${REPO_ROOT}/docs/_selftest_injected.md"
+  PLAN_MD="${REPO_ROOT}/docs/04-implementation-plan.md"
+  PLAN_BAK="$(mktemp)"
+  cp "${PLAN_MD}" "${PLAN_BAK}"
   # ★ 用 trap 清理：早前手工测试时因为 exit 在 rm 之前触发，残留了一个临时文件
-  trap 'rm -f "${TMP_MD}"' EXIT
+  #   D4/D5 的注入会改**真实**计划文件，所以恢复必须挂在 trap 上（异常退出也不留残迹）
+  trap 'rm -f "${TMP_MD}"; cp -f "${PLAN_BAK}" "${PLAN_MD}" 2>/dev/null || true; rm -f "${PLAN_BAK}"' EXIT
   cat > "${TMP_MD}" <<'MD'
 # 临时自证文件（由 check_docs.sh --selftest 生成，检查后删除）
 指向不存在的目标：[坏的链接](no-such-document.md)
 这个性能数字现在没有依据：达到 58,741 files/s。
 MD
+  # D4 注入：多位数阶段行标 ✅ 但不在 IMPLEMENTED_PHASES 里（同时锁住"只认一位数"的回归）
+  printf '%s\n' '| **P99** | 自证注入阶段 | - | - | ✅ **已完成** |' >> "${PLAN_MD}"
+  # D5 注入：把最后一条 C10.* 门槛改成 C10.17 → C10 的 1..N 出现断号
+  python3 - "${PLAN_MD}" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p, encoding='utf-8').read()
+assert '| **C10.16** |' in text, 'selftest 注入前提失效：计划里找不到 | **C10.16** |'
+open(p, 'w', encoding='utf-8').write(text.replace('| **C10.16** |', '| **C10.17** |', 1))
+PY
   set +e
   out="$("${BASH_SOURCE[0]}" --quiet 2>&1)"; rc=$?
   set -e
   rm -f "${TMP_MD}"
-  ok_d1=0; ok_d2=0
+  cp -f "${PLAN_BAK}" "${PLAN_MD}"   # ★ 立即恢复，后面的正式检查必须看到原始计划
+  ok_d1=0; ok_d2=0; ok_d4=0; ok_d5=0
   printf '%s' "$out" | grep -q "D1 失效链接" && ok_d1=1
   printf '%s' "$out" | grep -q "D2 已作废的值" && ok_d2=1
-  if [[ ${rc} -ne 0 && ${ok_d1} -eq 1 && ${ok_d2} -eq 1 ]]; then
-    printf '%s\n' "${C_GRN}  ✓${C_OFF} 自证：D1 与 D2 都能检出注入的错误（检查器有效）"
+  printf '%s' "$out" | grep -q "D4 标 ✅ 但未启用门槛的阶段：\['99'\]" && ok_d4=1
+  printf '%s' "$out" | grep -q "D5 C10 门槛编号断号.*C10.16" && ok_d5=1
+  if [[ ${rc} -ne 0 && ${ok_d1} -eq 1 && ${ok_d2} -eq 1 && ${ok_d4} -eq 1 && ${ok_d5} -eq 1 ]]; then
+    printf '%s\n' "${C_GRN}  ✓${C_OFF} 自证：D1/D2/D4/D5 都能检出注入的错误（检查器有效）"
   else
-    printf '%s\n' "${C_RED}  ✗${C_OFF} 自证失败：检查器未能检出注入的错误（rc=${rc}, D1=${ok_d1}, D2=${ok_d2}）"
+    printf '%s\n' "${C_RED}  ✗${C_OFF} 自证失败：检查器未能检出注入的错误（rc=${rc}, D1=${ok_d1}, D2=${ok_d2}, D4=${ok_d4}, D5=${ok_d5}）"
     printf '%s\n' "     → 检查器的"通过"结论不可信"
     exit 1
   fi
@@ -163,7 +186,7 @@ gates = read(os.path.join(root, 'scripts', 'run_all_gates.sh'))
 done_in_plan = set()
 partial_in_plan = set()
 for line in plan.splitlines():
-    m = re.match(r'\|\s*\*\*P(\d)\*\*', line)
+    m = re.match(r'\|\s*\*\*P(\d+)\*\*', line)
     if not m:
         continue
     if '✅' in line:
@@ -171,7 +194,9 @@ for line in plan.splitlines():
     elif '🚧' in line:
         partial_in_plan.add(m.group(1))
 impl = re.search(r'IMPLEMENTED_PHASES=\(([^)]*)\)', gates)
-impl_set = set(re.findall(r'\d', impl.group(1))) if impl else set()
+# ★ 必须 `\d+` 整段取号：`findall(r'\d')` 会把 10 拆成 '1'+'0'（恰好已被 0/1 覆盖，
+#   于是"漏写一个阶段"永远检查不出来）
+impl_set = set(re.findall(r'\d+', impl.group(1))) if impl else set()
 
 # 规则：
 #   ① 标 ✅ 的阶段必须已启用门槛（不允许"声称完成但没有门槛"）
@@ -180,27 +205,28 @@ not_gated = done_in_plan - impl_set
 unmarked = impl_set - done_in_plan - partial_in_plan
 if not_gated:
     failures.append(
-        f"D4 标 ✅ 但未启用门槛的阶段：{sorted(not_gated)}"
+        f"D4 标 ✅ 但未启用门槛的阶段：{sorted(not_gated, key=int)}"
         f"（请把编号加入 run_all_gates.sh 的 IMPLEMENTED_PHASES）")
 if unmarked:
     failures.append(
-        f"D4 已启用门槛但计划中无标记的阶段：{sorted(unmarked)}"
+        f"D4 已启用门槛但计划中无标记的阶段：{sorted(unmarked, key=int)}"
         f"（请在 docs/04-implementation-plan.md 的阶段表标 ✅ 或 🚧）")
-print(f"  D4 已完成 {sorted(done_in_plan) or '无'}，进行中 {sorted(partial_in_plan) or '无'}，"
-      f"门槛启用 {sorted(impl_set) or '无'}")
+print(f"  D4 已完成 {sorted(done_in_plan, key=int) or '无'}，"
+      f"进行中 {sorted(partial_in_plan, key=int) or '无'}，"
+      f"门槛启用 {sorted(impl_set, key=int) or '无'}")
 
 # ------------------------------------------- D5 门槛编号完整性
 # 形如 C1.7 / C1.2b：同一阶段内数字必须连续无断号、无重复
 # （本条检查就是被"补端口时顺手加了 C1.11+ 却漏了 C1.8~C1.10"这个真实缺陷驱动的）
 # ★ 只认"定义行"：门槛编号必须出现在表格的【第一列】
 #   （否则会把"支撑门槛"引用列里的 C2.10 当成第二次定义 —— 已踩过这个误报）
-gate_defs = re.findall(r'^\|\s*\*{0,2}(C\d\.\d+[a-z]?)\*{0,2}\s*\|', plan, flags=re.M)
+gate_defs = re.findall(r'^\|\s*\*{0,2}(C\d+\.\d+[a-z]?)\*{0,2}\s*\|', plan, flags=re.M)
 flat = gate_defs
 by_phase = {}
 for gid in flat:
-    m = re.match(r'C(\d)\.(\d+)([a-z]?)', gid)
+    m = re.match(r'C(\d+)\.(\d+)([a-z]?)', gid)
     by_phase.setdefault(m.group(1), []).append((int(m.group(2)), m.group(3), gid))
-for ph, items in sorted(by_phase.items()):
+for ph, items in sorted(by_phase.items(), key=lambda kv: int(kv[0])):
     nums = [n for n, _, _ in items]
     maxn = max(nums)
     missing = [n for n in range(1, maxn + 1) if n not in nums]
