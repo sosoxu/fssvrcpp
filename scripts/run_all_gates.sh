@@ -18,6 +18,10 @@
 # =============================================================================
 set -euo pipefail
 
+#  ★ C9.7：门槛要"顺序跑 P0→P9 全绿，总耗时记录在案"。下面记录**总耗时**与**每阶段耗时**
+#    （`SECONDS` 是 bash 内建，秒级）；收尾时打印一行机器可读的汇总，便于写进证据文件。
+GATES_START=${SECONDS}
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build}"
 JOBS="${JOBS:-$(nproc)}"
@@ -242,5 +246,8 @@ fi
 
 echo "  失败: 无"
 echo
+GATES_TOTAL=$((SECONDS - GATES_START))
+printf '⏱  总耗时: %d 分 %d 秒（%d s，阶段数 %d）\n' \
+  $((GATES_TOTAL / 60)) $((GATES_TOTAL % 60)) "${GATES_TOTAL}" "${#IMPLEMENTED_PHASES[@]}"
 echo "✅ 全部已启用阶段门槛通过。"
 echo "   提醒：通过后请把命令、输出摘要与结论写入 docs/test-evidence/phaseN.md。"

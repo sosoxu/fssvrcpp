@@ -550,3 +550,10 @@ fss_add_test(test_uring_io_engine
   SOURCES unit/test_uring_io_engine.cpp
   LIBS    fss_io
   LABELS  phase3 unit)
+
+# C9.9：运维文档完整性 —— docs/operations.md 必须覆盖 config/fss.example.json 的每个叶子键
+# （正向覆盖 + 反向"不得写不存在的键"，均用 CoreSchema().IsAllowedPath 判定）
+fss_add_test(test_operations_doc
+  SOURCES unit/test_operations_doc.cpp
+  LIBS    fss_config fss_json
+  LABELS  "phase9;docs")

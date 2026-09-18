@@ -3,13 +3,15 @@
 | 项 | 值 |
 | --- | --- |
 | 阶段 | P9（硬化与交付） |
-| 状态 | 🚧 **进行中 —— 切片 1/3 完成 + 切片 2 的指标/GC/性能基线完成**（C9.1/C9.2/C9.3/C9.4/C9.5/C9.6/C9.11/C9.13/C9.15/C9.25；ADR-006 复核见 `docs/test-evidence/phase9-adr006.md`） |
+| 状态 | ✅ **P9 完成 —— 切片 1/2/3 全部完成**（C9.1~C9.13、C9.15、C9.16、C9.25 满足；C9.8 见 `docs/test-evidence/phase9-image.md`；C9.12 见 `docs/test-evidence/phase9-adr006.md`） |
 | 门槛命令 | `ctest -L phase9` |
-| 退出码 | `0`（**5 测试 / 451 断言**：`test_concurrency` 92、`test_fault_injection` 79、`test_resource_limits` 44、`test_metrics_and_gc` 195、`test_transfer_error_semantics` 41） |
+| 退出码 | `0`（**6 测试 / 466 断言**：`test_concurrency` 92、`test_fault_injection` 79、`test_resource_limits` 44、`test_metrics_and_gc` 196、`test_transfer_error_semantics` 41、`test_operations_doc` 14） |
+| 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P9 全绿，总耗时 225 s（3 分 45 秒，10 个阶段）**；`ctest` **75/75** 通过 |
 
-> **剩余**：ADR-006 的定稿结论（C9.12/C9.16，数字与结论见 `docs/test-evidence/phase9-adr006.md`）；
-> 切片 3 = `run_all_gates.sh` 纳入 P9（C9.7）+ 容器镜像（C9.8）
-> + `operations.md`/`runbook.md`/`README.md`（C9.9）+ 11 项风险收口（C9.10）。
+> **切片 3（交付面）**：C9.7 门槛纳入 P9 并记录耗时（**225 s / 10 阶段**）、C9.8 容器镜像
+> （构建/启动/readiness 200/强制 jwt/非 root/HEALTHCHECK **全部实测**）、
+> C9.9 运维文档（`operations.md` + `runbook.md` + 自动比对测试覆盖 **156 个配置键**）、
+> C9.10 风险收口（§16.1 覆盖全部 **20 行**）。
 >
 > ★ 本切片顺带修掉了 6 个**同族**缺陷（P9-D04~D09，见 §6）：全部是"**元数据/状态语义错误**"
 > —— 时间戳时基、临时文件计数、响应状态码被覆盖、守卫白名单。它们的共同特征是
@@ -44,7 +46,10 @@
 | **C9.11** 容量基线（方法学） | ✅（本机数字，非生产结论） | 独立进程 + **互不重叠**绑核（服务端 `4-7`、客户端 `8-15`）+ 同一负载生成器；四类都测了：① 小段读请求率上限（控制面 **14.3k req/s @c4**；数据面小对象 **13.7k req/s @c16**）② 大文件单流吞吐（**1272 MiB/s @c1**，c4 合计 3395 MiB/s）③ **4→64 并发扩展曲线**（见下：**c4 之后吞吐回落**）④ SQLite 写吞吐（**1482 / 2409 writes/s** @1/8 线程）。全部点位 `errs=0`；客户端 CPU 占比同时记录（R4） |
 | **C9.13** 内存预算 | ✅ | `test_resource_limits` ⑥：`并发上限 × 缓冲 > budget` → `ValidateOptions` 拒绝（组合根在 `Server` 构造时校验 → `Bind()` 失败即**拒绝启动**），并有一条**正例**（满足预算 → 通过），见 §2 的 C9.3 行 |
 | **C9.15** 小文件上传端到端 + fsync 档位 | ✅（本机数字） | `chain` 模式实测**完整链路**（uploadURL → PUT → POST metadata，含 token 校验、POSIX 原子写、位置/元数据两处 SQLite 写）：**34.9 files/s @c1 → 174.2 @c8**；**fsync 档位差异**（c4）：`per_file` **96.4 files/s** vs `batch` **410.1** vs `never` **426.0** ≈ **4.3×**，与 ADR-008 的"fsync 是主成本"一致 |
-| C9.7/C9.8/C9.9/C9.10 | ⬜ 未开始 | 见开头"剩余" |
+| **C9.9** 运维文档 | ✅ | `docs/operations.md`（68 KB）+ `docs/runbook.md`；**自动比对测试** `tests/unit/test_operations_doc.cpp`（14 断言）：`config/fss.example.json` 的 **156 个叶子键全部**以 `` `路径` `` 形式出现在文档中（非空洞下限 40 + 文档 >5000 字节）、示例⇄schema 一致、**反向断言**（文档里出现的每个 `a.b.c` 都必须 `CoreSchema().IsAllowedPath`）。自证：注入假键 → 反向断言失败；删掉 `gc.interval_seconds` 的文档 → 正向断言失败 |
+| **C9.10** 风险收口 | ✅ | `docs/02-design.md` §16.1：**实际 20 行风险**（R-01~R-08/R-12~R-16/R-23~R-29）逐条给出"✅ 已落地 / 🟡 部分 / ⛔ 显式接受"与**可执行证据**（测试名/脚本/ADR）；并登记纠正"计划里的 11 项"为过时数字。已登记未做：多实例运行形态（PG 仓储/租约）、NFS 语义（生产门禁）、sendfile 实现、组合根未接 JSON 配置 |
+| **C9.7** 门槛纳入 P9 + 耗时 | ✅ | `scripts/run_all_gates.sh` 的 `IMPLEMENTED_PHASES` 已含 9；P0~P9 **顺序全绿**，脚本末尾打印 **`⏱ 总耗时: 3 分 45 秒（225 s，阶段数 10）`**（本轮实测）；`ctest` 75/75 |
+| **C9.8** 容器镜像 | ✅ | `Dockerfile`（多阶段、非 root `fss` uid 10001、`HEALTHCHECK`、`VOLUME /data`、**强制 `FSS_AUTH_MODE=jwt`**）+ `scripts/verify_image.sh`：镜像 **107 MB**、冷构建 452 s、`readiness_check` **200**、`/v2/info.authMode=jwt`、无 token → **401**、伪造 token → **401**、`HEALTHCHECK=healthy`、`FSS_AUTH_MODE=disabled`/空密钥 → **exit 64 拒绝启动**。证据 `docs/test-evidence/phase9-image.md`（含代码冻结后的最终复验） |
 | C9.12/C9.16（ADR-006 受控复核） | 🚧 进行中 | `docs/test-evidence/phase9-adr006.md`（同一负载生成器对比 httplib 内容提供者 vs 裸 `sendfile`） |
 | C9.14/C9.17–C9.30（需真实硬件/多进程/容器） | ⬜ 未验证 | 环境不具备（详见 §9） |
 | C9.17–C9.30（需真实硬件/多进程/容器） | ⬜ 未验证 | 环境不具备（详见 §5） |
@@ -181,7 +186,7 @@
   各加一次 `sync`，复测 7 次为 2014~2488）。
 - 因此"回归 >20% 判失败"这个判据**在本机只对"同一次会话 / 同一机器状态"有意义**；
   跨会话的机器漂移（实测 40%）会淹没 20% 的阈值。这一点与 fsync 类点位的告警机制一起，
-  写进了 `scripts/bench_baseline.sh` 的注释与 §10 的未验证清单。
+  写进了 `scripts/bench_baseline.sh` 的注释与 §11 的未验证清单。
 
 **方法学自证（为什么这些数字可信）**
 
@@ -193,12 +198,48 @@
 | 基线的"能失败" | `--check` 模式对吞吐退化 >20% 判失败；对 **fsync/磁盘类**点位（`data_put_*`/`upload_chain_*`/`sqlite_write_*`）**只告警**，因为 WSL2 上这些点位的逐次散布本身就 >20%（实测 `per_file c4` = 78.6 / 96.4 files/s）—— 这是 R4 的"无结论"处理，而不是放宽所有阈值 | ✅ |
 | 基线不腐烂 | 基线文件头部记录环境/绑核/协议/时长与"仅本机参考"警示；`--save` 才写，日常跑只对比 | ✅ |
 
-## 10. 未验证 / 环境限制（如实登记）
+## 10. 切片 3（交付面）补充
+
+### 10.1 组合根补齐：指标与日志脱敏（P9-D10）
+
+`docs/operations.md` 的逐键核对（C9.9）顺带查出**我自己在切片 2 留下的同类缺陷**：
+
+| 编号 | 症状 | 根因 | 修法 / 证据 |
+| --- | --- | --- | --- |
+| **P9-D10** | **真实进程**的 `/metrics` 只有 HTTP 族（没有 `fss_storage_*`）；且**日志完全不打码** | 组合根从不创建 `fss::metrics::Registry`/`MeteredBlobStore`（`RouterOptions::metrics_registry` 恒为 `nullptr`），并用 `LogOptions{}` 构造 logger（`redact_keys` 为空）。**测试夹具里都接上了** ⇒ "测试里通过、产品里不存在"（R15 那类陷阱的第三次应验） | 组合根创建 `metrics::Registry` + `MeteredBlobStore`（纯转发）并接进 `RouterOptions`；日志改用 `logging::OptionsFromConfig`，默认脱敏键与 `config/fss.example.json` 的 `observability.redact_keys` **逐项一致**（11 个键，`FSS_LOG_REDACT_KEYS` 可覆盖）；启动横幅新增 `log redact : 11 个键` 与 `metrics : 已接入（含存储计量）` 两行，使"接没接上"**在真实进程上可见** |
+
+**真实进程实测**（`taskset -c 0 build/bin/fss_server` + 一次 `uploadURL` + 一次带 body 的 `PUT`）：
+
+```
+# TYPE fss_storage_bytes_total counter
+fss_storage_bytes_total{direction="in"} 13
+# TYPE fss_storage_operations_total counter
+fss_storage_operations_total{driver="posix",op="ensure_container",outcome="ok"} 2
+fss_storage_operations_total{driver="posix",op="put",outcome="ok"} 2
+```
+
+启动横幅：`log redact : 11 个键` / `metrics : 已接入（含存储计量）`。
+
+### 10.2 C9.9 顺带记录的配置面事实（如实登记，非缺陷申报）
+
+`docs/operations.md` §1/§8 逐键核对了 `config/fss.example.json`：**156 个叶子键中 31 个已接通**
+（组合根读 `FSS_*`），**125 个未接通**（改配置文件不生效）。三条最需要注意：
+
+1. **默认值分歧**：`auth.mode`（组合根 `disabled` vs schema `jwt`）、
+   `storage.posix.durability`（`per_file` vs schema `batch`）⇒ **不设环境变量启动 = 无鉴权 + 每文件 fsync**。
+   生产必须显式设 `FSS_AUTH_MODE=jwt`（容器镜像已强制）与耐久档位；三者差异已写进 `operations.md` §1.4。
+2. `storage.posix.durability` 的 schema enum **不含 `never`**，而组合根接受三档（只能经环境变量打开）。
+3. `observability.metrics_enabled` / `metrics_path` 未接通（`/metrics` 恒开、路径固定）。
+
+这些属于"组合根未接 JSON 配置"这一个登记项（见 §11 与 `docs/02-design.md` §16.1 末尾）。
+
+## 11. 未验证 / 环境限制（如实登记）
 
 | 项 | 为什么未验证 | 已登记的替代证据 |
 | --- | --- | --- |
 | 指标口径的"生产级"校验（每秒采样、基数爆炸、远端抓取） | 需要真实 Prometheus/长跑流量 | 已断言"family 数有限 + 标签值受控 + 渲染稳定 + 不含 secret"；**未**做基数压测（登记） |
 | **容量基线的"跨会话"可比性** | 本机是共享的 WSL2 主机：同一 3 次取中位数的点位在三次独立运行中给出 **14308 / 14140 / 9969 req/s**（control_read_c4，跨会话漂移 ≈40%），而同一次运行内的 3 次重复散布 <5% | 已把"每点位 3 次取中位数""逐次散布 >20% 显式告警""fsync 类点位只告警"写进 `scripts/bench_baseline.sh`；**"退化 >20% 即失败"在本机只对"同一会话/同一机器状态"有判定力**，独占硬件上才可作最终判据（C9.14） |
+| "配置文件即真相"（`config/fss.example.json` 生效） | **组合根只读环境变量**：156 个叶子键里 125 个未接通（逐键见 `docs/operations.md` §1.3）；改配置文件不生效 | 已如实登记（`docs/02-design.md` §16.1 末尾、`operations.md` §1.1）并把每个键的 `FSS_*` 映射/未接通状态写进文档；**未做** JSON 配置加载器接线 |
 | 大文件吞吐的**磁盘**语义 | 64 MiB 对象全程在页缓存（1159 MiB/s 是内存/loopback 量级）；无 root 无法 `drop_caches` | 只作"路径开销"参考；C9.14（真实 NVMe/HDD/NFS + 真实网卡）登记为未验证 |
 | `fss_gc_skipped_total{reason=tmp_too_young}` 在真实生产流量下的量级 | 需要真实在途上传并发 | 已有确定性用例（5 秒前的临时文件必须被保护且计数为 1） |
 | 真实 ENOSPC（写满一个小文件系统） | 需要一个可写的小文件系统（`mount` 需要 root；tmpfs 也不例外） | 用注入的 ENOSPC 语义（`kUnavailable`）覆盖**行为**（含回滚），并断言状态码 |

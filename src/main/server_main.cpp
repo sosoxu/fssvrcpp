@@ -26,6 +26,8 @@
 #include "domain/ports/ports.h"
 #include "infra/auth/local/local_jwt_authorizer.h"
 #include "infra/auth/remote/remote_entitlements_authorizer.h"
+#include "common/metrics/metrics.h"
+#include "infra/blob/metered/metered_blob_store.h"
 #include "infra/blob/posix/posix_blob_store.h"
 #include "infra/blob/s3/s3_blob_store.h"
 #include "infra/location/sqlite/sqlite_location_repository.h"
@@ -233,7 +235,18 @@ int main(int /*argc*/, char** /*argv*/) {
 
   //  ---- 组合根：唯一实例化具体实现的位置（R12）----
   SystemClock clock;
-  logging::StreamLogger logger(logging::LogOptions{}, clock);
+  //  ★ 日志脱敏（安全相关）：此前这里用 `LogOptions{}` → `redact_keys` 为空，
+  //    于是**真实进程不做任何打码**（`token`/`signature`/`secret_key` 会原样进日志）。
+  //    默认清单与 `config/fss.example.json` 的 `observability.redact_keys` **逐项一致**；
+  //    部署可用 `FSS_LOG_REDACT_KEYS`（逗号分隔）覆盖，或 `FSS_LOG_FORMAT`/`FSS_LOG_LEVEL`。
+  const std::string redact_keys =
+      Env("FSS_LOG_REDACT_KEYS",
+          "secret_key,access_key,token,sig,signature,authorization,x-amz-signature,password,"
+          "signing_key,dsn,static_token");
+  logging::StreamLogger logger(logging::OptionsFromConfig(logging::Level::kInfo,
+                                                         Env("FSS_LOG_FORMAT", "json"),
+                                                         "file-service", redact_keys),
+                               clock);
   UuidGenerator ids;
   //  ★ 两种驱动都只在**组合根**创建（R12）。上层只看到 `IBlobStore` 与能力声明，
   //    因此"换驱动"对用例/适配层完全透明（C5.9 要证明的正是这一点）。
@@ -277,7 +290,14 @@ int main(int /*argc*/, char** /*argv*/) {
     std::cerr << "未知的 storage.driver: " << storage_driver << "（可选：posix | s3）\n";
     return 1;
   }
-  SingleStoreFactory blob_factory(*blob_store);
+  //  ★ C9.6 的"暴露存储指标"必须在**真实进程**上成立：此前组合根从不创建 Registry，
+  //    `RouterOptions::metrics_registry` 恒为 nullptr → `/metrics` 只有 HTTP 族，
+  //    存储操作/字节只在测试夹具里被验证过（"测试里通过、产品里不存在"，正是 R15 那类陷阱）。
+  //    这里把驱动包一层计量装饰器（纯转发，不改语义），并把注册表接到 `/metrics`。
+  metrics::Registry metrics_registry;
+  MeteredBlobStore metered_blob(*blob_store, metrics_registry,
+                               storage_driver == "s3" ? "s3" : "posix");
+  SingleStoreFactory blob_factory(metered_blob);
 
   auto location_repository = SqliteLocationRepository::Open(sqlite_path);
   if (!location_repository.ok()) {
@@ -387,6 +407,7 @@ int main(int /*argc*/, char** /*argv*/) {
   adapters::http::RouterOptions router_options;
   router_options.error_format = adapters::http::ErrorFormat::kAppError;
   router_options.base_path = base_path;
+  router_options.metrics_registry = &metrics_registry;  // `/metrics` 渲染存储/GC 族
 
   //  数据面回调：适配层不认识 L2，由这里把 TransferEndpoint 绑上去（R12）。
   //  ★ 只在**集中存储**模式下注册：S3 有原生预签名，客户端直连存储端点，
@@ -463,6 +484,11 @@ int main(int /*argc*/, char** /*argv*/) {
             << "  storage root   : " << storage_root << "\n"
             << "  sqlite path    : " << sqlite_path << "\n"
             << "  error format   : " << adapters::http::ErrorFormatName(router_options.error_format)
+            << "\n"
+            << "  log redact     : " << logger.options().redact_keys.size() << " 个键"
+            << "（FSS_LOG_REDACT_KEYS 可覆盖）\n"
+            << "  metrics        : " << (router_options.metrics_registry != nullptr ? "已接入（含存储计量）"
+                                                                                 : "未接入")
             << "\n"
             << "  auth           : "
             << (auth_mode == "jwt"

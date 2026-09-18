@@ -100,8 +100,8 @@ add_executable(fss_server
   main/server_main.cpp)
 target_link_libraries(fss_server PRIVATE
   fss_http_adapter fss_grpc_adapter fss_auth_local fss_auth_remote fss_blob_posix fss_blob_s3
-  fss_location_sqlite fss_metadata_sqlite fss_transfer fss_metadata_memory fss_logging
-  Threads::Threads)
+  fss_blob_metered fss_metrics fss_location_sqlite fss_metadata_sqlite fss_transfer
+  fss_metadata_memory fss_logging Threads::Threads)
 
 # -----------------------------------------------------------------------------
 #  L2 基础设施适配层：每个端口实现一个独立目标（依赖倒置：L2 → L3 端口）

@@ -47,6 +47,12 @@
 | [`docs/adr/`](docs/adr/) | 关键决策记录（ADR-001 RPC 扩展 / ADR-002 HTTP 传输栈 / ADR-003 存储抽象 / ADR-004 持久化策略） |
 | [`docs/test-evidence/phase0.md`](docs/test-evidence/phase0.md) | 阶段 0 测试证据（含 4 个在门槛中发现并修复的缺陷） |
 | [`docs/development.md`](docs/development.md) | **开发指南**：环境事实、构建/测试、`scripts/dev_postgres.sh` 用法、写测试的三条纪律、已知陷阱 |
+| [`docs/operations.md`](docs/operations.md) | ★ **运维手册**：`config/fss.example.json` 的 **156 个配置键逐条**（含义/约束/组合根是否接通）、启动与探活、可观测性（指标族清单）、容量、耐久性、安全、未验证清单 |
+| [`docs/runbook.md`](docs/runbook.md) | ★ **故障处置手册**：症状 → 诊断 → 处置（含可执行命令与"不要做什么"）、访问日志 `note` 字段对照表 |
+| [`docs/test-evidence/phase9.md`](docs/test-evidence/phase9.md) | 阶段 9 证据（硬化与交付）：并发/故障注入/资源上限/指标/GC/容量基线/风险收口，含 P9-D01~D10 缺陷记录 |
+| [`docs/test-evidence/phase9-adr006.md`](docs/test-evidence/phase9-adr006.md)、[`docs/adr/ADR-006-large-file-data-plane.md`](docs/adr/ADR-006-large-file-data-plane.md) | ADR-006 的受控复核报告与定稿结论（`sendfile` vs httplib = **2.12x**） |
+| [`docs/test-evidence/phase9-image.md`](docs/test-evidence/phase9-image.md) | 容器镜像验证证据（构建/启动/readiness 200/强制 jwt/非 root/HEALTHCHECK，全部实测） |
+| [`Dockerfile`](Dockerfile) → `scripts/verify_image.sh` | 多阶段镜像与可复现验证脚本（C9.8） |
 | [`docs/appendix/osdu-file-service-source-notes.md`](docs/appendix/osdu-file-service-source-notes.md) | 上游源码逐文件调研原始笔记（~60 个已验证 URL、逐字段实测证据） |
 | `proto/osdu/file/v1/file_service.proto` | RPC 契约（含 `json_name` 与 OSDU JSON 的逐字段对齐） |
 | `config/fss.example.json` | 完整配置样例（与运维文档一一对应） |
@@ -57,7 +63,12 @@
 
 ---
 
-## 3. 快速开始（构建与运行阶段 0 门槛）
+> **项目状态**：P0~P9 全部完成并通过门槛（`./scripts/run_all_gates.sh` **全绿，225 s / 10 阶段**；
+> `ctest` **75/75**）。**未做/未验证项**集中登记在 `docs/00-final-design.md` §5、
+> `docs/02-design.md` §16.1 与 `docs/operations.md` §8（多实例运行形态、JSON 配置接线、
+> 真实硬件/网卡容量、NFS 语义、sendfile 数据面实现等）。
+
+## 3. 快速开始（构建与运行门槛）
 
 ### 3.1 依赖
 
