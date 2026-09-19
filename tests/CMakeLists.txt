@@ -565,6 +565,26 @@ fss_add_test(test_operations_doc
   LABELS  "phase9;docs")
 
 # =============================================================================
+#  C9.31（P9 补交，P10 期间完成）：按需 GC 的 HTTP 端点 `POST {base}/v2/gc:run`
+#    真实 `build/bin/fss_server`：正例（够旧 .tmp.* 真的消失）/ dry-run 只能更保守 /
+#    授权矩阵 401/403/200（admin 不需要 data-partition-id）/ 审计两侧（gcRun）/
+#    `scheduled` 字段 / `/metrics` 的 `fss_gc_runs_total` 真的涨。
+# =============================================================================
+fss_add_test(test_gc_endpoint
+  SOURCES integration/test_gc_endpoint.cpp
+  LIBS    fss_app fss_crypto fss_json Threads::Threads
+  LABELS  "phase9;integration")
+# 被测进程就是 build/bin/fss_server → 构建它必须先于本测试
+add_dependencies(test_gc_endpoint fss_server)
+
+# C9.31（P9 补交）：`GcTask::Run` 的**单飞护栏**（L4 单测；用会阻塞的 blob store 替身
+# 把"确实还在跑"变成确定性判据，而不是 sleep 猜时序）
+fss_add_test(test_gc_task_single_flight
+  SOURCES unit/test_gc_task_single_flight.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory Threads::Threads
+  LABELS  "phase9;unit")
+
+# =============================================================================
 #  阶段 10 切片 1：配置面接线（C10.1~C10.8）—— 全部在**真实二进制**上断言
 #    server_process.h 负责拉起 build/bin/fss_server（可传 --config/--set/环境变量），
 #    反向用例用 RunServerForExit() 拿退出码与输出。

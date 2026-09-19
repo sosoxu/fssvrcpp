@@ -22,6 +22,7 @@
 #include "adapters/http/dto/dto.h"
 #include "adapters/http/http_error_mapper.h"
 #include "adapters/http/metrics.h"
+#include "app/tasks/gc_task.h"
 #include "app/usecases/usecases.h"
 #include "common/http/http.h"
 #include "common/metrics/metrics.h"
@@ -53,6 +54,23 @@ struct TransferCallbacks {
 //  否则发出去的上传/下载地址会指向 404（P4-D04）。
 inline constexpr std::string_view kDefaultBasePath = "/api/file";
 
+//  按需 GC 回调（C9.31 / ADR-013 §10）：由**组合根**绑定到 `app::GcTask`。
+//  为什么用回调而不是让适配层直接持有 `GcTask`（R12）：`GcTask` 是 L4 的具体实现，
+//  适配层只认"跑一轮、拿到 `GcReport`"这个形状；周期调度（`GcScheduler`）与按需端点
+//  因此共享**同一个** `GcTask` 实例（连带它的单飞护栏）。
+struct GcCallbacks {
+  //  `force_dry_run` 只能让本轮**更保守**：有效值 = `配置 gc.dry_run || 请求 dryRun`。
+  //  ★ 绝不允许用查询参数把配置里的 dry-run 翻成"真删"（运维的预览开关不能被调用方降级）。
+  std::function<fss::Result<app::GcReport>(const app::CallerContext&, bool force_dry_run)> run;
+  //  本轮针对的 partition：`ops.gc_run` **不需要** `data-partition-id`（admin 运维动作），
+  //  数据分区由组合根（单租户注册表）决定。
+  std::string partition = "opendes";
+  //  **运行态**字段：周期调度是否真的在跑。`gc.enabled=false` 时端点仍可用（按需 GC 与
+  //  周期调度是两件事），此时报告里 `scheduled=false` —— 调用方一眼能区分
+  //  "端点不可用"与"调度没开"。
+  bool scheduled = false;
+};
+
 //  路由的角色要求（契约 §1.3 的手抄表；空 `roles` = 免鉴权路由，如 /v2/info 与数据面）
 struct RouteAuth {
   std::vector<std::string_view> roles;  // "任一即通过"
@@ -82,11 +100,15 @@ struct RouterOptions {
 
 class Router {
  public:
-  Router(app::UseCasePorts& ports, TransferCallbacks transfers, RouterOptions options = {})
-      : ports_(ports), transfers_(std::move(transfers)), options_(std::move(options)) {}
+  Router(app::UseCasePorts& ports, TransferCallbacks transfers, RouterOptions options = {},
+         GcCallbacks gc = {})
+      : ports_(ports),
+        transfers_(std::move(transfers)),
+        gc_(std::move(gc)),
+        options_(std::move(options)) {}
   //  不要数据面时的便捷构造（运维/位置/元数据仍可用）
-  explicit Router(app::UseCasePorts& ports, RouterOptions options = {})
-      : ports_(ports), options_(std::move(options)) {}
+  explicit Router(app::UseCasePorts& ports, RouterOptions options = {}, GcCallbacks gc = {})
+      : ports_(ports), gc_(std::move(gc)), options_(std::move(options)) {}
 
   //  注册契约 §2 的端点（运维 + 位置 + 元数据 + DMS/delivery/revoke + 数据面 + /metrics）
   void Register(fss::http::Server& server);
@@ -112,6 +134,7 @@ class Router {
 
   app::UseCasePorts& ports_;
   TransferCallbacks transfers_;
+  GcCallbacks gc_;
   RouterOptions options_;
   //  ★ 计数必须在**唯一横切入口** `Wrap()` 里做：否则每个 handler 各记一次，
   //    迟早漏掉某条路由（新增 19 条路由时这就是"指标静默缺失"的来源）

@@ -63,6 +63,10 @@ std::optional<RouteAuth> RouteAuthTable(std::string_view route) {
       {"dms.copy", kStorageCreatorOrAdmin},
       {"delivery.get_file_signed_url", kDeliveryViewer},
       {"file.revoke_url", kAdminNoPartition},
+      //  ★ C9.31 / ADR-013 §10：按需 GC 是**运维动作**（会删数据），因此要
+      //    `service.file.admin`；与 `revokeURL` 一样**不要求** `data-partition-id`
+      //    （数据分区由组合根的单租户注册表决定，不是调用方说了算）。
+      {"ops.gc_run", kAdminNoPartition},
   };
   const auto it = kTable.find(route);
   if (it == kTable.end()) return std::nullopt;
@@ -516,6 +520,44 @@ void Router::Register(fss::http::Server& server) {
                     "revokeURL 在当前集中存储驱动下无委派密钥可吊销；已记录审计事件");
                 return response;
               }));
+
+  // ---------------------------------------------------------------------------
+  //  §7.3 扩展：按需 GC `POST {base_path}/v2/gc:run`（C9.31 / ADR-013 §10）
+  //  · **上游 OSDU 没有** GC 端点 —— 这是本服务的运维扩展（契约 §7.3），
+  //    因此字段名用 snake_case（与 `gc.*` 配置一致），不套 OSDU 的大小写约定。
+  //  · 授权 `service.file.admin`，**不要求** `data-partition-id`（见 RouteAuthTable）。
+  //  · `?dryRun=true` 只能把这一轮**降级成预览**；**没有**能让它变成真删的查询参数。
+  //  · 与周期调度共享 `GcTask`（连带单飞护栏）：已在跑时 `kUnavailable` → **503**。
+  // ---------------------------------------------------------------------------
+  if (gc_.run) {
+    server.Post(base + "/v2/gc:run", MakeRoute("ops.gc_run", kSmallBodyLimit),
+                Wrap([this](fss::http::Request& request, const app::CallerContext& caller)
+                         -> fss::Result<fss::http::Response> {
+                  //  ★ dry-run 只能**更保守**：`配置 gc.dry_run || 请求 dryRun`。
+                  //    只认显式 `true`/`1`；其它值（含 `false`）不改变配置的取值。
+                  const auto raw_dry_run = request.Query("dryRun");
+                  const bool force_dry_run =
+                      raw_dry_run.has_value() && (*raw_dry_run == "true" || *raw_dry_run == "1");
+                  FSS_TRY(report, gc_.run(caller, force_dry_run));
+                  GcRunResponse response;
+                  //  `report.dry_run` 是**有效值**（由组合根的 `GcTask` 回填）：
+                  //  调用方据此判断这一轮到底删没删，而不是去猜配置。
+                  response.dry_run = report.dry_run;
+                  response.partition = gc_.partition;
+                  response.scheduled = gc_.scheduled;
+                  response.expired_leases_claimed = report.expired_leases_claimed;
+                  response.deleted_objects = report.deleted_objects;
+                  response.deleted_locations = report.deleted_locations;
+                  response.skipped_has_record = report.skipped_has_record;
+                  response.skipped_no_location = report.skipped_no_location;
+                  response.skipped_too_young = report.skipped_too_young;
+                  response.tmp_removed = report.tmp_removed;
+                  response.tmp_skipped_too_young = report.tmp_skipped_too_young;
+                  response.tmp_skipped_unknown_mtime = report.tmp_skipped_unknown_mtime;
+                  response.errors = report.errors;
+                  return fss::http::Response::Json(200, fss::json::Dump(ToJson(response)));
+                }));
+  }
 
   // ---------------------------------------------------------------------------
   //  §7 扩展数据面 `/v1/transfer/{token}`（集中存储的字节通道）

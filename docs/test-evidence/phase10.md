@@ -1256,3 +1256,16 @@ assertions: 302 | 301 passed | 1 failed
 （`REQUIRE(exists(staging_path))` 证明路径解析是真的），6 处调用点同步；
 反转目标判据跑一次确认会失败（详见 **§11.4.2**）。断言数 464 → **528**（+6 条正控）。
 教训已写进 `AGENTS.md` §4.3（"否定式判据必须配正控"）。
+
+---
+
+## 13. P9 补交（C9.31）：GC 的按需 HTTP 端点 —— 证据在 `phase9.md` §12
+
+本文件（P10 切片 1~6b）之外，本轮**同时补交了 P9 登记未交付的一项**：GC 的 HTTP 端点
+（`POST {base_path}/v2/gc:run` + `GcTask` 单飞护栏，判据编号 **C9.31**，见
+`docs/04-implementation-plan.md` 的 P9 段）。因为它属于 **P9** 门槛，证据按阶段归档在
+**`docs/test-evidence/phase9.md` §12**（结论 / 实现点 / 命令输出 / R1 自证 / 未做项）。
+
+对 P10 的影响：**零**——本切片**不新增任何配置键**，`docs/operations.md` §1.3 的三态计数
+保持 **生效 106 / 拒绝启动 19 / 已读但无效果 31 = 156** 不变（`test_operations_doc` 继续通过）；
+新增两个测试二进制（`test_gc_endpoint` / `test_gc_task_single_flight`，标签 `phase9`）。

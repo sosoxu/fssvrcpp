@@ -1277,7 +1277,7 @@ exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、
 | [ADR-010](adr/ADR-010-io-engine-choice.md) | I/O 引擎：阻塞线程池为默认；io_uring 为可选引擎（默认容器 seccomp 阻断） | 已采纳 |
 | [ADR-011](adr/ADR-011-logging-library.md) | 日志实现：自研最小实现（spdlog 评估后不采用，附重开触发条件） | 已采纳 |
 | [ADR-012](adr/ADR-012-auth-and-tenant-binding.md) | 认证与租户绑定：本地 JWT（HS256）+ `partition` claim 绑定 + fail-closed；远端 Entitlements 与 RS256/JWKS 登记为未实现 | 已采纳（P8 切片 1；未实现项见其 §5.3） |
-| [ADR-013](adr/ADR-013-file-service-extension-endpoints.md) | 平台外扩展端点约定：远端 legal/schema 校验器（完整 URL + fail-closed + 不透传身份）与事件 webhook（完整 URL + **非致命**，§9） | 已采纳（P10 切片 6a/6b；未验证项见其 §5.3、§9.4） |
+| [ADR-013](adr/ADR-013-file-service-extension-endpoints.md) | 平台外扩展端点约定：远端 legal/schema 校验器（完整 URL + fail-closed + 不透传身份）与事件 webhook（完整 URL + **非致命**，§9）；按需 GC 端点 `POST /v2/gc:run`（§10） | 已采纳（P10 切片 6a/6b；P9 补交 C9.31；未验证项见其 §5.3、§9.4、§10.7） |
 
 ---
 

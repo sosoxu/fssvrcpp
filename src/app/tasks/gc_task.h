@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -72,6 +73,14 @@ class GcTask {
         registry_(registry) {}
 
   //  `partition` 必填：所有仓储访问都必须带 partition（R6/R9 的护栏）。
+  //
+  //  ★ C9.31：**单飞护栏**（single-flight）是 `Run` 的**通用**性质，不是 HTTP 层的：
+  //    周期调度（组合根的 `GcScheduler`）与按需端点（`ops.gc_run`）共享同一个 `GcTask`。
+  //    · 已经在跑时**不排队、不并行**：`try_lock` 立刻失败 → `kUnavailable`（HTTP 503），
+  //      并带一条可读消息。排队会让"磁盘满时点一下"变成"等上一轮一小时的扫描结束"，
+  //      并行则会让两轮 GC 同时扫同一份目录（删除数/跳过数互相污染，指标失真）。
+  //    · 用互斥量的 `try_lock`（而不是原子标志）是**为了 RAII**：任何提前 return / 异常
+  //      都会在 `unique_lock` 析构时释放，不会留下"永久卡住"的假锁。
   Result<GcReport> Run(std::string_view partition, const GcOptions& options = {});
 
  private:
@@ -102,6 +111,8 @@ class GcTask {
   domain::ILeaseRepository& leases_;
   std::string instance_id_;
   fss::metrics::Registry* registry_ = nullptr;
+  //  ★ C9.31 的单飞护栏（见 `Run` 的注释）。`mutable` 不需要：`Run` 非 const。
+  std::mutex run_mutex_;
 };
 
 }  // namespace fss::app

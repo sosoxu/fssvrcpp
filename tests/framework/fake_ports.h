@@ -18,7 +18,9 @@
 #include "domain/model/file_metadata.h"
 #include "domain/ports/ports.h"
 
+#include <atomic>
 #include <cstdint>
+#include <future>
 #include <map>
 #include <mutex>
 #include <string>
@@ -138,6 +140,79 @@ class CapabilityOverrideBlobStore final : public domain::IBlobStore {
   int presign_put_calls_ = 0;
   int presign_get_calls_ = 0;
   domain::PresignOptions last_options_{};
+};
+
+// =============================================================================
+//  ★ C9.31：会**阻塞**的存储装饰器 —— 专用于证明 `GcTask::Run` 的"单飞护栏"
+// =============================================================================
+//  为什么需要它：单飞护栏的正确性判据是"**已经在跑时**，第二次调用立刻拿到
+//  `kUnavailable`，而不是排队/并行"。若用 `sleep` 去猜"现在应该正在跑"，判据就变成
+//  时序赌博。这里把 `remove_temp_files`（`GcTask::Run` 尾部的必经路径）变成一扇门：
+//    · 第一次进入 → 置位 `entered`（测试据此**确定性地**知道"Run 已经持有护栏"）；
+//    · 然后等 `release`（测试放行后才返回）。
+//  装饰器只转发数据面方法，不改任何语义（与 `CapabilityOverrideBlobStore` 同一纪律）。
+class BlockingTempSweepBlobStore final : public domain::IBlobStore {
+ public:
+  explicit BlockingTempSweepBlobStore(domain::IBlobStore& inner) : inner_(inner) {}
+
+  domain::BlobCapabilities capabilities() const override { return inner_.capabilities(); }
+  fss::Result<void> ensure_container(const std::string& container) override {
+    return inner_.ensure_container(container);
+  }
+  fss::Result<domain::SignedLocation> presign_put(const domain::ObjectRef& ref,
+                                                  const domain::PresignOptions& o) override {
+    return inner_.presign_put(ref, o);
+  }
+  fss::Result<domain::SignedLocation> presign_get(const domain::ObjectRef& ref,
+                                                  const domain::PresignOptions& o) override {
+    return inner_.presign_get(ref, o);
+  }
+  fss::Result<void> put(const domain::ObjectRef& ref, bytes::ByteSource& source,
+                        const domain::PutOptions& options) override {
+    return inner_.put(ref, source, options);
+  }
+  fss::Result<void> get(const domain::ObjectRef& ref, bytes::ByteSink& sink,
+                        const domain::ByteRange& range) override {
+    return inner_.get(ref, sink, range);
+  }
+  fss::Result<domain::ObjectStat> stat(const domain::ObjectRef& ref) override {
+    return inner_.stat(ref);
+  }
+  fss::Result<void> remove(const domain::ObjectRef& ref) override { return inner_.remove(ref); }
+  fss::Result<domain::ObjectStat> copy(const domain::ObjectRef& from,
+                                       const domain::ObjectRef& to) override {
+    return inner_.copy(from, to);
+  }
+  fss::Result<domain::ListPage> list(const std::string& container, const std::string& prefix,
+                                     const std::string& continuation_token,
+                                     int limit) override {
+    return inner_.list(container, prefix, continuation_token, limit);
+  }
+  //  ★ 唯一被改变语义的方法：第一次调用会阻塞到测试放行。
+  //    （`Run` 会按 zone 调两次：staging 与 persistent —— 只拦第一次就够，
+  //     否则第二次又要置位同一个 promise 会抛 `future_error`。）
+  fss::Result<domain::TempSweepResult> remove_temp_files(const std::string& container,
+                                                         std::int64_t older_than_epoch_seconds,
+                                                         bool dry_run) override {
+    if (first_call_.exchange(false)) {
+      entered_.set_value();
+      release_future_.wait();
+    }
+    return inner_.remove_temp_files(container, older_than_epoch_seconds, dry_run);
+  }
+
+  //  等待"第一次进入 `remove_temp_files`"（= `Run` 已持有单飞护栏）
+  void WaitEntered() { entered_future_.wait(); }
+  //  放行被阻塞的那一轮
+  void Release() { release_.set_value(); }
+
+ private:
+  domain::IBlobStore& inner_;
+  std::atomic<bool> first_call_{true};
+  std::promise<void> entered_;
+  std::shared_future<void> entered_future_ = entered_.get_future().share();
+  std::promise<void> release_;
+  std::shared_future<void> release_future_ = release_.get_future().share();
 };
 
 class FakeBlobStoreFactory final : public domain::IBlobStoreFactory {

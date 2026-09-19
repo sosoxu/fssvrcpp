@@ -128,4 +128,24 @@ json::Value RecordToJson(const domain::FileMetadataRecord& record) {
   return domain::ToJson(record);
 }
 
+json::Value ToJson(const GcRunResponse& response) {
+  //  ★ 运维扩展：snake_case（与 `gc.*` 配置键一致），不套 OSDU 的大小写约定
+  //    （上游没有 GC 端点，见契约 §7.3 与 ADR-013 §10）。
+  json::Value body = json::Value::object();
+  body["dry_run"] = response.dry_run;
+  body["partition"] = response.partition;
+  body["scheduled"] = response.scheduled;
+  body["expired_leases_claimed"] = response.expired_leases_claimed;
+  body["deleted_objects"] = response.deleted_objects;
+  body["deleted_locations"] = response.deleted_locations;
+  body["skipped_has_record"] = response.skipped_has_record;
+  body["skipped_no_location"] = response.skipped_no_location;
+  body["skipped_too_young"] = response.skipped_too_young;
+  body["tmp_removed"] = response.tmp_removed;
+  body["tmp_skipped_too_young"] = response.tmp_skipped_too_young;
+  body["tmp_skipped_unknown_mtime"] = response.tmp_skipped_unknown_mtime;
+  body["errors"] = response.errors;
+  return body;
+}
+
 }  // namespace fss::adapters::http

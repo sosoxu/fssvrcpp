@@ -4,6 +4,7 @@
 #include "app/services/object_key_policy.h"
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -243,6 +244,13 @@ void GcTask::CollectOrphanObjects(std::string_view partition, const GcOptions& o
 }
 
 Result<GcReport> GcTask::Run(std::string_view partition, const GcOptions& options) {
+  //  ★ C9.31 单飞护栏（见头文件）：周期调度与按需端点共享同一个 `GcTask`。
+  //    `try_lock` 失败 = "已有一轮在跑" → 立刻 `kUnavailable`（503），**不排队、不并行**。
+  std::unique_lock<std::mutex> run_lock(run_mutex_, std::try_to_lock);
+  if (!run_lock.owns_lock()) {
+    return Err(fss::ErrorKind::kUnavailable,
+               "GC 已在运行（上一轮尚未结束），请稍后重试");
+  }
   if (partition.empty()) {
     return Err(fss::ErrorKind::kInvalidArgument, "GC 必须指定 partition");
   }

@@ -961,6 +961,7 @@ REST 与 RPC 两次调用会生成**不同的**签名 URL（含不同时间戳/n
 | 远端 legal 校验器 | **出站** POST 到 `legal.remote.base_url`（运维给的完整 URL） | 配置驱动（`legal.validator=remote`）；不新增入站路径 | 关闭（`noop`，不发任何请求） |
 | 远端 schema 校验器 | **出站** POST 到 `schema.remote.base_url`（运维给的完整 URL） | 配置驱动（`schema.validator=remote`）；不新增入站路径 | 关闭（`noop`，不发请求） |
 | 事件 webhook（出站） | **出站** POST 到 `events.webhook.url`（运维给的完整 URL，**不追加路径**） | 配置驱动（`events.publisher=webhook`）；不新增入站路径 | 关闭（`events.publisher=log`，默认；`none` = 显式关闭且不发请求） |
+| **按需 GC（入站扩展）** | `POST /api/file/v2/gc:run` | `/v2` 下的**新路径**（`gc:run` 不是上游端点；字段用 snake_case） | 启用（需 `service.file.admin`；与 `gc.enabled` **无关**） |
 
 **原则**：任何扩展都**不得**修改 OSDU 端点的既有状态码、字段名或字段语义。
 扩展只能以"新端口 / 新路径段 / 新响应头 / 配置开关"的形式存在。
@@ -1064,6 +1065,62 @@ datasetDetails : {"topic":T,"kind":"datasetDetails",
 **测试**：`tests/integration/test_webhook_publisher.cpp`（真实 `build/bin/fss_server` +
 `tests/tools/mock_validators.py --mode webhook`；`--observe-file` 的 `bodies` 列表断言
 "两个 kind 都发了"）。
+
+### 7.3 按需 GC 端点（入站扩展；ADR-013 §10 / C9.31）
+
+> **上游 OSDU 没有 GC 端点。** 上游 File Service 的垃圾回收由平台侧的批量作业/运维流程负责，
+> 没有任何 REST 入口。因此本端点是**本服务的运维扩展**（与 `/v1/transfer` 同类）：路径在
+> `/v2` 段下新增，字段名用 **snake_case**（与 `config/fss.example.json` 的 `gc.*` 一致），
+> **不适用** §2 的 PascalCase/camelCase 约定，也**不改**任何 OSDU 端点的状态码/字段。
+
+| 项 | 内容 |
+| --- | --- |
+| 路径 / 方法 | `POST {base_path}/v2/gc:run`（`base_path` 默认 `/api/file`） |
+| 授权 | **`service.file.admin`**；与 `revokeURL` 同类：**不需要** `data-partition-id`（分区由组合根的单租户注册表决定，不是调用方说了算） |
+| 请求体 | **无**（空体即可；字段全部来自配置与查询参数） |
+| 查询参数 | `dryRun`（可选）：只认 `true` / `1` → 本轮**强制干跑**。**没有**任何参数能把配置里的 dry-run 翻成"真删" |
+| 成功 | `200` + JSON 报告（下表） |
+| 未带 token | `401`（`Missing authorization token`） |
+| 有 token 但无 admin 角色 | `403`（不是 400：未授权者不得靠状态码差异探测数据） |
+| 已有一轮 GC 在跑 | `503`（`kUnavailable`），消息可读（`GC 已在运行（上一轮尚未结束），请稍后重试`）。**不排队、不并行** |
+
+**有效 dry-run 的定义（"只能更保守"）**：`有效值 = 配置 gc.dry_run || 请求 dryRun`。
+请求只能把"真删"降级为"预览"。报告里的 `dry_run` 是**有效值** —— 调用方据此一眼判断这一轮
+到底删没删，而不必反查配置。
+
+**响应字段（全部 snake_case）**：
+
+| 字段 | 来源 | 含义 |
+| --- | --- | --- |
+| `dry_run` | `GcReport`（**有效值**） | `true` = 本轮只报候选，**绝不会**有真删除 |
+| `expired_leases_claimed` | `GcReport` | 本轮原子领取到的过期租约数 |
+| `deleted_objects` | `GcReport` | 删除的对象数（dry-run 下 = 候选数） |
+| `deleted_locations` | `GcReport` | 删除的位置记录数 |
+| `skipped_has_record` | `GcReport` | 有元数据记录 → **永不删** |
+| `skipped_no_location` | `GcReport` | 租约指向的位置记录已不存在 |
+| `skipped_too_young` | `GcReport` | 未到 TTL / 宽限期 |
+| `tmp_removed` | `GcReport` | 清理的 `.tmp.*` 残留数（dry-run 下 = 候选数） |
+| `tmp_skipped_too_young` | `GcReport` | `.tmp.*` 太新 → 保护（在途上传） |
+| `tmp_skipped_unknown_mtime` | `GcReport` | 取不到 mtime → 保守保护 |
+| `errors` | `GcReport` | 本轮扫描/删除的错误数；`> 0` 表示这一轮**没有正常跑完**（审计记 `failure`） |
+| `partition` | **运行态** | 本轮针对的 partition（组合根的单租户，默认 `opendes`） |
+| `scheduled` | **运行态** | 周期调度（`gc.enabled && gc.interval_seconds > 0`）是否在跑 |
+
+**`gc.enabled=false` 时端点仍然可用**：按需 GC 与周期调度是**两件事** —— `gc.enabled`
+只决定"后台是否周期跑"，不决定"运维能不能手动扫一轮"（磁盘满时这是刚需）。此时报告里
+`scheduled=false`，调用方一眼能区分"调度没开"与"端点不可用"。
+
+**审计**：这是会**删数据**的运维动作，成功与失败两侧都写审计事件
+（`operation="gcRun"`，带 `user`(actor) / `partition` / `result` / `correlation_id` / `epoch_millis`）。
+`result=failure` 的条件是"`GcTask::Run` 返回错误 **或** 报告里 `errors > 0`"（扫描没跑完不算成功）。
+
+**`errors > 0` 时仍回 `200`**：报告本身携带 `errors`（HTTP 状态码表达"端点是否可用"，
+报告字段表达"这一轮干得怎么样"）。要求"非 0 错误 → 5xx"会让调用方拿不到报告，
+反而更难排障；审计的 `result` 已经承担了"这一轮失败"的信号。
+
+**测试**：`tests/integration/test_gc_endpoint.cpp`（真实 `build/bin/fss_server`：
+正例真的删文件、dry-run 两种保守形态、授权矩阵、审计两侧、`scheduled` 两态、`/metrics` 计数）
++ `tests/unit/test_gc_task_single_flight.cpp`（单飞护栏的确定性判据）。
 
 ---
 

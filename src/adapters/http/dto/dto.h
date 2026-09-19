@@ -182,4 +182,30 @@ json::Value ToJson(const UrlSigningResponse& response);
 //  里本来就有、但只在响应里才出现的 `version` —— 领域 `ToJson` 已包含它，这里保持透传。
 json::Value RecordToJson(const domain::FileMetadataRecord& record);
 
+// -----------------------------------------------------------------------------
+//  §7.3 扩展：`POST {base_path}/v2/gc:run` → `GcRunResponse`（C9.31 / ADR-013 §10）
+// -----------------------------------------------------------------------------
+//  ★ 字段名一律 **snake_case**（与 `config/fss.example.json` 的 `gc.*` 一致）：
+//    这是本服务的**运维扩展**，不是 OSDU 端点 —— 上游没有 GC 端点，因此不适用
+//    §2 的 PascalCase/camelCase 约定（契约 §7.3）。
+//  ★ `dry_run` 是**有效值**（`配置 gc.dry_run || 请求 dryRun`）：调用方一眼看出这一轮
+//    到底删没删 —— 报告里出现 `dry_run=true` 就绝不可能有真删除。
+struct GcRunResponse {
+  bool dry_run = true;                        // → `dry_run`（有效值，不是配置值）
+  std::string partition;                      // → `partition`（本轮针对的 partition）
+  bool scheduled = false;                     // → `scheduled`（周期调度是否在跑）
+  std::int64_t expired_leases_claimed = 0;    // → `expired_leases_claimed`
+  std::int64_t deleted_objects = 0;           // → `deleted_objects`
+  std::int64_t deleted_locations = 0;         // → `deleted_locations`
+  std::int64_t skipped_has_record = 0;        // → `skipped_has_record`
+  std::int64_t skipped_no_location = 0;       // → `skipped_no_location`
+  std::int64_t skipped_too_young = 0;         // → `skipped_too_young`
+  std::int64_t tmp_removed = 0;               // → `tmp_removed`
+  std::int64_t tmp_skipped_too_young = 0;     // → `tmp_skipped_too_young`
+  std::int64_t tmp_skipped_unknown_mtime = 0; // → `tmp_skipped_unknown_mtime`
+  std::int64_t errors = 0;                    // → `errors`
+};
+
+json::Value ToJson(const GcRunResponse& response);
+
 }  // namespace fss::adapters::http

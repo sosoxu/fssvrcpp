@@ -113,12 +113,56 @@ curl -sS http://127.0.0.1:8080/metrics | grep -E 'fss_gc_'
 find "$FSS_STORAGE_ROOT/blobs/opendes-staging" -name '*.tmp.*' -mmin +60 -ls | head
 ```
 
+### 4.1 立即清一轮（**不用重启**）：先预览，再真跑
+
+故障现场（磁盘将被写满）**不要**等周期调度，也**不要**重启（磁盘满时重启正是最危险的动作，
+见 §6）。用按需端点手动跑一轮（契约 §7.3 / ADR-013 §10）：
+
+```bash
+BASE=http://127.0.0.1:8080/api/file          # 与 §0 同源；base_path 见启动横幅
+TOKEN=<service.file.admin 的 JWT>
+
+# ① 预览：这一轮**会**删什么（?dryRun=true 只会让本轮更安全，绝不会让它更激进）
+curl -sS -X POST "$BASE/v2/gc:run?dryRun=true" \
+     -H "Authorization: Bearer $TOKEN" -H 'Content-Length: 0' | python3 -m json.tool
+
+# ② 确认候选（tmp_removed / deleted_objects）与 skipped_* 都合理后，再真跑：
+#    是否需要真删由**配置** gc.dry_run 决定 —— **没有**任何参数能"强制真删"。
+curl -sS -X POST "$BASE/v2/gc:run" \
+     -H "Authorization: Bearer $TOKEN" -H 'Content-Length: 0' | python3 -m json.tool
+```
+
+**这份响应怎么读**（全部 snake_case；字段含义见契约 §7.3）：
+
+| 字段 | 处置 |
+| --- | --- |
+| `dry_run` | **有效值**。`true` = 这一轮只报候选、**绝不会**真删（配置里 `gc.dry_run=true`，或你带了 `?dryRun=true`）。想让 ② 真的删，必须把配置改成 `gc.dry_run=false` 并重启（或 `--set`） |
+| `scheduled` | 后台周期调度是否在跑。`false` **不代表端点不可用** —— 按需 GC 与周期调度是两件事 |
+| `tmp_removed` / `deleted_objects` | 本轮删除数（dry-run 下 = 候选数）。`tmp_*` 是残留临时文件，`deleted_objects` 是租约过期/孤儿对象 |
+| `tmp_skipped_too_young` | 在途上传被正确保护（TTL 内）→ 正常；持续很大说明有上传卡住（查 §3） |
+| `skipped_has_record` | 有元数据记录的对象**永不删** → 正常 |
+| `errors` | `> 0` 表示这一轮**没有正常跑完**（HTTP 仍是 200，报告如实带着它，审计记 `result=failure`）。先修依赖（存储根/容器目录/SQLite），再重试 |
+
+**授权与调用要点**：
+
+* 需要 `service.file.admin`；**不需要** `data-partition-id`（与 `revokeURL` 同类：分区由服务端决定）。
+* `401` = 没带 token；`403` = token 有效但**没有 admin 角色**（换 admin token；不要试图带别的头绕过）。
+* `503` + `GC 已在运行（上一轮尚未结束）` = 有一轮 GC 正在跑（周期调度或另一个运维同时点了）。
+  **不排队、不并行**是设计行为：稍等再重试，不要反复猛点。
+* 响应里的 `errors>0` 仍是 200：报告带着错误计数，审计记 `failure` —— 看 `errors`，不要只看状态码。
+* ⚠️ `auth.mode=disabled`（仅开发/测试）下，allow-all 的占位实现**仍会**要求 `data-partition-id`；
+  生产必须是 `jwt`（见 §5），此时按上面命令即可（不带 `data-partition-id`）。
+
+> **禁令**：无论走端点还是 `--once`，**不要**用 `rm -rf` 清整个容器目录 —— 那会连
+> 在途上传的临时文件、甚至有效对象一起删掉（GC 有租约 + 元数据记录两道保护，`rm -rf` 没有）。
+> 只在维护窗口、进程已停且你确认过目录内容时，才考虑用 `--once` 做一次性清理。
+
 | 指标/症状 | 含义 | 处置 |
 | --- | --- | --- |
-| `fss_gc_runs_total{mode="dry_run"}` 涨、`fss_gc_tmp_removed_total` 不涨 | dry-run 只报候选 | 确认无误后把 `gc.dry_run` 置 false |
+| `fss_gc_runs_total{mode="dry_run"}` 涨、`fss_gc_tmp_removed_total` 不涨 | dry-run 只报候选 | 先按 §4.1 的 ① 预览；确认无误后把 `gc.dry_run` 置 false（配置 + 重启，或直接用 `--set` 起的进程） |
 | `fss_gc_skipped_total{reason="has_record"}` 涨 | GC 按设计**永不删**有记录的对象 | 正常 |
 | `fss_gc_skipped_total{reason="tmp_too_young"}` 涨 | **在途上传被正确保护**（TTL 内） | 正常；持续不降说明有上传卡住（查 §3 的 408） |
-| `fss_gc_tmp_removed_total` 长期不涨但目录里全是 `.tmp.` | **GC 未启用**：组合根装配了周期调度，但 `gc.enabled` 的默认是 `false`（不提供配置时不跑 GC）；也可能是 `gc.dry_run=true` 只报候选 | 显式配 `gc.enabled=true` + `gc.dry_run=false` 后重启（看启动横幅的 `gc :` 行）；一次性清理用 `--once`；**不要**用 `rm -rf` 清整个容器目录 |
+| `fss_gc_tmp_removed_total` 长期不涨但目录里全是 `.tmp.` | **周期调度未启用**：`gc.enabled` 的默认是 `false`（不提供配置时不跑 GC）；也可能是 `gc.dry_run=true` 只报候选 | 应急用 §4.1 的按需端点（**不重启**）；要长期周期清理再配 `gc.enabled=true` + 间隔（看启动横幅的 `gc :` 行）；一次性清理也可用 `--once`。**不要**用 `rm -rf` 清整个容器目录 |
 | 误删/误留（怀疑 TTL 判定） | 时间戳语义问题曾在 P9 被修复（P9-D04/D08） | 升级到修复版本；用 `list()`/`stat()` 的时间戳与 `stat -c %Y` 对照 |
 
 ---

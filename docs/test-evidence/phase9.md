@@ -247,3 +247,220 @@ fss_storage_operations_total{driver="posix",op="put",outcome="ok"} 2
 | io_uring 在目标内核上的可用性（C9.18/C9.29/C9.30） | 需目标部署内核；本机默认 seccomp 阻断（ADR-010 已实测 `EPERM`） | `scripts/check_io_uring.sh`（退出码 2 = 无结论）+ `UringIoEngine` 骨架 |
 | 多实例 + 共享 PG 端到端（C9.26）与 PG 租约 | PG 版仓储/租约未交付（P9 登记项） | `db/tests/00{1,2,3}` 的 PG 基建门槛（`FSS_GATES_WITH_PG=1`）+ `test_multi_instance`（内存/单进程） |
 | 容器镜像（C9.8）与真实网卡吞吐（C9.14） | 本环境无 docker/真实网卡 | 待切片 3 评估（Dockerfile 至少静态可检查） |
+
+---
+
+## 12. P9 补交（P10 期间完成）：GC 的按需 HTTP 端点（C9.31）
+
+> **指针**：本轮（P10 切片 1~6b 期间）补交了 P9 登记未交付的一项 —— "GC 的 HTTP 端点"。
+> 判据编号 **C9.31**（`docs/04-implementation-plan.md` 的 P9 段）；契约 **§7.3**；决策 **ADR-013 §10**。
+> 因为它是 **P9** 门槛，证据按阶段归档在本文件；P10 侧只留指针（`docs/test-evidence/phase10.md` §13）。
+
+### 12.1 结论（先说答案）
+
+* **端点**：`POST {base_path}/v2/gc:run`（本实现选 `gc:run` 这一形态；路由名 `ops.gc_run`）——
+  上游 OSDU **没有** GC 端点，这是本服务的**运维扩展**。
+* **授权**：`service.file.admin`，**不要求** `data-partition-id`；`401`（无 token）/ `403`（非 admin）/ `200`。
+* **报告**：`GcReport` 的全部字段（**snake_case**）+ 运行态 `partition` / `scheduled`。
+* **dry-run 只能更保守**：有效值 = `配置 gc.dry_run || 请求 ?dryRun=true`；**没有**"强制真删"的参数。
+* **单飞护栏是 `GcTask` 的通用性质**：周期调度与端点共享同一实例；已在跑 → `kUnavailable` → **503**，
+  **不排队、不并行**。
+* **`gc.enabled=false` 时端点仍可用**（按需 GC 与周期调度是两件事），报告 `scheduled=false`。
+* **审计**：`operation=gcRun`（actor / partition / result / correlationId / epochMillis），成功与失败两侧。
+* **不加任何配置键**：`docs/operations.md` §1.3 三态仍是 **106 / 19 / 31 = 156**（`test_operations_doc` 通过）。
+
+### 12.2 实现点（可点击）
+
+| 位置 | 内容 |
+| --- | --- |
+| `src/app/tasks/gc_task.h:75` / `:115`、`src/app/tasks/gc_task.cpp:245` | ★ **单飞护栏**：`std::mutex run_mutex_` + `std::unique_lock(..., std::try_to_lock)`；失败即 `kUnavailable` + 可读消息（"GC 已在运行（上一轮尚未结束），请稍后重试"）。用 RAII 而不是裸原子标志：任何提前 return/异常都释放，不留假锁 |
+| `src/adapters/http/router.h:61` | `GcCallbacks`（`run` 回调 + `partition` + `scheduled`）——适配层不认识 L4/L2（R12） |
+| `src/adapters/http/router.cpp:69` | `RouteAuthTable` 的 `{"ops.gc_run", kAdminNoPartition}`（`{roles, false}`，与 `revokeURL` 同型） |
+| `src/adapters/http/router.cpp:525` | 路由注册：`server.Post(base + "/v2/gc:run", MakeRoute("ops.gc_run", kSmallBodyLimit), ...)`；`?dryRun` 只认 `true`/`1`，其余值不改变配置 |
+| `src/adapters/http/dto/dto.h:193` / `dto.cpp:131` | `GcRunResponse` + `ToJson`（snake_case；`dry_run` 是**有效值**） |
+| `src/main/server_main.cpp:1844` | 组合根：`gc_schedule` 提前判定 → `gc_callbacks.{partition,scheduled,run}`；`run` 里 `options.dry_run = gc_options.dry_run \|\| force_dry_run`，并写审计 `gcRun`（失败/`errors>0` → `result=failure`）；`:1906` 把回调交给 Router；`:1955` 复用同一个 `gc_schedule` 起调度 |
+| `tests/integration/test_gc_endpoint.cpp` | 真实 `build/bin/fss_server`：6 用例 / **208 断言** |
+| `tests/unit/test_gc_task_single_flight.cpp` | L4 单测：2 用例 / **12 断言** |
+| `tests/framework/fake_ports.h` | ★ 新增 `BlockingTempSweepBlobStore`：把 `remove_temp_files` 变成一扇门（`WaitEntered()`/`Release()`），让"确实还在跑"成为**确定性**判据，而不是 sleep 猜时序 |
+
+### 12.3 实测命令与输出摘要
+
+```
+$ cmake --build build -j4
+[100%] Built target test_config_wiring
+
+$ ctest --test-dir build -j4
+100% tests passed, 0 tests failed out of 81
+  phase9         =   3.52 sec*proc (8 tests)      # C9.31 前是 6 tests
+  phase10        =  15.35 sec*proc (4 tests)
+
+$ ctest --test-dir build -L phase10 --output-on-failure
+100% tests passed, 0 tests failed out of 4
+  (test_config_wiring / test_remote_validators / test_webhook_publisher / test_operations_doc)
+
+$ ./scripts/check_docs.sh --selftest
+  ✓ 自证：D1/D2/D4/D5 都能检出注入的错误（检查器有效）
+  D5 门槛编号检查：11 个阶段，共 146 条门槛           # C9.31 前是 145
+  全部检查通过（D1~D5）
+
+$ ./scripts/verify_config_wiring.sh
+  配置面接线：全部通过（54 条断言）
+
+$ ./build/bin/test_operations_doc
+All tests passed (24 assertions in 2 test cases)     # 156 键三态 106/19/31 未变
+
+$ ./build/bin/test_gc_endpoint
+All tests passed (208 assertions in 6 test cases)
+
+$ ./build/bin/test_gc_task_single_flight
+All tests passed (12 assertions in 2 test cases)
+```
+
+**逐条判据的实测**（`test_gc_endpoint.cpp`）：
+
+| 判据 | 断言要点（**真实物理路径**） |
+| --- | --- |
+| ① 正例（R16） | `gc.enabled=false` + `gc.dry_run=false` + 够旧 `.tmp.*`（`<root>/blobs/opendes-staging/residue...`，`utime` 改到 3 天前）→ `200`；`dry_run=false`、`tmp_removed>=1`、`tmp_skipped_too_young>=1`、`errors=0`、`partition=opendes`、`scheduled=false`；**`REQUIRE_FALSE(exists(residue))`**（真的消失），同一条路径上 **正控** `REQUIRE(exists(fresh))`（太新的仍在）+ 调用前 `REQUIRE(exists(residue))` |
+| ② 干跑安全 | `gc.dry_run=true` → `200` + `dry_run=true` + `tmp_removed>=1`（报候选）+ **文件仍在**；`gc.dry_run=false` + `?dryRun=true` → 有效 `dry_run=true` + **文件仍在**（同一实例不带参数时确实删掉，作为对照） |
+| ③ 授权矩阵 | 无 token → `401`；只有 `service.file.editors` → `403`；`service.file.admin`（**不带** `data-partition-id`）→ `200`；无 token 但带 partition → 仍 `401` |
+| ④ 审计 | 成功：日志含 `"operation":"gcRun"` + `"user":"gc-operator@example.com"` + `"result":"success"`；失败（删掉 persistent 容器目录 → `errors>=1`）：`"result":"failure"` + 同一 actor |
+| ⑤ scheduled | `gc.enabled=false` → `scheduled=false` 且端点可用；`gc.enabled=true` → `scheduled=true`（横幅 `gc : 已启动`） |
+| ⑥ 指标 | 调用前 `/metrics` **没有** `fss_gc_runs_total`（`gc.enabled=false`，调度不跑 → 计数只能来自端点）；调用后**轮询**到 `fss_gc_runs_total{...}` 非 0 |
+
+### 12.4 R1 自证（注入 → 用例失败 → 还原）
+
+**注入 ①：去掉单飞护栏**（`gc_task.cpp` 的 `try_lock` 分支改成无条件 `lock()`）→ 单飞用例必须失败：
+
+```
+$ cmake --build build -j4 && ./build/bin/test_gc_task_single_flight
+tests/unit/test_gc_task_single_flight.cpp:98: FAILED:
+  REQUIRE( returned_while_first_round_running )
+with expansion:  false
+with messages: returned_while_first_round_running := false
+               b_ok := true
+               a_done.load() := false
+tests/unit/test_gc_task_single_flight.cpp:152: FAILED:
+  REQUIRE( returned )
+with expansion:  false
+test cases: 2 | 2 failed
+assertions: 3 | 1 passed | 2 failed
+```
+
+即：没有护栏时第二次调用会**排队**（窗口内没返回，`b_ok=true` 说明它最终成功了）——判据有区分力。
+
+**注入 ②：忽略请求的 `?dryRun=true`**（组合根 `options.dry_run = gc_options.dry_run;`）→ 干跑用例必须失败：
+
+```
+$ cmake --build build -j4 && ./build/bin/test_gc_endpoint "★ C9.31：dry-run*"
+tests/integration/test_gc_endpoint.cpp:301: FAILED:
+  REQUIRE( forced_json.value()["dry_run"] == true )
+with expansion:  false == true
+with messages: forced.status := 200
+  forced.body := {..."dry_run":false,..."tmp_removed":1,...}
+test cases:  1 | 0 passed | 1 failed
+assertions: 51 | 50 passed | 1 failed
+```
+
+（**注意**：同一用例的第一个 SECTION「配置 `dry_run=true`」在注入下**仍然通过** —— 它不是这条判据的
+区分点；真正有区分力的是第二个 SECTION「配置 `false` + `?dryRun=true`」。已如实记录。）
+
+**注入 ③：端点不做授权**（`RouteAuthTable` 里 `{"ops.gc_run", kAdminNoPartition}` → `{"ops.gc_run", {}}`，
+即免鉴权）→ 授权矩阵必须失败：
+
+```
+$ cmake --build build -j4 && ./build/bin/test_gc_endpoint "★ C9.31：授权矩阵*"
+tests/integration/test_gc_endpoint.cpp:325: FAILED:
+  REQUIRE( reply.status == 401 )
+with expansion:  200 == 401 (0x191)
+test cases:  1 | 0 passed | 1 failed
+assertions: 15 | 14 passed | 1 failed
+```
+
+**还原证据**：
+
+```
+$ grep -rn "R1-INJECT" src/ tests/        # 无输出（rc=1）
+$ ./build/bin/test_gc_task_single_flight  → All tests passed (12 assertions in 2 test cases)
+$ ./build/bin/test_gc_endpoint            → All tests passed (208 assertions in 6 test cases)
+```
+
+⚠️ **每次都做了全量重建**（`cmake --build build -j4`）：用例拉起的是 `build/bin/fss_server`，
+只重建测试目标注入不进被测二进制（phase10 §11.4.1 的教训）。三次注入**第一次就都失败**，
+没有出现"注入后仍全绿"的判据缺口。
+
+**本轮抓到的一个**真实**缺陷（判据之外的收获）**：写运维文档时在 `operations.md` §1.3 里
+顺手举了一个**不存在**的配置键做例子（`gc.endpoint_enabled`）→ `test_operations_doc` 的
+反向检查（"文档里出现的配置路径必须能被 `CoreSchema().IsAllowedPath()` 接受"）**立刻失败**：
+
+```
+$ ./build/bin/test_operations_doc
+tests/unit/test_operations_doc.cpp:187: FAILED: REQUIRE( unknown.empty() )
+with messages: operations.md 写了但 example/schema 中不存在的配置路径（共 1）
+```
+
+改成"不引入任何『端点开关』之类的新键"（不含点分路径）后 24 断言全过。这正是
+phase10 §12.5 想说的：**判据有效时，它会在你写错的那一刻说话**。
+
+### 12.5 未做 / 未验证（如实登记）
+
+1. **无异步 / 进度查询**：端点同步等待整轮结束才返回；**没有** job id、进度、取消。
+   大目录（百万级 `.tmp.*`）下这一轮可能很久（ADR-013 §10.7）。
+2. **无 rate limit / 并发配额**：单飞护栏只保证"同时最多一轮"，不限制"每分钟点几次"。
+3. **无 per-partition 授权细化**：`service.file.admin` 是全局角色；分区由组合根单租户决定
+   （`opendes`），**不是**调用方通过 `data-partition-id` 指定。多租户下"只允许自己租户"需要
+   分区级角色 + `data-partition-id`，本切片**不做也不假装做了**。
+4. **`errors > 0` 仍回 200**：报告携带 `errors`，审计记 `failure`；未定义"部分失败"的 HTTP 语义。
+5. **`deleted_file_ids` 未进响应**（避免响应体随删除规模线性膨胀）；需要逐条清单查审计/日志。
+6. **未与真实大目录联调**：全部用例都在临时目录（个位数文件）上跑；未测百万级目录的耗时/内存，
+   也未测"上游网关超时切断后服务端仍把这一轮跑完"的行为。
+7. **未做 ASan 第二遍**：本切片是"路由 + 回调 + 互斥量"的常规路径，未改内存/生命周期敏感代码；
+   `scripts/run_sanitizers.sh` 由父代理在收尾时按常规门槛跑（phase0~7）。
+8. **发现的一处既有不一致（不在本切片范围，如实登记）**：`auth.mode=disabled` 下组合根的
+   allow-all **占位**授权器仍要求非空 `partition`，因此 `revokeURL` 与 `gc:run` 在
+   `disabled` 模式下不带 `data-partition-id` 会得到 `401 Missing partitionID`
+   （`LocalJwtAuthorizer` 在 `jwt` 模式下**不会**这样判）。契约 §1.2 说 `revokeURL` 不需要
+   partition，这条不一致在 P8 引入占位实现时就存在，**本切片不改它**（改了会动 P8 的语义），
+   只在 runbook §4.1 与契约 §7.3 注明"生产必须是 `jwt`；`disabled` 仅开发/测试"。
+
+### 12.6 父代理独立复核（不是转述实现者）
+
+```
+cmake --build build -j4                    → 0 error
+ctest --test-dir build -j4                 → 100% tests passed, 0 failed out of 81
+./scripts/check_docs.sh --selftest         → 自证 ✓；13 ADR / 146 门槛 / D1~D5 全过
+grep -rn "R1-INJECT" src/ tests/           → 无输出
+git status --porcelain config/             → 空（**确认未新增任何配置键**，三态 106/19/31 不变）
+./scripts/run_all_gates.sh                 → 失败 无（P0~P10）
+```
+
+**我自己重做了一次注入**（单飞护栏是本切片的实质新增性质，最值得独立验证）：把
+`GcTask::Run` 的 `std::unique_lock(run_mutex_, std::try_to_lock)` + `if (!owns_lock())` 改成
+**排队**（`std::unique_lock(run_mutex_)` + `if (false)`）→
+
+```
+$ ./build/bin/test_gc_task_single_flight
+tests/unit/test_gc_task_single_flight.cpp:152: FAILED:
+  REQUIRE( returned )
+with expansion:  false
+test cases: 2 | 2 failed      assertions: 3 | 1 passed | 2 failed
+# 还原后：All tests passed (12 assertions in 2 test cases)
+```
+
+即：该判据真的依赖"同时只允许一轮"这一性质（不是恒真）；且注入成"排队"时用例**会结束**而不是
+挂死（说明它断言的是"第二次调用必须立刻被拒"，不是靠超时）。
+
+**两处既有不一致的核对**（实现者如实登记、未擅自更改，我已读代码确认描述准确）：
+
+1. `auth.mode=disabled` 用的 `AllowAllAuthorizer`（`src/main/server_main.cpp:705~715`）在
+   `partition` 为空时返回 `kUnauthenticated "Missing partitionID"` → `disabled` 模式下不带
+   `data-partition-id` 会 **401**（`jwt` 模式不会）。本切片**不改**它（改 `disabled` 的语义
+   超出范围），已在契约 §7.3 与 `runbook.md` §4.1 注明"生产必须 jwt"。
+2. `errors>0` 仍返回 **200**（报告携带错误计数、审计记 `result=failure`）——这是"运维端点"
+   的合理选择（部分失败要能看到报告），已写进契约与 §12.5。
+
+**P10 收口**：本切片使计划里的 P10 判据 C10.1~C10.19 **全部满足**（`docs/04-implementation-plan.md`
+的 P10 行与 §「阶段 10」状态行均标 ✅；`check_docs.sh` 的 D4 确认"计划 ✅ 集合 ⇄
+`IMPLEMENTED_PHASES`"一致：`已完成 ['0'..'10']`、`进行中 无`）。**156 键里仍有 31 个
+「已读但无效果」**——它们不是接线遗漏，而是**依赖尚未交付的能力**（PG/multi、远端 Storage
+Service 仓储、ADR-006 数据面、ADR-008 P4），逐键理由与下一步登记在 `docs/operations.md` §1.3.3；
+按 C10.11 的判据原文，这属于允许状态（必须给出理由与下一步）。

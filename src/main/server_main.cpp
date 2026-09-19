@@ -1836,6 +1836,42 @@ int main(int argc, char** argv) {
           : std::max<std::int64_t>(transfer_max_body_bytes, partition_file.max_file_bytes);
   router_options.transfer_put_max_body_bytes = transfer_put_max_body_bytes;
 
+  //  ---- 按需 GC 回调（C9.31 / ADR-013 §10）----
+  //  ★ R12：`GcTask` 的实例只在这里创建；适配层只拿到"跑一轮、返回 GcReport"的形状。
+  //  ★ **同一个** `gc_task` 既给周期调度、又给端点 —— 单飞护栏因此是共享的（不排队/不并行）。
+  //  ★ `gc_schedule` 在这里就判定（而不是等横幅前），因为响应里的 `scheduled` 字段
+  //    必须与"调度到底跑不跑"一致：`gc.enabled=false` 时端点仍然可用，但 `scheduled=false`。
+  const bool gc_schedule = gc_enabled && gc_interval_seconds > 0;
+  adapters::http::GcCallbacks gc_callbacks;
+  gc_callbacks.partition = gc_partition;
+  gc_callbacks.scheduled = gc_schedule;
+  gc_callbacks.run = [&gc_task, &gc_options, &gc_partition, &ports, &logger](
+                         const app::CallerContext& caller,
+                         bool force_dry_run) -> Result<app::GcReport> {
+    //  ★ dry-run 只能**更保守**：配置为真删时，请求可以要求本轮干跑；反之**不行**。
+    app::GcOptions options = gc_options;
+    options.dry_run = gc_options.dry_run || force_dry_run;
+    auto result = gc_task.Run(gc_partition, options);
+
+    //  ★ 审计（C9.31）：这是会**删数据**的运维动作，成功/失败两侧都要留痕。
+    //    operation = `gcRun`（不套 `Success`/`Failure` 后缀：结果在 `result` 字段里）。
+    //    "失败"包含两种：`Run` 返回错误，或报告里 `errors > 0`（扫描没跑完）。
+    const bool round_ok = result.ok() && result.value().errors == 0;
+    domain::AuditEvent event;
+    event.operation = "gcRun";
+    event.user = caller.user_id;
+    event.partition = gc_partition;
+    event.result = round_ok ? "success" : "failure";
+    event.epoch_millis = ports.clock.NowEpochMillis();
+    event.correlation_id = caller.correlation_id;
+    //  审计写入失败**不改结论**（与 `observability.audit_fail_closed=false` 的默认一致：
+    //  GC 已经真的跑了，谎报失败会让运维以为没删；`Record` 的返回码在这里只用于告警）。
+    if (const auto recorded = ports.audit.Record(event); !recorded.ok()) {
+      logging::Warn(logger, "gc_run_audit_failed", {{"error", recorded.error().message()}});
+    }
+    return result;
+  };
+
   //  数据面回调：适配层不认识 L2，由这里把 TransferEndpoint 绑上去（R12）。
   //  ★ 只在**集中存储**模式下注册：S3 有原生预签名，客户端直连存储端点，
   //    服务不代理字节（C5.8）；此时注册 `/v1/transfer` 是死代码。
@@ -1867,7 +1903,7 @@ int main(int argc, char** argv) {
     };
   }  // 仅 POSIX 模式（且 self_signed.enabled）注册自签数据面
 
-  adapters::http::Router router(ports, transfers, router_options);
+  adapters::http::Router router(ports, transfers, router_options, std::move(gc_callbacks));
 
   //  ---- gRPC 面：与 REST 共用**同一个** `UseCasePorts`（C7.8：双协议同时运行）----
   //  ★ 与 HTTP 面一样，服务的具体实现只在这里创建（R12）；两个服务共用同一批
@@ -1915,7 +1951,7 @@ int main(int argc, char** argv) {
   router.Register(server);
 
   //  ---- GC 周期调度（C10.9）：先判定，再在横幅里如实说明"跑/不跑 + 原因" ----
-  const bool gc_schedule = gc_enabled && gc_interval_seconds > 0;
+  //  ★ `gc_schedule` 已在构造按需端点回调时判定（响应里的 `scheduled` 必须与它一致）。
   std::unique_ptr<GcScheduler> gc_scheduler;
   std::string gc_banner;
   if (!gc_enabled) {
@@ -1933,6 +1969,11 @@ int main(int argc, char** argv) {
                 std::to_string(gc_staging_ttl_hours) + "h，orphan_grace=" +
                 std::to_string(gc_orphan_grace_hours) + "h；每轮立即跑一次再按间隔重复）";
   }
+  //  ★ C9.31：按需端点是**独立于周期调度**的能力（`gc.enabled=false` 也可用）——
+  //    横幅必须把它说清楚，否则运维只会看到"GC 未启动"而不知道可以手动清一轮。
+  gc_banner += "；按需端点 POST " + base_path +
+               "/v2/gc:run（需 service.file.admin，不需要 data-partition-id；"
+               "本轮结果见响应；?dryRun=true 只能把本轮降级为预览）";
 
   if (!server.Start()) {
     std::cerr << "监听失败: " << server.last_error() << "\n";

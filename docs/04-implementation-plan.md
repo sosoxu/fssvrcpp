@@ -19,8 +19,8 @@
 | **P6** | 元数据记录语义完整化 | `File.Generic` 全字段、版本链、staging→persistent 搬迁与回滚、`getFileList`、DMS、Delivery | `ctest -L phase6` | ✅ **已完成（C6.1~C6.13；9 测试 / 2578 断言）** |
 | **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | ✅ **已完成（C7.1~C7.10 全部满足；17/17 RPC；6 测试 / 5378 断言）** |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ✅ **已完成（C8.1~C8.8 全部满足；C8.9 配置级 + C8.10 机制级完成；6 测试 / 1323 断言）** |
-| **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ✅ **已完成（C9.1~C9.13、C9.15、C9.16、C9.25 满足；C9.8/C9.12 有独立证据文件；环境不具备的判据登记为未验证）** |
-| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | 🚧 **切片 1 完成**（C10.1~C10.8：156 键中 66 键接通、90 键如实登记；退出码 78 失败语义；真实二进制证据） |
+| **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ✅ **已完成（C9.1~C9.13、C9.15、C9.16、C9.25、C9.31 满足；C9.8/C9.12 有独立证据文件；环境不具备的判据登记为未验证）**。**C9.31 为 P9 补交（P10 期间完成）**：GC 的 HTTP 按需端点 `POST /v2/gc:run` + `GcTask` 单飞护栏（证据 `docs/test-evidence/phase9.md` §12） |
+| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | ✅ **切片 1/2/3/4/5/6a/6b 全部完成（C10.1~C10.19）**：三态 156 键 **生效 106 / 拒绝启动 19 / 已读但无效果 31**（`docs/operations.md` §1.3）；真实二进制证据见 `docs/test-evidence/phase10.md`。**期间补交 P9 的 C9.31**（GC 按需端点；不改任何配置键，三态计数不变） |
 
 **全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P10 并全绿。
 任何阶段的门槛脚本一旦被加入，后续阶段不得使其退化。
@@ -693,7 +693,7 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase8 --output-on
 
 > **当前进度（切片 1/2/3 全部完成）**：`ctest -L phase9` **6 测试 / 466 断言**；
 > `run_all_gates.sh` **P0~P9 全绿（225 s / 10 阶段）**；`ctest` 75/75。
-> C9.1~C9.13、C9.15、C9.16、C9.25 满足（C9.14/C9.17~C9.22/C9.24/C9.26~C9.30 为环境不具备的
+> C9.1~C9.13、C9.15、C9.16、C9.25、**C9.31**（P9 补交）满足（C9.14/C9.17~C9.22/C9.24/C9.26~C9.30 为环境不具备的
 > 判据，已如实登记为未验证，见证据 §11）。
 > ① **C9.1 并发**：100 并发 JSON（真实端口 + 真实线程）**零 5xx**；8 并发大文件（真实 POSIX）
 > **逐路 SHA-256 + 存储侧 `stat().checksum` 三方一致**（载荷带路标识，串数据必然被抓）。
@@ -798,8 +798,9 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase9 --output-on
 | **C9.29** | **io_uring 收益复核（U2/U4）**：在**目标存储**（NVMe/HDD/NFS）上复测 io_uring vs 阻塞线程池。HDD/NFS（高延迟）场景若差异 ≥1.5x 则建议启用；NVMe 级别不足则维持默认 |
 | **C9.30** | `/v2/info` 与指标正确暴露 `ioEngine` / `ioUringAvailable`；在**不允许 io_uring 的部署**里所有 OSDU 端点行为不变 |
 | **C9.22** | **真实存储上重测 I/O 延迟分布**（NVMe/HDD/NFS，非 WSL2 虚拟盘），替换 `docs/appendix/posix-io-probe/RESULTS.txt` 的量级参考；HDD/NFS 延迟高 1–2 个数量级，并发需求完全不同 |
+| **C9.31** | **（P9 补交，P10 期间完成）GC 的 HTTP 按需端点**：`POST {base_path}/v2/gc:run`，授权 **`service.file.admin`** 且**不需要** `data-partition-id`（401/403/200）；响应 = `GcReport` 的字段（snake_case）+ 运行态 `partition` / `scheduled`；**有效 dry-run = 配置 `gc.dry_run` ‖ 请求 `?dryRun=true`**（请求只能更保守，**没有**"强制真删"的参数）；`GcTask::Run` 自带**单飞护栏**（已在跑 → `kUnavailable` → **503**，**不排队、不并行**；是 `GcTask` 的**通用**性质，周期调度与端点共享）；`gc.enabled=false` 时端点**仍可用**且报告 `scheduled=false`；会删数据的动作写**审计**（`operation=gcRun`，成功/失败两侧）；`/metrics` 的 `fss_gc_runs_total` 真的涨；**不新增任何配置键**（三态保持 106/19/31）。R1 自证：①去掉单飞护栏、②忽略请求的 `?dryRun=true`、③让端点免鉴权 —— 三种错误实现都必须让对应用例**失败** |
 
-**退出条件**：C9.1–C9.10 满足，证据写入 `docs/test-evidence/phase9.md`。
+**退出条件**：C9.1–C9.10 满足（含 P9 补交的 **C9.31**），证据写入 `docs/test-evidence/phase9.md`。
 
 ---
 

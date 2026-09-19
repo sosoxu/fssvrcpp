@@ -225,7 +225,7 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | [ADR-010](adr/ADR-010-io-engine-choice.md) | I/O 引擎：**阻塞线程池为默认**，io_uring 为可选加速引擎（默认容器 seccomp 阻断，实测 EPERM） | 已采纳 |
 | [ADR-011](adr/ADR-011-logging-library.md) | 日志：**保留自研最小实现**（spdlog 只覆盖约 3% 的耗时与 0% 的核心需求），并把热路径优化到实测地板的同一量级 | 已采纳（附 4 条重开触发条件） |
 | [ADR-012](adr/ADR-012-auth-and-tenant-binding.md) | 认证与租户绑定：**本地 JWT 校验（HS256）+ `partition` claim 绑定 + fail-closed**；不假设"前面一定有可信网关"；远端 Entitlements / RS256-JWKS 登记为未实现（`remote-entitlements` 模式**拒绝启动**而不是静默放行） | 已采纳（P8；证据 `docs/test-evidence/phase8.md`） |
-| [ADR-013](adr/ADR-013-file-service-extension-endpoints.md) | 平台外扩展端点约定：**远端 legal/schema 校验器**（`base_url` = 完整端点 URL、不追加路径；**fail-closed**：依赖故障一律 503；**不透传调用方身份** → 端点须允许无 per-request 认证）；webhook 复用同一套「完整 URL + 不透传身份」（**但失败非致命**，§9） | 已采纳（P10 切片 6a + 6b；证据 `docs/test-evidence/phase10.md` §11/§12） |
+| [ADR-013](adr/ADR-013-file-service-extension-endpoints.md) | 平台外扩展端点约定：**远端 legal/schema 校验器**（`base_url` = 完整端点 URL、不追加路径；**fail-closed**：依赖故障一律 503；**不透传调用方身份** → 端点须允许无 per-request 认证）；webhook 复用同一套「完整 URL + 不透传身份」（**但失败非致命**，§9）；**按需 GC 端点** `POST /v2/gc:run`（§10：`service.file.admin`、dry-run 只能更保守、`GcTask` 单飞护栏） | 已采纳（P10 切片 6a + 6b；C9.31 为 P9 补交；证据 `docs/test-evidence/phase10.md` §11/§12 与 `docs/test-evidence/phase9.md` §12） |
 
 ---
 
