@@ -724,9 +724,13 @@ inline domain::FileMetadataRecord MakeRecord(const std::string& partition,
 }
 
 inline void CheckMetadataRepositoryContract(domain::IMetadataRepository& repo,
-                                            fss::ManualClock& clock) {
-  const std::string pa = "contract-part-a";
-  const std::string pb = "contract-part-b";
+                                            fss::ManualClock& clock,
+                                            const std::string& partition_prefix = "contract-part") {
+  //  ★ `partition_prefix`（默认值保持既有调用点逐字不变）让**共享 PG 上的测试**可以用
+  //    `pgtest-<pid>-…` 这样每次运行都唯一的租户名（可重跑 + 不打扰别人的数据），
+  //    与 `CheckLocationRepositoryContract` / `CheckLeaseContract` 同一套约定。
+  const std::string pa = partition_prefix + "-a";
+  const std::string pb = partition_prefix + "-b";
 
   SECTION("Create：version=1，GetById / GetLatestByFileSource 可取回") {
     const auto rec = MakeRecord(pa, "aaa1", "/u/1/ts/aaa1", "record-one");
@@ -764,7 +768,7 @@ inline void CheckMetadataRepositoryContract(domain::IMetadataRepository& repo,
   }
 
   SECTION("Create 参数校验：id 与 partition 不一致 / 空 file_source / 重复 id 必须被拒") {
-    ContractError(repo.Create("contract-part-x", MakeRecord(pa, "ccc1", "/u/3/ts/ccc1", "n")),
+    ContractError(repo.Create(partition_prefix + "-x", MakeRecord(pa, "ccc1", "/u/3/ts/ccc1", "n")),
                   fss::ErrorKind::kInvalidArgument,
                   "record.id 的前缀与 partition 参数不一致（防止绕过租户隔离）");
     ContractError(repo.Create(pa, MakeRecord(pa, "ccc2", "", "n")),

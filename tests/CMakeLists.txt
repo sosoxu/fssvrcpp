@@ -141,7 +141,7 @@ if(FSS_WITH_PG)
   # ===========================================================================
   fss_add_test(test_postgres_repositories
     SOURCES integration/test_postgres_repositories.cpp
-    LIBS    fss_location_postgres Threads::Threads
+    LIBS    fss_location_postgres fss_metadata_postgres Threads::Threads
     LABELS  "pg;infra")
   set_tests_properties(test_postgres_repositories PROPERTIES
     FIXTURES_REQUIRED pg

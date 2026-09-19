@@ -244,4 +244,12 @@ if(FSS_HAVE_LIBPQ)
     infra/location/postgres/postgres_lease_repository.cpp)
   target_include_directories(fss_location_postgres PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(fss_location_postgres PUBLIC fss_domain fss_json fss_pg)
+
+  # 元数据仓储：与内存/SQLite 实现共用同一套 `CheckMetadataRepositoryContract`，
+  # 并提供 ADR-009 §4.2 的**原子领取**（M2 缺陷的修复）。
+  add_library(fss_metadata_postgres STATIC
+    infra/metadata/postgres/postgres_metadata_repository.cpp)
+  target_include_directories(fss_metadata_postgres PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(fss_metadata_postgres PUBLIC fss_domain fss_json fss_pg
+                        PostgreSQL::PostgreSQL)
 endif()

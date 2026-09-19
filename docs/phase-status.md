@@ -14,11 +14,13 @@
 >
 > ⚠️ **下面是搬迁时的快照（逐字保留，不改写）**。快照之后发生的变更以 `AGENTS.md` §0.1、
 > `04-implementation-plan.md` 与对应的 `test-evidence/phaseN.md` 为准。
-> **已知的后继变更（截至本次搬迁）**：ADR-009 的 **PG 位置仓储 + 在途租约已交付**（L2，
-> 已在 PG 14.24 与目标 PG 12.6 实测；见 `test-evidence/phase10.md` §15），因此下面
-> P6/P8/P9 行里"PG 版 `ILeaseRepository` / PG 仓储**未交付**"的说法**已部分过时**；
-> `PostgresMetadataRepository`、`CreateFileMetadata` 原子领取、leader election、组合根的
-> `deployment.mode=multi` 接线**仍未交付**（`multi` 仍拒绝启动）。
+> **已知的后继变更（截至本次搬迁）**：ADR-009 的**数据层三件已交付** —— PG 位置仓储、
+> 在途租约（见 `test-evidence/phase10.md` §15）与**元数据仓储**（§16），因此下面 P6/P8/P9 行里
+> "PG 版 `ILeaseRepository` / PG 仓储**未交付**"的说法**已过时**；
+> **仍未交付**：`CreateFileMetadata` 的**跨步骤**原子领取与 `claiming→ready` 状态机、
+> leader election、组合根的 `deployment.mode=multi` 接线（`multi` 仍拒绝启动），
+> 即 `location.postgres.*`/`metadata.postgres.*`/`leases.*`/`leader_election.*` 仍是
+> 「已读但无效果」（三态计数 **113/18/25** 未变）。
 
 ---
 

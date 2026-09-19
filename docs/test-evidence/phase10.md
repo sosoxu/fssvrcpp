@@ -1796,4 +1796,270 @@ constexpr const char* kBlindInjection = R"pgsql(DELETE FROM file_locations WHERE
 `002_advisory_lock.sh` 的 holder 改成真的"短语句心跳"（让它在两个引擎上都有判定力），
 并保留 A3b 作为"为什么锁会话不能跑长语句"的对照。
 
+---
+
+## 16. A2（本轮）：ADR-009 §10 第 1 项的 metadata 一半 —— `PostgresMetadataRepository` + 原子领取判据
+
+> 依据：`docs/adr/ADR-009-multi-instance-consistency.md` §4.2/§6.4 与 §10 待办第 1 项；
+> schema 是 `db/migrations/001_init.sql` 的 `file_metadata_records`（**已应用**，本切片**不改** schema）。
+> 本切片**只做 L2 + 测试**：新增 PG 元数据仓储与 PG 侧契约/并发判据；**组合根未接线**。
+> 这是 §15（A1）的续作：A1 落地了位置仓储 + 租约，本切片落地 metadata 那一半。
+
+### 16.1 结论（先说答案）
+
+1. **`PostgresMetadataRepository` 真的存在且跑同一套契约**：`file_metadata_records`
+   的 L2 实现在真实 PG **14.24 与 12.6** 上都跑 `tests/framework/port_contract.h` 的
+   `CheckMetadataRepositoryContract`（与内存/SQLite 实现**逐字同一份断言**）——
+   不是"各写一套测试"（C2.10 的元数据侧 / C6.11）。
+2. **实测计数（两个引擎完全一致）**：
+   `test_postgres_repositories` = **508 断言 / 14 用例**（A1 时是 276/8）；
+   其中元数据 6 个用例 = **112 + 16 + 17 + 13 + 21 + 53 = 232 断言**
+   （共享契约 / 跨租户隔离 / 墓碑不可见 / JSONB 无损往返 / `created_at` 精确往返 + 含端点区间 / 原子领取）。
+   默认树 `ctest` **86/86 无回归**；`ctest -L pg` **6/6**（两个引擎）。
+3. **原子领取（ADR-009 M2）有"与线程到达顺序无关"的判据**：8 个并发 `Create` 用
+   **不同 id、同一 `(partition, file_source)`** → 库里**恰好 1 行**、**所有**调用者拿到
+   同一条（同 id、`version == 1`）；正控是 8 个**不同 `file_source`** → 恰好 8 行、
+   每个调用者拿到自己那条（证明"恰好 1 行"不是"并发调用全被丢掉"）。
+   去掉 `ON CONFLICT` 的部分索引谓词 → 用例失败（§16.5 ①）。
+4. **`created_at` 由注入的 `IClock` 产生**（与 SQLite 逐字一致），SQL 写
+   `to_timestamp($n::bigint)`、读/过滤用 `floor(extract(epoch from created_at))::bigint`。
+   实测往返**精确无漂移**（写 `1700000000` → 读回 `1700000000`，两引擎一致，§16.3）。
+   ⚠️ 本条是对本轮早些时候一处**错误规格的纠正**：ADR-009 §6.4 的"一律用数据库 `now()`"
+   适用于**租约/过期判定**（`staging_leases`，§15 的租约仓储），**不**适用于元数据记录的
+   `created_at`；后者的契约用 `ManualClock` 钉住，组合根将来注入真实时钟。
+5. **SQL 只用 ≤12 语法**：无扩展、无 `INCLUDE`、无 `MERGE`、无 `NULLS NOT DISTINCT`、
+   无 PG-14 专属 GUC；同一份二进制直接指向 PG 12.6 全绿。
+6. **fail-closed**：DSN 连不上 → `kUnavailable` + libpq 消息；**不存在**到 SQLite/内存的
+   静默回退。测试连不上时**大声失败**，不 skip。
+7. **诚实边界**：`state='deleted'` 的**软删除**语义与 `claiming`→`ready` 状态机
+   **未实现**（§16.6）；组合根**未接线**（因此 `metadata.postgres.*` 仍是
+   **「已读但无效果」**，`deployment.mode=multi` 仍**拒绝启动**）。
+
+### 16.2 实现点（可点击）
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/infra/metadata/postgres/postgres_metadata_repository.{h,cpp}` **（新增）** | `IMetadataRepository` 的 PG 实现：`Create` 用单条 `INSERT … ON CONFLICT (partition_id, file_source) WHERE state <> 'deleted' AND is_latest DO NOTHING RETURNING id, version` 做**原子领取**（0 行 = 别人赢了竞态 → 按 `file_source` 回读返回那条；绝不把唯一冲突当 500）；`Update` 在**同一借出连接**上 `BEGIN` → 清旧 latest → 插 `version+1` → `COMMIT`（任何一步失败都 `ROLLBACK`，不留"半个操作"）；`GetById`/`GetLatestByFileSource`/`List` 一律 `is_latest AND state <> 'deleted'`；`Delete` 硬删全部版本；`List` 下推 `kind` / `name_prefix` / 含端点时间区间 + 稳定全序 + `total`；`VersionCount` 诊断访问器；`pool()` 诊断访问器 |
+| `src/CMakeLists.txt` | `if(FSS_HAVE_LIBPQ)` 内新增 `fss_metadata_postgres`（链接 `fss_domain fss_json fss_pg PostgreSQL::PostgreSQL`，与 `fss_metadata_sqlite` 同构）；无 libpq 的机器仍然**什么都不建** |
+| `tests/CMakeLists.txt` | `test_postgres_repositories` 链接 `fss_metadata_postgres` |
+| `tests/framework/port_contract.h` | `CheckMetadataRepositoryContract` 新增**可选** `partition_prefix`（默认 `"contract-part"`，既有调用点零改动）；内部唯一的硬编码 `"contract-part-x"` 改成 `partition_prefix + "-x"`（默认值下**逐字相同**） |
+| `tests/integration/test_postgres_repositories.cpp` | 新增 6 个元数据用例（共享契约 + 5 个 PG 专属）；`CleanupPrefix` 增加 `file_metadata_records` 清理；新增 `ScalarQuery` / `RawInsertMetadata` 辅助 |
+| `docs/adr/ADR-009-multi-instance-consistency.md` §10 | 勾选 `PostgresMetadataRepository`（`CreateFileMetadata` 原子领取 / `claiming`→`ready` / leader election 等**仍未勾**） |
+
+### 16.3 实测命令与输出摘要
+
+```bash
+cmake --build build -j4            # 默认树（FSS_WITH_PG=OFF）：rc=0
+ctest --test-dir build --output-on-failure
+#  100% tests passed, 0 tests failed out of 86          ← 无回归
+./build/bin/test_sql_guardrail
+#  All tests passed (17 assertions in 3 test cases)     ← 新仓储文件通过 C3.9 两条规则
+
+cmake -S . -B build-pg -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFSS_WITH_PG=ON
+cmake --build build-pg -j4         # rc=0
+ctest --test-dir build-pg -L pg --output-on-failure
+#  100% tests passed, 0 tests failed out of 6            [PG 14.24]
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg
+#  100% tests passed, 0 tests failed out of 6            [PG 12.6]
+
+./build-pg/bin/test_postgres_repositories
+#  All tests passed (508 assertions in 14 test cases)    [PG 14.24]
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ./build-pg/bin/test_postgres_repositories
+#  All tests passed (508 assertions in 14 test cases)    [PG 12.6，逐项一致]
+```
+
+元数据 6 个用例的逐条断言数（**两个引擎完全相同**）：
+
+```text
+*PostgresMetadataRepository*  -> 112 assertions in 1 test case   （共享契约，含 List 时间区间）
+*PG 元数据仓储：partition*    ->  16 assertions in 1 test case   （跨租户严格隔离）
+*墓碑*                        ->  17 assertions in 1 test case   （state='deleted' 不可见 + 正控）
+*JSONB*                       ->  13 assertions in 1 test case   （未知字段无损往返）
+*created_at 由注入时钟*       ->  21 assertions in 1 test case   （精确往返 + 含端点区间）
+*并发 Create*                 ->  53 assertions in 1 test case   （原子领取 + 正控）
+```
+
+**`created_at` 往返（两引擎逐字一致）**：写 `1700000001 / 1700000002 / 1700000003`
+→ 独立连接回读 `floor(extract(epoch from created_at))::bigint` 得到 `1700000001 / 1700000002 / 1700000003`；
+区间过滤 `after = 1700000002` → 2 条、`before = 1700000002` → 2 条、
+单点窗口 `[1700000002,1700000002]` → 恰好 1 条（`alphabet`）；窗口外 `[1700000010,1700000020]` → 0 条（正控）。
+
+**数据卫生（`pgtest-%` 残留，两引擎都是 0）**：
+
+```text
+PG 14.24: loc=0  lease=0  meta=0
+PG 12.6 : loc=0  lease=0  meta=0
+```
+
+> 注：开始本轮时 `build/CMakeCache.txt` 里 `FSS_WITH_PG=ON`（于是 `ctest --test-dir build`
+> 是 92 个测试）。这与本文件 §15 与 AGENTS §0 记录的"默认树 = `FSS_WITH_PG=OFF`、86/86"
+> 不一致，因此已用 `cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFSS_WITH_PG=OFF`
+> 恢复默认，并在此状态下报告 86/86。**没有**削弱任何测试。
+
+### 16.4 Schema 映射裁决（SQLite ↔ PG；写进仓储头文件，不重新设计）
+
+| SQLite `metadata` | PG `file_metadata_records` | 本实现 |
+| --- | --- | --- |
+| `version` | `version` | `Create` → `1`；`Update` → 现有 latest `+1`；读回时**列覆盖** JSON 里的 `version` |
+| `is_latest` | `is_latest` | `Update` 先清旧 latest，再插新版本为 `TRUE`（`ux_mr_latest` 保证每 `(partition,id)` 一个 latest） |
+| `previous_version` | **无列** | 不建列、不加迁移：领域侧 `ancestry` 在记录 JSON 里（`ToJson` 输出 `"ancestry"`），靠 `data` 列无损往返 |
+| `name` | **无列** | 不建列：`name_prefix` 过滤 `data -> 'data' ->> 'Name'` |
+| `created_at INTEGER` | `created_at TIMESTAMPTZ` | 写注入时钟 epoch 秒（`to_timestamp($n::bigint)`）；读/过滤 `floor(extract(epoch from created_at))::bigint`（**floor 截断**而非四舍五入，否则 ±1 s 漂移会破坏含端点区间） |
+| `created_by` | `created_by` | 两边都写 `""`（PG 列 NOT NULL 且无默认值） |
+| `data TEXT` | `data JSONB` | 存 `json::Dump(domain::ToJson(record))` —— 与 SQLite 是**同一份完整信封** |
+| （无） | `state` | 所有读取过滤 `state <> 'deleted'`；`Create`/`Update` 写 `'ready'`；`Delete` **硬删全部版本**（含外部 tombstone，否则同 id 重新 `Create` 会撞主键） |
+| （无） | `acl_viewers`/`acl_owners`/`legal_tags` | 写入时从 `record.acl.viewers` / `record.acl.owners` / `record.legal.legaltags` 填（**忠实的反规范化镜像**，不再永久为空）；**读取只用 `data` JSON**（单一事实来源） |
+
+### 16.5 R1 注入（每条都在完整重编 `cmake --build build-pg -j4 --target test_postgres_repositories` 之后跑；末尾已全部还原）
+
+**① 去掉 `ON CONFLICT` 的部分索引谓词（原子领取退化为"无仲裁者"）**
+
+```
+tests/integration/test_postgres_repositories.cpp:713: FAILED:
+  REQUIRE( results.errors[i].empty() )
+with expansion:
+  false
+with message:
+  caller 0 : 插入元数据失败：ERROR:  there is no unique or exclusion
+  constraint matching the ON CONFLICT specification
+test cases: 1 | 1 failed      assertions: 2 | 1 passed | 1 failed
+```
+
+⇒ 部分唯一索引 `ux_mr_source` 的谓词必须与 `db/migrations/001_init.sql` **逐字一致**
+（PostgreSQL 才能推断出该索引；两引擎实测都报 42P10，12.6 上是本地化中文）。
+还原后：`All tests passed (508 assertions in 14 test cases)`。
+
+**② 停止清旧 `is_latest`（版本链断裂；`kClearLatest` 的 `SET` 改成 `is_latest = TRUE`）**
+
+```
+tests/framework/port_contract.h:93: FAILED:
+  REQUIRE( r.ok() )
+with expansion:
+  false
+with messages:
+  ...
+  契约点：Update → v2
+test cases:  1 |  0 passed | 1 failed
+assertions: 87 | 85 passed | 2 failed
+```
+
+⇒ `Update` 命中 `ux_mr_latest` 唯一冲突，`is_latest` 没有从旧版移到新版。还原后：
+`All tests passed (508 assertions in 14 test cases)`。
+
+**③ `GetById` 丢掉 `state <> 'deleted'`（墓碑重新可见）**
+
+```
+tests/integration/test_postgres_repositories.cpp:509: FAILED:
+  REQUIRE_FALSE( by_id.ok() )
+with expansion:
+  !true
+test cases:  1 | 1 failed      assertions: 10 | 9 passed | 1 failed
+```
+
+⇒ 同用例里的**正控**（同一 `GetById` 路径对 live 行命中、`List` 里 live 行可见）说明这条
+负断言不是恒真。还原后：`All tests passed (508 assertions in 14 test cases)`。
+
+**还原自证**：`md5sum -c`（三个文件）全部 `OK`；
+`grep -rn "R1-INJECT" src/ tests/` → 无输出；
+还原后完整重编 + 全量 PG 测试 = `All tests passed (508 assertions in 14 test cases)`。
+
+### 16.6 仍未交付 / 未验证（如实登记）
+
+| 项 | 状态 |
+| --- | --- |
+| 组合根接线 `metadata.postgres.*` | **未交付**：`metadata.postgres.*` 仍逐字登记为**「已读但无效果」**（`docs/operations.md` §1.3.3）；组合根仍注入 SQLite/内存元数据仓储 |
+| `CreateFileMetadata` 的**跨步骤**原子领取 | **未交付**：仓储只提供"单条 INSERT 的原子领取" |
+| `state='deleted'` 软删除 + `claiming`→`ready` 状态机 + 崩溃回收 | **未交付**（ADR-009 §10 第 2 项）；本仓储只写 `'ready'`、只按 `state <> 'deleted'` 过滤 |
+| `deployment.mode=multi` 的 5 条启动校验 | **未交付**：`multi` 仍**拒绝启动** |
+| leader election（PG advisory lock）+ GC leader-only | **未交付** |
+| 多实例端到端（C9.26：2 进程 + 共享 PG + 共享目录 + 崩溃注入） | **未验证** |
+| PG 连接预算校验（C9.28） | **未交付**（仓储的 `PgPool` 有 `max_connections` 上限，但没有"实例数 × 池上限 ≤ 服务端上限"的启动校验） |
+| readiness 的 PG `SELECT 1` + 迁移版本校验 / 时钟偏移校验 | **未交付** |
+| NFS/SAN 的 `rename` 原子性、close-to-open、`syncfs` 语义（C9.27） | **未验证**（无目标存储） |
+| 并发 `Update` 同一 id | **未验证/未序列化**：没有跨实例互斥，第二个 `Update` 会因 `ux_mr_latest` 冲突报错（不重试、不合并）；契约只要求串行语义 |
+| `List` 的 `name_prefix` 下推 | 用 `left(data -> 'data' ->> 'Name', length($n)) = $n`（**字面前缀**，与 SQLite 的 C++ `rfind(prefix,0)==0` 等价；`%`/`_` 不是通配符）；**没有**为它建表达式索引（分区内记录数本阶段可控） |
+| 完整构建日志中的告警 | 新增/改动的 3 个文件 **0 警告**；完整 `build-pg` 重建日志里仍有 **24 条既有告警**（`tests/framework/app_fixture.h`、`tests/framework/raw_http.h`、`tests/framework/mock_s3.h`、`tests/integration/test_metadata_lifecycle.cpp`、`tests/integration/test_upload_flow_s3.cpp` 的 `-Wmissing-field-initializers`/`-Wunused-parameter`/`-Wunused-result`），**不是**本切片引入 |
+
+### 16.7 门槛结果
+
+```
+./scripts/check_docs.sh
+#  全部检查通过（D1~D5）；D5：11 个阶段、148 条门槛
+
+JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh
+#  ==> [infra] ctest -L pg → 100% tests passed, 0 tests failed out of 6
+#  失败: 无
+#  ⏱  总耗时: 7 分 5 秒（425 s，阶段数 11）
+#  ✅ 全部已启用阶段门槛通过。（退出码 0）
+
+md5sum -c /tmp/r1_baseline.md5    # 三个文件全部 OK（R1 注入逐字还原）
+grep -rn "R1-INJECT" src/ tests/  # 无输出
+```
+
+> 门槛脚本（`FSS_GATES_WITH_PG=1`）会把 `build` 缓存改成 `FSS_WITH_PG=ON`；跑完后已再次
+> `cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFSS_WITH_PG=OFF` 并重跑
+> `ctest --test-dir build` = **86/86**，把默认树恢复到本文件 §15 / AGENTS §0 记录的形态。
+
+### 16.8 父代理独立复核（不采信子代理自述，全部自己重跑）
+
+#### 16.8.1 派发前：先在两台引擎上验证映射裁决（这一次让一处**错误规格**在写代码前被打掉）
+
+本轮 spec 初稿把元数据 `created_at` 定为"用数据库 `now()`"。派发后复核契约发现这是**错的**：
+`tests/framework/port_contract.h` 的签名是
+`CheckMetadataRepositoryContract(domain::IMetadataRepository& repo, fss::ManualClock& clock)`，
+测试用 `ManualClock clock{1700000000}` + `clock.AdvanceSeconds(1)` 驱动时间，并断言
+`created_after = t0 + 1` **恰好 2 条**、单点窗口 `[t0+1, t0+1]` **恰好 1 条**。
+若写 `now()`，存进去的是真实墙钟（≈1789820936），契约在 1700000000 附近过滤 ⇒
+**所有时间区间断言必然失败**。已即时把纠正发给子代理：注入 `IClock`、写
+`to_timestamp($n::bigint)`；并撤掉我原先要求的"epoch 接近数据库时钟"断言。
+
+纠正后的机制**由我在两台引擎上独立预验证**（`build/pg_epoch_probe.sql`，全部 ROLLBACK）：
+
+| 项 | PG 14.24 | PG 12.6 |
+| --- | --- | --- |
+| `to_timestamp` 往返 `1700000001 / 1700000010 / 0` | 逐值相等，**drift = 0** | 同左 |
+| 真实写入 → 独立读回 `floor(extract(epoch ...))::bigint` | `1700000001`，drift = 0 | 同左 |
+| 下界**含端点**（`>=` 1 条 / `>` 0 条） | ✅ | ✅ |
+
+同一次预验证还覆盖了本切片其余全部映射裁决（`build/pg_meta_probe.sql`，两引擎**逐项一致**）：
+`name_prefix` 走 JSONB `data -> 'data' ->> 'Name'`（命中 1 / 未命中 0）、
+`floor(extract(epoch ...))` 截断、时间区间含端点、`state='deleted'` 行不可见**且同查询正控可见**、
+软删除后同一 `file_source` 可重新领取（返回 1 行新记录）、版本链"清旧 latest → 插 v2"后
+同 id 只有 1 条 latest、`total` = 过滤后分页前 + 稳定排序分页。两库 `probe-m%` / `probe-e%`
+残留均为 **0**。
+
+#### 16.8.2 落地后的复核
+
+| 复核项 | 我的命令 | 实测 |
+| --- | --- | --- |
+| 默认树无回归 | `ctest --test-dir build`（缓存确认 `FSS_WITH_PG:BOOL=OFF`） | **86/86**、无失败 |
+| PG 测试本体（本地 14.24） | `FSS_PG_DSN=postgresql://fss@127.0.0.1:15432/fss ./build-pg/bin/test_postgres_repositories` | **508 断言 / 14 用例** |
+| PG 测试本体（目标 **12.6**） | 同上，DSN 指 `172.17.64.1:5555` | **508 断言 / 14 用例**（与 14.24 逐项一致） |
+| fail-closed 不是 skip | DSN 指不可达端口 `127.0.0.1:15999` | `test cases: 14 \| 1 passed \| 13 failed`、**退出码 13** |
+| 数据卫生 | 两库 `pgtest-%` 在 `file_locations`/`staging_leases`/`file_metadata_records` 的残留 | 两库 **0/0/0** |
+| 静态护栏覆盖新文件 | `./build/bin/test_sql_guardrail` | 17 断言 / 3 用例通过（新仓储用 `R"sql(` 且 DML 都带 `partition_id`） |
+| 代码复核 | 读 `postgres_metadata_repository.cpp` 全部 SQL 与 `Create`/`Update`/`Delete`/`List` | 读路径一律 `is_latest AND state <> 'deleted'`；`Update` 用**同一借出连接** `BEGIN…COMMIT`、统一失败出口 `ROLLBACK`、且"清 latest 命中 0 行"显式报 `kInternal`（R9）；`Delete` 硬删全部版本并查 `AffectedRows`；`RowToRecord` 以**列**覆盖 JSON 里的 `version` |
+| 测试是否有区分力（读用例本体） | 墓碑用例、并发领取用例 | 墓碑：三条负断言各自**同路径正控**（`GetById(live)` 在前后各断言一次）、并在 `List` 上先证明 live 行 `total == 1`；并发领取：`std::atomic` 起跑栅栏最大化真实竞态、结果按线程分开收集、另有"8 个不同 `file_source` → 恰好 8 行"的正控 |
+| 门槛（我自己跑） | `JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh` | `失败: 无`、**461 s / 11 阶段**、退出码 0；随后把 `build` 缓存恢复 `FSS_WITH_PG=OFF` 并重跑 `ctest --test-dir build` = **86/86** |
+
+#### 16.8.3 我自己的消融（子代理没做过的那一条）
+
+把 `created_at` 的写入整体前移 100000 秒（`to_timestamp($4::bigint)` →
+`to_timestamp($4::bigint - 100000)`；SQL 仍合法、参数个数不变，因此失败只能来自**语义**），
+完整重编后跑元数据用例：
+
+```
+tests/framework/port_contract.h:870: FAILED:  REQUIRE( after_page.total == 2 )
+tests/integration/test_postgres_repositories.cpp:611: FAILED:
+  REQUIRE( raw.value().Value(0, 1) == "1700000001" )
+test cases: 5 | 3 passed | 2 failed ; assertions: 150 | 148 passed | 2 failed   [退出码 2]
+```
+
+⇒ 两条结论都被钉住：① `created_at` 确实来自**注入时钟**（我纠正后的规格）；② 契约的
+时间窗口断言**有区分力**，不是恒真。还原后 `md5` 逐字一致、重编后 **508/14 全绿**。
+
+> 另外复核确认：`grep -rn "R1-INJECT" src/ tests/` 无输出；`AGENTS.md`、
+> `config/fss.example.json`、`docs/operations.md`、`src/main/server_main.cpp`、
+> `db/migrations/001_init.sql` **均未被本切片触碰**（三态计数因此逐字不变）。
+
 

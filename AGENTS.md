@@ -40,7 +40,7 @@
 | 事实 | 现状 |
 | --- | --- |
 | **配置键三态** | 156 个叶子键：**生效 113 / 拒绝启动 18 / 已读但无效果 25**。逐键见 [docs/operations.md](docs/operations.md) §1.3，由 `test_operations_doc` 自动比对 |
-| **PG 多实例（ADR-009）** | **部分交付**：PG 位置仓储 + 在途租约已落地（L2，已在本地 PG 14.24 与**目标环境的 PG 12.6** 实测）。`PostgresMetadataRepository`、`CreateFileMetadata` 原子领取、leader election **未交付**；组合根**未接线** ⇒ `location.postgres.*`/`metadata.postgres.*`/`leases.*`/`leader_election.*` 仍是「已读但无效果」，`deployment.mode=multi` **仍拒绝启动** |
+| **PG 多实例（ADR-009）** | **数据层三件已交付**：PG 位置仓储、在途租约、**元数据仓储**（L2，共用同一套端口契约测试，已在本地 PG 14.24 与**目标环境的 PG 12.6** 实测；`Create` 内含单条 INSERT 的原子领取）。**仍未交付**：`CreateFileMetadata` 的**跨步骤**原子领取与 `claiming→ready` 状态机、leader election、组合根接线 ⇒ `location.postgres.*`/`metadata.postgres.*`/`leases.*`/`leader_election.*` 仍逐字是「已读但无效果」，`deployment.mode=multi` **仍拒绝启动** |
 | **io_uring（ADR-010）** | `ioUringAvailable` 只表达**宿主能力**（**可用 ≠ 已启用**）；**引擎实现未交付**（U1~U4 未满足）⇒ `ioEngine` 恒 `blocking`、`storage.io_engine=uring` 仍 exit 78 |
 | **sendfile 数据面（ADR-006）** | 只**采纳方向**（受控复核 2.12x ≥ 1.5x），**实现未交付**；默认仍走 httplib |
 | **生产强校验** | `deployment.environment=production` 要求 `auth.mode=jwt` + 验签 + 密钥非空，否则**拒绝启动**（exit 78） |

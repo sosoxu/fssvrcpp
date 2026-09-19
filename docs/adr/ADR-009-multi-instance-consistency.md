@@ -445,8 +445,8 @@ gc:
 ## 10. 待办
 
 - [x] 实现 `PostgresLocationRepository` / `PostgresLeaseRepository`（L2 + libpq 薄封装；与内存/SQLite 共用 `tests/framework/port_contract.h` 的同一套契约测试；已在 PG 14.24 与 12.6 实测。证据：`docs/test-evidence/phase10.md` §15）
-- [ ] 实现 `PostgresMetadataRepository`（上一项里 metadata 那一半；仍未交付）
-- [ ] 实现 `CreateFileMetadata` 的原子领取 + `claiming`→`ready` 状态机 + 崩溃回收
+- [x] 实现 `PostgresMetadataRepository`（上一项里 metadata 那一半）：`file_metadata_records` 的 L2 实现，读路径过滤 `state <> 'deleted'`，`Create` 用 `ON CONFLICT (partition_id, file_source) WHERE state <> 'deleted' AND is_latest DO NOTHING` 做**单条 INSERT 的原子领取**；与内存/SQLite 共用 `tests/framework/port_contract.h` 的同一套 `CheckMetadataRepositoryContract`，并新增"并发 Create 同一 fileSource → 恰好 1 行 / 所有调用者同一个 id"的判据。已在 PG 14.24 与 12.6 实测。证据：`docs/test-evidence/phase10.md` §16
+- [ ] 实现 `CreateFileMetadata` 的原子领取 + `claiming`→`ready` 状态机 + 崩溃回收（仓储只提供"单条 INSERT 的原子领取"，跨步骤领取与状态机仍未交付）
 - [ ] 实现 leader election（PG advisory lock）+ GC 的租约与原子领取
 - [ ] 实现 `deployment.mode=multi` 的 5 条启动校验与时钟偏移检查
 - [ ] `ObjectKeyPolicy` 的 tmp 名唯一化
