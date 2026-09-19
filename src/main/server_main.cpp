@@ -1323,17 +1323,16 @@ int main(int argc, char** argv) {
         "deployment.clock_skew_tolerance_seconds 非默认 —— 该键用于「与数据库 now() 的偏移容忍」，"
         "而数据库时钟未交付（单实例用本地钟；multi 已拒绝启动）。下一步：保持 60。");
   }
-  if (posix_group_commit_max_batch != 500 || !posix_sync_dir_after_batch) {
-    //  ★ 如实拒绝，不假装生效：ADR-008 的 P4（两阶段批提交：写整批 .tmp → syncfs →
-    //    统一 rename → fsync(dir)）在实现里**不存在**。现有代码只有"按大小决定是否
-    //    fdatasync + 改名后 fsync 目录"（`FsyncPolicy::kBySize`），既没有批边界，
-    //    也没有 `syncfs`。把这两个参数接上去只能是"读了但无效果"的假象。
+  //  ★ 本轮（ADR-008 的 P4 已交付）：`group_commit_max_batch` **生效**（不再拒绝启动）；
+  //    `sync_dir_after_batch=false` 仍然**拒绝启动** —— ADR-008 §5 的 R2（"rename 之后
+  //    必须 fsync 目录"）是**不变量**，schema 描述也写明"必须 true"。为了多一个"生效"
+  //    键而放宽这条护栏，等于允许"已确认的对象在崩溃后消失"（AGENTS §4.3：
+  //    机械护栏挡住架构上必须存在的代码时，不要放宽护栏）。
+  if (!posix_sync_dir_after_batch) {
     return reject_startup(
-        "storage.posix.group_commit_max_batch / sync_dir_after_batch 非默认 —— "
-        "批提交协议未实现（ADR-008 的 P4 待做）：实现里只有「按大小决定是否 fdatasync + "
-        "改名后 fsync 目录」，没有「整批 .tmp → syncfs → 统一 rename」的两阶段顺序，"
-        "这两个参数没有可接的真实语义。下一步：保持 group_commit_max_batch=500 且 "
-        "sync_dir_after_batch=true，或在 ADR-008 §6 落地 P4 后再接通。");
+        "storage.posix.sync_dir_after_batch=false —— ADR-008 §5 的 R2 是**不变量**："
+        "rename 之后必须 fsync(目录)，否则「已确认」的对象在崩溃后可能消失"
+        "（schema 描述也写明该键必须为 true）。下一步：保持 true。");
   }
   //  ★ 切片 4：两个仓储的 journal_mode 只接通 WAL / DELETE 两档（Options 里是 `wal` 布尔）。
   //    TRUNCATE 若被静默当成 DELETE，运维会得到"配置写了 TRUNCATE、实际是 DELETE"的假象。
@@ -1456,6 +1455,10 @@ int main(int argc, char** argv) {
       logging::OptionsFromConfig(log_level, log_format, log_service, Join(redact_keys)), clock);
   UuidGenerator ids;
 
+  //  ★ 注册表要**早于** blob store 构造：POSIX 驱动的批提交（ADR-008 的 P4）要把
+  //    `syncfs`/批次数记进 `fss_*` 指标族（否则运维无法观察摊销是否发生）。
+  metrics::Registry metrics_registry;
+
   std::unique_ptr<domain::IBlobStore> blob_store;
   if (storage_driver == "s3") {
     if (s3_endpoint.empty() || s3_access_key.empty() || s3_secret_key.empty()) {
@@ -1489,8 +1492,17 @@ int main(int argc, char** argv) {
     if (durability == "per_file") {
       posix_options.fsync_policy = FsyncPolicy::kAlways;
     } else if (durability == "batch") {
+      //  ★ ADR-008 的 P4：**真批提交**（并发驱动的组提交）。
+      //    此前的映射是近似 —— `kBySize` 的语义是"小文件不 fsync，靠批提交摊销"，
+      //    而批提交根本不存在 ⇒ 默认配置下小文件**从不落盘**（耐久性谎言）。
+      //    现在 `batch_commit=true` 打开「写整批 tmp → syncfs → 统一 rename →
+      //    fsync(dir)」，`fsync_policy` 只用来表达"≥ 阈值的对象强制单独 fdatasync"。
+      posix_options.batch_commit = true;
       posix_options.fsync_policy = FsyncPolicy::kBySize;
       posix_options.fsync_threshold_bytes = fsync_threshold_bytes;
+      posix_options.group_commit_max_batch =
+          static_cast<std::size_t>(posix_group_commit_max_batch);
+      posix_options.sync_dir_after_batch = posix_sync_dir_after_batch;
     } else if (durability == "never") {
       //  ★ 只能用于"数据可重建"的场景：这里显式告警，不做静默降级
       std::cerr << "警告：storage.posix.durability=never —— 进程崩溃可能丢已确认的写入\n";
@@ -1511,6 +1523,8 @@ int main(int argc, char** argv) {
     posix_options.file_mode = static_cast<decltype(posix_options.file_mode)>(posix_file_mode);
     posix_options.fadvise_random = posix_fadvise_random;
     posix_options.fadvise_dontneed_after_large_read = posix_fadvise_dontneed;
+    //  ★ 批提交的 syncfs/批次数进 `fss_*` 指标族（C9.6 的"真实进程可观察"）
+    posix_options.metrics = &metrics_registry;
     blob_store = std::make_unique<PosixBlobStore>(storage_root + "/blobs", clock, posix_options);
   } else {
     std::cerr << "拒绝启动：未知的 storage.driver：" << storage_driver
@@ -1522,13 +1536,22 @@ int main(int argc, char** argv) {
   //    `RouterOptions::metrics_registry` 恒为 nullptr → `/metrics` 只有 HTTP 族，
   //    存储操作/字节只在测试夹具里被验证过（"测试里通过、产品里不存在"，正是 R15 那类陷阱）。
   //    这里把驱动包一层计量装饰器（纯转发，不改语义），并把注册表接到 `/metrics`。
-  metrics::Registry metrics_registry;
+  //    （`metrics_registry` 在 blob store **之前**已声明：POSIX 驱动的批提交要用它记
+  //     `syncfs`/批次数，见 ADR-008 的 P4。）
   //  ★ C10.4/R11：I/O 引擎的探测与回退结果必须**可见**（横幅 + /metrics），
   //    否则"auto 回退到 blocking"只能等线上性能回归才发现。
   metrics_registry.Register("fss_io_engine", metrics::Registry::Kind::kGauge,
                             "当前生效的 I/O 引擎（1 = 生效；requested=配置请求值）");
   metrics_registry.SetGauge("fss_io_engine", 1,
                             {{"engine", io_engine_active}, {"requested", io_engine}});
+  //  ★ ADR-008 的 P4：批提交的摊销是否发生，必须能被运维观察（否则"批提交"只是文档）。
+  //    判据：`fss_posix_batch_objects_total / fss_posix_group_commits_total` = 平均批大小。
+  metrics_registry.Register("fss_posix_syncfs_total", metrics::Registry::Kind::kCounter,
+                            "POSIX 批提交中 syncfs(2) 的调用次数（ADR-008 的 P4）");
+  metrics_registry.Register("fss_posix_group_commits_total", metrics::Registry::Kind::kCounter,
+                            "POSIX 批提交的批次数（每批 1 次 syncfs + 1 次 fsync(dir)）");
+  metrics_registry.Register("fss_posix_batch_objects_total", metrics::Registry::Kind::kCounter,
+                            "通过两阶段批提交提交的对象数（用于计算平均批大小）");
   MeteredBlobStore metered_blob(*blob_store, metrics_registry,
                                storage_driver == "s3" ? "s3" : "posix");
   SingleStoreFactory blob_factory(metered_blob);
@@ -1995,6 +2018,17 @@ int main(int argc, char** argv) {
             << "  base path      : " << base_path << "\n"
             << "  storage driver : " << storage_driver << "\n"
             << "  storage root   : " << storage_root << "\n"
+            //  ★ ADR-008 §5.4 / C9.20：**必须在真实进程里显式声明当前耐久性粒度**
+            //    （批级 / 单文件级），不允许"默认值不说清"。
+            << "  durability     : " << durability
+            << (durability == "batch"
+                    ? "（两阶段批提交：write all tmp → syncfs → rename all → fsync(dir)；"
+                      "粒度=批，批上限 " +
+                          std::to_string(posix_group_commit_max_batch) + "；并发才有摊销）"
+                    : std::string(durability == "per_file"
+                                      ? "（每对象 fdatasync + fsync(dir)；粒度=单文件）"
+                                      : "（不落盘；仅限可重建数据）"))
+            << "\n"
             << "  sqlite path    : " << sqlite_path << "\n"
             << "  sqlite tuning  : location busy_timeout=" << location_sqlite_busy_timeout_ms
             << "ms journal_mode=" << location_sqlite_journal_mode << "（wal="

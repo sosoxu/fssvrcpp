@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <optional>
@@ -123,6 +124,18 @@ class RealFadviseSink final : public IFadviseSink {
 //  `storage.posix.fadvise_dontneed_after_large_read` 的阈值：**大于** 1 MiB 的读
 //  才丢弃页缓存（小文件重读命中缓存的收益更高）。
 constexpr std::uint64_t kDontNeedThresholdBytes = 1024 * 1024;
+
+//  ★ ADR-008 的 P4：组提交的**有界等待窗口**。
+//  为什么是这个值（且为什么是常量而不是配置键）：
+//    · `storage.posix` 没有 wait 键，也**不新增**配置键（ADR-008 只定义了
+//      `durability` / `group_commit_max_batch` / `fsync_threshold_bytes`）；
+//    · 太小（例如 50 µs）在 WSL2 / 高负载下批常常凑不满 → 摊销退化成"每文件一次
+//      syncfs"，等于没实现 P4；
+//    · 太大（例如 10 ms）给每个"孤立写入"加上固定延迟；
+//    · 2 ms 足以让并发写入者（各自写 tmp 只需几十 µs）汇入同一批，同时把单文件
+//      延迟上界钉在 2 ms。**顺序单文件写不受影响**：领队发现没有别的写入者时立即提交。
+//  ⚠️ 本窗口只影响"批能凑多大"；它**不是**耐久性参数 —— 耐久性粒度始终是"批"。
+constexpr auto kBatchWaitWindow = std::chrono::microseconds(2000);
 
 }  // namespace
 
@@ -269,6 +282,20 @@ fss::Result<void> PosixBlobStore::put(const domain::ObjectRef& ref, bytes::ByteS
   //    代价是"打开即截断"，因此失败路径必须删除目标：宁可"没有文件"，也绝不留下半成品
   //    （ADR-008 的 R3 不变量在两种模式下都必须成立）。
   const bool atomic = options_.atomic_write;
+  //  ★ ADR-008 的 P4 只在"原子写 + durability=batch"时成立：直写目标没有 rename 阶段，
+  //    因此**不参与批**（逐字保持接线前的直写语义）。
+  const bool batch_phase = atomic && options_.batch_commit;
+  //  入批计数（仅 batch 档）：领队用它判断"还有没有别的写入者值得等"。任何早退路径
+  //  （源端读失败 / 校验不符 / open 失败）都必须递减，否则领队会空等窗口。
+  struct WritersGuard {
+    std::atomic<std::size_t>* counter;
+    bool active;
+    ~WritersGuard() {
+      if (active) counter->fetch_sub(1);
+    }
+  } writers_guard{&batch_writers_, batch_phase};
+  if (batch_phase) batch_writers_.fetch_add(1);
+
   const std::string tmp = atomic ? TempPathFor(path) : path;
   const int open_flags = atomic
                              ? (O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC)
@@ -331,12 +358,18 @@ fss::Result<void> PosixBlobStore::put(const domain::ObjectRef& ref, bytes::ByteS
     }
   }
 
+  //  事件：数据已进入 `.tmp_*`（阶段 A）。顺序判据要求它早于本批的 `syncfs`。
+  if (Observer() != nullptr) Observer()->OnWriteTmp(tmp);
+
   //  ADR-008：数据先落盘，再改名；改名后 fsync 目录。
-  //  是否落盘由 `fsync_policy` 决定（C3.11）：`by_size` 下小文件靠批提交摊销。
+  //  · `batch` 档的小对象（< 阈值）**不**在这里单文件落盘 —— 靠批次末的 `syncfs` 摊销；
+  //  · `>= 阈值` 的对象**强制单独 fdatasync**（不靠批摊销，与 schema 描述一致）；
+  //  · `per_file` 档（kAlways）每个对象都单独落盘；`never`（旧别名，kNever）都不落盘。
   const bool need_sync =
       ShouldFsync(options_.fsync_policy, static_cast<std::int64_t>(total),
                   options_.fsync_threshold_bytes);
   if (need_sync) {
+    if (Observer() != nullptr) Observer()->OnDataSync(tmp);
     const auto sync = FileSync().DataSync(fd);
     if (!sync.ok()) {
       cleanup();
@@ -348,15 +381,6 @@ fss::Result<void> PosixBlobStore::put(const domain::ObjectRef& ref, bytes::ByteS
     (void)::unlink(tmp.c_str());
     return error;
   }
-  if (atomic && ::rename(tmp.c_str(), path.c_str()) != 0) {
-    const auto error = ErrFromErrno("rename 失败");
-    (void)::unlink(tmp.c_str());
-    return error;
-  }
-  if (need_sync) {
-    //  目录 fsync 失败不致命（文件已可见）；但如实记录到 stderr 之外由调用方决定是否重试。
-    (void)FileSync().SyncDirectory(path.substr(0, path.rfind('/')));
-  }
 
   domain::ObjectStat st;
   st.exists = true;
@@ -365,7 +389,193 @@ fss::Result<void> PosixBlobStore::put(const domain::ObjectRef& ref, bytes::ByteS
   st.checksum = checksum;
   st.checksum_algorithm = "SHA256";
   st.last_modified_epoch_seconds = clock_.NowEpochSeconds();
+
+  if (atomic && batch_phase && !need_sync) {
+    //  ★ ADR-008 的 P4：把「对象本体 + sidecar」一起入批。
+    //    为什么 sidecar 也进批：否则会出现"对象已 durable、元数据没 durable"的窗口；
+    //    而 `syncfs` 是文件系统级操作，把 sidecar 的 tmp 也写出来一起同步**代价为零**。
+    json::Value meta = json::Value::object();
+    meta["content_type"] = st.content_type;
+    meta["checksum"] = st.checksum;
+    meta["checksum_algorithm"] = st.checksum_algorithm;
+    meta["size"] = st.size;
+    meta["last_modified_epoch_seconds"] = st.last_modified_epoch_seconds;
+    const std::string sidecar_final = path + std::string(kSidecarSuffix);
+    const std::string sidecar_tmp = TempPathFor(sidecar_final);
+    const auto wrote_sidecar = WriteTmpFile(sidecar_tmp, json::Dump(meta));
+    if (!wrote_sidecar.ok()) {
+      (void)::unlink(tmp.c_str());  // 对象 tmp 从未入批 → 这里必须清掉
+      return wrote_sidecar.error();
+    }
+    if (Observer() != nullptr) Observer()->OnWriteTmp(sidecar_tmp);
+    std::vector<PendingRename> renames;
+    renames.push_back(PendingRename{tmp, path});
+    renames.push_back(PendingRename{sidecar_tmp, sidecar_final});
+    return JoinBatch(std::move(renames));
+  }
+
+  //  单文件提交（直写 / per_file / never / batch 档的大对象例外）：
+  //  `rename` →（可选）`fsync(目录)`。逐字保持接线前的顺序与语义。
+  if (atomic && ::rename(tmp.c_str(), path.c_str()) != 0) {
+    const auto error = ErrFromErrno("rename 失败");
+    (void)::unlink(tmp.c_str());
+    return error;
+  }
+  if (atomic && Observer() != nullptr) Observer()->OnRename(tmp, path);
+  if (need_sync && options_.sync_dir_after_batch) {
+    //  目录 fsync 失败不致命（文件已可见）；但如实记录到 stderr 之外由调用方决定是否重试。
+    const std::string dir = path.substr(0, path.rfind('/'));
+    if (Observer() != nullptr) Observer()->OnDirectorySync(dir);
+    (void)FileSync().SyncDirectory(dir);
+  }
+
   FSS_TRY(WriteSidecar(path, st, need_sync));
+  return Ok();
+}
+
+// =============================================================================
+//  ADR-008 的 P4：两阶段批提交（`write all tmp → syncfs → rename all → fsync(dir)`）
+// =============================================================================
+//  批如何形成（**并发驱动的组提交**，没有独立的批量写 API）：
+//    每个 put 先写自己的 `.tmp_*`（+ 大对象单独 fdatasync），然后在 store 内入批。
+//    本批第 1 个入批者成为领队，等"批满 `group_commit_max_batch`"或"有界窗口到期"
+//    （`kBatchWaitWindow`）；任何人把批填满时由**他**成为提交者（这样批不会超过上限）。
+//    提交者执行 ② `syncfs` → ③ 统一 `rename` → ④ `fsync(目录)`，然后唤醒全批返回。
+//  顺序不变量（R1/R2，机器可检查）：
+//    · 本批**所有** rename 都在 `syncfs` **之后**（R1：可见即完整）；
+//    · `fsync(目录)` 在**所有** rename 之后（R2：承诺即可靠）。
+//  失败规则（先定义再断言）：
+//    · `syncfs` 失败 → **整批**都失败，一个 rename 都不做（宁可没有对象，也不留残缺）；
+//    · 某个对象的 rename 失败 → **只有那个对象**失败（返回错误给它的调用者），
+//      同批其它对象照常提交；失败对象的所有 tmp 被清理（绝不留半个对象）。
+//  ⚠️ 诚实标注的偏差：ADR-008 的 31,478 文件/秒 / 82.3x 是在**显式批量写 5000 文件 /
+//     批 500** 的场景测的。本实现是**并发驱动**的组提交，因此**顺序单文件写**仍然是
+//     "一文件一次提交"（领队发现没有别的写入者时立即提交，拿不到那个摊销），
+//     只有**并发**写才有摊销。不要把 ADR 的吞吐数字当成本实现的成绩。
+// =============================================================================
+fss::Result<void> PosixBlobStore::JoinBatch(std::vector<PendingRename> renames) {
+  //  门控（测试）：在"tmp 已写好、尚未入批"处对齐并发写入者，让批大小成为确定性事实。
+  if (options_.batch_gate != nullptr) options_.batch_gate->ArriveAndWait();
+
+  std::unique_lock<std::mutex> lock(batch_mutex_);
+  if (current_batch_ == nullptr || current_batch_->sealed) {
+    current_batch_ = std::make_shared<Batch>();
+  }
+  std::shared_ptr<Batch> batch = current_batch_;
+  const std::size_t my_index = batch->entries.size();
+  batch->entries.push_back(BatchEntry{std::move(renames)});
+
+  const std::size_t max_batch =
+      options_.group_commit_max_batch == 0 ? 1 : options_.group_commit_max_batch;
+  bool committer = false;
+  if (batch->entries.size() >= max_batch) {
+    //  批满：**当前入批者**成为提交者（不能只让领队提交 —— 否则领队被调度延迟时
+    //  批会继续变大，超过 `group_commit_max_batch`）。
+    batch->sealed = true;
+    committer = true;
+    batch_cv_.notify_all();
+  } else if (my_index == 0) {
+    //  领队：等"批满"或"有界窗口到期"或"没有别的写入者还在路上"。
+    const auto deadline = std::chrono::steady_clock::now() + kBatchWaitWindow;
+    batch_cv_.wait_until(lock, deadline, [&] {
+      return batch->sealed || batch_writers_.load() <= batch->entries.size();
+    });
+    if (!batch->sealed) {
+      batch->sealed = true;
+      committer = true;
+    }
+  }
+
+  if (committer) {
+    if (current_batch_ == batch) current_batch_.reset();
+    std::vector<BatchEntry> committed = std::move(batch->entries);
+    batch->entries.clear();
+    lock.unlock();  //  提交期间不持 `batch_mutex_`：新写入者可以开始凑下一批
+    {
+      //  串行化提交（理由见头文件 `batch_commit_mutex_`）：保证"逐批事件序列"可切分。
+      std::lock_guard<std::mutex> commit_lock(batch_commit_mutex_);
+      CommitBatch(committed, &batch->results);
+    }
+    lock.lock();
+    batch->done = true;
+    batch_cv_.notify_all();
+  } else {
+    batch_cv_.wait(lock, [&] { return batch->done; });
+  }
+
+  if (my_index < batch->results.size()) return batch->results[my_index];
+  return Ok();
+}
+
+void PosixBlobStore::CommitBatch(const std::vector<BatchEntry>& entries,
+                                 std::vector<fss::Result<void>>* results) {
+  results->assign(entries.size(), Ok());
+  //  同一批的 rename 目标通常在同一容器目录；`syncfs` 是文件系统级操作，取一个目录
+  //  作为"该文件系统上的 fd"即可覆盖整批（即使跨目录也一样）。
+  std::string directory;
+  if (!entries.empty() && !entries.front().renames.empty()) {
+    const std::string& final_path = entries.front().renames.front().final_path;
+    const auto slash = final_path.rfind('/');
+    if (slash != std::string::npos) directory = final_path.substr(0, slash);
+  }
+
+  //  阶段 ②：一次 `syncfs` 让**全批数据** durable（R1 的前提）。
+  if (Observer() != nullptr) Observer()->OnSyncFilesystem(directory, entries.size());
+  const auto synced = FileSync().SyncFilesystem(directory);
+  if (Metrics() != nullptr) Metrics()->Increment("fss_posix_syncfs_total");
+  if (!synced.ok()) {
+    //  ★ R1：数据未 durable → **一个 rename 都不做**。整批失败 + 清理所有 tmp。
+    for (auto& result : *results) result = synced.error();
+    for (const auto& entry : entries) {
+      for (const auto& rename : entry.renames) (void)::unlink(rename.tmp.c_str());
+    }
+    if (Metrics() != nullptr) Metrics()->Increment("fss_posix_group_commits_total");
+    return;
+  }
+
+  //  阶段 ③：统一 rename（**全批都在 syncfs 之后** —— 顺序不变量 R1）。
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    for (const auto& rename : entries[i].renames) {
+      if (::rename(rename.tmp.c_str(), rename.final_path.c_str()) != 0) {
+        (*results)[i] = ErrFromErrno("rename 失败");
+        //  该对象失败：清掉它**所有** tmp（含刚失败的那条）—— 绝不留下半个对象。
+        //  同批其它对象不受影响，继续按协议提交。
+        for (const auto& other : entries[i].renames) (void)::unlink(other.tmp.c_str());
+        break;
+      }
+      if (Observer() != nullptr) Observer()->OnRename(rename.tmp, rename.final_path);
+    }
+  }
+
+  //  阶段 ④：`fsync(目录)` 让**全批改名** durable（R2）。`sync_dir_after_batch=false`
+  //  会破坏 R2，因此它是**不变量**：组合根对 false 拒绝启动（见 server_main.cpp）。
+  if (options_.sync_dir_after_batch && !directory.empty()) {
+    if (Observer() != nullptr) Observer()->OnDirectorySync(directory);
+    (void)FileSync().SyncDirectory(directory);
+  }
+  if (Metrics() != nullptr) {
+    Metrics()->Increment("fss_posix_group_commits_total");
+    Metrics()->Increment("fss_posix_batch_objects_total", {},
+                         static_cast<std::int64_t>(entries.size()));
+  }
+}
+
+fss::Result<void> PosixBlobStore::WriteTmpFile(const std::string& path,
+                                               std::string_view data) const {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                        static_cast<mode_t>(options_.file_mode));
+  if (fd < 0) return ErrFromErrno("创建临时文件失败");
+  if (!WriteAll(fd, data.data(), data.size())) {
+    const auto error = ErrFromErrno("写入临时文件失败");
+    ::close(fd);
+    (void)::unlink(path.c_str());
+    return error;
+  }
+  if (::close(fd) != 0) {
+    const auto error = ErrFromErrno("close 失败");
+    (void)::unlink(path.c_str());
+    return error;
+  }
   return Ok();
 }
 
@@ -502,7 +712,11 @@ fss::Result<domain::ObjectStat> PosixBlobStore::copy(const domain::ObjectRef& fr
   const bool have_size = ::fstat(in, &source_info) == 0;
   const std::int64_t copied_bytes =
       have_size ? static_cast<std::int64_t>(source_info.st_size) : 0;
+  //  ★ `copy` 路径**不参与** ADR-008 的 P4 组提交（它不走 put 的入批逻辑）。
+  //    因此 `batch_commit=true` 时也按"单文件落盘"处理（安全方向）：少一次摊销，
+  //    但绝不留下"已确认、数据未 durable"的副本。诚实偏差见 ADR-008 §6。
   const bool need_sync =
+      options_.batch_commit ||
       ShouldFsync(options_.fsync_policy, copied_bytes, options_.fsync_threshold_bytes);
 
   bool ok = CopyFd(in, out);

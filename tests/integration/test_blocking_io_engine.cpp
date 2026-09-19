@@ -44,6 +44,11 @@ class CountingFileSync final : public fss::infra::IFileSync {
     ++dir_sync_calls;
     return fss::Ok();
   }
+  //  ADR-008 的 P4 接缝：I/O 引擎不使用批提交，这里只是让替身完整。
+  fss::Result<void> SyncFilesystem(const std::string& directory) override {
+    (void)directory;
+    return fss::Ok();
+  }
   int data_sync_calls = 0;
   int dir_sync_calls = 0;
 };

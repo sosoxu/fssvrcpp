@@ -464,3 +464,190 @@ test cases: 2 | 2 failed      assertions: 3 | 1 passed | 2 failed
 「已读但无效果」**——它们不是接线遗漏，而是**依赖尚未交付的能力**（PG/multi、远端 Storage
 Service 仓储、ADR-006 数据面、ADR-008 P4），逐键理由与下一步登记在 `docs/operations.md` §1.3.3；
 按 C10.11 的判据原文，这属于允许状态（必须给出理由与下一步）。
+
+---
+
+## 13. P9 补交（ADR-008 的 P4 / C9.20 / C9.23）：两阶段批提交的**真实实现**
+
+> 本节的命令、输出与注入都是本轮实测，不是转述。被测二进制：`build/bin/test_posix_batch_commit`
+> 与 `build/bin/test_config_wiring`（后者拉起真实 `build/bin/fss_server`）。
+
+### 13.1 结论（先说答案）
+
+1. **`storage.posix.durability=batch` 从"近似"改成真话**：此前组合根把它映射成
+   `FsyncPolicy::kBySize`（语义 = "小于阈值的文件**不 fsync**，靠批提交摊销"），而**批提交不存在**
+   ⇒ 默认配置（`config/fss.example.json` 的 `durability: "batch"`）下小文件**从不落盘**。
+   现在它是 ADR-008 的 P4：`write all tmp → syncfs → rename all → fsync(dir)`。
+2. **摊销判据是确定性的**（不靠 sleep）：N=8 并发 `put`、批上限 C=4 → `syncfs == 2`（`ceil(8/4)`）；
+   C=1 → `syncfs == 8`（退化即"每文件一次"）；`durability=per_file` → 0 次 `syncfs`（走 `data_sync`）。
+3. **顺序不变量（C9.23）可机器检查且能失败**：任何 `rename` 都不在第一次 `syncfs` 之前；
+   每批 `fsync_dir` 在所有 `rename` 之后。三个 R1 注入都让对应用例失败（§13.4）。
+4. **诚实偏差**：本实现是**并发驱动**的组提交，ADR-008 的 31,478 文件/秒 / 82.3x 是**显式批量写**
+   场景的协议研究数字，**不迁移**——顺序单文件写仍是一文件一次提交（`fss_posix_syncfs_total`
+   与 `fss_posix_group_commits_total` 之比 ≈ 1 可观测）。
+
+### 13.2 实现点（可点击）
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/infra/io/file_sync.h` / `file_sync.cpp` | `IFileSync::SyncFilesystem(dir)`（生产 = `RealFileSync` → `syncfs(2)`），与既有 `DataSync`/`SyncDirectory` 同族的**窄注入接缝** |
+| `src/infra/blob/posix/posix_blob_store.h` | `IBatchCommitObserver`（记录 `write_tmp`/`data_sync`/`syncfs`/`rename`/`fsync_dir`）、`IBatchArrivalGate`（测试门控）；`PosixBlobStoreOptions::{batch_commit,group_commit_max_batch,sync_dir_after_batch,batch_observer,batch_gate,metrics}` |
+| `src/infra/blob/posix/posix_blob_store.cpp` | `JoinBatch`（并发组提交：入批 → 第 1 个入批者为领队等 `kBatchWaitWindow=2ms` 或批满；**填满者**成为提交者，保证不超过上限）、`CommitBatch`（② `syncfs` → ③ 统一 `rename` → ④ `fsync(dir)`；`syncfs` 失败 → 整批不 rename；单条 rename 失败 → 只该对象失败）、`WriteTmpFile`（把 sidecar 也纳入同批） |
+| `src/main/server_main.cpp` | `durability=batch → batch_commit=true`；`group_commit_max_batch` 生效；`sync_dir_after_batch=false` **仍拒绝启动**（R2 不变量）；启动横幅新增 `durability` 行（粒度 + 批上限）；注册 `fss_posix_{syncfs,group_commits,batch_objects}_total` |
+| `tests/integration/test_posix_batch_commit.cpp` | 6 个用例：摊销 == ceil(N/C) / 顺序不变量 / 数据正确性 + 无 `.tmp_` 残留（配**正控**）/ 阈值例外 / `atomic_write=false` / 失败路径 |
+| `tests/integration/test_config_wiring.cpp` | 更新 C10.16 续的守卫用例（`group_commit_max_batch=7` 现在 `--print-config` 退出 0；`sync_dir_after_batch=false` → exit 78 且消息含 `R2`）+ 新增 C9.23 真实进程用例（默认 batch 上传 200 且 `/metrics` 的 `fss_posix_syncfs_total >= 1`） |
+
+### 13.3 实测命令与输出摘要
+
+```
+$ cmake --build build -j4
+  → 0 error（全量重建；测的是 `build/bin/fss_server` 与 test 二进制，不是只重建某个 target）
+
+$ ./build/bin/test_posix_batch_commit
+  → All tests passed (128 assertions in 6 test cases)
+
+$ ./build/bin/test_config_wiring "★ C9.23*"
+  → All tests passed (25 assertions in 1 test case)
+    （其中真实进程 `/metrics` 三段：fss_posix_syncfs_total / group_commits_total /
+      batch_objects_total；runbook 报告里可见上传后 syncfs=2、commits=2、objects=2 ——
+      顺序单文件写下"平均批大小 = 1"正是 §13.1 的诚实偏差）
+
+$ ctest --test-dir build -L phase3
+  → 100% tests passed, 0 tests failed out of 10（含新 test_posix_batch_commit）
+```
+
+`/metrics`（真实进程）片段：
+
+```
+# HELP fss_posix_batch_objects_total 通过两阶段批提交提交的对象数（用于计算平均批大小）
+# TYPE fss_posix_batch_objects_total counter
+fss_posix_batch_objects_total 2
+# HELP fss_posix_group_commits_total POSIX 批提交的批次数（每批 1 次 syncfs + 1 次 fsync(dir)）
+# TYPE fss_posix_group_commits_total counter
+fss_posix_group_commits_total 2
+# HELP fss_posix_syncfs_total POSIX 批提交中 syncfs(2) 的调用次数（ADR-008 的 P4）
+# TYPE fss_posix_syncfs_total counter
+fss_posix_syncfs_total 2
+```
+
+> ⚠️ **踩到并修掉的判据陷阱**：第一次写真实进程断言时用 `find("fss_posix_syncfs_total ")`
+> 解析数值，先命中的是 `# HELP fss_posix_syncfs_total POSIX ...`（帮助文本），`strtol` 返回 **0**
+> → 判据误报失败。改成解析**样本行**（`"\nfss_posix_syncfs_total "`）后通过。这类"解析到了
+> HELP 行而不是样本行"与 phase10 §11.4.1 的"两条防线重合"同族，记在这里备用。
+
+### 13.4 R1 自证（3 个注入 → 对应用例失败 → 完整还原）
+
+每个注入都**全量重建**后再跑；还原后 `grep -rn "R1-INJECT" src/ tests/` **无输出（rc=1）**。
+
+**① 把 `syncfs` 挪到 `rename` 之后**（违反 R1 顺序不变量）→ 顺序判据必须失败：
+
+```
+$ ./build/bin/test_posix_batch_commit "★ C9.23 顺序不变量*"
+/home/ll/fssvrcpp/tests/integration/test_posix_batch_commit.cpp:284: FAILED:
+  REQUIRE( events[i].op != "rename" )
+with expansion:
+  "rename" != "rename"
+with messages:
+  事件序列:
+  i := 16
+  events[i].op := "rename"
+  events[i].path := ".../o_4.bin.tmp.local.1100754.5 -> .../o_4.bin"
+test cases:  1 |  0 passed | 1 failed
+assertions: 28 | 27 passed | 1 failed
+```
+
+**② 让批大小上限被忽略**（`max_batch = 1`，退化成每文件一次提交）→ 摊销判据必须失败：
+
+```
+$ ./build/bin/test_posix_batch_commit "★ C9.23 摊销*"
+/home/ll/fssvrcpp/tests/integration/test_posix_batch_commit.cpp:204: FAILED:
+  REQUIRE( sink.Count("syncfs") == 2 )
+with expansion:
+  8 == 2
+test cases:  1 |  0 passed | 1 failed
+assertions: 28 | 27 passed | 1 failed
+```
+
+**③ 让阈值例外被忽略**（batch 档下大对象也走批、不单独 `fdatasync`）→ 阈值判据必须失败：
+
+```
+$ ./build/bin/test_posix_batch_commit "★ C9.23 阈值例外*"
+/home/ll/fssvrcpp/tests/integration/test_posix_batch_commit.cpp:412: FAILED:
+  REQUIRE( sink.Count("data_sync") == 1 )
+with expansion:
+  0 == 1
+test cases:  1 | 1 failed
+assertions: 6 | 5 passed | 1 failed
+```
+
+**还原后的实测**：
+
+```
+$ grep -rn "R1-INJECT" src/ tests/         # 无输出（rc=1）
+$ ./build/bin/test_posix_batch_commit       # All tests passed (128 assertions in 6 test cases)
+```
+
+> **第一次"全绿"记录**：三个注入都是**第一次就红**（分别命中 §13.4 的三条断言），没有出现
+> phase10 §11.4.1 那种"注入后仍全绿"的判据缺口。顺序判据在实现前特意加了两条互相独立的编码
+> （"所有 `write_tmp` 早于第一次 `syncfs`" + "第一次 `syncfs` 前不得有任何 `rename`"），
+> 因此注入 ① 无法从任何一条缝里溜过去。
+
+### 13.5 未做 / 未验证（如实登记）
+
+1. **真实断电 / 崩溃的耐久性（R1/R2 在断电下成立）：未验证（R4/R8）**。本环境**无 root、
+   不能 `mount`、无电源故障注入**（`dm-log-writes`/`dm-flakey`/VM 快照均不可用）。已验证的是
+   **顺序不变量**（机器可检查，§13.4）——它是 ADR-008 §4.2 的**主要依据**，但**不是**断电实验。
+2. **C9.24（`syncfs` 全局 flush 对他人的影响）：未验证**。无多租户共盘场景；缓解方向（按
+   partition 分盘）依赖的 `storage.posix.one_filesystem_per_partition` **仍未接通**。
+3. **吞吐数字不迁移 / 未重测**：ADR-008 的 31,478 文件/秒、82.3x、383 文件/秒来自**显式批量写**
+   场景；本实现是并发驱动组提交。P9 的 `batch` 基线值（410.1 / 468.6）是在 P4 交付**之前**用
+   `kBySize` 近似测的 → 已在 `docs/operations.md` §5.2、`docs/02-design.md` §13.4、
+   `docs/05-capacity-and-concurrency.md` §1.9 就地标**作废**；本切片**未**跑 `bench_baseline.sh --save`
+   （会覆盖基线；环境漂移已知）。
+4. **`/v2/info` 未暴露耐久性粒度**：C9.20 原文要求"在 `/v2/info` 与运维文档中显式声明"。本轮把
+   粒度与批上限写进了**启动横幅**与 `docs/operations.md` §5.1（真实进程可见），但**没有**给
+   `/v2/info` 加字段——加字段会动契约 §7 的响应形状与等价性断言，超出"把默认耐久性语义修成真话"
+   的定案范围。**登记为未做**。
+5. **批窗口敏感性（推荐默认值与上限）未做**：`kBatchWaitWindow=2ms` 是具名常量（`storage.posix`
+   没有 wait 键，不新增配置键）；只在"批大小上限"一维有确定性判据（N=8/C=4 → 2；C=1 → 8）。
+6. **`copy` 路径不参与批**：`batch_commit=true` 时 `copy` 按"单文件落盘"处理（安全方向），
+   因此 copy 拿不到摊销；已在 ADR-008 §7.2 登记。
+
+### 13.6 三态计数（ADR-008 的 P4 收尾）
+
+`storage.posix.group_commit_max_batch` 从「拒绝启动」移入「生效」（+1）；
+`storage.posix.sync_dir_after_batch` **保持拒绝启动**（`false` → exit 78，理由 = R2 **不变量**，
+不是"未实现"）。三态：**生效 107 / 拒绝启动 18 / 已读但无效果 31 = 156**。
+**未新增/删除任何配置键**（`git status --porcelain config/` 为空）。
+
+### 13.7 父代理独立复核（自己重做顺序不变量注入）
+
+```
+cmake --build build -j4        → 0 error
+ctest --test-dir build -j4     → 100% tests passed, 0 failed out of 82（81 → 82）
+check_docs.sh --selftest       → 13 ADR / 146 门槛 / D1~D5 全过
+git status --porcelain config/ → 空（**未新增/删除任何配置键**；三态 107/18/31）
+grep -rn R1-INJECT src/ tests/ → 无输出
+```
+
+**第一次注入不干净，我如实记录并重做**：先把 `CommitBatch` 里的 `syncfs` 挪到 rename 之后，但**忘了同时挪走观察者事件**，于是每批记录到 **两个** `syncfs` 事件 → 失败的是**摊销计数**断言
+（`REQUIRE(sink.Count("syncfs") == 2)` 等 5 条），**不是**顺序断言。那样的注入只能证明"计数判据有牙齿"。
+
+**干净注入**（唯一一个 `syncfs` 事件，但发生在 `rename` 之后）：
+
+```
+$ ./build/bin/test_posix_batch_commit
+tests/integration/test_posix_batch_commit.cpp:284: FAILED
+test cases:   6 |   5 passed | 1 failed
+assertions: 122 | 121 passed | 1 failed
+# 还原后：All tests passed (128 assertions in 6 test cases)
+```
+
+失败的正是**顺序不变量**那一条：判据按 `syncfs` 位置切批，然后要求"每批 syncfs 之后
+`renames > 0`" —— `syncfs` 后移后该窗口内 **0 个 rename**，`REQUIRE(renames > 0)` 失败
+（`test_posix_batch_commit.cpp:284`）。即：**ADR-008 §5 的 R1（所有 rename 在 syncfs 之后）
+是被真正机器检查的**，而且它与摊销计数是**两条互相独立**的判据（一个坏了不会掩盖另一个）。
+
+**R2 不变量未被放宽**（已核对代码）：`src/main/server_main.cpp:1331` 仍对
+`storage.posix.sync_dir_after_batch=false` 拒绝启动（ADR-008 §5 的 R2：rename 之后必须
+fsync 目录），**没有**为了多一个"生效"键去放宽它 —— 这是本切片刻意保留的拒绝项。

@@ -253,6 +253,14 @@ fss_add_test(test_fsync_policy
   LIBS    fss_blob_posix fss_io
   LABELS  phase3 integration)
 
+# ★ C9.23（ADR-008 的 P4）：两阶段批提交的摊销 / 顺序不变量 / 数据正确性 / 失败路径。
+#   用**注入的事件记录器 + 入批门控**把"批大小"和"顺序"变成确定性判据（不靠 sleep）。
+#   放在 integration（真实文件系统 + 多线程），与 test_fsync_policy 同类。
+fss_add_test(test_posix_batch_commit
+  SOURCES integration/test_posix_batch_commit.cpp
+  LIBS    fss_blob_posix fss_io Threads::Threads
+  LABELS  phase3 integration)
+
 # C3.7：自签传输 token + /v1/transfer 内核
 fss_add_test(test_transfer_endpoint
   SOURCES integration/test_transfer_endpoint.cpp

@@ -193,7 +193,7 @@ scripts/bench_baseline.sh --check    # 退化 >20% 直接失败（退出码 1）
 | --- | --- | --- |
 | 小请求吞吐骤降、p99 出现 ~40 ms 台阶 | `TCP_NODELAY` 没开（或反向代理没开） | 服务端/代理都开；参见 §1.2 的 950x 实测 |
 | 并发上来后吞吐不升反降 | 并发不是越多越好（本机实测 c4 之后不再提升） | 按 `worker_threads`/`max_connections` 与目标硬件重算；先用 `--check` 定位 |
-| 小文件上传只有百级 files/s | 逐文件 `fsync` | 用 `durability=batch`（实测 4.3x）；**不要**用 `never` 承载 staging/persistent 的对象 |
+| 小文件上传只有百级 files/s | 逐文件 `fsync` | 用 `durability=batch`（ADR-008 的两阶段批提交；⚠️ 旧文档里的 4.3x 是在 P4 交付**之前**测的 `kBySize` 近似，**已作废**）；**不要**用 `never` 承载 staging/persistent 的对象 |
 | `503` + `Retry-After` | 在途连接数超上限（背压生效） | 调 `worker_threads`/`max_connections` 或加副本（多实例见 §8） |
 | 基线与本次差异 >20% | **先怀疑测量环境**：批量删除/回写会污染写入点位（实测把 p99 从 7~44 ms 抬到 293~890 ms） | 在空闲机器上重跑；跨会话漂移可达 40%（已登记） |
 

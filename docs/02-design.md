@@ -1128,9 +1128,9 @@ fssvrcpp/
 | 推荐拓扑 | **对象存储模式**：字节走客户端直连预签名 URL，**服务不在字节路径上**，元数据可水平扩展 |
 | 集中存储模式 | 字节经过服务 → 每并发传输占一个线程；小段读实测请求率上限约 **40,000 req/s**（4 KiB 段 35,206 req/s） |
 | DB 固定成本 | 每小文件 2 次事务。WAL + `synchronous=NORMAL` 实测 **25,471 tx/s**；`synchronous=FULL` 仅 **1,219 tx/s**（差 21x） |
-| `fsync` 策略 | 由全局开关改为分级：`fsync_policy: always \| by_size \| never` + `fsync_threshold_bytes`（默认 1 MiB） |
+| `fsync` 策略 | 分级：`storage.posix.durability: batch \| per_file`（+ 旧别名 `never`）+ `fsync_threshold_bytes`（默认 1 MiB）。★ **`batch` = ADR-008 的两阶段批提交**（`write all tmp → syncfs → rename all → fsync(dir)`，本切片交付，C9.23）；**并发**写才有摊销，顺序单文件写仍一文件一次提交 |
 | 审计 / 事件 | 移出请求关键路径 → **异步有界队列**（满则丢弃并计数；审计可配 fail-closed） |
-| 原子写 | 保留 tmp+rename；`fsync` 按上面的分级策略，避免逐文件 fsync |
+| 原子写 | 保留 tmp+rename；`batch` 档按批摊销 `syncfs`、`per_file` 档逐文件 `fdatasync` |
 
 ### 13.4 硬上限（均可在配置中调整，均有"被拒绝"的测试）
 
@@ -1145,11 +1145,13 @@ fssvrcpp/
 | 传输内存预算 | 256 MiB | **拒绝启动**（配置校验） |
 
 > **★ P9 实测（`docs/test-evidence/phase9.md` §9 / `docs/05-capacity-and-concurrency.md` §1.9）**：
-> 上表"传输内存预算 → 拒绝启动"已有正/反两条测试（C9.3 ⑥ / C9.13）；
-> `storage.posix.durability` 的三档在**产品进程**上的端到端差异为
-> `per_file` **96.4** files/s vs `batch` **410.1** vs `never` **426.0**（c4，4 KiB 对象），
-> 即 **4.3×** —— 收益来自"摊销 fsync"而不是"不做耐久性"（ADR-008）。
-> ⚠️ 这些数字来自 WSL2 虚拟盘，只作**本机量级参考**（C9.14 未验证）。
+> 上表"传输内存预算 → 拒绝启动"已有正/反两条测试（C9.3 ⑥ / C9.13）。
+> ⚠️ **`batch` 的数字已作废（无效）**：P9 的三档实测（`per_file` **96.4** files/s vs
+> ~~`batch` **410.1**~~ vs `never` **426.0**，c4 / 4 KiB 对象，~~4.3×~~）是在 ADR-008 的 P4
+> **交付之前**做的 —— 当时 `durability=batch` 被近似成 `FsyncPolicy::kBySize`（语义 = 小文件
+> **不 fsync**、靠**不存在**的批提交摊销），因此那一行测的是"没有 fsync"，不是批提交。
+> 现在 `batch` 是真两阶段批提交（C9.23），**不得**把该值当作本实现的成绩；本切片未重测基线。
+> `per_file` 与 `never` 两档不受 P4 影响，仅作**本机量级参考**（WSL2 虚拟盘，C9.14 未验证）。
 
 **并发上限的取值公式**（取代初版硬编码的 8）：
 
@@ -1208,7 +1210,7 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 | **R-12** | **`TCP_NODELAY` 未开启导致小请求 40ms 停顿** | 高 | **已实测** | 强制 `set_tcp_nodelay(true)` + 阶段 1 门槛断言（含"关闭时必须复现 40ms"的自证测试） | 升级 httplib 后默认值变化；见 `docs/05-capacity-and-concurrency.md` §1.2 |
 | **R-13** | **线程池过小 = 并发硬上限**（默认 15） | 高 | **已实测** | 显式配置 + 控制面/数据面池分离 + 503 背压 + 容量门槛 | 见 §1.3 |
 | **R-14** | 集中存储模式下大文件传输占用线程且无法零拷贝 | 高 | **已实测** | [ADR-006](adr/ADR-006-large-file-data-plane.md)：受控复核 **2.12x ≥ 1.5x → 采纳 sendfile 方向**（实现未交付，落地必须与控制面校验同源、可关闭）；在此之前**显式接受** httplib 路径的带宽/CPU 上限 | 真实存储/网卡上复核 <1.5x；或"复用控制面校验"做不到；或 TLS 成为硬需求（ADR-006 §7） |
-| **R-15** | 小文件逐文件 fsync 把上限压到 ~1.2k/s | 高 | **已实测** | `fsync_policy: by_size` + SQLite `synchronous=NORMAL` + 有界写并发 8 + 批提交 | 见 §1.8 |
+| **R-15** | 小文件逐文件 fsync 把上限压到 ~1.2k/s | 高 | **已实测** | `storage.posix.durability=batch`（ADR-008 的两阶段批提交，C9.23 交付）+ `per_file` 精确档 + SQLite `synchronous=NORMAL` + 有界写并发 8 | 见 §1.8；⚠️ `batch` 的旧实测数字（`kBySize` 近似）已作废，见 §13.4 |
 | **R-16** | 容量测量方法本身不可信（进程内客户端压测） | 中 | **已发生** | 负载生成器必须独立进程 + 绑核；保留错误方法探针作对照；门槛 C9.11 | 见 `docs/appendix/capacity-probe/README.md` |
 | **R-23** | **多实例下 tmp 名冲突导致静默内容错乱** | 高（数据悄悄被换成别人的） | ADR-009 M1；tmp 名含实例标识；门槛 C6.13 | 已实测复现 21/40 |
 | **R-24** | 多实例重复创建（重复记录 + 重复复制） | 高 | ADR-009 M2；幂等键唯一约束 + 原子领取；门槛 C6.11 | 已实测复现 20/20 |
@@ -1240,7 +1242,7 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 | R-12 `TCP_NODELAY` | ✅ | 强制 `set_tcp_nodelay(true)`；H-2/C1.2 自证（关闭时复现停顿）；容量基线顶部标注协议 | — |
 | R-13 线程池=并发上限 | ✅ | `max_connections ≤ worker_threads` 启动校验 + 503 背压（C9.3 ⑤）+ 容量基线（C9.11：c4 之后吞吐不再提升，延迟显著上升） | 生产线程/连接取值需按目标硬件重算（C9.14 未验证） |
 | R-14 大文件零拷贝 | 🟡 | ADR-006 受控复核 **2.12x** → 采纳方向（`docs/test-evidence/phase9-adr006.md`）；落地边界与 4 条重开条件已定 | **sendfile 数据面未实现**（判据只要求定稿）：在此之前**显式接受** httplib 路径的上限 |
-| R-15 逐文件 fsync | ✅ | 三档 `durability`（`FSS_POSIX_DURABILITY`）+ 实测 4.3x（`per_file` 110 → `batch` 469 files/s，C9.15）+ ADR-008 批提交与不变量测试（`db/tests/001`） | 组合根仍用 env 而非 JSON 配置（见 §16.1 末尾"配置接通"） |
+| R-15 逐文件 fsync | ✅ | 三档 `durability` + ADR-008 的**真两阶段批提交**（C9.23：`tests/integration/test_posix_batch_commit.cpp` 的摊销/顺序不变量/失败路径判据；真实进程 `fss_posix_syncfs_total`） | ⚠️ P9 的 4.3x（`per_file` 110 → ~~`batch` 469~~ files/s，C9.15）是在 P4 交付**之前**测的（`kBySize` 近似）→ **`batch` 数字已作废**，本切片未重测；组合根现已接 JSON 配置（切片 1） |
 | R-16 容量测量方法 | ✅ | 独立进程 + 互不重叠绑核 + 每点位 3 次取中位数（`scripts/bench_baseline.sh`）+ 保留错误方法探针（`docs/appendix/capacity-probe/`）+ 门槛 C9.11；本轮新增"批量删除不得与测量并发""报告型点位"两条方法学约束 | 跨会话机器漂移 ≈40%（共享 WSL2 主机）⇒ 20% 判据的判定力受限，已如实登记 |
 | R-23 tmp 名冲突 | ✅ | tmp 名含 `instance_id`+`pid`+计数；`test_posix_tmp_names`（C6.13） | — |
 | R-24 重复创建 | ✅ | 幂等键唯一约束 + `ON CONFLICT` 原子领取（C6.11；`db/tests/003_concurrent_claim.sh` 含自证） | — |
@@ -1254,7 +1256,7 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
 exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、`expiry.*` 接进组合根，
 并把 16 个未实现键改为"非默认值 → 拒绝启动"（后续切片与 C10.16 / C10.16 续 / 切片 4 / 切片 5 / **切片 6a（C10.18）** 继续收敛，当前三态为
-**生效 106 / 拒绝启动 19 / 已读但无效果 31**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
+**生效 107 / 拒绝启动 18 / 已读但无效果 31**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
 ② 多实例相关的 `shared_mount_required`/`one_filesystem_per_partition` 仍不可配（在 §1.3 的
 34 个"已读但无效果"键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
 实现（ADR-006 §6 的门槛）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。

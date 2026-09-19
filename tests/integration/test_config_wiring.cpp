@@ -65,11 +65,13 @@
 namespace {
 
 using fss::test::Authed;
+using fss::test::HttpDo;
 using fss::test::ProcessOutcome;
 using fss::test::RawClient;
 using fss::test::RunServerForExit;
 using fss::test::ServerProcess;
 using fss::test::ServerProcessOptions;
+using fss::test::TargetOf;
 using fss::test::TempDir;
 
 //  让内核分配一个空闲端口（配置文件里要写一个**具体**端口，不能用 0，
@@ -1904,7 +1906,7 @@ TEST_CASE("★ C10.16 续：非法容器名 / 分区级驱动冲突 / 非法权�
     REQUIRE(outcome.output.find("dir_mode") != std::string::npos);
   }
 
-  SECTION("storage.posix.group_commit_max_batch / sync_dir_after_batch 非默认 → exit 78（批提交未实现）") {
+  SECTION("storage.posix.group_commit_max_batch 生效；sync_dir_after_batch=false → exit 78（R2 不变量）") {
     auto cfg_with_posix = [&](const std::string& tag, const std::string& posix_extra) {
       return WriteFile(
           data_dir, tag + ".json",
@@ -1919,18 +1921,23 @@ TEST_CASE("★ C10.16 续：非法容器名 / 分区级驱动冲突 / 非法权�
               "  \"self_signed\": {\"signing_key\": \"c1016-bad\"},\n"
               "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
     };
-    const auto outcome = RunServerForExit(
-        {"--config", cfg_with_posix("bad_batch", "\"group_commit_max_batch\": 7")});
-    CAPTURE(outcome.exit_code, outcome.output);
-    REQUIRE(outcome.exit_code == 78);
-    REQUIRE(outcome.output.find("批提交协议未实现") != std::string::npos);
-    REQUIRE(outcome.output.find("ADR-008") != std::string::npos);
+    //  ★ 本轮（ADR-008 的 P4 已交付）：`group_commit_max_batch` **生效**（不再是拒绝启动）。
+    //    用 `--print-config` 证明它被读取且值可见（退出 0）；真正"生效到磁盘行为"
+    //    由下面的真实进程冒烟（`fss_posix_syncfs_total`）与 test_posix_batch_commit 锁定。
+    const auto accepted = RunServerForExit(
+        {"--config", cfg_with_posix("ok_batch", "\"group_commit_max_batch\": 7"),
+         "--print-config"});
+    CAPTURE(accepted.exit_code, accepted.output);
+    REQUIRE(accepted.exit_code == 0);
+    REQUIRE(accepted.output.find("storage.posix.group_commit_max_batch = 7") != std::string::npos);
 
+    //  `sync_dir_after_batch=false` 仍然拒绝启动：ADR-008 §5 的 R2 是**不变量**。
     const auto outcome2 = RunServerForExit(
         {"--config", cfg_with_posix("bad_syncdir", "\"sync_dir_after_batch\": false")});
     CAPTURE(outcome2.exit_code, outcome2.output);
     REQUIRE(outcome2.exit_code == 78);
-    REQUIRE(outcome2.output.find("批提交协议未实现") != std::string::npos);
+    REQUIRE(outcome2.output.find("sync_dir_after_batch") != std::string::npos);
+    REQUIRE(outcome2.output.find("R2") != std::string::npos);
   }
 }
 
@@ -2119,3 +2126,69 @@ TEST_CASE("★ C10.17：self_signed.{default,max}_ttl_seconds 是自签分支的
   }
 }
 
+
+// =============================================================================
+//  ★ C9.23（ADR-008 的 P4）：真实进程冒烟 —— 默认 `durability=batch` 真的走两阶段批提交
+// =============================================================================
+//  判据（父代理定案）：确认默认配置（`durability=batch`）下真实 HTTP 上传仍 200，
+//  且**默认配置现在真的会 syncfs**。
+//  ★ 为什么用 `/metrics` 而不是"进程内事件接缝"：事件接缝只能在**同进程**观察；
+//    跨进程的 strace 在本环境不稳（且会与 ctest 并发互相干扰）。组合根已把批提交的
+//    `syncfs`/批次数接进 `fss_*` 指标族 —— 于是"真实二进制里 syncfs 真的发生了"
+//    有了可证事实，而不是靠推断（这正是 AGENTS「组合根没读的配置 = 不存在的配置」的同族）。
+// =============================================================================
+TEST_CASE("★ C9.23 真实进程：默认 durability=batch 下上传 200 且 /metrics 显示 syncfs > 0",
+          "[phase10][config][c9.23]") {
+  TempDir cfg_dir("c923_batch_proc");
+  TempDir data_dir("c923_batch_proc_data");
+  const int port = FreePort();
+  REQUIRE(port > 0);
+  const std::string config = WriteFile(
+      cfg_dir, "batch.json",
+      "{\n"
+      "  // 默认耐久性档位：batch = ADR-008 的两阶段批提交\n"
+      "  \"server\": {\"http\": {\"bind\": \"127.0.0.1\", \"port\": " + std::to_string(port) +
+          "}},\n"
+          "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child("store") +
+          "\", \"durability\": \"batch\"}},\n"
+          "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child("loc.db") + "\"}},\n"
+          "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child("meta.db") + "\"}},\n"
+          "  \"self_signed\": {\"signing_key\": \"c923-batch-secret\", \"public_base_url\": "
+          "\"http://127.0.0.1:" + std::to_string(port) + "/api/file\"},\n"
+          "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+
+  ServerProcess server(SelfContainedOptions({"--config", config}));
+  REQUIRE(WaitReady(server.http_port()));
+
+  //  上传一个**小**对象（< fsync_threshold_bytes → 走批提交）。
+  const auto upload = HttpDo(server.http_port(), "GET", "/api/file/v2/files/uploadURL", Authed());
+  REQUIRE(upload.status == 200);
+  const auto parsed = fss::json::ParseObject(upload.body);
+  REQUIRE(parsed.ok());
+  const std::string signed_url =
+      parsed.value()["Location"]["SignedURL"].get<std::string>();
+  const std::string body = std::string(128, 'b');
+  const auto put = HttpDo(server.http_port(), "PUT", TargetOf(signed_url), Authed(), body);
+  CAPTURE(put.body);
+  REQUIRE(put.status == 200);  // 默认配置下真实 HTTP 上传仍然 200
+
+  //  ★ 真实二进制里 syncfs 真的发生了：`/metrics` 上该计数 > 0。
+  const auto metrics = HttpGet(server.http_port(), "/metrics");
+  REQUIRE(metrics.transport_ok);
+  REQUIRE(metrics.status == 200);
+  CAPTURE(metrics.body);
+  REQUIRE(metrics.body.find("fss_posix_syncfs_total") != std::string::npos);
+  //  解析**样本行**（不是 HELP 行）：样本行前面是换行。HELP 行是
+  //  `# HELP fss_posix_syncfs_total POSIX ...`，如果只找 `fss_posix_syncfs_total `
+  //  会先命中 HELP 行、把帮助文本当数字（实测踩到：strtol 返回 0，判据误报失败）。
+  const std::string kSample = "\nfss_posix_syncfs_total ";
+  const std::size_t name = metrics.body.find(kSample);
+  REQUIRE(name != std::string::npos);
+  const long value =
+      std::strtol(metrics.body.c_str() + name + kSample.size(), nullptr, 10);
+  INFO("fss_posix_syncfs_total = " << value);
+  REQUIRE(value >= 1);
+  //  正控：批次数与对象数也在动（不是只注册了一个恒 0 的家族）
+  REQUIRE(metrics.body.find("fss_posix_group_commits_total") != std::string::npos);
+  REQUIRE(metrics.body.find("fss_posix_batch_objects_total") != std::string::npos);
+}

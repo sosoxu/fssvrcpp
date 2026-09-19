@@ -38,6 +38,13 @@ class IFileSync {
   virtual fss::Result<void> DataSync(int fd) = 0;
   //  把目录项刷到持久介质（对应"打开目录 + fsync"；rename 之后必须做）
   virtual fss::Result<void> SyncDirectory(const std::string& directory) = 0;
+  //  ★ ADR-008 的 P4（两阶段批提交）阶段 B：对目录所在的**整个文件系统**做一次
+  //    `syncfs(2)`，让**全批**的 `.tmp_*` 数据一起 durable。这是"一次系统调用摊销
+  //    整批数据 fdatasync"的唯一手段；它必须在**所有 rename 之前**发生（R1 不变量）。
+  //  ⚠️ `syncfs` 是**文件系统级**操作：多实例/多业务共盘时会牵连他人的写入
+  //    （ADR-008 §3.2 / 未验证项 C9.24）。`directory` 只是用来拿到该文件系统上的
+  //    一个 fd，不表达"只同步这个目录"。
+  virtual fss::Result<void> SyncFilesystem(const std::string& directory) = 0;
 };
 
 //  生产实现。失败时把 errno 映射成结构化错误（不抛异常）。
@@ -45,6 +52,7 @@ class RealFileSync final : public IFileSync {
  public:
   fss::Result<void> DataSync(int fd) override;
   fss::Result<void> SyncDirectory(const std::string& directory) override;
+  fss::Result<void> SyncFilesystem(const std::string& directory) override;
 };
 
 //  按策略判断"这次写入是否需要 DataSync"

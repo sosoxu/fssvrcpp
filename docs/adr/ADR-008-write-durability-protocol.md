@@ -1,6 +1,7 @@
 # ADR-008：小文件写入的耐久性协议 —— 两阶段批提交（同步先行，改名后置）
 
-- 状态：**已采纳（Accepted）**，协议已通过顺序不变量验证
+- 状态：**已采纳（Accepted）**，协议已通过顺序不变量验证；**P4 已实现**（并发驱动的组提交，
+  见 §7；真实断电语义仍**未验证**，见 §7.3）
 - 日期：2025
 - 相关：`docs/05-capacity-and-concurrency.md`、`docs/adr/ADR-007-async-and-coroutines.md` §8、
   `docs/appendix/group-commit-durability/`
@@ -196,11 +197,63 @@ fdatasync(3)                                     ← 全批改名落盘
 
 - [ ] 门槛 **C9.20**（本 ADR 的验证已部分完成）：把 `model_check2.py` 的顺序不变量检查
       **固化为 CI 测试**（对新实现产出的 strace 跟踪做机器检查），并要求 P4 顺序
-- [ ] 门槛 **C9.23**：实现"顺序不变量"回归测试 —— 故意把 `syncfs` 移到 `rename` 之后，
+- [x] 门槛 **C9.23**：实现"顺序不变量"回归测试 —— 故意把 `syncfs` 移到 `rename` 之后，
       测试**必须**失败（自证手法，参照 C1.2b）
+      —— **已交付（本切片）**。判据在 `tests/integration/test_posix_batch_commit.cpp`：
+      ① 摊销（并发 N=8 / C=4 → `syncfs == 2`；C=1 → == 8；`per_file` → 0）；
+      ② 顺序不变量（任何 `rename` 都不在第一次 `syncfs` 之前；`fsync_dir` 在每批所有
+      `rename` 之后）；③ 数据正确性 + 无 `.tmp_*` 残留（配正控）；④ 阈值例外；
+      ⑤ `atomic_write=false` 不入批；⑥ 失败路径。R1 自证 3 个注入都让对应用例失败（证据：
+      [`docs/test-evidence/phase9.md`](../test-evidence/phase9.md) §13）。实现状态见 §7。
 - [ ] 门槛 **C9.24**：`syncfs` 全局 flush 的影响评估 —— 在多租户共盘场景下测量它对其他写入的
-      干扰；必要时默认改为 `per_file` 或要求按 partition 分盘
+      干扰；必要时默认改为 `per_file` 或要求按 partition 分盘。⚠️ **本环境无法测**（见 §7.3）
 - [ ] 门槛 **C9.25**：GC 对残留 `.tmp_*` 的清理测试（含"绝不视为有效对象"的反向测试）
-- [ ] 批大小与耐久性窗口的敏感性测试，确定推荐默认值与上限
+      —— **已交付（P9）**：`IBlobStore::remove_temp_files` + `tests/hardening/test_metrics_and_gc.cpp`
+- [ ] 批大小与耐久性窗口的敏感性测试，确定推荐默认值与上限。⚠️ 本实现的批形成是
+      **并发驱动**的组提交，窗口是具名常量 `kBatchWaitWindow = 2 ms`（不是配置键），
+      敏感性测试只在"批大小上限 `group_commit_max_batch`"这一维可做（见 §7）
 - [ ] 在目标部署环境尝试真实断电/VM 快照测试（若可获得 root 或虚拟化能力）；否则在文档中
       维持"**真实断电未验证**"的标注
+
+---
+
+## 7. 实现状态（P4 **已实现**：并发驱动的组提交）
+
+### 7.1 结论
+
+- `storage.posix.durability=batch` 现在是**真两阶段批提交**：`write all tmp → syncfs →
+  rename all → fsync(dir)`。此前组合根把它**近似**成 `FsyncPolicy::kBySize`，而该策略的语义
+  是"小于阈值的文件**不 fsync**、靠批提交摊销"——**批提交根本不存在**，于是默认配置下
+  小文件**从不落盘**（崩溃可能丢已确认的写入）。这是"默认路径的耐久性承诺与实现不符"，
+  已按 §5 的 R1/R2 修正（推翻记录见 `docs/00-final-design.md` §5）。
+- 实现位置：`src/infra/blob/posix/posix_blob_store.cpp`（`JoinBatch` / `CommitBatch` /
+  `WriteTmpFile`）与 `src/infra/io/file_sync.cpp`（`RealFileSync::SyncFilesystem` →
+  `syncfs(2)`）；接缝声明在 `posix_blob_store.h`（`IBatchCommitObserver` /
+  `IBatchArrivalGate`）与 `file_sync.h`（`IFileSync::SyncFilesystem`）。
+- 配置映射（`src/main/server_main.cpp`）：`durability=batch → batch_commit=true` +
+  `group_commit_max_batch` + `sync_dir_after_batch`；`per_file`/`never` 逐字保持既有语义；
+  `sync_dir_after_batch=false` **拒绝启动**（R2 是不变量，schema 也写明必须 true）。
+- 可观测：`fss_posix_{syncfs,group_commits,batch_objects}_total`（真实进程 `/metrics`）。
+
+### 7.2 批如何形成 / 领队做什么 / 失败规则
+
+| 项 | 实现 |
+| --- | --- |
+| 批的形成 | **并发驱动的组提交**（没有独立的批量写 API，也没有调用方写过批）：每个 `put` 先写自己的 `.tmp_*`（+ sidecar 的 tmp），再入批；把批填满 `group_commit_max_batch` 的**那个入批者**成为提交者（因此批不会超过上限）；本批第 1 个入批者（领队）等"批满"或"有界窗口到期"（`kBatchWaitWindow = 2 ms`，具名常量，理由见源码注释）或"没有别的写入者" |
+| 领队/提交者做什么 | ② 一次 `syncfs(dirfd)` 让全批数据 durable → ③ 统一 `rename`（对象本体 + sidecar）→ ④ `fsync(目录)`。提交串行化（`batch_commit_mutex_`），保证逐批事件序列可切分 |
+| `syncfs` 失败 | **整批失败、一个 rename 都不做**（R1：宁可没有对象，也不留"可见但可能残缺"的对象），并清理全部 tmp |
+| 某个 rename 失败 | **只有那个对象**失败（`put` 返回错误给它的调用者），同批其它对象照常提交；失败对象的所有 tmp 被清理 |
+| `atomic_write=false` | **不参与批**（没有 rename 阶段）：逐字保持"直接写目标、失败删目标"的旧直写语义 |
+| `>= fsync_threshold_bytes` | **强制单独 `fdatasync`**（不靠批摊销）：单文件 `fdatasync → rename → fsync(dir)`，与 schema 描述一致 |
+| `copy` 路径 | **不参与批**（不走 put 的入批逻辑）；`batch_commit=true` 时按"单文件落盘"处理（安全方向），因此 copy 拿不到摊销 |
+
+### 7.3 本实现的**未验证项**（不许含糊）
+
+| 项 | 状态 | 为什么本环境测不了 |
+| --- | --- | --- |
+| **power-loss durability（R1/R2 在真实断电下成立）** | **未验证（R4/R8）** | 无 root、不能 `mount`、无电源故障注入（`dm-log-writes`/`dm-flakey`/VM 快照都不可用）。已验证的是**顺序不变量**（机器可检查）——它是安全性的**主要依据**（ADR-008 §4.2），但**不是**断电实验 |
+| §4.3 的 `SIGKILL` 可见性证据 | **属于协议研究，不是对本实现的验证** | `SIGKILL` 不丢页缓存；它只证明 `tmp+rename` 的可见性原子性（R3） |
+| **C9.24（`syncfs` 全局 flush 对他人的影响）** | **未验证** | 无多租户共盘场景可测；缓解方向（按 partition 分盘）依赖的 `storage.posix.one_filesystem_per_partition` 未接通 |
+| **吞吐数字** | **不迁移** | §3/§4 的 31,478 文件/秒、82.3×、383 文件/秒来自**显式批量写** 5000 文件 / 批 500 场景；本实现是并发驱动的组提交，**顺序单文件写仍是一文件一次提交**（拿不到摊销），只有**并发**写才有摊销。不得把 ADR 数字当成本实现成绩；本切片未重测基线 |
+| **批窗口敏感性（推荐默认值与上限）** | **未做** | 窗口是具名常量而非配置键；只在"批大小上限"一维上可由 `tests/integration/test_posix_batch_commit.cpp` 覆盖（N=8/C=4 → 2；C=1 → 8） |
+

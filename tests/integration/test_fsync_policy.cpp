@@ -41,8 +41,15 @@ class CountingFileSync final : public IFileSync {
     ++dir_sync_calls;
     return fss::Ok();
   }
+  //  ADR-008 的 P4 接缝：本用例不进入批提交路径，因此它**不应**被调用。
+  fss::Result<void> SyncFilesystem(const std::string& directory) override {
+    (void)directory;
+    ++syncfs_calls;
+    return fss::Ok();
+  }
   int data_sync_calls = 0;
   int dir_sync_calls = 0;
+  int syncfs_calls = 0;
 };
 
 ObjectRef Ref(const std::string& key) {

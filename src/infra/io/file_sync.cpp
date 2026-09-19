@@ -46,6 +46,23 @@ fss::Result<void> RealFileSync::SyncDirectory(const std::string& directory) {
   return Ok();
 }
 
+//  ADR-008 的 P4 阶段 B：`syncfs(2)` 是**文件系统级** flush。
+//  `directory` 只用来取得该文件系统上的任意一个 fd（Linux 的 `syncfs` 按 fd 所在的
+//  superblock 工作，不按目录）。真实实现必须走系统调用，不能"假装成功"：一次失败的
+//  `syncfs` 意味着**全批数据未 durable** → 调用方必须放弃整批的 rename（R1）。
+fss::Result<void> RealFileSync::SyncFilesystem(const std::string& directory) {
+  const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) return ErrFromErrno("打开目录失败");
+  const int rc = ::syncfs(fd);
+  const int saved = errno;
+  ::close(fd);
+  if (rc != 0) {
+    errno = saved;
+    return ErrFromErrno("syncfs 失败");
+  }
+  return Ok();
+}
+
 bool ShouldFsync(FsyncPolicy policy, std::int64_t object_bytes, std::int64_t threshold_bytes) {
   switch (policy) {
     case FsyncPolicy::kAlways:

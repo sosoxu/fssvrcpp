@@ -787,9 +787,9 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase9 --output-on
 | **C9.17** | **异步化基线**：测量并记录"线程模型 vs 协程模型"的关键指标（吞吐 / RSS / 可达并发），作为 ADR-007 触发条件 T1–T3 的基线；在**真实存储**（非定时器、非稀疏文件）上复核 ADR-007 §2.3 的结论 |
 | **C9.18** | **io_uring 可用性验证**：在**目标部署内核**上验证（本机为 WSL2，**不得作为判定依据**）；输出"可用/不可用"两种情形下的数据面异步方案 |
 | **C9.19** | ADR-007 触发条件评估：明确记录 T1–T3 是否达成；若达成则启动数据面异步化（第 2 步），否则记录为"未触发"及复核时间点 |
-| **C9.20** | **组提交耐久性语义**：实现 ADR-008 的**两阶段批提交**（`write all tmp → syncfs → rename all → fsync(dir)`）；在 `/v2/info` 与运维文档中显式声明耐久性粒度（批级/单文件级）与批大小 |
-| **C9.21** | **`fsync` 摊销收益的端到端验证**：同一负载下对比 `durability` 各档位。**实测参考（ADR-008，安全协议）**：每文件 `fdatasync`+每文件 `fsync(dir)` = 383 文件/s；每文件 `fdatasync`+每批 `fsync(dir)` = 784；**两阶段批提交 = 31,478**；不安全方案 35,389（**禁止使用**） |
-| **C9.23** | **写入顺序不变量回归测试（自证）**：把 `syncfs` 故意移到 `rename` 之后 → 顺序检查**必须失败**；恢复 → 必须通过。依据：ADR-008 §4.2 的 R1 不变量 |
+| **C9.20** | **组提交耐久性语义**：实现 ADR-008 的**两阶段批提交**（`write all tmp → syncfs → rename all → fsync(dir)`）；在 `/v2/info` 与运维文档中显式声明耐久性粒度（批级/单文件级）与批大小 —— **已交付（本轮 / ADR-008 的 P4）**：`PosixBlobStore::JoinBatch/CommitBatch` + `IFileSync::SyncFilesystem`；`storage.posix.group_commit_max_batch` 生效；粒度与批上限在**启动横幅**（`durability` 行）与 `docs/operations.md` §5.1 显式声明。⚠️ `/v2/info` **未加字段**（未做项，见 `docs/test-evidence/phase9.md` §13.5） |
+| **C9.21** | **`fsync` 摊销收益的端到端验证**：同一负载下对比 `durability` 各档位。**实测参考（ADR-008，安全协议）**：每文件 `fdatasync`+每文件 `fsync(dir)` = 383 文件/s；每文件 `fdatasync`+每批 `fsync(dir)` = 784；**两阶段批提交 = 31,478**；不安全方案 35,389（**禁止使用**）。⚠️ 那些数字来自**显式批量写**场景，**不迁移**到本实现（并发驱动组提交）；P9 的 `batch` 基线值已作废，本切片未重测 |
+| **C9.23** | **写入顺序不变量回归测试（自证）**：把 `syncfs` 故意移到 `rename` 之后 → 顺序检查**必须失败**；恢复 → 必须通过。依据：ADR-008 §4.2 的 R1 不变量 —— **已交付（本轮）**：`tests/integration/test_posix_batch_commit.cpp`（摊销 / 顺序不变量 / 数据正确性含正控 / 阈值例外 / `atomic_write=false` / 失败路径）+ 3 个 R1 注入实测（`docs/test-evidence/phase9.md` §13.4） |
 | **C9.24** | **`syncfs` 全局 flush 的影响评估**：多租户共盘场景下测量它对其他写入的干扰；必要时默认改为 `per_file` 或要求按 partition 分盘 |
 | **C9.25** | **GC 对残留 `.tmp_*` 的清理**：必须能识别并删除；且有"绝不把 `.tmp_*` 视为有效对象"的反向测试 |
 | **C9.26** | **多实例端到端**：2 个真实进程 + 共享 PG + 共享目录，跑完整 上传→登记→下载→删除 流程，并注入实例崩溃（验证 `claiming` 记录的租约回收） |
@@ -798,7 +798,7 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase9 --output-on
 | **C9.29** | **io_uring 收益复核（U2/U4）**：在**目标存储**（NVMe/HDD/NFS）上复测 io_uring vs 阻塞线程池。HDD/NFS（高延迟）场景若差异 ≥1.5x 则建议启用；NVMe 级别不足则维持默认 |
 | **C9.30** | `/v2/info` 与指标正确暴露 `ioEngine` / `ioUringAvailable`；在**不允许 io_uring 的部署**里所有 OSDU 端点行为不变 |
 | **C9.22** | **真实存储上重测 I/O 延迟分布**（NVMe/HDD/NFS，非 WSL2 虚拟盘），替换 `docs/appendix/posix-io-probe/RESULTS.txt` 的量级参考；HDD/NFS 延迟高 1–2 个数量级，并发需求完全不同 |
-| **C9.31** | **（P9 补交，P10 期间完成）GC 的 HTTP 按需端点**：`POST {base_path}/v2/gc:run`，授权 **`service.file.admin`** 且**不需要** `data-partition-id`（401/403/200）；响应 = `GcReport` 的字段（snake_case）+ 运行态 `partition` / `scheduled`；**有效 dry-run = 配置 `gc.dry_run` ‖ 请求 `?dryRun=true`**（请求只能更保守，**没有**"强制真删"的参数）；`GcTask::Run` 自带**单飞护栏**（已在跑 → `kUnavailable` → **503**，**不排队、不并行**；是 `GcTask` 的**通用**性质，周期调度与端点共享）；`gc.enabled=false` 时端点**仍可用**且报告 `scheduled=false`；会删数据的动作写**审计**（`operation=gcRun`，成功/失败两侧）；`/metrics` 的 `fss_gc_runs_total` 真的涨；**不新增任何配置键**（三态保持 106/19/31）。R1 自证：①去掉单飞护栏、②忽略请求的 `?dryRun=true`、③让端点免鉴权 —— 三种错误实现都必须让对应用例**失败** |
+| **C9.31** | **（P9 补交，P10 期间完成）GC 的 HTTP 按需端点**：`POST {base_path}/v2/gc:run`，授权 **`service.file.admin`** 且**不需要** `data-partition-id`（401/403/200）；响应 = `GcReport` 的字段（snake_case）+ 运行态 `partition` / `scheduled`；**有效 dry-run = 配置 `gc.dry_run` ‖ 请求 `?dryRun=true`**（请求只能更保守，**没有**"强制真删"的参数）；`GcTask::Run` 自带**单飞护栏**（已在跑 → `kUnavailable` → **503**，**不排队、不并行**；是 `GcTask` 的**通用**性质，周期调度与端点共享）；`gc.enabled=false` 时端点**仍可用**且报告 `scheduled=false`；会删数据的动作写**审计**（`operation=gcRun`，成功/失败两侧）；`/metrics` 的 `fss_gc_runs_total` 真的涨；**不新增任何配置键**（当时三态保持 106/19/31；ADR-008 的 P4 交付后为 107/18/31）。R1 自证：①去掉单飞护栏、②忽略请求的 `?dryRun=true`、③让端点免鉴权 —— 三种错误实现都必须让对应用例**失败** |
 
 **退出条件**：C9.1–C9.10 满足（含 P9 补交的 **C9.31**），证据写入 `docs/test-evidence/phase9.md`。
 
@@ -995,7 +995,7 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
 切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）、切片 4（数据面 PUT 上限 + SQLite PRAGMA）
 与切片 5（`self_signed` 三键：`key_id` + 自签 TTL 上界）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态：**生效 106 / 拒绝启动 19 / 已读但无效果 31**（`docs/operations.md` §1.3）。
+三态：**生效 107 / 拒绝启动 18 / 已读但无效果 31**（`docs/operations.md` §1.3；ADR-008 的 P4 交付后）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
@@ -1158,7 +1158,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   组合根三分支：`log`（默认，既有 `LogEventPublisher` 逐字不变）/ `webhook` / `none`（内联 `NoopEventPublisher`，  **显式关闭**）；横幅打印 publisher/端点/timeout/topic（**不打印密钥**）。
   `src/app/usecases/usecases.cpp` 的 `PublishStatus` 补上 `record_id`（第 10 步/幂等命中路径带真实 id；  第 1 步 IN_PROGRESS 发生在建记录前 → 空），使 `statusChanged.body.recordId` 与上游形状一致。
   用例：`tests/integration/test_webhook_publisher.cpp`（真实进程 + `mock_validators.py --mode webhook`；  `--observe-file` 新增 `bodies` 列表断言两个 kind 都发了）+ `tests/unit/test_composition_root_guard.cpp` 清单加   `WebhookEventPublisher`。**未交付**：异步有界发布队列、重试退避、投递保证、与真实消息总线/中间件联调。
-* 三态计数：**生效 106 / 拒绝启动 19 / 已读但无效果 31 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* 三态计数：**生效 107 / 拒绝启动 18 / 已读但无效果 31 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
   其中「拒绝启动」+1 来自 C10.18 的**伴随更正**（`auth.remote_entitlements.fail_closed`），
   与"6 个键接通"是两件事（落点不同：一个进「生效」、一个进「拒绝启动」）。
 

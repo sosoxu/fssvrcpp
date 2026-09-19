@@ -160,7 +160,7 @@ target_link_libraries(fss_io PUBLIC fss_domain fss_sys)
 add_library(fss_blob_posix STATIC
   infra/blob/posix/posix_blob_store.cpp)
 target_include_directories(fss_blob_posix PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(fss_blob_posix PUBLIC fss_domain fss_crypto fss_fs fss_io)
+target_link_libraries(fss_blob_posix PUBLIC fss_domain fss_crypto fss_fs fss_io fss_metrics)
 
 # S3 驱动（P5）：SigV4 签名器 + S3BlobStore（逐步补齐）
 add_library(fss_blob_s3 STATIC
