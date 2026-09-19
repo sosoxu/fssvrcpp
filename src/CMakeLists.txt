@@ -213,3 +213,35 @@ add_library(fss_metadata_memory STATIC
 target_include_directories(fss_metadata_memory PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # IClock 声明在 L1（fss_time），元数据仓储用它记录 created_at
 target_link_libraries(fss_metadata_memory PUBLIC fss_domain fss_time)
+
+# -----------------------------------------------------------------------------
+#  L2：PostgreSQL 共享状态（ADR-009）—— 多实例的位置仓储 + 在途租约
+#    ★ libpq 是**可选**依赖（与上面的 `find_package(CURL QUIET)` + `FSS_WITH_LIBCURL`
+#      同一套写法）：找不到就**什么都不建、什么都不定义**，保证默认构建在"机器上
+#      没有任何 PostgreSQL"时照样成立（未来组合根对 `deployment.mode=multi` fail-closed）。
+#    ★ `FSS_HAVE_LIBPQ` 用 `CACHE INTERNAL` 发布（不是普通变量）：tests/ 是**后**加入的
+#      子目录，普通变量虽然当前能看见，但一旦子目录顺序变化就会静默失效 ——
+#      缓存变量让"有没有 libpq"这件事与子目录顺序无关。
+# -----------------------------------------------------------------------------
+find_package(PostgreSQL QUIET)
+if(PostgreSQL_FOUND)
+  # libpq 薄封装：RAII 结果/连接、有界连接池、数据库时钟、SQLSTATE → ErrorKind 映射
+  add_library(fss_pg STATIC
+    infra/postgres/pg_connection.cpp)
+  target_include_directories(fss_pg PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(fss_pg PUBLIC fss_domain PostgreSQL::PostgreSQL)
+  #  发布给 tests/：PG 仓储的契约测试必须能看见"libpq 真的可用"
+  target_compile_definitions(fss_pg PUBLIC FSS_HAVE_LIBPQ=1)
+  set(FSS_HAVE_LIBPQ 1 CACHE INTERNAL "libpq (PostgreSQL::PostgreSQL) found: PG-backed targets built")
+else()
+  set(FSS_HAVE_LIBPQ 0 CACHE INTERNAL "libpq (PostgreSQL::PostgreSQL) not found: PG-backed targets skipped")
+endif()
+
+if(FSS_HAVE_LIBPQ)
+  # 位置仓储 + 租约：与内存/SQLite 实现共用 tests/framework/port_contract.h 的同一套断言
+  add_library(fss_location_postgres STATIC
+    infra/location/postgres/postgres_location_repository.cpp
+    infra/location/postgres/postgres_lease_repository.cpp)
+  target_include_directories(fss_location_postgres PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(fss_location_postgres PUBLIC fss_domain fss_json fss_pg)
+endif()

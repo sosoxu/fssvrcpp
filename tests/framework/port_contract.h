@@ -58,9 +58,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -493,9 +497,14 @@ inline void RequireSameLocation(const domain::FileLocation& got,
   REQUIRE(json::Dump(got.extra) == json::Dump(want.extra));
 }
 
-inline void CheckLocationRepositoryContract(domain::IFileLocationRepository& repo) {
-  const std::string pa = "contract-part-a";
-  const std::string pb = "contract-part-b";
+inline void CheckLocationRepositoryContract(domain::IFileLocationRepository& repo,
+                                            const std::string& partition_prefix = "contract-part") {
+  //  ★ `partition_prefix`（默认值保持既有调用点逐字不变）让**共享 PG 上的测试**可以用
+  //    `pgtest-<pid>-…` 这样每次运行都唯一的租户名，从而"可重跑 + 不打扰别人的数据"；
+  //    内存/SQLite 实现每次都是全新状态，沿用默认前缀即可。
+  const std::string pa = partition_prefix + "-a";
+  const std::string pb = partition_prefix + "-b";
+  const std::string pe = partition_prefix + "-empty";
 
   SECTION("Save/Find：字段逐一往返（含 extra 开放字段）") {
     auto loc = MakeLocation("file-1", "/u/1/ts/file-1", domain::StorageZone::kStaging, 100, 100);
@@ -590,7 +599,7 @@ inline void CheckLocationRepositoryContract(domain::IFileLocationRepository& rep
     REQUIRE(b.file_id == "shared-id");
 
     // 跨租户不得命中
-    ContractError(repo.Find("contract-part-empty", "shared-id"), fss::ErrorKind::kNotFound,
+    ContractError(repo.Find(pe, "shared-id"), fss::ErrorKind::kNotFound,
                   "第三个租户不得看到 A/B 的记录");
     // 删除 A 不影响 B
     ContractOk(repo.Delete(pa, "shared-id"), "Delete A");
@@ -677,7 +686,7 @@ inline void CheckLocationRepositoryContract(domain::IFileLocationRepository& rep
     REQUIRE(empty.records.empty());
     domain::LocationQuery missing_partition;
     missing_partition.limit = 100;
-    const auto missing = ContractOk(repo.List("contract-part-empty", missing_partition),
+    const auto missing = ContractOk(repo.List(pe, missing_partition),
                                     "List 不存在的 partition → 空页");
     REQUIRE(missing.total == 0);
 
@@ -908,6 +917,184 @@ inline void CheckMetadataRepositoryContract(domain::IMetadataRepository& repo,
 
     ContractOk(repo.Delete(pa, pa + ":dataset--File.Generic:g1"), "Delete A");
     ContractOk(repo.GetLatestByFileSource(pb, "/shared/fs"), "删除 A 不影响 B");
+  }
+}
+
+// =============================================================================
+//  四、ILeaseRepository 契约（memory / postgres 共用）
+// =============================================================================
+//  语义登记（依据 ADR-009 §4.3 与 `ports.h` 的端口注释；实现方必须遵守）：
+//    Acquire(partition, lease_key, owner, ttl)
+//        · 键不存在 或 **已过期** → 插入/接管，`expires_at` = now() + ttl
+//        · 键存在且**未过期**     → kUnavailable（"租约已被占用"）
+//        · ttl <= 0               → 立即过期（因此可被立刻重新 Acquire / 被 ClaimExpired 领走）
+//    Renew / Release
+//        · 不存在                 → kNotFound
+//        · 是别人的租约           → kPermissionDenied（**不是** kNotFound —— R16：
+//                                    "不存在"与"不是你的"必须可区分，否则调用方无法排障）
+//    ClaimExpired(partition, limit, claimant)
+//        · limit <= 0             → 空结果（不是错误）
+//        · 只领取 `expires_at <= now()` 的行；原子地把 owner 改成 claimant 并把
+//          expiry 推后（内存实现与 PG 实现都是 60 s），因此不会被立即重复领取
+//        · 并发领取者之间**不得重复领取同一条**
+//
+//  ★ 移植性约定（否则同一套断言无法同时跑内存与 PG 实现）
+//    ① `Lease::file_id` / `Lease::file_source` 的取值范围各实现不同：内存实现把端口
+//       参数当成 `file_id`（`file_source` 留空），PG 实现的表身份列是 `file_source`
+//       （`file_id` 由 `LEFT JOIN file_locations` 反解，可能为空）。因此本套件只用
+//       辅助函数 `LeaseContractKey()` 判断"领到的是哪一条租约"，**不直接对这两个
+//       字段断言**。
+//    ② 时间源不同：内存实现用注入的 `IClock`，PG 实现用数据库 `now()`。本套件用传入的
+//       `clock` 只做"expiry 落在 now + ttl 附近"的上下界断言（±5 s 容差），
+//       不假设能拨动数据库时钟。
+inline std::string LeaseContractKey(const domain::ILeaseRepository::Lease& lease) {
+  //  两个字段里哪个是"租约键"由实现决定（见上）；至少一个是键。
+  return lease.file_source.empty() ? lease.file_id : lease.file_source;
+}
+
+inline void CheckLeaseContract(domain::ILeaseRepository& repo, const fss::IClock& clock,
+                               const std::string& partition_prefix = "contract-lease") {
+  using domain::ILeaseRepository;
+  const std::string owner = partition_prefix + "-owner";
+  const std::string other = partition_prefix + "-other";
+  const auto contains = [](const std::vector<ILeaseRepository::Lease>& leases,
+                           const std::string& key) {
+    for (const auto& lease : leases) {
+      if (LeaseContractKey(lease) == key) return true;
+    }
+    return false;
+  };
+
+  SECTION("Acquire：返回租约键与 owner；expires_at 落在 now + ttl 附近（正例对照）") {
+    const std::string p = partition_prefix + "-acquire";
+    const auto lease = ContractOk(repo.Acquire(p, "lease-basic", owner, 60000), "Acquire");
+    REQUIRE(LeaseContractKey(lease) == "lease-basic");
+    REQUIRE(lease.owner_instance_id == owner);
+    const std::int64_t now = clock.NowEpochMillis();
+    CAPTURE(lease.expires_at_epoch_millis, now);
+    //  下界挡"未初始化 / 秒当毫秒"，上界挡"时基错误 / ttl 没生效"
+    REQUIRE(lease.expires_at_epoch_millis > now);
+    REQUIRE(lease.expires_at_epoch_millis <= now + 60000 + 5000);
+  }
+
+  SECTION("Acquire：未过期不可被抢；过期后可被接管（正反两侧）") {
+    const std::string p = partition_prefix + "-occupied";
+    ContractOk(repo.Acquire(p, "held", owner, 60000), "首次 Acquire");
+    ContractError(repo.Acquire(p, "held", other, 60000), fss::ErrorKind::kUnavailable,
+                  "未过期的租约不能被第二个实例抢走");
+    //  正控：ttl=0 → 立即过期，**必须**能被他人接管（证明上面的 kUnavailable 不是恒真）
+    ContractOk(repo.Acquire(p, "expired", owner, 0), "ttl=0 建租约");
+    ContractOk(repo.Acquire(p, "expired", other, 60000), "已过期的租约必须可被接管");
+  }
+
+  SECTION("ClaimExpired：只领过期的；未过期的**绝不在结果里**（负断言 + 同调用正控）") {
+    const std::string p = partition_prefix + "-claim";
+    ContractOk(repo.Acquire(p, "claim-live", owner, 60000), "有效租约（负断言对象）");
+    ContractOk(repo.Acquire(p, "claim-dead", owner, 0), "过期租约（同一次调用的正控）");
+    const auto claimed = ContractOk(repo.ClaimExpired(p, 10, other), "ClaimExpired");
+    //  正控 ①：已过期的必须被领到 —— 证明这条查询/领取路径真的工作
+    REQUIRE(contains(claimed, "claim-dead"));
+    //  正控 ②：有效租约这一行确实存在（Renew 成功 = 行在、且 owner 匹配）
+    ContractOk(repo.Renew(p, "claim-live", owner, 60000), "有效租约到期前 Renew 成功");
+    //  负断言：有效期内的租约绝不能被领走
+    REQUIRE_FALSE(contains(claimed, "claim-live"));
+    for (const auto& lease : claimed) {
+      REQUIRE(lease.owner_instance_id == other);
+    }
+  }
+
+  SECTION("ClaimExpired：limit 生效；limit<=0 → 空；领取过的不会被重复领取") {
+    const std::string p = partition_prefix + "-limit";
+    for (int i = 0; i < 3; ++i) {
+      ContractOk(repo.Acquire(p, "expired-" + std::to_string(i), owner, 0), "建过期租约");
+    }
+    const auto two = ContractOk(repo.ClaimExpired(p, 2, other), "limit=2");
+    REQUIRE(two.size() == 2);  // 正控
+    const auto none = ContractOk(repo.ClaimExpired(p, 0, other), "limit=0");
+    REQUIRE(none.empty());
+    const auto negative = ContractOk(repo.ClaimExpired(p, -1, other), "limit=-1");
+    REQUIRE(negative.empty());
+    //  正控：limit<=0 只是"不领"，不是"把数据丢了" —— 剩下的 1 条仍必须能领到
+    const auto one = ContractOk(repo.ClaimExpired(p, 10, other), "limit=10");
+    REQUIRE(one.size() == 1);
+  }
+
+  SECTION("Renew：延长过期；非本人 → kPermissionDenied；不存在 → kNotFound") {
+    const std::string p = partition_prefix + "-renew";
+    ContractOk(repo.Acquire(p, "renew-me", owner, 0), "ttl=0（本来立刻可领）");
+    ContractOk(repo.Acquire(p, "renew-control", owner, 0), "正控：另一条过期租约");
+    ContractOk(repo.Renew(p, "renew-me", owner, 60000), "Renew 延长到 60 s");
+    const auto claimed = ContractOk(repo.ClaimExpired(p, 10, other), "ClaimExpired");
+    //  正控：control 被领到 → "过期可领"这条路径有效
+    REQUIRE(contains(claimed, "renew-control"));
+    //  负断言：已续到未来的 renew-me 不得被领走（证明 Renew 真的改了 expiry）
+    REQUIRE_FALSE(contains(claimed, "renew-me"));
+    //  非本人续租 → kPermissionDenied（R1 注入点：去掉 owner 条件后这条必须红）
+    ContractError(repo.Renew(p, "renew-me", other, 60000), fss::ErrorKind::kPermissionDenied,
+                  "非本人 Renew 必须 kPermissionDenied");
+    ContractError(repo.Renew(p, "no-such-lease", owner, 1000), fss::ErrorKind::kNotFound,
+                  "Renew 不存在的租约 → kNotFound");
+    //  正控：本人续租仍然成功（证明上面的 kPermissionDenied 不是"Renew 一律失败"）
+    ContractOk(repo.Renew(p, "renew-me", owner, 60000), "本人 Renew 成功");
+  }
+
+  SECTION("Release：本人释放后即消失；非本人 → kPermissionDenied；不存在 → kNotFound") {
+    const std::string p = partition_prefix + "-release";
+    ContractOk(repo.Acquire(p, "release-me", owner, 0), "过期租约");
+    ContractOk(repo.Acquire(p, "release-control", owner, 0), "正控：另一条过期租约");
+    //  非本人不能释放（且必须**不删**）
+    ContractError(repo.Release(p, "release-me", other), fss::ErrorKind::kPermissionDenied,
+                  "非本人 Release 必须 kPermissionDenied");
+    ContractError(repo.Release(p, "no-such-lease", owner), fss::ErrorKind::kNotFound,
+                  "Release 不存在的租约 → kNotFound");
+    ContractOk(repo.Release(p, "release-me", owner), "本人 Release");
+    const auto claimed = ContractOk(repo.ClaimExpired(p, 10, other), "ClaimExpired");
+    //  正控：control 必须被领到（证明"过期 → 可领"路径有效）
+    REQUIRE(contains(claimed, "release-control"));
+    //  负断言：已释放的租约不得再出现（Release 是**删除**，不是改 owner）
+    REQUIRE_FALSE(contains(claimed, "release-me"));
+    //  正控：释放后同一个键可以重新 Acquire
+    ContractOk(repo.Acquire(p, "release-me", owner, 60000), "释放后可重新 Acquire");
+  }
+
+  SECTION("ClaimExpired：两个并发领取者不得拿到同一条租约（不重不漏）") {
+    const std::string p = partition_prefix + "-concurrent";
+    constexpr int kCount = 40;
+    for (int i = 0; i < kCount; ++i) {
+      ContractOk(repo.Acquire(p, "c-" + std::to_string(i), owner, 0), "建过期租约");
+    }
+    std::vector<ILeaseRepository::Lease> first;
+    std::vector<ILeaseRepository::Lease> second;
+    std::mutex gate_mutex;
+    std::condition_variable gate;
+    bool go = false;
+    auto worker = [&](std::vector<ILeaseRepository::Lease>* out, const std::string& claimant) {
+      {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate.wait(lock, [&] { return go; });
+      }
+      auto claimed = repo.ClaimExpired(p, kCount, claimant);
+      if (claimed.ok()) *out = std::move(claimed).value();
+    };
+    std::thread one(worker, &first, partition_prefix + "-c1");
+    std::thread two(worker, &second, partition_prefix + "-c2");
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      go = true;
+    }
+    gate.notify_all();
+    one.join();
+    two.join();
+
+    std::set<std::string> keys;
+    for (const auto& lease : first) keys.insert(LeaseContractKey(lease));
+    for (const auto& lease : second) keys.insert(LeaseContractKey(lease));
+    //  原子领取的两个判据：**不重复**（并集大小 == 总数）与**不遗漏**（并集覆盖全部）。
+    //  任何一条被两个领取者同时拿到 → 并集 < 总数 → 失败。
+    //  ★ 这一条是"真实并发"用例，但重复领取是否出现仍可能受调度影响；不加锁也能
+    //    确定性判定的版本在 PG 侧（`test_postgres_repositories.cpp` 的"锁住行再领"用例）。
+    CAPTURE(first.size(), second.size(), keys.size());
+    REQUIRE(keys.size() == static_cast<std::size_t>(kCount));
   }
 }
 

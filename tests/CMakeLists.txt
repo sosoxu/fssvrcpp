@@ -90,6 +90,16 @@ if(FSS_WITH_PG)
   if(NOT EXISTS "${_pg_script}")
     message(FATAL_ERROR "FSS_WITH_PG=ON 但找不到 ${_pg_script}")
   endif()
+  #  ★ A1 起：`FSS_WITH_PG` 还要求 libpq（`src/infra/postgres/` 的 PG 仓储要链接
+  #    PostgreSQL::PostgreSQL）。原来只检查 dev 脚本存在，于是"有 PG 服务但没有 libpq
+  #    开发文件"的机器会在链接期才失败（甚至表现为 PG 测试被静默跳过）——
+  #    这里在配置期就 fail-closed 并给出可执行的修复指令（R9）。
+  if(NOT FSS_HAVE_LIBPQ)
+    message(FATAL_ERROR
+      "FSS_WITH_PG=ON 需要 libpq（CMake 未找到 PostgreSQL::PostgreSQL）。\n"
+      "  修复：安装 libpq 开发文件（Debian/Ubuntu: libpq-dev），或去掉 -DFSS_WITH_PG=ON。\n"
+      "  （`scripts/dev_postgres.sh` 只提供**服务端二进制**，不提供 libpq 头文件与库。）")
+  endif()
 
   add_test(NAME pg_fixture_setup
            COMMAND "${_pg_script}" start)
@@ -119,6 +129,23 @@ if(FSS_WITH_PG)
     FIXTURES_REQUIRED pg
     LABELS "pg;infra"
     TIMEOUT 900)
+
+  # ===========================================================================
+  #  A1（ADR-009 §10）：PostgreSQL 仓储的**共享契约测试**
+  #    · 与内存/SQLite 实现跑**同一套**断言（`tests/framework/port_contract.h`）：
+  #      位置仓储 `CheckLocationRepositoryContract` + 租约 `CheckLeaseContract`；
+  #    · DSN 来自 `FSS_PG_DSN`（未设时用本机 dev PG 的默认 DSN），
+  #      因此同一份测试可以指向任何 PG（含远端 12.6）；
+  #    · **连不上就失败**（REQUIRE + libpq 消息），绝不静默跳过 —— 跳过的门槛是空证据；
+  #    · 每个用例用 `pgtest-<pid>-<n>-…` 的**唯一 partition**，teardown 删自己的行。
+  # ===========================================================================
+  fss_add_test(test_postgres_repositories
+    SOURCES integration/test_postgres_repositories.cpp
+    LIBS    fss_location_postgres Threads::Threads
+    LABELS  "pg;infra")
+  set_tests_properties(test_postgres_repositories PROPERTIES
+    FIXTURES_REQUIRED pg
+    TIMEOUT 300)
 
   if(FSS_PG_TEARDOWN)
     add_test(NAME pg_fixture_teardown COMMAND "${_pg_script}" stop)

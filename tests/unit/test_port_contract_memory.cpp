@@ -17,6 +17,7 @@
 #include "common/time/clock.h"
 #include "domain/ports/ports.h"
 #include "infra/blob/memory/memory_blob_store.h"
+#include "infra/location/memory/memory_lease_repository.h"
 #include "infra/location/memory/memory_location_repository.h"
 #include "infra/metadata/memory/memory_metadata_repository.h"
 
@@ -26,16 +27,19 @@
 using fss::domain::ObjectRef;
 using fss::domain::PutOptions;
 using fss::infra::InMemoryBlobStore;
+using fss::infra::InMemoryLeaseRepository;
 using fss::infra::InMemoryLocationRepository;
 using fss::infra::InMemoryMetadataRepository;
 
-// 编译期：三个适配器都必须**可实例化**并实现对应端口（签名变了这里立刻失败）
+// 编译期：适配器都必须**可实例化**并实现对应端口（签名变了这里立刻失败）
 static_assert(std::is_base_of_v<fss::domain::IBlobStore, InMemoryBlobStore>);
 static_assert(!std::is_abstract_v<InMemoryBlobStore>);
 static_assert(std::is_base_of_v<fss::domain::IFileLocationRepository, InMemoryLocationRepository>);
 static_assert(!std::is_abstract_v<InMemoryLocationRepository>);
 static_assert(std::is_base_of_v<fss::domain::IMetadataRepository, InMemoryMetadataRepository>);
 static_assert(!std::is_abstract_v<InMemoryMetadataRepository>);
+static_assert(std::is_base_of_v<fss::domain::ILeaseRepository, InMemoryLeaseRepository>);
+static_assert(!std::is_abstract_v<InMemoryLeaseRepository>);
 
 TEST_CASE("★ IBlobStore 契约：InMemoryBlobStore（memory/POSIX/S3 共用同一套断言）",
           "[phase2][contract][c2.10]") {
@@ -55,6 +59,15 @@ TEST_CASE("★ IMetadataRepository 契约：InMemoryMetadataRepository",
   fss::ManualClock clock;
   InMemoryMetadataRepository repo(clock);
   fss::test::CheckMetadataRepositoryContract(repo, clock);
+}
+
+//  ★ A1（ADR-009 §4.3）：租约端口的第一份共享契约测试。PG 实现（PostgresLeaseRepository）
+//    在 `tests/integration/test_postgres_repositories.cpp` 里跑**同一套**断言。
+TEST_CASE("★ ILeaseRepository 契约：InMemoryLeaseRepository（memory/PG 共用同一套断言）",
+          "[phase2][contract][c2.10]") {
+  fss::ManualClock clock;
+  InMemoryLeaseRepository leases(clock);
+  fss::test::CheckLeaseContract(leases, clock);
 }
 
 TEST_CASE("InMemoryBlobStore 故障注入：错误 / 字节截断 / 延迟 / 校验和替换",

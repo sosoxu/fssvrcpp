@@ -206,10 +206,22 @@ CREATE TABLE IF NOT EXISTS staging_leases (
 SELECT pg_try_advisory_lock(:gc_lock_key);   -- 拿不到就跳过本轮，下轮再试
 ```
 
-- 优先用 **PostgreSQL advisory lock**（已验证 PG 14 支持），不引入 etcd/consul。
+- 优先用 **PostgreSQL advisory lock**（已在 PG 14.24 与目标环境 PG 12.6 上实测），不引入 etcd/consul。
 - **同时**要求 GC 本身幂等且用原子领取（§4.3）——**纵深防御**：
   即使选举失效、两个实例同时 GC，也不会误删。
-- leader 需要**续期健康检查**：持锁实例退出时连接断开，锁自动释放。
+- leader 需要**续期健康检查**。★ 措辞按实测收窄（见 `docs/test-evidence/phase10.md` §15.9）：
+  "持锁实例退出时连接断开，锁自动释放"**只在持锁会话空闲（或只跑短语句）时成立**。
+  实测（kill -9 客户端进程）：
+
+  | 持锁会话被杀时的状态 | PG 14.24 | PG **12.6**（目标） |
+  | --- | --- | --- |
+  | 空闲（阻塞在客户端 socket 读） | 释放 9 ms | 释放 **51 ms** |
+  | 正在跑 15 s 单语句 | 释放 633 ms（14 能察觉客户端消失并取消） | **≥8 s 仍未释放**，语句结束后才释放 |
+
+  12.6 **没有** `client_connection_check_interval`（14+ 才有），因此崩溃后的锁滞留窗口 =
+  **当前语句的剩余时长**。实现约束：① leader 的**锁连接与数据连接分离**；
+  ② 锁连接**只跑短语句**；③ 每条语句带 `statement_timeout`（把滞留窗口夹到
+  `statement_timeout_ms` 以内）——空闲态崩溃 51 ms 即可接管，可接受。
 
 ### 4.5 实例本地必须唯一化的东西
 
@@ -432,7 +444,8 @@ gc:
 
 ## 10. 待办
 
-- [ ] 实现 `PostgresLocationRepository` / `PostgresMetadataRepository` / `PostgresLeaseRepository`
+- [x] 实现 `PostgresLocationRepository` / `PostgresLeaseRepository`（L2 + libpq 薄封装；与内存/SQLite 共用 `tests/framework/port_contract.h` 的同一套契约测试；已在 PG 14.24 与 12.6 实测。证据：`docs/test-evidence/phase10.md` §15）
+- [ ] 实现 `PostgresMetadataRepository`（上一项里 metadata 那一半；仍未交付）
 - [ ] 实现 `CreateFileMetadata` 的原子领取 + `claiming`→`ready` 状态机 + 崩溃回收
 - [ ] 实现 leader election（PG advisory lock）+ GC 的租约与原子领取
 - [ ] 实现 `deployment.mode=multi` 的 5 条启动校验与时钟偏移检查

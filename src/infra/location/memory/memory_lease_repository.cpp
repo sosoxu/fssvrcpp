@@ -33,8 +33,13 @@ fss::Result<void> InMemoryLeaseRepository::Renew(std::string_view partition,
                                                  std::int64_t ttl_millis) {
   std::lock_guard<std::mutex> guard(mutex_);
   const auto it = leases_.find(Key(partition, file_id));
-  if (it == leases_.end() || it->second.owner_instance_id != owner_instance_id) {
-    return Err(fss::ErrorKind::kNotFound, "租约不存在或不属于该实例");
+  if (it == leases_.end()) return Err(fss::ErrorKind::kNotFound, "租约不存在");
+  //  ★ A1：把"不存在"（kNotFound）与"不是你的"（kPermissionDenied）**分开**。
+  //    旧版把两者都折叠成 kNotFound —— 调用方无法区分"租约没了"与"抢错了"，
+  //    而 Release 一直是后者用 kPermissionDenied，端口语义本来就要求可区分（R16）。
+  //    端口契约测试 `CheckLeaseContract` 现在钉住这条（PG 实现同样如此）。
+  if (it->second.owner_instance_id != owner_instance_id) {
+    return Err(fss::ErrorKind::kPermissionDenied, "租约属于别的实例");
   }
   it->second.expires_at_epoch_millis = clock_.NowEpochMillis() + ttl_millis;
   return Ok();

@@ -1515,3 +1515,285 @@ test cases: 6 | 4 passed | 2 failed      assertions: 47 | 42 passed | 5 failed
 **④ 说明**：`== ceil(N/B)` 的确定性判据在 L2（观察者 + 门控），真实进程侧只断言横幅取值、
 两族指标存在且动过、以及窗口时延差异（416ms vs 14ms）—— 这一点实现者已如实登记，我认可：
 SQLite 不对外暴露"事务次数"，真实进程侧无法直接数。**没有**任何吞吐数字被声明。
+
+---
+
+## 15. A1（本轮）：ADR-009 §10 的 PostgreSQL 仓储落地 —— L2 位置仓储 + 在途租约
+
+> 依据：`docs/adr/ADR-009-multi-instance-consistency.md` §4.1/§4.2/§4.3/§6.4 与 §10 待办第 1 项；
+> schema 是 `db/migrations/001_init.sql`（**已应用**，本切片**不改** schema）。
+> 本切片**只做 L2**：新增两个 PG 仓储 + libpq 薄封装 + 契约测试；**组合根未接线**
+> （R12：具体实现只能在 `src/main/` 创建，那个改动留给后续切片）。
+> 与 ADR-009 有关的既有证据：端口与契约基座在 §（`phase2.md`），GC 租约的单实例侧在
+> `phase6.md` §7；本文件记录**共享 PG 侧**的落地。
+
+### 15.1 结论（先说答案）
+
+1. **两个 PG 仓储真的存在且跑同一套契约**：`PostgresLocationRepository`
+   （`file_locations`）与 `PostgresLeaseRepository`（`staging_leases`）
+   在**真实 PG 14.24 与 12.6** 上都跑 `tests/framework/port_contract.h` 的
+   `CheckLocationRepositoryContract` / `CheckLeaseContract` —— 不是"各写一套测试"。
+2. **实测计数**：`test_postgres_repositories` = **8 用例 / 276 断言**，两个引擎**完全一致**；
+   `ctest -L pg` = **6/6**（原来 5 个基建测试 + 本切片 1 个）；默认 `ctest` **86/86 无回归**。
+3. **SQL 只用 ≤12 语法**：没有扩展/`gen_random_uuid`、没有 `INCLUDE` 索引、没有
+   `NULLS NOT DISTINCT`、没有 `MERGE`、没有 PG-14 专属 GUC；同一份二进制直接指向
+   PG 12.6（`FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss`）全绿。
+4. **`ClaimExpired` 的原子性有"与线程顺序无关"的判据**：另一条**独立连接**把过期行
+   `FOR UPDATE` 锁住后再调用 → 正确实现（CTE + `SKIP LOCKED`）**立即返回空**；
+   ROLLBACK 后同一条路径必须能把 3 条全领到（正控）。去掉 `SKIP LOCKED` 的注入 →
+   用例失败在 `statement_timeout`（57014，§15.4 ①）。
+5. **fail-closed**：DSN 连不上 → `kUnavailable` + libpq 消息；**不存在**任何到
+   SQLite/内存的静默回退（ADR-009 §4.1 的明确禁止）。测试连不上时**大声失败**，不 skip。
+6. **数据库时钟**：`PgConnection::NowEpochMillis()` 执行
+   `SELECT (extract(epoch from now()) * 1000)::bigint`（ADR-009 §6.4：租约/过期判定
+   只能用数据库 `now()`）；`expires_at` / `renewed_at` 全部由 SQL 侧 `now()` 计算。
+7. **诚实边界**：`PostgresMetadataRepository` **未交付**；组合根**未接线**（因此
+   `location.postgres.*`、`metadata.postgres.*`、`leases.*` 仍是「已读但无效果」，
+   `deployment.mode=multi` 仍**拒绝启动**）；leader election、多实例 E2E、NFS 语义
+   验证均**未做**（§15.6 逐条列出）。
+
+### 15.2 实现点（可点击）
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/infra/postgres/pg_connection.{h,cpp}` **（新增）** | libpq 薄封装：RAII `PgResult`（行数/列名→下标/NULL/按名按位取值/受影响行数/错误消息+SQLSTATE）、RAII `PgConnection`（`PQconnectdb` + 新连接即 `SET statement_timeout`）、**有界连接池** `PgPool`（活跃数 ≤ `max_connections`；坏连接丢弃不借出；借空则条件变量等待）、`NowEpochMillis()`（数据库时钟）、`MapPgError`（`23505`→`kLocationAlreadyExists`、`57014`/`08xxx`→`kUnavailable`、其余→`kInternal`；Error 带 `sqlstate` detail） |
+| `src/infra/location/postgres/postgres_location_repository.{h,cpp}` **（新增）** | `IFileLocationRepository` 的 PG 实现（`file_locations`）：`Save` 用 `ON CONFLICT (partition_id, file_id) DO UPDATE` 保留 upsert 语义；`UpdateSignedUrl` 用一条 `jsonb_set(jsonb_set(data,...))` 原子改 `signed_url`/`updated_at_epoch_seconds`（未知字段与 `created_at` 不动）；`List` 的过滤/排序/分页/`total` 与 SQLite 逐条对齐；`data` JSONB 无损往返未知字段 |
+| `src/infra/location/postgres/postgres_lease_repository.{h,cpp}` **（新增）** | `ILeaseRepository` 的 PG 实现（`staging_leases`）：`Acquire` 的 `ON CONFLICT ... WHERE expires_at <= now()` 原子接管/占用；`Renew`/`Release` 用 `owner = $3` 做归属校验，未命中再区分 `kNotFound`/`kPermissionDenied`；`ClaimExpired` 一条 CTE：`FOR UPDATE SKIP LOCKED` 挑选 → 改 owner、`expires_at = now() + 60s` → `LEFT JOIN file_locations` 反解 `Lease::file_id`（无位置记录留空） |
+| `src/infra/location/memory/memory_lease_repository.cpp` | `Renew` 的"非本人"从 `kNotFound` 改为 `kPermissionDenied`（与 `Release` 一致；端口语义要求"不存在"与"不是你的"可区分，R16） |
+| `src/CMakeLists.txt` | `find_package(PostgreSQL QUIET)` + `FSS_HAVE_LIBPQ`（**`CACHE INTERNAL`**，子目录顺序无关）；命中时建 `fss_pg`（`PUBLIC FSS_HAVE_LIBPQ=1`）与 `fss_location_postgres`；未命中**什么都不建**（默认构建在无 PG 机器上依旧成立） |
+| `tests/CMakeLists.txt` | `FSS_WITH_PG=ON` **additionally require** `FSS_HAVE_LIBPQ`（配置期 fail-closed + 修复指令）；新增 `test_postgres_repositories`（`LABELS "pg;infra"` + `FIXTURES_REQUIRED pg`） |
+| `tests/framework/port_contract.h` | 位置契约新增**可选** `partition_prefix`（默认值不变，既有调用点零改动）；新增租约契约 `CheckLeaseContract`（Acquire/Renew/Release/ClaimExpired 两侧 + 并发领取者不重不漏），带 `LeaseContractKey()` 处理内存/PG 的字段差异 |
+| `tests/unit/test_port_contract_memory.cpp` | 用同一套租约契约跑 `InMemoryLeaseRepository`（+ 编译期 `is_base_of`/非抽象断言） |
+| `tests/integration/test_postgres_repositories.cpp` **（新增）** | PG 侧：两套共享契约 + 显式跨租户隔离 + `file_id` 反解 + **锁住行再领**的确定性并发判据 + options 校验 / 连不上 fail-closed / 有界池与等待 / 数据库时钟 |
+
+### 15.3 实测命令与输出摘要
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j4
+#  0 error / 0 warning（新增目标单独重编亦无告警）
+ctest --test-dir build --output-on-failure
+#  100% tests passed, 0 tests failed out of 86     ← 无回归
+./build/bin/test_port_contract_memory
+#  All tests passed (472 assertions in 6 test cases)   ← 新增租约契约（原 5 用例）
+./build/bin/test_sqlite_location_repository
+#  All tests passed (275 assertions in 7 test cases)
+
+cmake -S . -B build-pg -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFSS_WITH_PG=ON
+cmake --build build-pg -j4 --target test_postgres_repositories
+ctest --test-dir build-pg -L pg --output-on-failure
+#  100% tests passed, 0 tests failed out of 6
+#    pg_fixture_setup / pg_schema_invariants / pg_advisory_lock / pg_concurrent_claim
+#    / test_postgres_repositories / pg_fixture_teardown
+./build-pg/bin/test_postgres_repositories
+#  All tests passed (276 assertions in 8 test cases)        [PG 14.24]
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ./build-pg/bin/test_postgres_repositories
+#  All tests passed (276 assertions in 8 test cases)        [PG 12.6]
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg
+#  100% tests passed, 0 tests failed out of 6               [远端 12.6，本地 fixture 仍指向本机 14]
+```
+
+> `pg_fixture_setup` 在本机启动/复用 dev PG 14.24 并应用迁移；`FSS_PG_DSN` 只影响
+> **新测试**连哪个库，**不会**对远端 12.6 执行迁移（远端 schema 早已就绪）。
+
+### 15.4 R1 注入（每条都在完整重编后跑；末尾已全部还原）
+
+**① `ClaimExpired` 去掉 `FOR UPDATE SKIP LOCKED`（领取退化为"先读后写"）**
+
+```
+tests/integration/test_postgres_repositories.cpp:365: FAILED:
+  REQUIRE( claimed.ok() )
+with expansion:
+  false
+with message:
+  claimed.ok() ? std::string("ok") : claimed.error().message() :=
+  "领取过期租约失败：ERROR:  canceling statement due to statement
+  timeout
+  CONTEXT:  while updating tuple (0,4) in relation "staging_leases""
+test cases: 1 | 1 failed      assertions: 9 | 8 passed | 1 failed
+```
+
+⇒ 非原子实现在"行已被别人锁住"时**阻塞到 `statement_timeout`（57014）**，而不是跳过；
+判据与线程到达顺序无关。还原后：`All tests passed (13 assertions in 1 test case)`。
+
+**② 位置仓储 `Find` 去掉 `partition_id` 过滤**
+
+```
+tests/integration/test_postgres_repositories.cpp:254: FAILED:
+  REQUIRE_FALSE( by_id.ok() )
+with expansion:
+  !true
+test cases: 1 | 1 failed      assertions: 8 | 7 passed | 1 failed
+```
+
+⇒ 第三个租户用同样的 `file_id` **命中**了 A 的记录；同一用例里的正控
+（A/B 各自 `Find` 成功）说明这条负断言不是恒真。还原后：
+`All tests passed (14 assertions in 1 test case)`。
+
+**③ `Renew` 去掉 owner 校验（恒真谓词 `AND (owner = $3 OR owner <> $3)`）**
+
+```
+tests/framework/port_contract.h:103: FAILED:
+  REQUIRE_FALSE( r.ok() )
+with expansion:
+  !true
+with messages:
+  契约点（期望失败 kPermissionDenied）：非本人 Renew 必须 kPermissionDenied
+test cases: 1 | 0 passed | 1 failed    assertions: 94 | 93 passed | 1 failed
+```
+
+⇒ 非本人续租**成功了**，契约点正确报红。还原后：
+`All tests passed (98 assertions in 1 test case)`。
+
+**④（追加）位置仓储 `Save` 去掉 `ON CONFLICT DO UPDATE`（幂等 upsert 失效）**
+
+```
+tests/framework/port_contract.h:84: FAILED:
+  REQUIRE( r.ok() )
+with messages:
+  契约点：Save persistent（同 file_id 必须覆盖而不是报冲突）
+  契约点：Save 更新
+test cases: 1 | 0 passed | 1 failed    assertions: 109 | 107 passed | 2 failed
+```
+
+⇒ 同 `file_id` 的第二次 `Save` 变成唯一键冲突（不再覆盖）。还原后：
+`All tests passed (276 assertions in 8 test cases)`。
+
+**还原自证**：`grep -rn "R1-INJECT" src/ tests/` → 无输出；
+`git status --short` 只列出本切片新增/修改的文件（见 §15.2）。
+
+### 15.5 关于契约语义的三处判断（附理由）
+
+1. **端口的 `file_id` 参数 = 表身份列 `file_source`（"租约键"）**：`staging_leases` 的
+   主键是 `(partition_id, file_source)`（ADR-009 §4.3），表里没有 `file_id` 列。
+   裁决：端口参数是"被写入的 staging 对象的 `file_source`"；`ClaimExpired` 再用
+   `LEFT JOIN file_locations` 反解真正的 `file_id` 回填给 GC。**已写进仓储头文件**。
+   当前**没有**任何生产调用方 `Acquire`（上传路径接租约是后续切片），因此落地不改变现网行为。
+2. **内存实现的 `Renew` 非本人动作改为 `kPermissionDenied`**：旧版把"不存在"与"不是你的"
+   都折叠成 `kNotFound`，与 `Release` 不一致、也让调用方无法排障（R16）。端口契约测试
+   现在同时钉住两种情形。
+3. **共享租约契约不直接断言 `Lease::file_id` / `file_source` 的取值**：内存实现把端口参数
+   当 `file_id`（`file_source` 留空），PG 实现反之（`file_source` = 键、`file_id` 反解）。
+   套件用 `LeaseContractKey()` 以"两个字段里非空的那个"识别租约，并**另有一条 PG 专属用例**
+   验证 `file_id` 反解与"无位置记录 → 留空"。这是把差异显式登记，而不是让断言变弱到恒真。
+
+另有一处**未引入**的新语义：`migrated_at`（PG 有、SQLite 没有）在 `zone=persistent` 时写
+`updated_at_epoch_seconds`，读回**忽略**（端口没有对应领域字段；写进 `extra` 会破坏
+未知字段的无损往返）。
+
+### 15.6 仍未交付 / 未验证（如实登记）
+
+| 项 | 状态 |
+| --- | --- |
+| `PostgresMetadataRepository` | **未交付**（ADR-009 §10 第 1 项的 metadata 部分仍未勾） |
+| 组合根接线 `location.postgres.*` / `metadata.postgres.*` / `leases.*` | **未交付**：这些键仍逐字登记为**「已读但无效果」**（`docs/operations.md` §1.3.3）；`deployment.mode=multi` 仍**拒绝启动** |
+| `CreateFileMetadata` 的原子领取 + `claiming`→`ready` 状态机 | **未交付** |
+| leader election（PG advisory lock）+ GC 的 leader-only 调度 | **未交付** |
+| 上传路径 `Acquire`/定期 `Renew` 租约 | **未交付**（当前无生产调用方） |
+| 多实例端到端（C9.26：2 进程 + 共享 PG + 共享目录 + 崩溃注入） | **未验证** |
+| PG 连接预算校验（C9.28：实例数 × 池上限 ≤ `max_connections`） | **未交付** |
+| readiness 的 PG `SELECT 1` + 迁移版本校验 | **未交付** |
+| 与 PG 的时钟偏移启动校验（ADR-009 §6.4 第二半） | **未交付** |
+| NFS/SAN 的 `rename` 原子性、close-to-open、`syncfs` 语义（C9.27） | **未验证**（无目标存储） |
+| `single_use_nonce` 入共享存储（M5） | **未交付**（默认 `false` 不变） |
+| 真实远端 PG 的网络故障/断连恢复（重试/退避） | **未验证**：连接池只做"坏连接丢弃 + 重建"，**没有**重试策略 |
+
+### 15.7 门槛结果
+
+```
+JOBS=4 ./scripts/run_all_gates.sh
+#  失败: 无；⏱ 总耗时: 7 分 46 秒（466 s，阶段数 11）；✅ 全部已启用阶段门槛通过
+#  （build 目录为默认配置：FSS_WITH_PG=OFF；ctest 86/86）
+
+JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh
+#  [infra] ctest -L pg → 100% tests passed, 0 tests failed out of 6
+#  失败: 无；⏱ 总耗时: 7 分 51 秒（471 s，阶段数 11）；✅ 全部已启用阶段门槛通过
+
+./scripts/check_docs.sh
+#  全部检查通过（D1~D5）
+grep -rn "R1-INJECT" src/ tests/    # 无输出
+```
+
+### 15.8 父代理独立复核（不采信子代理的自述，全部自己重跑）
+
+| 复核项 | 我的命令 | 实测结果 |
+| --- | --- | --- |
+| PG 测试本体（本地 14.24） | `FSS_PG_DSN=postgresql://fss@127.0.0.1:15432/fss ./build-pg/bin/test_postgres_repositories` | **276 断言 / 8 用例**，全通过 |
+| PG 测试本体（局域网 **12.6**） | `FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ./build-pg/bin/test_postgres_repositories` | **276 断言 / 8 用例**，两个引擎**逐项一致** |
+| CTest 集成（fixture 启库 + 迁移 + 标签） | `ctest --test-dir build-pg -L pg --output-on-failure` | **6/6** |
+| **fail-closed 不是 skip** | DSN 指向不可达端口 `127.0.0.1:15999` | `test cases: 8 \| 1 passed \| 7 failed`、`assertions: 18 \| 11 passed \| 7 failed`、**进程退出码 7** —— 连不上就大声失败；唯一通过的 1 个是不需要连库的 `PgOptions` 校验用例 |
+| 数据卫生（可重跑、不污染共享库） | 两库各查 `pgtest-%` 在 `file_locations`/`staging_leases`/`file_metadata_records` 的残留 | 两库都是 **0/0/0** |
+| 有界连接池（安全属性） | `./build-pg/bin/test_postgres_repositories "PgPool*"` | 14 断言通过；读代码确认负断言 `REQUIRE_FALSE(acquired)` **带正控**（归还后等待者必须 5 s 内拿到），且用 `started` 标志避免到达顺序影响判据 |
+| 跨租户隔离 | `"...*partition 严格隔离*"` | 14 断言通过 |
+| 门槛（我自己跑一遍） | `JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh` | `失败: 无`、**376 s / 11 阶段**、退出码 0 |
+| 门槛（加入下面的护栏补丁后**重跑**） | 同上 | `失败: 无`、**436 s / 11 阶段**、退出码 0；`test_sql_guardrail` 断言数 9/2 → **17/3** |
+| **无 libpq 的默认构建路径**（R11：可选依赖必须有无依赖的默认路径） | `cmake -S . -B build-nolibpq -DCMAKE_DISABLE_FIND_PACKAGE_PostgreSQL=ON`（默认选项）；再追加 `-DFSS_WITH_PG=ON` | 前者**配置成功（退出码 0）**且不编译任何 PG 源；后者**配置期 fail-closed（退出码 1）** 并打印可执行修复指令（"安装 libpq 开发文件，或去掉 `-DFSS_WITH_PG=ON`"） |
+| **静态 SQL 护栏是否覆盖新 PG 文件**（我自己的消融） | 把 `postgres_lease_repository.cpp` 的 `kRelease` 去掉 `partition_id = $1 AND` → 跑 `test_sql_guardrail` | **失败**并点名 `tests/unit/test_sql_guardrail.cpp:138`；`md5` 逐字还原（`a4e35e94…`）后恢复全绿 |
+
+#### 15.8.1 复核中发现并**修掉**的一个真问题：SQL 护栏有"换定界符即失明"的盲区
+
+新代码里第一次出现 `R"pgsql(...)pgsql"`（数据库时钟那条语句，理由已写在
+`src/infra/postgres/pg_connection.h` 文件头）。复核时意识到：C3.9 的扫描器
+**只认 `R"sql(...)sql"`**，所以只要换个定界符，里面的 DML 就从检查范围里消失，
+而"每条 DML 都必须带 `partition_id`"这条规则**不会因此失败** —— 检查静默退化成
+"只覆盖一部分 SQL"。留一条"想绕过就绕过"的通道比不检查更危险（它给的是虚假的安全感）。
+
+修法（`tests/unit/test_sql_guardrail.cpp`）：新增用例
+**「★ C3.9 仓储实现文件不得用非 sql 定界符藏 SQL（护栏盲区补丁）」** ——
+`src/**/*_repository.{h,cpp}` 里出现的每个原始字符串字面量都必须是 `R"sql(`；
+并带**非空洞性断言**（真的扫到了仓储文件、也真的扫到了原始字符串）与**提取器自证**
+（合成样本 `R"pgsql(SELECT 1)pgsql"` 必须被识别为 `pgsql` 定界符且行号正确）。
+
+**注入自证（证明这条新规则不是恒真的，且盲区原先真实存在）**：往
+`src/infra/location/postgres/postgres_location_repository.cpp` 追加一行
+
+```cpp
+constexpr const char* kBlindInjection = R"pgsql(DELETE FROM file_locations WHERE file_id = $1)pgsql";
+```
+
+| 跑的用例 | 结果 |
+| --- | --- |
+| 旧规则 `*不存在缺少*`（partition_id 扫描） | **仍然全绿**（2 断言 / 1 用例）⇒ 这条 `DELETE` 确实**逃过了**原有检查 |
+| 新规则 `*非 sql 定界符*` | **失败**，并点名 `src/infra/location/postgres/postgres_location_repository.cpp:281` 与定界符 `pgsql`（退出码 1） |
+| 还原后 | `md5` 逐字一致、`test_sql_guardrail` 全绿（17 断言 / 3 用例）、`grep -rn "R1-INJECT\|kBlindInjection" src/ tests/` 无输出 |
+
+★ 该用例现在为**仓储实现文件**钉死了范围；`pg_connection.*` 里那条不访问任何表的
+数据库时钟语句**不在**仓储文件里，因此不受此约束（它的定界符与理由仍然逐字写在
+文件头，属于"显式登记"而非"悄悄绕过"）。
+
+### 15.9 目标引擎 PG 12.6 的前置实测（父代理，本轮为 PG 落地新做）
+
+> 生产 PG 是局域网 **12.6**（Windows，`server_encoding=UTF8`，
+> `lc_collate=Chinese (Simplified)_China.936`）；开发用本地 **14.24**。
+> 本轮在其上新建**专用角色 `fss` + 专用库 `fss`**（owner=`fss`，`trust` 免密），
+> **未触碰**既有的 `fsserver`/`ndp*`/`permsvr` 等库与角色。
+
+| 项 | 命令 | 结果 |
+| --- | --- | --- |
+| 迁移可用性 | `psql -f db/migrations/001_init.sql` | 12.6 上 **0 错误**（7 表 + 1 视图） |
+| schema 不变量 | `psql -f db/tests/001_verify_invariants.sql` | 12.6 与 14.24 **各 9 条全通过**（I1~I9b，ROLLBACK 不污染） |
+| 原子领取（真实 schema） | `db/tests/003_concurrent_claim.sh 10 8`（经临时 shim 指向 12.6） | **C1~C4 全绿**，含 C3 自证（去掉唯一索引后 **5/5** 轮出现多赢家） |
+| 适配层依赖的 SQL 语义（8 项探针） | `build/pg_probe.sql`（`ON CONFLICT` 部分索引推断、版本链、`now()` 时钟、`ctid` + `FOR UPDATE SKIP LOCKED` 租约领取 + `LEFT JOIN` 反解 `file_id`、跨分区隔离、视图） | 两引擎**逐项一致**，全部符合预期（探针 P8 的"期望 0 行"是我自己注解写错：它插入了 1 条 staging 位置记录，**1 行才是对的**） |
+| SQLSTATE（错误映射的依据） | `statement_timeout` / 唯一冲突 | 两引擎都是 **57014** / **23505**。★ 12.6 的报错是**本地化中文**（合法 UTF-8，如 `错误` = `e9 94 99 e8 af af`）⇒ 任何"匹配英文子串"的判定在目标库上会**静默失效**，必须按 SQLSTATE 映射（`MapPgError` 正是这么做的） |
+| 会话级 advisory lock 的崩溃释放语义 | `build/pg_probe2.sh`（A 例空闲持锁、B 例持锁跑长语句，各 kill -9 客户端） | 见下表 |
+
+| 持锁会话被杀时的状态 | PG 14.24 | PG **12.6** |
+| --- | --- | --- |
+| **空闲**（阻塞在客户端 socket 读） | 释放 **9 ms** | 释放 **51 ms** |
+| **正在跑 15 s 单语句** | 释放 **633 ms**（14 能察觉客户端消失并取消） | **≥8 s 仍未释放**；语句结束后才释放（滞留窗口 = 当前语句剩余时长） |
+
+★ **仓库自带的 `db/tests/002_advisory_lock.sh` 在 PG 12.6 上 A3 失败**（`✗ 持锁会话崩溃后锁仍被持有`）。
+根因不是"12.6 不可用"，而是该脚本 `spawn_holder()` 的**注释与实现不符**：注释说
+"循环短查询（leader 持锁的会话基本空闲，只做心跳）"，实现却是**一条 120 秒的
+`DO $$ FOR i IN 1..600 LOOP PERFORM pg_sleep(0.2)` 单语句** —— PG 14 的客户端消失
+侦测掩盖了这个不一致，12.6 如实暴露。
+
+⇒ **对切片 B（leader election）的硬约束**（实测得出，不是推测）：
+① leader 的**锁连接必须与数据连接分离**；② 锁连接**只跑短语句**（空闲态崩溃实测
+51 ms 即可接管）；③ 每条语句带 `statement_timeout`，把"崩溃后锁滞留窗口"夹到
+`statement_timeout_ms` 以内；④ ADR-009 §4.4 的"连接断开即释放"只在**空闲/短语句**
+会话下成立，这句话需要按上面的实测**收窄措辞**。切片 B 同时会把
+`002_advisory_lock.sh` 的 holder 改成真的"短语句心跳"（让它在两个引擎上都有判定力），
+并保留 A3b 作为"为什么锁会话不能跑长语句"的对照。
+
+
