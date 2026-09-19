@@ -2062,4 +2062,229 @@ test cases: 5 | 3 passed | 2 failed ; assertions: 150 | 148 passed | 2 failed   
 > `config/fss.example.json`、`docs/operations.md`、`src/main/server_main.cpp`、
 > `db/migrations/001_init.sql` **均未被本切片触碰**（三态计数因此逐字不变）。
 
+---
+
+## 17. B1（本轮）：`deployment.mode=multi` 真的能跑 —— PG 数据层接线 + leader election + GC 门控
+
+> 依据：ADR-009 §4.4/§4.5/§6.4 与 §10 待办；前置：A1（`§15`）的 PG 位置/租约仓储与
+> A2（`§16`）的 PG 元数据仓储。**本切片把三件 PG 数据层接进组合根**，并补齐
+> leader election（会话级 advisory lock）与 POSIX 临时文件名的随机后缀。
+
+### 17.1 结论（先说答案）
+
+1. **`deployment.mode=multi` 不再被一刀切拒绝**：组合根真的创建 PG 元数据仓储、PG
+   位置仓储、PG 租约（`staging_leases`）与 `PgLeaderElection`（**专用锁连接** +
+   `pg_try_advisory_lock`），并让 GC 的周期调度与 `POST /v2/gc:run` 由 leader 门控。
+   任一创建/取锁失败 → **exit 78** + libpq 原文（绝不回退 SQLite）。
+2. **multi 真的用 PG**：真实进程上传（uploadURL → PUT → POST metadata）后，记录可从
+   **直连 libpq** 读回（`file_metadata_records` / `file_locations` 各 1 行，正控），
+   而同 data dir 下**没有** SQLite 库文件（负断言 + 同路径 `blobs` 正控）。
+3. **single + `*.repository=postgres` 也成立**（接线不是 multi-only）。
+4. **advisory lock 是真的**：进程运行期 `pg_locks` 能看到配置的 `lock_key`
+   （正控；另一个未使用的键必须不出现 = 负控），SIGTERM 后**轮询**到释放。
+5. **两个共键进程恰好一个 leader**：非 leader 的 `fss_gc_runs_total` 窗口内恒为 0，
+   leader 的持续增加 —— 证明选举真的门控了 GC。
+6. **multi + 空/未配置 `instance_id` → 自动生成唯一 id**（两个进程不同）；single
+   **不生成**（逐字不变）。POSIX `.tmp.*` 补齐 ADR-009 §4.5 的**每 store 随机后缀**
+   （`.` + `crypto::RandomHex(8)`）；`fs::AtomicWriteFile` 那条路径本来就含随机
+   （`...<pid>.<tmp_suffix>.<RandomHex(8)>`，见 `src/common/fs/fs.cpp:116-118`），**未重复加**。
+7. **fail-closed 负例**：multi + 不可达 metadata DSN / single + postgres + 不可达 DSN /
+   `metadata.repository=mysql` → exit 78 + 可读原因 + **不绑定** HTTP 端口（并配
+   同段端口探测的**正控**：合法 multi 配置端口真的可连）。
+8. **无 libpq 的构建**（`-DCMAKE_DISABLE_FIND_PACKAGE_PostgreSQL=ON`）：multi（以及
+   `*.repository=postgres` / `leases.enabled=true` / `leader_election.enabled=true`）
+   → **exit 78** + 「安装 libpq-dev 后重新 cmake + 重编」的可执行指令；
+   **single + sqlite 仍 readiness 200**（证明拒绝是可执行的 fail-closed，不是"整个二进制坏了"）。
+
+### 17.2 实现点（可点击）
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/infra/postgres/pg_leader_election.{h,cpp}`（新增，L2） | 会话级 advisory lock：**专用** `PgConnection`（不过数据池）、`TryAcquire()` 一条短语句、`Release()`、`LockKey()`、`Ready()/NotReadyReason()`；★ `IsLeader()` **每次做廉价往返**（`SELECT 1`）验证连接，失败即丢弃连接（结束会话 → PG 释放锁）并降级；非 leader 时每次调用尝试接管（failover）。头注释写明 PG **12.6** 无 `client_connection_check_interval` 的实测依据（空闲 51 ms / 15 s 长语句 ≥8 s） |
+| `src/main/server_main.cpp` | 组合根：`*.repository=postgres` 创建 PG 仓储；`leases.enabled` 选 PG/内存租约；`leader_election.*` 创建选举并门控 `GcScheduler::RunOnce` 与 `GcCallbacks::run`；multi 未配置/为空 `instance_id` → 自动生成；`#ifndef FSS_HAVE_LIBPQ` → exit 78；横幅新增 `repositories`/`instance id`/`lease backend`/`leader` 四行（**既有行逐字不变**）；顺手清掉 3 个既有 `-Wshadow` |
+| `src/infra/blob/posix/posix_blob_store.{h,cpp}` | `TempPathFor` 追加**每 store 随机后缀**（ADR-009 §4.5）；新增窄诊断访问器 `TempPathForDiagnostics()` / `temp_name_token()`（只为"随机后缀真的在路径里"这条判据） |
+| `src/CMakeLists.txt` | `fss_pg` 加 `pg_leader_election.cpp`；`fss_server` 在 libpq 可用时链接 `fss_location_postgres fss_metadata_postgres fss_pg`（`FSS_HAVE_LIBPQ` 经 `fss_pg` 的 PUBLIC 定义传递） |
+| `tests/integration/test_multi_mode.cpp`（新增） | 6 用例 / 183~185 断言：多实例启动+PG 落库、single+PG、`pg_locks` 持锁/释放、两进程一主+GC 门控、instance_id 自动生成、fail-closed 负例（含端口正控） |
+| `tests/integration/test_posix_tmp_names.cpp` | 新增 C6.13/B1 用例：随机后缀在路径里、两个同 `instance_id` 的 store 不撞名 |
+| `docs/operations.md` + `tests/unit/test_operations_doc.cpp` | 9 键移入「生效」，三态 **113/18/25 → 122/16/18** |
+| `docs/runbook.md` + `docs/phase-status.md` | 纠正"multi 拒绝启动 / PG 未交付"的过时叙述 |
+| `scripts/verify_config_wiring.sh` | `leases.enabled` / `leader_election.enabled` 的拒绝原因描述改为"缺少可用 PG"（断言仍为 exit 78 + 原因指向该键，**未放宽**） |
+
+### 17.3 实测命令与输出摘要
+
+```bash
+# 默认树（FSS_WITH_PG=OFF）：无回归
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFSS_WITH_PG=OFF
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
+#  → 100% tests passed, 0 tests failed out of 86
+
+# PG 树（本地 PG 14.24）
+cmake -S . -B build-pg -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFSS_WITH_PG=ON
+cmake --build build-pg -j4
+ctest --test-dir build-pg -L pg --output-on-failure
+#  → 100% tests passed, 0 tests failed out of 7
+#    （pg_fixture_setup / pg_schema_invariants / pg_advisory_lock / pg_concurrent_claim
+#      / test_postgres_repositories / test_multi_mode / pg_fixture_teardown）
+./build-pg/bin/test_postgres_repositories        # All tests passed (508 assertions in 14 test cases)
+./build-pg/bin/test_multi_mode                   # All tests passed (185 assertions in 6 test cases)
+
+# 目标引擎 PG 12.6（DSN 由环境变量传入，服务器进程由测试经 --set 使用同一个 DSN）
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg --output-on-failure
+#  → 100% tests passed, 0 tests failed out of 7
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ./build-pg/bin/test_postgres_repositories
+#  → All tests passed (508 assertions in 14 test cases)
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ./build-pg/bin/test_multi_mode
+#  → All tests passed (183 assertions in 6 test cases)   ← 断言数随轮询次数微变，非语义差异
+
+# 残留（两引擎）
+#   file_locations / staging_leases / file_metadata_records 的 pgtest-% 残留 = 0/0/0
+#   本测试自己的 /osdu-user/% 行 = 0；pg_locks 里没有遗留 advisory lock
+
+# 无 libpq 构建（fail-closed 可执行）
+cmake -S . -B build-nolibpq -DFSS_WITH_PG=OFF -DCMAKE_DISABLE_FIND_PACKAGE_PostgreSQL=ON
+cmake --build build-nolibpq -j4 --target fss_server
+./build-nolibpq/bin/fss_server --set deployment.mode=multi --set metadata.repository=postgres \
+  --set location.repository=postgres --set leases.enabled=true --set leader_election.enabled=true \
+  --set storage.posix.shared_mount_required=true --set gc.require_lease_expiry=true
+#  → exit 78 + 「安装 libpq 开发文件 … 重新 cmake + 重编」
+#  → single + sqlite：readiness 200（同一次运行）
+```
+
+### 17.4 R1 注入（每条都在**完整重编**后跑；末尾已全部还原，`md5sum` 逐字一致）
+
+最终 md5（注入前后核对用；`grep -rn "R1-INJECT" src/ tests/` 无输出）：
+
+```
+09907aaebb154e4b0b05b5f27c86f0b8  src/main/server_main.cpp
+9b9998b81a6090417af2bb0f8e68ec91  src/infra/postgres/pg_leader_election.cpp
+c4b7be9564a5e9a831095a64afb799d1  src/infra/blob/posix/posix_blob_store.cpp
+```
+
+> 注入时先记下这三份的 md5；每条注入**完整重编**后跑对应用例，还原后用 `md5sum -c` 逐字核对。
+> `pg_leader_election.cpp` / `posix_blob_store.cpp` 全程未变。`server_main.cpp` 的**最终** md5
+> 与注入期基线不同，原因只有一处**有意的**改动（与本次注入无关）：把
+> `deployment.clock_skew_tolerance_seconds` 的拒绝原因里"multi 已拒绝启动"改成
+> "PG-vs-本地时钟比较未实现"（旧叙述已被 B1 推翻）。把这段文案临时换回旧文本后，
+> `server_main.cpp` 的 md5 **恰好等于**注入期基线 `e03e798c34652cca41da7dca2e9a88e7`
+> —— 即三次注入的还原都逐字成功，没有残留。
+
+| # | 注入 | 命令 | 结果 | 原始失败断言 |
+| --- | --- | --- | --- | --- |
+| ① | 组合根忽略 `location.repository`（`if (false && location_repository_name == "postgres")`） | `cmake --build build-pg -j4 --target fss_server` → `./build-pg/bin/test_multi_mode "*B1-1*"` | 失败（预期） | `test_multi_mode.cpp:368: FAILED: REQUIRE( CountLocationRows(uploaded.file_source, "PERSISTENT") == 1 ) with expansion: 0 == 1` |
+| ② | `PgLeaderElection::TryAcquire()` 直接 `return true`（不执行语句） | 同上 → `"*B1-3*"` | 失败（预期） | `test_multi_mode.cpp:439: FAILED: REQUIRE( WaitFor([&] { return AdvisoryLockHeld(key); }, 100, 50) ) with expansion: false` |
+| ③ | 去掉 `GcScheduler::RunOnce` 的 leader 门控（`if (false && is_leader_ && !is_leader_())`） | 同上 → `"*B1-4*"` | 失败（预期） | `test_multi_mode.cpp:514: FAILED: REQUIRE( b_max == 0 ) with expansion: 3 == 0` |
+| ④ | `TempPathFor` 去掉随机后缀（`+ "." + tmp_token_`） | `cmake --build build -j4 --target test_posix_tmp_names` → `./build/bin/test_posix_tmp_names "*B1*"` | 失败（预期） | `test_posix_tmp_names.cpp:235: FAILED: REQUIRE( path_first.find(token_first) != std::string::npos ) with expansion: npos != npos` |
+
+四条注入互相独立、都让**目标判据**（而不是别的判据）失败；每次还原后 `grep -rn "R1-INJECT" src/ tests/` 无输出、`md5sum` 与基线全等。
+
+### 17.5 三态净变化（逐键核实）
+
+| 键 | 原状态 | 新状态 | 证据 |
+| --- | --- | --- | --- |
+| `metadata.postgres.dsn` / `max_connections` / `statement_timeout_ms` | 已读但无效果 | **生效** | `PostgresMetadataRepository::Open` + `PgPool`；真实进程上传后直连 libpq 读回 |
+| `location.postgres.dsn` / `max_connections` | 已读但无效果 | **生效** | `PostgresLocationRepository::Open`；同上 |
+| `leases.enabled` | 拒绝启动 | **生效** | `true` → PG 租约（`staging_leases`）；`false` → 内存（默认语义不变） |
+| `leader_election.enabled` | 拒绝启动 | **生效** | 创建 `PgLeaderElection` + GC 门控；`pg_locks` 可观察 |
+| `leader_election.backend` / `lock_key` | 已读但无效果 | **生效** | backend 校验 + 横幅；`lock_key` 进 `pg_try_advisory_lock($1::bigint)` |
+
+**计数（由 `test_operations_doc` 机械断言）**：生效 **113 → 122**（+9）；
+拒绝启动 **18 → 16**（−2）；已读但无效果 **25 → 18**（−7）；合计 **156** 不变。
+
+**仍然留在「已读但无效果」/「拒绝启动」（不随 B1 移动，避免"文档说生效、实际没有"）**：
+`metadata.postgres.schema_version_check`（readiness PG `SELECT 1` + 迁移版本校验未实现）、
+`leases.{ttl_seconds,renew_interval_seconds,time_source}`（上传路径无 `Acquire`/`Renew` 调用方）、
+`storage.posix.{shared_mount_required,one_filesystem_per_partition}`（共享挂载探针未实现）、
+`deployment.clock_skew_tolerance_seconds`（PG-vs-本地时钟比较未实现）。
+
+### 17.6 仍未交付 / 未验证（如实登记）
+
+共享挂载探针（`storage.posix.shared_mount_required`）、readiness 的 PG `SELECT 1` +
+迁移版本校验（`metadata.postgres.schema_version_check`）、`instance_registry` / 配置版本
+一致性、PG 连接预算（C9.28）、PG-vs-本地时钟比较、上传路径的租约
+`Acquire`/`Renew`（`leases.ttl_seconds`/`renew_interval_seconds`）、`CreateFileMetadata`
+跨步骤原子领取 + `claiming→ready`、**完整多实例 E2E 与崩溃注入（C9.26）**、NFS 语义
+（C9.27）、`/v2/info` 暴露 `instanceId`、`storage.posix.one_filesystem_per_partition`。
+★ 特别说明：`instance_id` 自动生成与随机临时后缀**只**消除了 M1 的确定性撞名；
+"共享挂载探针"没做 ⇒ 配置了 `shared_mount_required=true` 也**不会**验证挂载真的是共享的。
+
+### 17.7 门槛结果
+
+```bash
+./scripts/check_docs.sh
+#  → 全部检查通过（D1~D5）；D5：11 个阶段，148 条门槛
+
+JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh
+#  → ==> [infra] ctest -L pg → 100% tests passed, 0 tests failed out of 7
+#  → 失败: 无
+#  → ⏱  总耗时: 8 分 57 秒（537 s，阶段数 11）
+#  → ✅ 全部已启用阶段门槛通过。（退出码 0）
+
+# 跑完后把默认树缓存恢复 FSS_WITH_PG=OFF 并重跑：
+ctest --test-dir build --output-on-failure
+#  → 100% tests passed, 0 tests failed out of 86
+```
+
+★ 注：门槛脚本会把 `build` 缓存改成 `FSS_WITH_PG=ON`；跑完后已再次
+`cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFSS_WITH_PG=OFF` 重编并把
+`ctest --test-dir build` 恢复为 **86/86**（与 AGENTS §0 / §15 记录的形态一致）。
+
+### 17.8 父代理独立复核（不采信子代理自述）
+
+#### 17.8.1 落地前的两处规格纠正（都由父代理先实测再改）
+
+| # | 我原先写进 spec 的前提 | 实测事实 | 后果 |
+| --- | --- | --- | --- |
+| 1 | "`deployment.instance_id` 的 schema 默认是空 ⇒ multi 下若为空才自动生成" | `--print-config` 实测默认是 **`local`**（`--set deployment.instance_id=` 才得空串） | 原规则对**实际会发生的情况**（没人配置）完全无效 ⇒ 改为 multi 下"未配置（有效值 `local`）**或**为空 → 自动生成" |
+| 2 | （未察觉） | `posix_blob_store.cpp:193` 的 `.tmp.*` 名是 `instance_id + pid + counter`，**没有随机后缀** —— 而 ADR-009 §4.5 明确要求随机后缀（pid/counter 跨主机不唯一） | multi + 默认 `local` 会让两台主机**可能**撞名 ⇒ ADR-009 §3 的 **M1（实测 21/40 静默串数据）会被重新放回**。已要求补随机后缀（含 sidecar 路径；`fs::AtomicWriteFile` 本就有，未重复加） |
+
+#### 17.8.2 复核中由**父代理自己修掉**的一个诚实性问题
+
+组合根的既有横幅行原本**硬编码**「内存租约」，却紧跟着打印 `enabled=true`
+（`server_main.cpp:2530`）—— 在 `leases.enabled=true`（PG 租约）时**自相矛盾**。
+子代理按我"既有行不得改"的指令原样保留并主动上报了冲突。我的判断：那条指令的目的是
+避免误伤测试，**不是**保留一句已经为假的话。已由我改为打印**实际后端**（`lease_backend`），
+并注明 ttl/renew/time_source 三个键当前无效果（上传路径尚未 `Acquire`）。改动前已确认
+**没有任何测试/脚本断言该文本**（`grep -rn "内存租约" tests/ scripts/` 为空）；改后重编
+`ctest` **86/86**、本地与目标 PG `-L pg` **7/7** 仍全绿。
+
+#### 17.8.3 我的独立运行与消融
+
+| 项 | 我的命令 | 实测 |
+| --- | --- | --- |
+| 默认树 | `cmake --build build -j4` + `ctest --test-dir build` | **86/86**；`touch server_main.cpp` 后强制重编，`grep "warning:"` **为空** |
+| PG 测试（本地 14.24） | `ctest --test-dir build-pg -L pg` | **7/7** |
+| PG 测试（目标 **12.6**） | `FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg` | **7/7** |
+| 数据卫生 | 两库 `pgtest-%` + `pg_locks` 残留 | **0/0/0**，`advisory_locks=0`（锁在进程退出后确实释放） |
+| 三态 | `docs/operations.md` 的三个小节标题 | **生效 122 / 拒绝启动 16 / 已读但无效果 18**（与子代理报告一致） |
+| 断言是否被削弱 | 读 `scripts/verify_config_wiring.sh` 的 `assert_reject($1,$2,$3)` | 只改了 `$3`（描述），**`$2`（needle）逐字未变** ⇒ 未削弱 |
+| 跨文档真相维护 | 读 `00-final-design §5.t`、`02-design` R-26、`03-api-contract §1.6b`、`04-plan` C8.9/C9.26 | 与实现一致（C8.9 由 5 条更正为 **7 条**、C9.26 的重定位如实） |
+| **我自己的消融** | 把 instance_id 规则从 `(empty() \|\| =="local")` 收窄为 `(empty())` → 重编 `fss_server` + `test_multi_mode` → 跑 B1-5 | **失败**：`test_multi_mode.cpp:560 REQUIRE( id_b != "local" )`（`1 \| 0 passed; 1 failed`）⇒ 我要求的那条 M1 修复**真的被钉住**（不是恒真）。`md5` 逐字还原后 B1-5 全绿（32 断言） |
+
+> 其余复核确认：`grep -rn "R1-INJECT" src/ tests/` 无输出；`AGENTS.md`、
+> `config/fss.example.json`、`db/migrations/001_init.sql`、`github.txt` 均未被本切片触碰
+> （`AGENTS.md` 的 B1 状态由父代理在本轮另行更新）。
+
+#### 17.8.4 复核中由父代理修掉的第二个问题：门禁脚本在**目标引擎**上失败
+
+`db/tests/002_advisory_lock.sh` 的 `spawn_holder()` 注释写着"循环短查询（leader 持锁的会话
+基本空闲，只做心跳）"，实现却是**一条 120 s 的 `DO $$ FOR i IN 1..600 LOOP PERFORM
+pg_sleep(0.2) $$`**。在 PG 14.24 上 `client_connection_check_interval`（该机为 `1s`）让它
+（正确地）通过；在目标库 **PG 12.6**（**没有**该 GUC）上 A3 **失败** —— 这是**脚本与自己的
+注释不符**，不是 12.6 的问题（实测依据：空闲持锁会话崩溃 51 ms 释放、长语句 ≥8 s 未释放，
+见 §15.9）。
+
+已改成"一条短语句取锁 + 循环**独立**短语句心跳"（`{ printf …; for …; } | psql &`，`$!` 即
+`psql` 的 PID），并**保留** A3b 长查询作为"为什么锁会话不能跑长语句"的对照。修后实测：
+
+| 引擎 | 结果 |
+| --- | --- |
+| 本地 PG 14.24 | **A1~A4 + A3b 全通过**（A3b 报 `client_connection_check_interval=1s`） |
+| 目标 PG 12.6（经 shim） | **A1~A4 全通过**；A3b 按设计降级为 info（该库无此 GUC） |
+| 锁卫生 | 两库 `pg_locks` 的 advisory lock 残留均为 **0** |
+
+该脚本属于 `FSS_GATES_WITH_PG=1`，因此**目标引擎现在也有判定力**（此前"通过"只发生在
+PG 14 上）。同时把 `pg_leader_election.h` 里"必须改成"的措辞改为"**已改成**"（R13）。
+
+
 

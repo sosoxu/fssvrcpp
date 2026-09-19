@@ -141,7 +141,13 @@ constexpr auto kBatchWaitWindow = std::chrono::microseconds(2000);
 
 PosixBlobStore::PosixBlobStore(std::string root, const fss::IClock& clock,
                                PosixBlobStoreOptions options)
-    : root_(std::move(root)), clock_(clock), options_(std::move(options)) {}
+    : root_(std::move(root)),
+      clock_(clock),
+      options_(std::move(options)),
+      //  ★ ADR-009 §4.5：每 store 一次的随机后缀（M1 依据见头文件）。
+      //    构造时生成一次即可：同一 store 内还有进程级递增计数保证不重复；
+      //    随机 token 解决的是"跨主机 instance_id / pid / 计数全部相同"的确定性撞车。
+      tmp_token_(crypto::RandomHex(8)) {}
 
 domain::BlobCapabilities PosixBlobStore::capabilities() const {
   domain::BlobCapabilities caps;
@@ -192,8 +198,13 @@ std::atomic<std::uint64_t> PosixBlobStore::tmp_counter_{0};
 
 std::string PosixBlobStore::TempPathFor(const std::string& target) const {
   const auto counter = tmp_counter_.fetch_add(1);
+  //  名字形态：`<target>.tmp.<instance_id>.<pid>.<counter>.<random>`
+  //  · 前四段是接线前的既有形态（`.tmp.` 前缀与 `IsInternalKey`/C9.25 的清理判据依赖它）；
+  //  · 第五段是 ADR-009 §4.5 要求的**随机后缀**（见头文件：默认 `instance_id=local`
+  //    时前四段在多实例共享挂载上会确定性撞名 → M1 静默串数据）。
   return target + std::string(kTempMarker) + options_.instance_id + "." +
-         std::to_string(static_cast<long>(::getpid())) + "." + std::to_string(counter);
+         std::to_string(static_cast<long>(::getpid())) + "." + std::to_string(counter) + "." +
+         tmp_token_;
 }
 
 fss::Result<void> PosixBlobStore::WriteSidecar(const std::string& object_path,

@@ -147,6 +147,25 @@ if(FSS_WITH_PG)
     FIXTURES_REQUIRED pg
     TIMEOUT 300)
 
+  # ===========================================================================
+  #  B1（ADR-009 §4.4/§4.5）：`deployment.mode=multi` **真的能跑**
+  #    · 真实 `build/bin/fss_server` 进程 + `--config`/`--set`（DSN 走 `FSS_PG_DSN`
+  #      同源的值，由测试显式写给服务器进程）；
+  #    · 直连 libpq 读回 PG 行（正控）与 `pg_locks`（advisory lock 正控）；
+  #    · 两个共键进程 → 恰好一个 leader；非 leader 的 `fss_gc_runs_total` 不增加；
+  #    · fail-closed 负例（不可达 DSN / 非法 repository）→ exit 78 且不绑定端口。
+  #  ★ 连不上 PG 就失败（REQUIRE），绝不静默跳过；等待一律轮询实际条件。
+  # ===========================================================================
+  fss_add_test(test_multi_mode
+    SOURCES integration/test_multi_mode.cpp
+    LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory fss_pg
+            Threads::Threads
+    LABELS  "pg;infra")
+  add_dependencies(test_multi_mode fss_server)
+  set_tests_properties(test_multi_mode PROPERTIES
+    FIXTURES_REQUIRED pg
+    TIMEOUT 900)
+
   if(FSS_PG_TEARDOWN)
     add_test(NAME pg_fixture_teardown COMMAND "${_pg_script}" stop)
     set_tests_properties(pg_fixture_teardown PROPERTIES

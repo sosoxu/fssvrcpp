@@ -159,9 +159,9 @@
 
 ---
 
-### 1.6b 多实例（`deployment.mode=multi`）的强制启动校验（C8.9）
+### 1.6b 多实例（`deployment.mode=multi`）的强制启动校验（C8.9；运行形态 B1 已交付）
 
-`multi` 模式下配置校验**必须**拒绝以下任一情况（每条都有"拒绝启动"的测试，且五条全满足
+`multi` 模式下配置校验**必须**拒绝以下任一情况（每条都有"拒绝启动"的测试，且七条全满足
 时**必须通过** —— 正例断言防"校验恒真"）：
 
 | # | 配置项 | 要求 | 理由 |
@@ -169,11 +169,15 @@
 | 1 | `metadata.repository` / `location.repository` | `postgres` | 各实例共享 SQLite 会让状态发散 |
 | 2 | `leases.enabled` / `leader_election.enabled` | `true` | 租约与领导者选举是多实例一致性的前提（ADR-009） |
 | 3 | `gc.require_lease_expiry` | `true` | 否则 GC 会把**在途上传**当孤儿删（实测 20/20 误删） |
-| 4 | `storage.posix.shared_mount_required` | `true` | 存储根必须在共享挂载上 |
+| 4 | `storage.posix.shared_mount_required` | `true` | 存储根必须在共享挂载上（★ 该键只做强制校验，**共享挂载探针未实现**） |
 | 5 | `deployment.max_clock_skew_seconds` | `0 < 值 ≤ 60` | 时钟偏差过大会让租约/过期误判（C8.10） |
 
-**运行形态**：PG 版仓储 + PG 租约 + 数据库时钟（ADR-009）尚未交付（计划 P9），因此
-组合根对 `FSS_DEPLOYMENT_MODE=multi` **拒绝启动**（明确报错），而不是以单实例状态跑在多实例里。
+**运行形态（B1 起）**：组合根对 `FSS_DEPLOYMENT_MODE=multi` 会**真的创建** PG 元数据仓储、
+PG 位置仓储、PG 租约（`staging_leases`）与 `PgLeaderElection`（会话级 advisory lock），并让
+GC 的周期调度与 `POST /v2/gc:run` 由 leader 门控；任一创建/取锁失败 → **exit 78** + libpq 原文
+（绝不回退 SQLite）。⚠️ 本构建未找到 libpq 时，multi 同样 **exit 78** 并给出可执行的修复指令。
+**仍未交付**：共享挂载探针、readiness PG 探活+迁移版本校验、完整多实例 E2E / 崩溃注入（C9.26）、
+NFS 语义（C9.27）——见 `operations.md` §7.3 与 `test-evidence/phase10.md` §17。
 
 ---
 

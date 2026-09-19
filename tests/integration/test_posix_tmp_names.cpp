@@ -194,3 +194,55 @@ TEST_CASE("★ C6.13 对照：临时名不含实例标识时**必然**出现内�
   REQUIRE(fss::crypto::Sha256Hex(content) != fss::crypto::Sha256Hex(payload_a));
   REQUIRE(fss::crypto::Sha256Hex(content) != fss::crypto::Sha256Hex(payload_b));
 }
+
+// =============================================================================
+//  ★ B1 补齐 ADR-009 §4.5 的**随机后缀**（M1 的关键一步）
+// =============================================================================
+//  为什么单靠 `instance_id` + `pid` + 进程内计数不够：默认 `deployment.instance_id`
+//  是 `local`（组合根历史默认），共享挂载上两台主机可以有**相同**的 instance_id、
+//  **相同**的 pid、**相同**的计数起点 → 临时名确定性撞车（ADR-009 §3 M1：40 次里
+//  21 次静默串数据）。因此名字里必须再有一个**构造时生成一次**的随机 token。
+//
+//  判据（都能失败，R1）：
+//    ① 同一 target 连续两次取路径必不同（计数维度）；
+//    ② 两个**相同 instance_id** 的 store 取同一 target 必不同，且各自的随机 token 不同；
+//    ③ 路径里**真的含**该 store 的随机 token（去掉随机后缀 → 这条必失败）。
+// =============================================================================
+TEST_CASE("★ C6.13/B1 临时名含随机后缀（ADR-009 §4.5）：同 target 必不同、同 id 不撞名",
+          "[phase6][integration][c6.13]") {
+  fss::test::TempDir dir("tmp_names_random");
+  fss::SystemClock clock;
+  //  ★ 故意共用同一个 instance_id：这正是"跨主机默认 local"的最坏情况。
+  PosixBlobStoreOptions options;
+  options.instance_id = "local";
+  PosixBlobStore first(dir.child("blobs"), clock, options);
+  PosixBlobStore second(dir.child("blobs"), clock, options);
+
+  const std::string target = dir.child("blobs/opendes-staging/osdu-user/x/object.bin");
+
+  //  ①② 随机 token 存在且两个 store 不同（每个 store 构造时生成一次）
+  const std::string token_first = first.temp_name_token();
+  const std::string token_second = second.temp_name_token();
+  INFO("token_first=" << token_first << " token_second=" << token_second);
+  REQUIRE_FALSE(token_first.empty());
+  REQUIRE_FALSE(token_second.empty());
+  REQUIRE(token_first != token_second);
+
+  //  ③ 路径里真的含该 store 的随机 token（去掉随机成分 → 这里必然失败）
+  const std::string path_first = first.TempPathForDiagnostics(target);
+  const std::string path_second = second.TempPathForDiagnostics(target);
+  INFO("path_first=" << path_first << " path_second=" << path_second);
+  REQUIRE(path_first.find(token_first) != std::string::npos);
+  REQUIRE(path_second.find(token_second) != std::string::npos);
+  //  既有形态不变（`.tmp.` 前缀 + instance_id + pid）—— C9.25 的清理判据依赖 `.tmp.`
+  REQUIRE(path_first.find(".tmp.local.") != std::string::npos);
+  REQUIRE(path_first.compare(0, target.size(), target) == 0);  // 目标路径在最前
+
+  //  ① 同一 store 对同一 target 连续取两次必不同（进程级计数）
+  const std::string path_first_again = first.TempPathForDiagnostics(target);
+  REQUIRE(path_first != path_first_again);
+  REQUIRE(path_first_again.find(token_first) != std::string::npos);
+
+  //  ② 两个相同 instance_id 的 store 对同一 target 不撞名
+  REQUIRE(path_first != path_second);
+}

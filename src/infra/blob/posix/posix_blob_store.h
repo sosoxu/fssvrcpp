@@ -187,6 +187,18 @@ class PosixBlobStore final : public domain::IBlobStore {
   static bool IsInternalKey(std::string_view relative_key);
   std::string TempPathFor(const std::string& target) const;
 
+ public:
+  //  ---- 窄诊断访问器（测试/排障；不改变任何运行时行为）----
+  //  ★ 为什么必须公开：ADR-009 §4.5 要求的"随机后缀"只能从**临时路径本身**判定
+  //    （否则判据只能间接依赖"并发写没串数据"，无法区分"随机后缀存在"与"恰好没撞名"）。
+  //    两者都是纯函数/只读成员，不写文件、不入库、不触碰批提交状态。
+  std::string TempPathForDiagnostics(const std::string& target) const {
+    return TempPathFor(target);
+  }
+  const std::string& temp_name_token() const { return tmp_token_; }
+
+ private:
+
   //  ---- ADR-008 的 P4：两阶段批提交（`batch_commit=true` 时） ----
   //  一次 `tmp → final` 的改名（一个对象可能有两条：对象本体 + sidecar）。
   struct PendingRename {
@@ -224,8 +236,19 @@ class PosixBlobStore final : public domain::IBlobStore {
   //    或同一份配置被装配两次）如果共享 `instance_id`，各自从 0 开始的序号会让
   //    它们算出**同一个临时路径** → 后者 `O_CREAT|O_EXCL` 直接失败，或（若不用 O_EXCL）
   //    两个写入者交错写同一份临时文件，改名后得到**两份数据混在一起**的对象（ADR-009 M1）。
-  //    进程级序号 + pid（跨进程）+ instance_id（跨实例）三者合起来才能保证唯一。
+  //    进程级序号 + pid（跨进程）+ instance_id（跨实例）+ **每进程随机 token**（见下）
+  //    四者合起来才能保证唯一。
+  //
+  //  ★ ADR-009 §4.5 的**随机后缀**（本切片的补齐，M1 的关键一步）：
+  //    `instance_id` + `pid` + 进程内计数**都不足以**保证跨主机唯一 —— 两台主机可以有
+  //    相同的 `deployment.instance_id`（默认 `local` 就是这种情况！）、相同的 pid、
+  //    相同的计数起点，于是临时名**确定性撞车**：ADR-009 §3 M1 实测 40 次里 21 次
+  //    内容错乱。因此名字里再加一个**构造时生成一次**的随机 token
+  //    （`crypto::RandomHex`），使唯一性不再单独依赖 `instance_id`。
+  //    名字形态保持 `.tmp.<instance_id>.<pid>.<counter>.<random>`（前缀与既有顺序不变）。
   static std::atomic<std::uint64_t> tmp_counter_;
+  //  构造时生成一次的随机 token（每个 store 实例一份；进程内两个 store 也不相同）。
+  std::string tmp_token_;
 
   //  ★ 组提交的共享状态（只有 `batch_commit=true` 时会用到）。
   //    `batch_writers_` = 当前处于"批阶段"（已写 tmp、尚未提交）的 put 数；

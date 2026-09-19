@@ -226,8 +226,10 @@ target_link_libraries(fss_metadata_memory PUBLIC fss_domain fss_time)
 find_package(PostgreSQL QUIET)
 if(PostgreSQL_FOUND)
   # libpq 薄封装：RAII 结果/连接、有界连接池、数据库时钟、SQLSTATE → ErrorKind 映射
+  # + 领导者选举（会话级 advisory lock，专用锁连接；ADR-009 §4.4）
   add_library(fss_pg STATIC
-    infra/postgres/pg_connection.cpp)
+    infra/postgres/pg_connection.cpp
+    infra/postgres/pg_leader_election.cpp)
   target_include_directories(fss_pg PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(fss_pg PUBLIC fss_domain PostgreSQL::PostgreSQL)
   #  发布给 tests/：PG 仓储的契约测试必须能看见"libpq 真的可用"
@@ -252,4 +254,14 @@ if(FSS_HAVE_LIBPQ)
   target_include_directories(fss_metadata_postgres PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(fss_metadata_postgres PUBLIC fss_domain fss_json fss_pg
                         PostgreSQL::PostgreSQL)
+
+  # ---------------------------------------------------------------------------
+  #  B1：组合根在 `deployment.mode=multi` / `*.repository=postgres` 时必须创建
+  #  PG 仓储、PG 租约与 leader election（`src/main/server_main.cpp` 里的
+  #  `#ifdef FSS_HAVE_LIBPQ` 分支）。目标在**本文件末尾**定义，因此把链接放在这里
+  #  （CMake 允许在 target 定义之后再补 target_link_libraries）。
+  #  `fss_pg` 把 `FSS_HAVE_LIBPQ=1` 作为 PUBLIC 编译定义传递，所以组合根里的
+  #  `#ifdef FSS_HAVE_LIBPQ` 与"libpq 真的可用"严格一致。
+  # ---------------------------------------------------------------------------
+  target_link_libraries(fss_server PRIVATE fss_location_postgres fss_metadata_postgres fss_pg)
 endif()

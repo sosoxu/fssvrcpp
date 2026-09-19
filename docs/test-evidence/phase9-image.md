@@ -156,7 +156,7 @@ ENV FSS_AUTH_MODE=jwt \
 | `FSS_JWT_ISSUER` | `""` | 非空才校验 `iss`（`local_jwt_authorizer.cpp:200-204`）。生产按平台实际值设置；非敏感，可直接放部署清单 |
 | `FSS_JWT_AUDIENCE` | `""` | 非空才校验 `aud` 包含关系。同上 |
 | `FSS_JWT_VERIFY_SIGNATURE` | `true` | 设为 `false` 会退化为不验签，生产**不得**关闭 |
-| `FSS_DEPLOYMENT_MODE` | `single` | `multi` 会被组合根拒绝启动（ADR-009 的 PG 形态尚未交付） |
+| `FSS_DEPLOYMENT_MODE` | `single` | `multi` 需要 PG（libpq + DSN）；**B1 起组合根不再一刀切拒绝**，但镜像内没有 PG 时仍 fail-closed（exit 78 + 可执行指令）。见 `phase10.md` §17 |
 
 `config/fss.example.json` 被复制到 `/etc/fss/fss.example.json`（fss:fss 0600）作为**带注释的参考文档**；
 **它不是生效来源**——组合根当前不读 JSON 配置（当时的登记见 `docs/phase-status.md` 的「阶段 4 后续」一行）。这一点在镜像注释里写明了。
@@ -419,7 +419,9 @@ docker stop "$CID" && docker rm "$CID"
   （`FSS_STORAGE_DRIVER=s3`）、未接 `remote-entitlements`。
 * **容器内完整业务链路**：✅ **已补（§10）**：容器内 upload → 登记（metadata）→ 下载读回
   （SHA-256 比对）已跑通；**仍未测**：容器内的 delete / list / 多租户越权（宿主 `ctest` 已覆盖）。
-* **`deployment.mode=multi`**：组合根仍**拒绝启动**（ADR-009 的 PG 形态未交付），镜像沿用该行为。
+* **`deployment.mode=multi`**：本镜像未内置 libpq 依赖的 PG 环境配置；**B1 起 multi 的接线已交付**
+  （见 `phase10.md` §17），但镜像里没有 PG 时仍 fail-closed（exit 78 + 可执行指令）。本节的容器
+  实测**只**覆盖 `single`（当时的形态）。
 
 ### 6.3 已知的良性噪声 / 有意偏离
 

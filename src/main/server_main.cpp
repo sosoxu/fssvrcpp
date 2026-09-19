@@ -46,10 +46,14 @@
 #include "infra/event/webhook_event_publisher.h"
 #include "infra/io/uring_io_engine.h"
 #include "infra/location/memory/memory_lease_repository.h"
+#include "infra/location/postgres/postgres_lease_repository.h"
+#include "infra/location/postgres/postgres_location_repository.h"
 #include "infra/location/sqlite/sqlite_location_repository.h"
 #include "infra/io/file_sync.h"
 #include "infra/legal/remote_legal_validator.h"
+#include "infra/metadata/postgres/postgres_metadata_repository.h"
 #include "infra/metadata/sqlite/sqlite_metadata_repository.h"
+#include "infra/postgres/pg_leader_election.h"
 #include "infra/schema/remote_schema_validator.h"
 #include "infra/transfer/blob_byte_source.h"
 #include "infra/transfer/transfer_endpoint.h"
@@ -65,6 +69,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -935,16 +940,23 @@ class FailingAuditLogger final : public fss::domain::IAuditLogger {
 //    等待用 `condition_variable::wait_for`（不是固定 sleep）：SIGTERM 后立刻退出。
 //  ★ 第一轮**立即执行**（不等一个 interval）：运维最需要的是"启动后马上有一轮结果"，
 //    而不是等一小时。之后按 `gc.interval_seconds` 周期运行。
-//  ★ `interval_seconds <= 0` 时**不启动**：宁可"不跑并在横幅说明"，也不要空转把机器压满。
+//  ★ B1：leader 门控。`interval_seconds <= 0` 时**不启动**：宁可"不跑并在横幅说明"，
+//    也不要空转把机器压满。
+//  ★ B1：`is_leader`（可空）= 领导者判定（组合根注入 `PgLeaderElection::IsLeader`）。
+//    为空 = 未启用 leader election ⇒ 每个实例都跑（单实例语义，逐字不变）。
+//    非 leader 时**在调用 `GcTask::Run` 之前**返回 —— 因此 `fss_gc_runs_total` 不增加
+//    （这是"选举真的门控了 GC"的判据）。
 class GcScheduler {
  public:
   GcScheduler(fss::app::GcTask& task, std::string partition, fss::app::GcOptions options,
-              std::int64_t interval_seconds, const fss::logging::ILogger& logger)
+              std::int64_t interval_seconds, const fss::logging::ILogger& logger,
+              std::function<bool()> is_leader = {})
       : task_(task),
         partition_(std::move(partition)),
         options_(options),
         interval_seconds_(interval_seconds),
-        logger_(logger) {}
+        logger_(logger),
+        is_leader_(std::move(is_leader)) {}
 
   ~GcScheduler() { Stop(); }
   GcScheduler(const GcScheduler&) = delete;
@@ -978,6 +990,15 @@ class GcScheduler {
   }
 
   void RunOnce() {
+    //  ★ B1：先做 leader 判定，再决定是否调用 `GcTask::Run`。
+    //    非 leader **不调用** Run ⇒ `fss_gc_runs_total` 不增加（可观测判据）。
+    if (is_leader_ && !is_leader_()) {
+      fss::logging::Warn(logger_, "gc_skipped_not_leader",
+                         {{"partition", partition_},
+                          {"reason", "本实例不是 leader（leader_election.enabled=true）→ "
+                                     "跳过本轮；fss_gc_runs_total 不增加"}});
+      return;
+    }
     const auto report = task_.Run(partition_, options_);
     runs_.fetch_add(1);
     if (!report.ok()) {
@@ -1005,6 +1026,8 @@ class GcScheduler {
   fss::app::GcOptions options_;
   std::int64_t interval_seconds_ = 3600;
   const fss::logging::ILogger& logger_;
+  //  ★ B1：空 = 不做 leader 门控（leader election 未启用）。
+  std::function<bool()> is_leader_;
   std::thread thread_;
   std::mutex mutex_;
   std::condition_variable cv_;
@@ -1141,9 +1164,26 @@ static int RunServer(int argc, char** argv) {
   const std::string s3_driver_report = resolver.Str("storage.driver_report_override", "");
   const std::string s3_provider_key = resolver.Str("storage.provider_key_override", "");
 
-  //  ---- 仓储（ADR-004：单实例 = 内置 SQLite）----
+  //  ---- 仓储（ADR-004：单实例 = 内置 SQLite；B1 起 multi = PG）----
   const std::string metadata_repository_name = resolver.Str("metadata.repository", "sqlite");
   const std::string location_repository_name = resolver.Str("location.repository", "sqlite");
+  //  ---- B1：PG 仓储的连接参数（`*.postgres.*`）----
+  //  ★ 逐键来源（默认值 = `core_schema.cpp` / `config/fss.example.json`）：
+  //    `metadata.postgres.{dsn,max_connections,statement_timeout_ms}`（3 个键 → 生效）
+  //    `location.postgres.{dsn,max_connections}`（2 个键 → 生效）
+  //  ★ `location.postgres.*` 组**没有** `statement_timeout_ms` 键 —— 该组用
+  //    `PgOptions` 的默认值（5000ms），不在这里发明一个配置键。
+  //  ★ dsn 是 secret：绝不打印（横幅只打印"用的是 postgres"与连接数）。
+  const std::string metadata_postgres_dsn = resolver.Str("metadata.postgres.dsn", "");
+  const long metadata_postgres_max_connections =
+      resolver.Int("metadata.postgres.max_connections", 16);
+  const long metadata_postgres_statement_timeout_ms =
+      resolver.Int("metadata.postgres.statement_timeout_ms", 5000);
+  const std::string location_postgres_dsn = resolver.Str("location.postgres.dsn", "");
+  const long location_postgres_max_connections =
+      resolver.Int("location.postgres.max_connections", 8);
+  //  ★ `metadata.postgres.schema_version_check` 仍然**未接线**（需要 readiness 的
+  //    `SELECT 1` + 迁移版本校验，留给后续切片）→ 不读它，如实留在「已读但无效果」。
   const std::string metadata_db_path =
       resolver.Str("metadata.sqlite.path", storage_root + "/metadata.db");
   const std::string sqlite_path =
@@ -1244,7 +1284,16 @@ static int RunServer(int argc, char** argv) {
   const long leases_renew_interval_seconds =
       resolver.Int("leases.renew_interval_seconds", 20);
   const std::string leases_time_source = resolver.Str("leases.time_source", "database");
+  //  ---- B1：领导者选举（`leader_election.*`，3 个键 → 生效）----
+  //  ★ `enabled` 不再是"未实现 → exit 78"的守卫：它真的决定是否创建
+  //    `PgLeaderElection` 并用它门控 GC（见本文件 §④ 与 GcScheduler/GcCallbacks）。
+  //  ★ `backend` 只有一个枚举值 `postgres_advisory_lock`：组合根**校验**它并把它
+  //    写进横幅（schema 已拒绝其它取值；这里的 else 是防御性的第二道）。
+  //  ★ `lock_key` 真的交给 `pg_try_advisory_lock($1::bigint)`。
   const bool leader_election_enabled = resolver.Bool("leader_election.enabled", false);
+  const std::string leader_election_backend =
+      resolver.Str("leader_election.backend", "postgres_advisory_lock");
+  const long leader_election_lock_key = resolver.Int("leader_election.lock_key", 1179865927);
   //  ---- 阶段 10 切片 6a：远端 legal / schema 校验器（ADR-013）----
   //  ★ `*.remote.base_url` 就是**完整端点 URL**（POST 到它，不追加路径）—— 与
   //    `auth.remote_entitlements` 不同（后者另有 `authorize_path` 键）。理由：
@@ -1399,17 +1448,9 @@ static int RunServer(int argc, char** argv) {
         "storage.io_uring.register_files=true —— io_uring 引擎本身未启用（ADR-010 U1~U4），"
         "注册文件表更不可能生效。下一步：保持 false，并先跑 scripts/check_io_uring.sh。");
   }
-  if (leases_enabled) {
-    return reject_startup(
-        "leases.enabled=true —— PG 版租约未交付（ADR-009），单实例组合根装配的是**内存**租约，"
-        "跨进程不共享。下一步：保持 false（单实例），或等 PG 租约（metadata.repository=postgres）"
-        "交付后一起开启。");
-  }
-  if (leader_election_enabled) {
-    return reject_startup(
-        "leader_election.enabled=true —— 领导者选举依赖 PG advisory lock，尚未交付（ADR-009）。"
-        "下一步：保持 false（单实例下 GC 只有一个实例在跑，无需选举）。");
-  }
+  //  ★ B1：`leases.enabled` / `leader_election.enabled` **不再是**这里的"未实现 → 拒绝启动"
+  //    守卫 —— 它们已经是**生效**键：分别决定"用 PG 租约还是内存租约"与"是否做 leader
+  //    选举并门控 GC"。真正打开它们需要可用 PG（见 §④ 的创建失败 → exit 78）。
   if (single_use_nonce) {
     return reject_startup(
         "self_signed.single_use_nonce=true —— nonce 存储未交付（ADR-009 M5：本地表无法跨实例）。"
@@ -1428,8 +1469,9 @@ static int RunServer(int argc, char** argv) {
   }
   if (clock_skew_tolerance_seconds != 60) {
     return reject_startup(
-        "deployment.clock_skew_tolerance_seconds 非默认 —— 该键用于「与数据库 now() 的偏移容忍」，"
-        "而数据库时钟未交付（单实例用本地钟；multi 已拒绝启动）。下一步：保持 60。");
+        "deployment.clock_skew_tolerance_seconds 非默认 —— 该键用于「本地钟与数据库 now() "
+        "的偏移容忍」，而 **PG-vs-本地时钟的比较本身未实现**（B1 虽已让 multi 启动，但组合根"
+        "不做偏移测量/拒绝判定）。下一步：保持 60；实现偏移比较后再放开。");
   }
   //  ★ 本轮（ADR-008 的 P4 已交付）：`group_commit_max_batch` **生效**（不再拒绝启动）；
   //    `sync_dir_after_batch=false` 仍然**拒绝启动** —— ADR-008 §5 的 R2（"rename 之后
@@ -1493,23 +1535,54 @@ static int RunServer(int argc, char** argv) {
       self_signed_default_ttl_seconds, self_signed_max_ttl_seconds};
 
   //  ---- 值域/依赖关系校验：任何一条不过 → 拒绝启动（exit 78）----
-  if (deployment_mode == "multi") {
-    //  `deployment.mode=multi` 的 5 条配置校验已经在 schema 里（C8.9），但**运行形态**还依赖
-    //  PG 版仓储、PG 租约与数据库时钟（ADR-009；计划 P9/阶段 10 明确不承诺）——本版本没有交付。
-    //  ★ 明确拒绝启动，而不是"以单实例状态跑在多实例里"（那会让各实例状态发散）。
-    std::cerr << "拒绝启动：deployment.mode=multi 需要 PG 仓储 + PG 租约 + 数据库时钟"
-                 "（ADR-009），本版本尚未交付。\n";
+  //  ★ B1：`deployment.mode=multi` **不再**在这里被一刀切拒绝。multi 的 7 条跨字段校验
+  //    （PG 仓储 / PG 租约 / leader election / shared_mount_required / require_lease_expiry /
+  //    clock skew）已经在 `core_schema.cpp` 里先行执行；本文件负责**真的把运行形态装配起来**：
+  //      · 本构建没有 libpq → 下面的 `#ifndef FSS_HAVE_LIBPQ` 给出可执行的修复指令；
+  //      · 有 libpq → §④ 创建 PG 仓储 + PG 租约 + leader election，任一失败 → exit 78。
+  if (metadata_repository_name != "sqlite" && metadata_repository_name != "postgres") {
+    std::cerr << "拒绝启动：metadata.repository 只支持 sqlite | postgres（当前="
+              << metadata_repository_name
+              << "）；remote 元数据仓储尚未交付（ADR-004/ADR-009）。\n";
     return kExitConfigError;
   }
-  if (metadata_repository_name != "sqlite" || location_repository_name != "sqlite") {
-    //  非 sqlite 的仓储实现（postgres/remote）尚未交付：**拒绝启动**而不是静默用 SQLite
-    //  （否则"配置写了 postgres、实际写 SQLite"是最危险的一类静默降级）。
-    std::cerr << "拒绝启动：仅支持 metadata.repository=sqlite 且 location.repository=sqlite"
-                 "（当前 metadata.repository=" << metadata_repository_name
-              << "，location.repository=" << location_repository_name
-              << "）；postgres/remote 实现尚未交付（ADR-004/ADR-009）。\n";
+  if (location_repository_name != "sqlite" && location_repository_name != "postgres") {
+    std::cerr << "拒绝启动：location.repository 只支持 sqlite | postgres（当前="
+              << location_repository_name << "）。\n";
     return kExitConfigError;
   }
+  //  ★ `leader_election.backend` 只有一个合法值；schema 的 enum 已拒绝其它取值，
+  //    这里是防御性的第二道（枚举被改宽时不会静默降级成"不做选举"）。
+  if (leader_election_enabled && leader_election_backend != "postgres_advisory_lock") {
+    std::cerr << "拒绝启动：leader_election.backend=" << leader_election_backend
+              << " 未实现（当前只有 postgres_advisory_lock）。\n";
+    return kExitConfigError;
+  }
+#ifndef FSS_HAVE_LIBPQ
+  //  ★ fail-closed 的**可执行**路径：本二进制在构建时没找到 libpq。绝不静默回退到 SQLite /
+  //    内存（那正是 ADR-009 §4.1 禁止的"以为共享、其实各存一份"）。
+  {
+    const bool wants_pg = deployment_mode == "multi" ||
+                          metadata_repository_name == "postgres" ||
+                          location_repository_name == "postgres" || leases_enabled ||
+                          leader_election_enabled;
+    if (wants_pg) {
+      std::cerr
+          << "拒绝启动：本配置需要 PostgreSQL（deployment.mode=" << deployment_mode
+          << "，metadata.repository=" << metadata_repository_name
+          << "，location.repository=" << location_repository_name
+          << "，leases.enabled=" << (leases_enabled ? "true" : "false")
+          << "，leader_election.enabled=" << (leader_election_enabled ? "true" : "false")
+          << "），但本二进制在构建时**未找到 libpq**。\n"
+             "  下一步：安装 libpq 开发文件（Debian/Ubuntu: `apt-get install libpq-dev`，"
+             "或从镜像 `apt-get download libpq-dev` + `dpkg-deb -x`），然后重新运行 "
+             "`cmake -S . -B build` 并重编 —— libpq 由 `find_package(PostgreSQL)` 自动发现，"
+             "**不需要** `-DFSS_WITH_PG=ON`（后者只用于注册 PG 测试）。\n"
+             "  绝不静默回退到 SQLite/内存：那会让每个实例各存一份状态。\n";
+      return kExitConfigError;
+    }
+  }
+#endif
   if (deployment_environment == "production" && auth_mode != "jwt") {
     //  schema 的跨字段规则已经拦了这条；这里再兜一层，保证"生产不可误配成无鉴权"。
     std::cerr << "拒绝启动：deployment.environment=production 要求 auth.mode=jwt"
@@ -1562,6 +1635,29 @@ static int RunServer(int argc, char** argv) {
   logging::StreamLogger logger(
       logging::OptionsFromConfig(log_level, log_format, log_service, Join(redact_keys)), clock);
   UuidGenerator ids;
+
+  //  ★ B1 / ADR-009 §4.5（M1）：`deployment.instance_id` 的 multi 语义。
+  //    schema 默认是 `""`，组合根历史默认是 `"local"` —— **两者都不是唯一标识**。
+  //    多实例共享同一标识 + 共享挂载 ⇒ 临时文件名确定性撞名 ⇒ 静默串数据
+  //    （ADR-009 §3 M1 实测 40 次里 21 次）。因此：
+  //      · multi 且**未显式配置**（有效值 = `local`）或显式为空 → 用组合根已有的
+  //        UUID 生成器自动生成唯一 id，并在横幅 + 日志里打印实际生效值与警告；
+  //      · multi 且显式配置了非默认值 → 原样使用（运维注入 POD_NAME 的场景）；
+  //      · single → **逐字不变**（空仍是空、`local` 仍是 `local`），绝不凭空造 id。
+  std::string effective_instance_id = posix_instance_id;
+  bool instance_id_generated = false;
+  if (deployment_mode == "multi" &&
+      (effective_instance_id.empty() || effective_instance_id == "local")) {
+    effective_instance_id = ids.NewUuid();
+    instance_id_generated = true;
+    logging::Warn(logger,
+                  "deployment.instance_id 未配置（有效值 local）或为空 → 在 multi 模式下"
+                  "已自动生成唯一实例 id；默认 local 会让多实例共享标识，导致共享挂载上的"
+                  "临时文件确定性撞名（ADR-009 M1：静默串数据）",
+                  {{"component", "server_main"},
+                   {"deployment.mode", deployment_mode},
+                   {"instance_id", effective_instance_id}});
+  }
 
   //  ★ 注册表要**早于** blob store 构造：POSIX 驱动的批提交（ADR-008 的 P4）要把
   //    `syncfs`/批次数记进 `fss_*` 指标族（否则运维无法观察摊销是否发生）。
@@ -1621,8 +1717,9 @@ static int RunServer(int argc, char** argv) {
       return kExitConfigError;
     }
     //  ★ 临时文件名里的实例标识（ADR-009 M1：多实例共盘时不得互相踩）来自
-    //    `deployment.instance_id`（schema 里唯一的实例标识键；默认 local）。
-    posix_options.instance_id = posix_instance_id;
+    //    `deployment.instance_id`；multi 下未配置/为空时用的是上面**自动生成的**
+    //    `effective_instance_id`（默认 `local` 正是 M1 的暴露面，见其说明）。
+    posix_options.instance_id = effective_instance_id;
     //  ★ 阶段 10（C10.16 续）：`storage.posix.*` 细节键 → 驱动层 Options。
     //    `atomic_write=false` 走"直接写目标文件"分支（失败时删除目标，不留半成品）；
     //    `dir_mode`/`file_mode` 是显式权限位；两个 fadvise 在读写路径上真的下发提示。
@@ -1683,47 +1780,195 @@ static int RunServer(int argc, char** argv) {
   //  ★ 切片 4：改用**具名赋值**（而不是聚合初始化）—— 结构体新增字段时，按位置的
   //    聚合初始化会把后面的 int 静默错位到新字段上（`-Wmissing-field-initializers`
   //    也拦不住），具名赋值让"哪个键落到哪个字段"一眼可见。
-  SqliteLocationRepositoryOptions location_sqlite_options;
-  location_sqlite_options.busy_timeout_millis =
-      static_cast<int>(location_sqlite_busy_timeout_ms);
-  location_sqlite_options.wal = location_sqlite_journal_mode != "DELETE";
-  location_sqlite_options.max_write_concurrency =
-      static_cast<int>(location_sqlite_max_write_concurrency);
-  location_sqlite_options.synchronous_level = location_sqlite_synchronous;
-  //  C10.20：`location.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
-  location_sqlite_options.group_commit = location_sqlite_group_commit;
-  location_sqlite_options.group_commit_max_wait_ms =
-      static_cast<int>(location_sqlite_group_commit_max_wait_ms);
-  location_sqlite_options.group_commit_max_batch =
-      static_cast<int>(location_sqlite_group_commit_max_batch);
-  location_sqlite_options.metrics = &metrics_registry;
-  auto location_repository =
-      SqliteLocationRepository::Open(sqlite_path, location_sqlite_options);
-  if (!location_repository.ok()) {
-    std::cerr << "打开位置仓储失败: " << location_repository.error().ToString() << "\n";
+  //
+  //  ★ B1：仓储的**后端选择**（sqlite | postgres）。具体实现只在这里创建（R12）；
+  //    上层（LocationIssuer / UseCasePorts / GcTask）只见 `domain::I*Repository` 端口。
+  //    创建失败一律 exit 78 + libpq 原文，**绝不**静默回退到 SQLite（ADR-009 §4.1）。
+  std::unique_ptr<domain::IFileLocationRepository> location_repository;
+  std::string location_repository_backend;
+  if (location_repository_name == "postgres") {
+#ifdef FSS_HAVE_LIBPQ
+    PostgresLocationRepositoryOptions pg_location_options;
+    pg_location_options.pg.dsn = location_postgres_dsn;
+    pg_location_options.pg.max_connections = static_cast<int>(location_postgres_max_connections);
+    //  `location.postgres.*` 组**没有** statement_timeout_ms 键 → 用 PgOptions 默认（5000ms）。
+    auto opened = PostgresLocationRepository::Open(std::move(pg_location_options));
+    if (!opened.ok()) {
+      std::cerr << "拒绝启动：location.repository=postgres 但打开 PG 位置仓储失败："
+                << opened.error().ToString()
+                << "\n  下一步：检查 location.postgres.dsn（当前"
+                << (location_postgres_dsn.empty() ? "为空" : "已配置")
+                << "）与 location.postgres.max_connections=" << location_postgres_max_connections
+                << "，确认 PG 可达且已执行 db/migrations/001_init.sql。\n";
+      return kExitConfigError;
+    }
+    location_repository = std::move(opened).value();
+    location_repository_backend = "postgres";
+#else
+    std::cerr << "拒绝启动：location.repository=postgres 需要 libpq（本二进制未编译 PG 支持）。"
+                 "下一步：安装 libpq-dev 后重新 cmake + 重编。\n";
     return kExitConfigError;
+#endif
+  } else {
+    SqliteLocationRepositoryOptions location_sqlite_options;
+    location_sqlite_options.busy_timeout_millis =
+        static_cast<int>(location_sqlite_busy_timeout_ms);
+    location_sqlite_options.wal = location_sqlite_journal_mode != "DELETE";
+    location_sqlite_options.max_write_concurrency =
+        static_cast<int>(location_sqlite_max_write_concurrency);
+    location_sqlite_options.synchronous_level = location_sqlite_synchronous;
+    //  C10.20：`location.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
+    location_sqlite_options.group_commit = location_sqlite_group_commit;
+    location_sqlite_options.group_commit_max_wait_ms =
+        static_cast<int>(location_sqlite_group_commit_max_wait_ms);
+    location_sqlite_options.group_commit_max_batch =
+        static_cast<int>(location_sqlite_group_commit_max_batch);
+    location_sqlite_options.metrics = &metrics_registry;
+    auto opened = SqliteLocationRepository::Open(sqlite_path, location_sqlite_options);
+    if (!opened.ok()) {
+      std::cerr << "打开位置仓储失败: " << opened.error().ToString() << "\n";
+      return kExitConfigError;
+    }
+    location_repository = std::move(opened).value();
+    location_repository_backend = "sqlite";
   }
-  SqliteMetadataRepositoryOptions metadata_sqlite_options;
-  metadata_sqlite_options.busy_timeout_millis = static_cast<int>(metadata_sqlite_busy_timeout_ms);
-  metadata_sqlite_options.wal = metadata_sqlite_journal_mode != "DELETE";
-  metadata_sqlite_options.synchronous_level = metadata_sqlite_synchronous;
-  //  C10.20：`metadata.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
-  metadata_sqlite_options.group_commit = metadata_sqlite_group_commit;
-  metadata_sqlite_options.group_commit_max_wait_ms =
-      static_cast<int>(metadata_sqlite_group_commit_max_wait_ms);
-  metadata_sqlite_options.group_commit_max_batch =
-      static_cast<int>(metadata_sqlite_group_commit_max_batch);
-  metadata_sqlite_options.metrics = &metrics_registry;
-  auto metadata_repository_handle =
-      SqliteMetadataRepository::Open(metadata_db_path, clock, metadata_sqlite_options);
-  if (!metadata_repository_handle.ok()) {
-    std::cerr << "打开元数据仓储失败: " << metadata_repository_handle.error().ToString() << "\n";
+
+  std::unique_ptr<domain::IMetadataRepository> metadata_repository;
+  std::string metadata_repository_backend;
+  if (metadata_repository_name == "postgres") {
+#ifdef FSS_HAVE_LIBPQ
+    PostgresMetadataRepositoryOptions pg_metadata_options;
+    pg_metadata_options.pg.dsn = metadata_postgres_dsn;
+    pg_metadata_options.pg.max_connections =
+        static_cast<int>(metadata_postgres_max_connections);
+    pg_metadata_options.pg.statement_timeout_millis =
+        static_cast<int>(metadata_postgres_statement_timeout_ms);
+    auto opened = PostgresMetadataRepository::Open(std::move(pg_metadata_options), clock);
+    if (!opened.ok()) {
+      std::cerr << "拒绝启动：metadata.repository=postgres 但打开 PG 元数据仓储失败："
+                << opened.error().ToString()
+                << "\n  下一步：检查 metadata.postgres.dsn（当前"
+                << (metadata_postgres_dsn.empty() ? "为空" : "已配置")
+                << "）与 metadata.postgres.max_connections=" << metadata_postgres_max_connections
+                << "，确认 PG 可达且已执行 db/migrations/001_init.sql。\n";
+      return kExitConfigError;
+    }
+    metadata_repository = std::move(opened).value();
+    metadata_repository_backend = "postgres";
+#else
+    std::cerr << "拒绝启动：metadata.repository=postgres 需要 libpq（本二进制未编译 PG 支持）。"
+                 "下一步：安装 libpq-dev 后重新 cmake + 重编。\n";
     return kExitConfigError;
+#endif
+  } else {
+    SqliteMetadataRepositoryOptions metadata_sqlite_options;
+    metadata_sqlite_options.busy_timeout_millis = static_cast<int>(metadata_sqlite_busy_timeout_ms);
+    metadata_sqlite_options.wal = metadata_sqlite_journal_mode != "DELETE";
+    metadata_sqlite_options.synchronous_level = metadata_sqlite_synchronous;
+    //  C10.20：`metadata.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
+    metadata_sqlite_options.group_commit = metadata_sqlite_group_commit;
+    metadata_sqlite_options.group_commit_max_wait_ms =
+        static_cast<int>(metadata_sqlite_group_commit_max_wait_ms);
+    metadata_sqlite_options.group_commit_max_batch =
+        static_cast<int>(metadata_sqlite_group_commit_max_batch);
+    metadata_sqlite_options.metrics = &metrics_registry;
+    auto opened = SqliteMetadataRepository::Open(metadata_db_path, clock, metadata_sqlite_options);
+    if (!opened.ok()) {
+      std::cerr << "打开元数据仓储失败: " << opened.error().ToString() << "\n";
+      return kExitConfigError;
+    }
+    metadata_repository = std::move(opened).value();
+    metadata_repository_backend = "sqlite";
   }
-  //  ---- 在途租约（C10.9）：单实例 = 内存实现 ----
-  //  ★ PG 版 `ILeaseRepository` 未交付（ADR-009），单实例下内存租约语义正确；
-  //    `deployment.mode=multi` 在更早处已拒绝启动，因此不存在"以为共享、其实各存一份"。
-  infra::InMemoryLeaseRepository lease_repository(clock);
+
+  //  ---- 在途租约（C10.9 / B1）：`leases.enabled` 现在**真的**选择后端 ----
+  //  · false（默认，单实例）→ 内存租约（逐字保持接线前的语义）；
+  //  · true → PG 租约（`staging_leases`；跨实例共享，时间源 = 数据库 now()，ADR-009 §4.3）。
+  //    ★ 生产代码目前仍没有调用方 `Acquire` 租约（上传路径是后续切片）⇒ 选了 PG 后端
+  //      在当前可观测行为上只影响 GC 的 `ClaimExpired` 走哪张表（空表 → 0 条）。
+  //  ★ 租约表与位置记录在**同一个库**，因此 DSN 取 `location.postgres.*`。
+  infra::InMemoryLeaseRepository memory_lease_repository(clock);
+#ifdef FSS_HAVE_LIBPQ
+  std::unique_ptr<infra::PostgresLeaseRepository> pg_lease_repository;
+#endif
+  domain::ILeaseRepository* lease_port = &memory_lease_repository;
+  std::string lease_backend = "内存（单实例；跨进程不共享；leases.enabled=false）";
+  if (leases_enabled) {
+#ifdef FSS_HAVE_LIBPQ
+    PostgresLeaseRepositoryOptions pg_lease_options;
+    pg_lease_options.pg.dsn = location_postgres_dsn;
+    pg_lease_options.pg.max_connections = static_cast<int>(location_postgres_max_connections);
+    auto opened = PostgresLeaseRepository::Open(std::move(pg_lease_options));
+    if (!opened.ok()) {
+      std::cerr << "拒绝启动：leases.enabled=true 但打开 PG 租约仓储失败："
+                << opened.error().ToString()
+                << "\n  下一步：配置 location.postgres.dsn（租约表 staging_leases 与位置记录"
+                   "在同一个库；当前 "
+                << (location_postgres_dsn.empty() ? "为空" : "已配置")
+                << "），并确认 PG 可达且已执行 db/migrations/001_init.sql。\n";
+      return kExitConfigError;
+    }
+    pg_lease_repository = std::move(opened).value();
+    lease_port = pg_lease_repository.get();
+    lease_backend = "postgres（staging_leases；时间源 = 数据库 now()）";
+#else
+    std::cerr << "拒绝启动：leases.enabled=true 需要 libpq（本二进制未编译 PG 支持）。"
+                 "下一步：安装 libpq-dev 后重新 cmake + 重编。\n";
+    return kExitConfigError;
+#endif
+  }
+
+  //  ---- B1：领导者选举（`leader_election.enabled` / `backend` / `lock_key`）----
+  //  · 启用 → 建立**专用锁连接**（`metadata.postgres.*`：该组有 statement_timeout_ms，
+  //    锁连接只跑短语句，滞留窗口因此被夹在 statement_timeout 以内）+ 启动时 `TryAcquire()`；
+  //  · 未启用 → `gc_leader_check` 为空，GC 在每个实例都跑（单实例语义，逐字不变）。
+#ifdef FSS_HAVE_LIBPQ
+  std::unique_ptr<infra::PgLeaderElection> pg_leader_election;
+#endif
+  std::function<bool()> gc_leader_check;  // 返回 true = 本实例可以跑单例任务（GC）
+  std::string leader_state_banner =
+      "未启用（leader_election.enabled=false；GC 在每个实例都会跑）";
+  if (leader_election_enabled) {
+#ifdef FSS_HAVE_LIBPQ
+    PgLeaderElectionOptions leader_options;
+    leader_options.pg.dsn = metadata_postgres_dsn;
+    leader_options.pg.max_connections = 1;  // 专用单连接（本类不过池）
+    leader_options.pg.statement_timeout_millis =
+        static_cast<int>(metadata_postgres_statement_timeout_ms);
+    leader_options.lock_key = static_cast<std::int64_t>(leader_election_lock_key);
+    auto opened = PgLeaderElection::Open(std::move(leader_options));
+    if (!opened.ok()) {
+      std::cerr << "拒绝启动：leader_election.enabled=true 但创建 leader election 失败："
+                << opened.error().ToString()
+                << "\n  下一步：配置 metadata.postgres.dsn（会话级 advisory lock 必须连到所有"
+                   "实例共享的数据库；当前 "
+                << (metadata_postgres_dsn.empty() ? "为空" : "已配置")
+                << "），并确认 PG 可达。\n";
+      return kExitConfigError;
+    }
+    pg_leader_election = std::move(opened).value();
+    const auto acquired = pg_leader_election->TryAcquire();
+    if (!acquired.ok()) {
+      std::cerr << "拒绝启动：leader_election.enabled=true 但获取 advisory lock 失败："
+                << acquired.error().ToString()
+                << "\n  提示：锁连接只跑短语句；若 PG 上 lock_key=" << leader_election_lock_key
+                << " 被别的会话长期持有，本实例不会成为 leader。\n";
+      return kExitConfigError;
+    }
+    const bool startup_leader = acquired.value();
+    gc_leader_check = [&pg_leader_election]() { return pg_leader_election->IsLeader(); };
+    leader_state_banner =
+        "启用（backend=" + leader_election_backend +
+        " lock_key=" + std::to_string(leader_election_lock_key) + "）；启动时本实例=" +
+        (startup_leader ? "leader（跑 GC）"
+                        : "非 leader（跳过 GC，由持锁实例负责；锁空闲时会自动接管）");
+#else
+    std::cerr << "拒绝启动：leader_election.enabled=true 需要 libpq（本二进制未编译 PG 支持）。"
+                 "下一步：安装 libpq-dev 后重新 cmake + 重编。\n";
+    return kExitConfigError;
+#endif
+  }
+
   HmacTransferTokenCodec token_codec(transfer_secret, clock, transfer_key_id);
 
   //  ---- 认证（P8 / ADR-012）----
@@ -1845,19 +2090,19 @@ static int RunServer(int argc, char** argv) {
     return kExitConfigError;
   }
 
-  domain::PartitionConfig partition;
-  partition.partition = partition_file.partition;
-  partition.driver = storage_driver == "s3" ? domain::StorageDriver::kS3
-                                            : domain::StorageDriver::kPosix;
-  partition.posix_root = storage_root;
+  domain::PartitionConfig partition_cfg;
+  partition_cfg.partition = partition_file.partition;
+  partition_cfg.driver = storage_driver == "s3" ? domain::StorageDriver::kS3
+                                                : domain::StorageDriver::kPosix;
+  partition_cfg.posix_root = storage_root;
   //  ★ 阶段 10：容器名覆盖（空串 → `ObjectKeyPolicy` 的默认命名，逐字一致）
-  partition.staging_container = partition_file.staging_container;
-  partition.persistent_container = partition_file.persistent_container;
-  partition.storage_driver = partition_file.storage_driver;
+  partition_cfg.staging_container = partition_file.staging_container;
+  partition_cfg.persistent_container = partition_file.persistent_container;
+  partition_cfg.storage_driver = partition_file.storage_driver;
   //  0（schema 语义：不限）→ -1（端口语义：不限）
-  partition.max_object_bytes = partition_file.max_file_bytes > 0 ? partition_file.max_file_bytes
-                                                                 : -1;
-  StaticPartitionRegistry partitions(partition);
+  partition_cfg.max_object_bytes = partition_file.max_file_bytes > 0 ? partition_file.max_file_bytes
+                                                                     : -1;
+  StaticPartitionRegistry partitions(partition_cfg);
 
   //  ---- 可选校验器（legal / schema；P10 切片 6a / ADR-013）----
   //  ★ R12：具体实现只能在**组合根**创建 —— 用例层只见 `ILegalValidator` /
@@ -1912,11 +2157,11 @@ static int RunServer(int argc, char** argv) {
   //  ★ 阶段 10：把租户注册表交给 LocationIssuer —— 否则 uploadURL 签发的容器名与
   //    用例/GC 解析出的容器名会不一致（`partition.file.*.staging_container` 只对
   //    一半路径生效，等于没生效）。
-  app::LocationIssuer issuer(blob_factory, *location_repository.value(), token_codec, clock, ids,
+  app::LocationIssuer issuer(blob_factory, *location_repository, token_codec, clock, ids,
                              self_base_url, expiry_options, &partitions, self_signed_ttl_options);
 
-  app::UseCasePorts ports{blob_factory,      *location_repository.value(),
-                          *metadata_repository_handle.value(),
+  app::UseCasePorts ports{blob_factory,      *location_repository,
+                          *metadata_repository,
                           *authorizer,       *events,
                           *audit_logger,     partitions,
                           *legal,            *schema_validator_port,
@@ -1943,7 +2188,7 @@ static int RunServer(int argc, char** argv) {
   gc_options.staging_ttl_hours = gc_staging_ttl_hours;
   gc_options.orphan_grace_hours = gc_orphan_grace_hours;
   const std::string gc_partition = "opendes";  // 组合根内置的单租户（与 StaticPartitionRegistry 同源）
-  app::GcTask gc_task(ports, lease_repository, posix_instance_id, &metrics_registry);
+  app::GcTask gc_task(ports, *lease_port, effective_instance_id, &metrics_registry);
 
   //  ★ GC 的两条 `list()` 路径要求容器真实存在（POSIX 驱动对不存在的容器返回
   //    `kNotFound`）。启动时按 `ObjectKeyPolicy` 生成的两个容器名确保目录存在 ——
@@ -1958,6 +2203,13 @@ static int RunServer(int argc, char** argv) {
 
   //  `--once`（便于 cron）：跑**一轮** GC 就退出（退出码 0），与正常启动共用配置加载。
   if (cli.once) {
+    //  ★ B1：`--once` 也做 leader 门控 —— 否则 multi 下每个实例的 cron 都会真删，
+    //    与"GC 单例运行"矛盾。非 leader 不是错误（退出码 0），但要明确说明跳过了。
+    if (gc_leader_check && !gc_leader_check()) {
+      std::cout << "gc once : 跳过（本实例不是 leader；leader_election.enabled=true，"
+                   "单例 GC 由持锁实例负责）\n";
+      return 0;
+    }
     const auto once_report = gc_task.Run(gc_partition, gc_options);
     if (!once_report.ok()) {
       std::cerr << "GC 单次运行失败：" << once_report.error().ToString() << "\n";
@@ -2014,9 +2266,20 @@ static int RunServer(int argc, char** argv) {
   adapters::http::GcCallbacks gc_callbacks;
   gc_callbacks.partition = gc_partition;
   gc_callbacks.scheduled = gc_schedule;
-  gc_callbacks.run = [&gc_task, &gc_options, &gc_partition, &ports, &logger](
+  gc_callbacks.run = [&gc_task, &gc_options, &gc_partition, &ports, &logger, &gc_leader_check](
                          const app::CallerContext& caller,
                          bool force_dry_run) -> Result<app::GcReport> {
+    //  ★ B1：leader 门控（与周期调度**同一判据**）。非 leader **不调用** `GcTask::Run`
+    //    ⇒ `fss_gc_runs_total` 不增加；HTTP 侧以 503 + 可读原因回应（与单飞护栏同族的语义）。
+    if (gc_leader_check && !gc_leader_check()) {
+      logging::Warn(logger, "gc_skipped_not_leader",
+                    {{"partition", gc_partition},
+                     {"reason", "按需 GC 被跳过：本实例不是 leader"
+                                "（leader_election.enabled=true）→ fss_gc_runs_total 不增加"}});
+      return Err(fss::ErrorKind::kUnavailable,
+                 "GC 未运行：本实例不是 leader（leader_election.enabled=true）。"
+                 "单例 GC 由持锁实例负责；本实例跳过本轮。");
+    }
     //  ★ dry-run 只能**更保守**：配置为真删时，请求可以要求本轮干跑；反之**不行**。
     app::GcOptions options = gc_options;
     options.dry_run = gc_options.dry_run || force_dry_run;
@@ -2081,14 +2344,16 @@ static int RunServer(int argc, char** argv) {
   //    的包装里（C7.7 的护栏要求 `src/` 全树除 adapters/grpc/ 外不出现 `<grpcpp/`；
   //    与 `fss_http` 把 httplib 挡在适配层内是同一条纪律）。
   std::unique_ptr<adapters::grpc::FileServiceAdapter> grpc_service;
-  std::unique_ptr<adapters::grpc::GrpcServerHandle> grpc_server;
+  //  ★ 变量名不用 `grpc_server`：那会遮蔽 libpq/grpc 头里的全局 typedef `grpc_server`
+  //    （`-Wshadow`；既有告警，本切片顺手清掉，让"改动的文件零告警"成立）。
+  std::unique_ptr<adapters::grpc::GrpcServerHandle> grpc_handle;
   //  C10.15：`server.grpc.enabled=false` 或 `server.grpc.port=0` 都表示"不开 gRPC 面"。
   if (grpc_enabled && grpc_port != 0) {
     grpc_service = std::make_unique<adapters::grpc::FileServiceAdapter>(ports, "osdu-user");
-    grpc_server =
+    grpc_handle =
         adapters::grpc::StartGrpcServer(*grpc_service, grpc_bind, static_cast<int>(grpc_port));
-    if (!grpc_server->ok()) {
-      std::cerr << grpc_server->last_error() << "\n";
+    if (!grpc_handle->ok()) {
+      std::cerr << grpc_handle->last_error() << "\n";
       return kExitConfigError;
     }
   }
@@ -2155,7 +2420,7 @@ static int RunServer(int argc, char** argv) {
             << "fss_server 已启动\n"
             << "  bind           : " << bind_address << ":" << server.port() << "\n"
             << "  grpc bind      : "
-            << (grpc_server ? grpc_bind + ":" + std::to_string(grpc_server->port())
+            << (grpc_handle ? grpc_bind + ":" + std::to_string(grpc_handle->port())
                             : std::string("disabled（") +
                                   (grpc_enabled ? "server.grpc.port=0"
                                                 : "server.grpc.enabled=false") +
@@ -2262,10 +2527,36 @@ static int RunServer(int argc, char** argv) {
             << "（进签名载荷；多密钥轮换未交付）TTL 自签上界 default="
             << self_signed_default_ttl_seconds << "s max=" << self_signed_max_ttl_seconds
             << "s（仅 !native_presign 分支；expiry.* 仍是 expiryTime 的解析规则与缺省）\n"
-            << "  leases         : 内存租约（单实例；enabled="
-            << (leases_enabled ? "true" : "false")
+            << "  leases         : " << lease_backend
+            << "（enabled=" << (leases_enabled ? "true" : "false")
             << " ttl=" << leases_ttl_seconds << "s renew=" << leases_renew_interval_seconds
-            << "s time_source=" << leases_time_source << "）\n";
+            << "s time_source=" << leases_time_source
+            << "；★ 上传路径尚未 Acquire/Renew，这三个键当前无效果）\n"
+            //  ★ 上面这一行原本**硬编码**「内存租约」，在 `leases.enabled=true` 时与本行打印的
+            //    `enabled=true` 自相矛盾（B1 复核发现）。现在打印的是**实际后端** `lease_backend`。
+            //  ---- B1 新增行 ----
+            << "  repositories   : metadata=" << metadata_repository_backend
+            << (metadata_repository_backend == "postgres"
+                    ? "（metadata.postgres.dsn=*** max_connections=" +
+                          std::to_string(metadata_postgres_max_connections) +
+                          " statement_timeout_ms=" +
+                          std::to_string(metadata_postgres_statement_timeout_ms) + "）"
+                    : "（" + metadata_db_path + "）")
+            << " | location=" << location_repository_backend
+            << (location_repository_backend == "postgres"
+                    ? "（location.postgres.dsn=*** max_connections=" +
+                          std::to_string(location_postgres_max_connections) +
+                          "；该组无 statement_timeout_ms 键 → PgOptions 默认 5000ms）"
+                    : "（" + sqlite_path + "）")
+            << "\n"
+            << "  instance id    : " << effective_instance_id
+            << (instance_id_generated
+                    ? "（★ multi 未配置/为空 → 自动生成唯一 id；默认 `local` 会让多实例共享"
+                      "标识 → 共享挂载上临时文件名确定性撞名，ADR-009 M1 静默串数据）"
+                    : std::string("（来自 deployment.instance_id，未改动）"))
+            << "\n"
+            << "  lease backend  : " << lease_backend << "\n"
+            << "  leader         : " << leader_state_banner << "\n";
   //  C10.2：逐键打印来源缩写（cli/env/file/default），`(别名 FSS_X)` 表示旧环境变量。
   std::cout << "  config sources :\n";
   for (const auto& [path, row] : resolver.rows()) {
@@ -2278,7 +2569,7 @@ static int RunServer(int argc, char** argv) {
   //  ---- 启动周期调度（在横幅之后：横幅要先回答"它会不会跑"）----
   if (gc_schedule) {
     gc_scheduler = std::make_unique<GcScheduler>(gc_task, gc_partition, gc_options,
-                                                 gc_interval_seconds, logger);
+                                                 gc_interval_seconds, logger, gc_leader_check);
     gc_scheduler->Start();
   }
 
@@ -2304,9 +2595,9 @@ static int RunServer(int argc, char** argv) {
   //  ★ 退出路径必须**显式**关掉 gRPC 服务：`grpc::Server` 是 joinable 的资源，
   //    提前 return 或析构顺序不当会让进程挂在 gRPC 的线程池上（与"先 stop 再 join"
   //    同一条纪律，见 AGENTS.md §4.3）。
-  if (grpc_server) {
-    grpc_server->Shutdown();
-    grpc_server.reset();
+  if (grpc_handle) {
+    grpc_handle->Shutdown();
+    grpc_handle.reset();
   }
   grpc_service.reset();
   return 0;

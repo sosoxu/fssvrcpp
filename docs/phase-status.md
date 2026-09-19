@@ -21,6 +21,19 @@
 > leader election、组合根的 `deployment.mode=multi` 接线（`multi` 仍拒绝启动），
 > 即 `location.postgres.*`/`metadata.postgres.*`/`leases.*`/`leader_election.*` 仍是
 > 「已读但无效果」（三态计数 **113/18/25** 未变）。
+>
+> ⚠️ **B1 之后的更新（最新，优先于上面的搬迁快照）**：组合根的 `deployment.mode=multi`
+> 接线**已交付**（见 `test-evidence/phase10.md` §17）——新增 L2 `src/infra/postgres/pg_leader_election.*`
+> （专用锁连接的会话级 advisory lock），组合根创建 PG 位置/元数据仓储 + PG 租约 + leader election，
+> 并让 GC 的周期调度与 `POST /v2/gc:run` 由 leader 门控；`deployment.instance_id` 在 multi 下
+> 未配置/为空时自动生成；POSIX `.tmp.*` 补齐 ADR-009 §4.5 的随机后缀。
+> 因此 `location.postgres.*`/`metadata.postgres.*`、`leases.enabled`、`leader_election.*`
+> **不再是「已读但无效果」**，三态计数变为 **生效 122 / 拒绝启动 16 / 已读但无效果 18**。
+> 快照行里"`multi` 仍拒绝启动""leader election 未交付"的说法**已过时**。
+> **B1 仍未交付**：共享挂载探针、readiness PG `SELECT 1`+迁移版本校验、`instance_registry`/配置版本
+> 一致性、PG 连接预算（C9.28）、PG-vs-本地时钟比较、上传路径租约 `Acquire`/`Renew`、
+> `CreateFileMetadata` 跨步骤原子领取、完整多实例 E2E（C9.26）、NFS 语义（C9.27）、
+> `/v2/info` 暴露 `instanceId`、`storage.posix.one_filesystem_per_partition`。
 
 ---
 

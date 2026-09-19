@@ -45,7 +45,9 @@ ss -ltnp | grep -E ':(8080|50051)'        # 端口是否真的在听
 | `storage.driver=s3 需要 FSS_STORAGE_S3_ENDPOINT...` | S3 模式配置不全 | 补齐三个变量（端点/AK/SK）——**缺一个都会拒绝启动**，这是有意的 |
 | `未知的 storage.posix.durability: X` | 档位拼错 | 只允许 `per_file` / `batch` / `never` |
 | `打开位置仓储失败` / `打开元数据仓储失败` | 数据目录不可写或 SQLite 文件损坏 | §2 |
-| `deployment.mode=multi` 相关校验失败 | **本版本不交付多实例运行形态**（缺 PG 仓储/租约） | 改回 `single`；多实例见 §8 |
+| `deployment.mode=multi` 相关校验失败 | schema 的 7 条跨字段校验缺一条（PG 仓储/租约/leader election/共享挂载/租约过期/时钟偏差） | 按 stderr 逐条补齐（`metadata.repository=postgres`、`location.repository=postgres`、`leases.enabled=true`、`leader_election.enabled=true`、`storage.posix.shared_mount_required=true`、`gc.require_lease_expiry=true`）；多实例见 §8 |
+| `拒绝启动：本配置需要 PostgreSQL ... 但本二进制在构建时未找到 libpq` | 本二进制没有 libpq（multi 或任意 `*.repository=postgres` / `leases.enabled` / `leader_election.enabled`） | 安装 libpq 开发文件（`apt-get install libpq-dev`）后重新 `cmake -S . -B build` + 重编；**不需要** `-DFSS_WITH_PG=ON`。**绝不**回退 `single` 掩盖问题 |
+| `拒绝启动：{metadata,location}.repository=postgres 但打开 PG ... 仓储失败` / `leases.enabled=true 但打开 PG 租约仓储失败` / `leader_election.enabled=true 但创建 leader election 失败` | PG 不可达 / DSN 为空 / 库未建表 | 检查对应 `*.postgres.dsn`（secret，横幅只打印 `***`）、PG 可达性、`db/migrations/001_init.sql` 已执行。见 §8 |
 | **`ExitCode=139/134` 且 stderr 有 `terminate called`** | **升级前**的表现：资源耗尽（典型是容器 `--pids-limit` 过小）时启动期线程创建抛 `std::system_error`，异常逃出 `main` → `terminate`。`139` 看起来像段错误，**很容易被误判为"进程崩了"**（实测 `OOMKilled=false`，不是 OOM） | 升级到含 **C9.32** 的版本：同一场景应变成 **`ExitCode=70`（EX_SOFTWARE）+ `未预期异常（exit 70）：…`**。容器 **`--pids-limit` 建议 ≥ 128**（默认线程数 66：`server.http.worker_threads = max(16, 4×nproc)`），或显式调小 `server.http.worker_threads`（会同时降低并发上限） |
 | **`ExitCode=70` + `未预期异常`** | 顶层兜底接住了一个未预期异常；`what()` 给出直接原因（`Resource temporarily unavailable` = 线程/进程数耗尽；`std::bad_alloc` = 内存不足） | 按 `what()` 定位：线程数 → 调 `--pids-limit` / `worker_threads`；内存 → `--memory` / `transfer_memory_budget_bytes`。**不要**把它当成配置错误（那是 78）或参数错误（那是 2） |
 
@@ -219,12 +221,23 @@ scripts/bench_baseline.sh --check    # 退化 >20% 直接失败（退出码 1）
 
 ---
 
-## 8. 多实例 / 部署注意（未交付部分）
+## 8. 多实例 / 部署注意（B1 起可启动；仍有未交付项）
 
-- `deployment.mode=multi` 在本版本**拒绝启动**（缺 PG 版仓储/租约/数据库时钟）。
-  多实例前的硬前提：**NFS 语义验证（C9.27）**、PG 仓储与租约落地、`syncfs` 干扰评估（C9.24）。
-- 共享 POSIX 挂载上的临时文件命名包含实例标识（`instance_id`+`pid`+计数），
-  **不要**手工清理正在被其它实例写入的 `.tmp.*`（用 GC 的 TTL 判定）。
+- `deployment.mode=multi` **能启动了**（B1）：组合根创建 PG 元数据/位置仓储、PG 租约
+  （`staging_leases`）与 `PgLeaderElection`（会话级 advisory lock），并让 GC 的周期调度
+  与 `POST /v2/gc:run` 都以 leader 门控。启动前提与故障排查见
+  [`docs/operations.md`](operations.md) §7.3 与 §2.1。
+- ★ **仍未交付**（不要把"能启动"读成"多实例已完整验证"）：共享挂载探针
+  （`storage.posix.shared_mount_required` 只参与强制校验）、readiness 的 PG `SELECT 1` +
+  迁移版本校验、`instance_registry`/配置版本一致性、PG 连接预算（C9.28）、
+  PG-vs-本地时钟比较、上传路径的租约 `Acquire`/`Renew`、`CreateFileMetadata` 跨步骤原子领取、
+  **完整多实例 E2E 与崩溃注入（C9.26）**、**NFS 语义验证（C9.27）**、`syncfs` 干扰评估（C9.24）、
+  `/v2/info` 暴露 `instanceId`。多实例前的硬前提仍是 **C9.27**。
+- 共享 POSIX 挂载上的临时文件命名包含实例标识与**每进程随机 token**
+  （`.tmp.<instance_id>.<pid>.<counter>.<random>`；ADR-009 §4.5 的随机后缀已在 B1 补齐）。
+  `deployment.instance_id` 在 multi 下未配置/为空时由组合根**自动生成**（默认 `local` 会让
+  多实例共享标识 → M1 静默串数据）。**不要**手工清理正在被其它实例写入的 `.tmp.*`
+  （用 GC 的 TTL 判定）。
 - `syncfs` 是**文件系统级**操作：建议按 partition 分盘，避免实例间互相拖慢。
 
 ---
@@ -261,8 +274,8 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 #   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
 ```
 
-**为什么它不是配置键**：`docs/operations.md` 的 156 个叶子键三态清单（生效 113 / 拒绝启动 18 /
-已读但无效果 25）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+**为什么它不是配置键**：`docs/operations.md` 的 156 个叶子键三态清单（生效 122 / 拒绝启动 16 /
+已读但无效果 18）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
 它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动

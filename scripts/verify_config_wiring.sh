@@ -362,6 +362,10 @@ assert_not_contains "${BROKEN_OUT}" "已启动" "被拒绝的进程没有进入�
 
 # -----------------------------------------------------------------------------
 #  ⑩ C10.11：未实现能力的非默认值 → exit 78（"未实现 + 下一步"）
+#  ★ B1：`leases.enabled` / `leader_election.enabled` 已**生效**，但默认环境里
+#    `location.postgres.dsn` / `metadata.postgres.dsn` 为空 ⇒ 组合根在创建 PG 仓储/
+#    租约/选举时 fail-closed（exit 78）。判据因此仍是 78 + 原因指向该键，只是原因从
+#    "未实现"变成"缺少可用的 PG 连接"（不再存在"配了也没用"的守卫键）。
 # -----------------------------------------------------------------------------
 assert_reject() {  # $1=key=value $2=needle $3=desc
   set +e
@@ -373,7 +377,8 @@ assert_reject() {  # $1=key=value $2=needle $3=desc
   assert_contains "${out}" "拒绝启动" "$3（有可读原因）"
   assert_contains "${out}" "$2" "$3（原因指向该键）"
 }
-assert_reject "leases.enabled=true" "leases.enabled=true" "leases.enabled=true"
+assert_reject "leases.enabled=true" "leases.enabled=true" \
+  "leases.enabled=true + 空 location.postgres.dsn（PG 租约 fail-closed）"
 #  ★ 切片 6b：`events.publisher=webhook` 已是**生效**能力，"没有 url 才拒绝"才是真实语义
 #    （断言原因指向 `events.webhook.url`，而不是"未实现"）。
 assert_reject "events.publisher=webhook" "events.webhook.url" \
@@ -383,7 +388,7 @@ assert_reject "self_signed.single_use_nonce=true" "single_use_nonce=true" \
 assert_reject "server.http.large_file_plane.enabled=true" "large_file_plane" \
   "server.http.large_file_plane.enabled=true"
 assert_reject "leader_election.enabled=true" "leader_election.enabled=true" \
-  "leader_election.enabled=true"
+  "leader_election.enabled=true + 空 metadata.postgres.dsn（选举 fail-closed）"
 
 # -----------------------------------------------------------------------------
 #  ⑪ C10.12：expiry.default / expiry.max 作用于签发 URL 的 TTL

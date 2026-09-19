@@ -39,8 +39,8 @@
 
 | 事实 | 现状 |
 | --- | --- |
-| **配置键三态** | 156 个叶子键：**生效 113 / 拒绝启动 18 / 已读但无效果 25**。逐键见 [docs/operations.md](docs/operations.md) §1.3，由 `test_operations_doc` 自动比对 |
-| **PG 多实例（ADR-009）** | **数据层三件已交付**：PG 位置仓储、在途租约、**元数据仓储**（L2，共用同一套端口契约测试，已在本地 PG 14.24 与**目标环境的 PG 12.6** 实测；`Create` 内含单条 INSERT 的原子领取）。**仍未交付**：`CreateFileMetadata` 的**跨步骤**原子领取与 `claiming→ready` 状态机、leader election、组合根接线 ⇒ `location.postgres.*`/`metadata.postgres.*`/`leases.*`/`leader_election.*` 仍逐字是「已读但无效果」，`deployment.mode=multi` **仍拒绝启动** |
+| **配置键三态** | 156 个叶子键：**生效 122 / 拒绝启动 16 / 已读但无效果 18**（B1 后）。逐键见 [docs/operations.md](docs/operations.md) §1.3，由 `test_operations_doc` 自动比对 |
+| **PG 多实例（ADR-009）** | **`deployment.mode=multi` 已真的可运行**（B1）：组合根创建 PG 元数据/位置仓储 + PG 租约（`staging_leases`）+ `PgLeaderElection`（会话级 advisory lock，**专用锁连接**、只跑短语句），GC 的周期调度与 `POST /v2/gc:run` 由 leader 门控；任一创建/取锁失败或本构建无 libpq → exit 78。`.tmp.*` 已补齐 ADR-009 §4.5 的**随机后缀**；multi 下未配置 `instance_id`（默认 `local`）→ 自动生成唯一 id。**仍未交付/未验证**：共享挂载探针、readiness 的 PG 探活 + `metadata.postgres.schema_version_check`、PG 连接预算（C9.28）、PG↔本地时钟偏移比对、上传路径的租约 `Acquire`/`Renew`（故 `leases.{ttl_seconds,renew_interval_seconds,time_source}` 仍「已读但无效果」）、`CreateFileMetadata` 跨步骤原子领取与 `claiming→ready`、真·多实例 E2E + 崩溃注入（C9.26）、NFS 语义（C9.27）、`/v2/info` 的 `instanceId` |
 | **io_uring（ADR-010）** | `ioUringAvailable` 只表达**宿主能力**（**可用 ≠ 已启用**）；**引擎实现未交付**（U1~U4 未满足）⇒ `ioEngine` 恒 `blocking`、`storage.io_engine=uring` 仍 exit 78 |
 | **sendfile 数据面（ADR-006）** | 只**采纳方向**（受控复核 2.12x ≥ 1.5x），**实现未交付**；默认仍走 httplib |
 | **生产强校验** | `deployment.environment=production` 要求 `auth.mode=jwt` + 验签 + 密钥非空，否则**拒绝启动**（exit 78） |
@@ -231,6 +231,7 @@ P10 配置面接线                          ✅ C10.1~C10.20 + ADR-008 的 P4�
 | **"写完才算数"的断言不能立刻做** | 客户端 `Finish()` 返回（`CANCELLED`）时服务端线程可能还在 `put` 里；"临时文件必须被清掉"要**轮询实际条件**（本例最多 5 s），固定 sleep 既慢又不稳（P7-D07） |
 | **换个原始字符串定界符就能让 SQL 护栏失明** | C3.9 只认 `R"sql(...)sql"`：把 DML 写成 `R"pgsql(...)pgsql"` 后，"每条 DML 必须带 `partition_id`"**不会失败** —— 检查静默退化成"只覆盖一部分 SQL"，而它给的是虚假安全感。规避：`src/**/*_repository.*` 的原始字符串定界符必须是 `sql`（`tests/unit/test_sql_guardrail.cpp` 的"盲区补丁"用例；注入自证见 `docs/test-evidence/phase10.md` §15.8.1）。**推论**：任何"按约定/按模式扫描"的护栏，都要先问"不符合约定时它是失败、还是静默放过" |
 | **被自动读入的文件有体积上限，超限会被"静默截断"** | 本文件（`AGENTS.md`）是每个新会话**自动读入**的指令文件，上限 **64 KiB**：超限时**尾部被悄悄切掉**（先丢 §8/§9），而**没有任何检查会失败** —— 与"护栏静默失明"同族。实测：明细长叙述曾占 37%，文件达 66 492 字节，已在截断边缘。规避：**长叙述外置**（各阶段明细搬到 `docs/phase-status.md`），本文件只留"不可违反的约束 + 陷阱 + 索引"，§0 阶段表**只加一行状态**。自查：`wc -c AGENTS.md` + 确认末尾 §9 仍在 |
+| **门禁脚本的夹具没有真实模拟它声称模拟的设计** | `db/tests/002_advisory_lock.sh` 的 holder 注释写着"循环短查询（leader 持锁只做心跳）"，实现却是一条 **120 s 的 `DO $$ … LOOP pg_sleep() $$`**：在 PG 14 上靠 `client_connection_check_interval` 蒙混通过，在目标库 **PG 12.6**（无该 GUC）上 A3 **失败**——"通过"其实只发生在开发引擎上。修法是**让夹具与设计一致**（改成独立短语句心跳），不是放宽判据；改后两引擎都通过且保留 A3b 长查询对照（§17.8.4）。**推论**：门禁脚本换引擎跑之前，先问"我的夹具真的在模拟文档里那条设计吗" |
 
 ### 4.4 分布式/并发类
 

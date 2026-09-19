@@ -198,7 +198,7 @@ TEST_CASE("★ C9.9 operations.md 覆盖 example 的全部叶子键且不写不�
 //    ③ 文档正文里声明的数字也必须一致（防止只改表格不改正文）。
 //  ★ 只认"最后一列以状态标记开头"的行：同一个键在别处（如 §5.1 的档位表）出现不算。
 // =============================================================================
-TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 113 / 拒绝启动 18 / 已读但无效果 25）",
+TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 122 / 拒绝启动 16 / 已读但无效果 18）",
           "[phase10][docs][c10.11]") {
   const std::string example_path = std::string(FSS_REPO_ROOT) + "/config/fss.example.json";
   const std::string doc_path = std::string(FSS_REPO_ROOT) + "/docs/operations.md";
@@ -256,11 +256,11 @@ TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 113 / 拒绝启�
   REQUIRE(unmarked.empty());
   INFO("生效=" << n_effective << " 拒绝启动=" << n_reject << " 已读但无效果=" << n_ineffective
                << " 合计=" << leaves.size());
-  REQUIRE(n_effective == 113);
-  REQUIRE(n_reject == 18);
-  REQUIRE(n_ineffective == 25);
+  REQUIRE(n_effective == 122);
+  REQUIRE(n_reject == 16);
+  REQUIRE(n_ineffective == 18);
   REQUIRE(n_effective + n_reject + n_ineffective == leaves.size());
   //  正文声明的数字也必须一致（防止"只改表格、不改正文"）
-  REQUIRE(doc.find("生效 113 / 拒绝启动 18 / 已读但无效果 25") != std::string::npos);
-  REQUIRE(doc.find("**113 + 18 + 25 = 156**") != std::string::npos);
+  REQUIRE(doc.find("生效 122 / 拒绝启动 16 / 已读但无效果 18") != std::string::npos);
+  REQUIRE(doc.find("**122 + 16 + 18 = 156**") != std::string::npos);
 }

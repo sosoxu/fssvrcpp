@@ -47,15 +47,25 @@ wait_lock_free() {
 }
 
 # 后台起一个真正持锁的会话；PID 通过全局变量 HOLDER_PID 返回
-# 先取锁，之后**循环短查询**——这贴近真实设计：leader 持锁的会话基本空闲，
-# 只做心跳；而不是在持锁的同一个会话里跑一个几分钟的长查询。
+# 先用**一条短语句**取锁，之后**循环独立的短语句**做心跳 —— 这贴近真实设计：
+# leader 持锁的会话基本空闲（阻塞在客户端 socket 读），只做心跳；而不是在持锁的
+# 同一个会话里跑一个几分钟的长查询。
+# ★ 为什么必须是"独立短语句"而不是一条 `DO $$ ... LOOP PERFORM pg_sleep() $$`（实测，见
+#   docs/test-evidence/phase10.md §15.9）：会话级 advisory lock 随会话结束释放，而
+#   "客户端消失"要等**下一次读写**才被发现。PG 14+ 有 `client_connection_check_interval`
+#   （能察觉并取消长语句），目标库 **PG 12.6 没有**：实测 kill -9 客户端后，**空闲**
+#   持锁会话 51 ms 释放（PG 14.24：9 ms），而"正在跑 15 s 单语句"**≥8 s 仍未释放**
+#   （滞留窗口 = 当前语句剩余时长；PG 14.24 因客户端消失侦测 633 ms 释放）。
+#   旧实现用一条 120 s 的 DO 块 ⇒ 在 PG 12.6 上 A3 会（正确地）判失败，那是
+#   **脚本与自己的注释不符**，不是 12.6 的问题。A3b 保留长查询作为对照。
 HOLDER_PID=""
 spawn_holder() {
   local secs="$1" i n
   n=$(( secs * 5 ))     # 每轮约 0.2s
-  ( exec psql -tAq -c "SELECT pg_try_advisory_lock(${KEY});" \
-      -c "DO \$\$ BEGIN FOR i IN 1..${n} LOOP PERFORM pg_sleep(0.2); END LOOP; END \$\$;" ) \
-      >/dev/null 2>&1 &
+  {
+    printf 'SELECT pg_try_advisory_lock(%s);\n' "${KEY}"
+    for (( i = 0; i < n; i++ )); do printf 'SELECT pg_sleep(0.2);\n'; done
+  } | psql -tAq >/dev/null 2>&1 &
   HOLDER_PID=$!
 }
 

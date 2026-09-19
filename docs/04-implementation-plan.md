@@ -20,7 +20,7 @@
 | **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | ✅ **已完成（C7.1~C7.10 全部满足；17/17 RPC；6 测试 / 5378 断言）** |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ✅ **已完成（C8.1~C8.8 全部满足；C8.9 配置级 + C8.10 机制级完成；6 测试 / 1323 断言）** |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ✅ **已完成（C9.1~C9.13、C9.15、C9.16、C9.25、C9.31、C9.32 满足；C9.8/C9.12 有独立证据文件；环境不具备的判据登记为未验证）**。**C9.31 为 P9 补交（P10 期间完成）**：GC 的 HTTP 按需端点 `POST /v2/gc:run` + `GcTask` 单飞护栏（证据 `docs/test-evidence/phase9.md` §12）。**C9.32 也为 P9 补交（P10 期间完成）**：`main()` 顶层兜底 → 未预期异常以 **exit 70（EX_SOFTWARE）+ 可读原因** 结束；容器 `--pids-limit=64` 真实回归 **ExitCode 70**（证据 `phase9.md` §14、`phase9-image.md` §10.12） |
-| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | ✅ **切片 1/2/3/4/5/6a/6b 全部完成（C10.1~C10.20）**：三态 156 键 **生效 113 / 拒绝启动 18 / 已读但无效果 25**（`docs/operations.md` §1.3；ADR-008 的 P4 +1 与 **C10.20** 的 6 键）；真实二进制证据见 `docs/test-evidence/phase10.md`。**期间补交 P9 的 C9.31**（GC 按需端点；不改任何配置键，三态计数不变） |
+| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | ✅ **切片 1/2/3/4/5/6a/6b 全部完成（C10.1~C10.20）**：三态 156 键 **生效 122 / 拒绝启动 16 / 已读但无效果 18**（`docs/operations.md` §1.3；ADR-008 的 P4 +1 与 **C10.20** 的 6 键）；真实二进制证据见 `docs/test-evidence/phase10.md`。**期间补交 P9 的 C9.31**（GC 按需端点；不改任何配置键，三态计数不变） |
 
 **全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P10 并全绿。
 任何阶段的门槛脚本一旦被加入，后续阶段不得使其退化。
@@ -608,7 +608,7 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase7 --output-on
 > 本次把操作名表写进契约 §4.6 并逐条对照。
 > ⑩ **C8.9 multi 5 条启动校验**：仓储必须 PG / 租约与选举开启 / GC 必须要求租约到期 /
 > 存储根共享挂载 / 时钟偏差容忍范围（0 < 值 ≤ 60）—— 五条各有一条"拒绝"测试 + 一条
-> "全满足必须通过"的正例；组合根对 `FSS_DEPLOYMENT_MODE=multi` **拒绝启动**（PG 运行形态属 P9）。
+> "全满足必须通过"的正例；组合根对 `FSS_DEPLOYMENT_MODE=multi` **真的创建 PG 仓储/租约/leader election**（B1 已交付；无 libpq 或缺 DSN → exit 78）。
 > ⑪ **C8.10 时钟偏移**：`app::ClockSkewGuard`（参考时钟是 TTL/过期判定的**唯一**时间源；
 > 快钟/慢钟超容忍 → fail-closed）+ JWT `exp` 的 ±skew 边界用例。
 >
@@ -680,7 +680,7 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase8 --output-on
 | C8.6 | 事件：`CreateFileMetadata` 触发 `IN_PROGRESS`→`SUCCESS`；失败路径触发 `FAILED`；事件内容含 record id 与 version |
 | C8.7 | 审计：每个受保护端点在成功与失败两侧都产生审计记录（含 actor、对象、结果、时间、correlation-id） |
 | C8.8 | 回归：P0–P7 全绿（注意 P4 的 allow-all 测试需改为显式注入 `AllowAllAuthorizer`，不得依赖配置默认值） |
-| **C8.9** | `deployment.mode=multi` 的 **5 条强制启动校验**各有一个"拒绝启动"的测试：仓储必须为 PG、租约与选举必须开启、GC 必须要求租约到期、存储根必须在共享挂载上、时钟偏移在容忍范围内 |
+| **C8.9** | `deployment.mode=multi` 的 **7 条强制启动校验**各有一个"拒绝启动"的测试：仓储必须为 PG、租约与选举必须开启、GC 必须要求租约到期、存储根必须在共享挂载上、时钟偏移在容忍范围内（B1 起校验后还会**真的装配**运行形态；见 `test-evidence/phase10.md` §17） |
 | **C8.10** | 时钟偏移：模拟快钟/慢钟实例 → 租约与 token 过期**不误判**（租约判定一律用 PG 的 `now()`） |
 
 **退出条件**：C8.1–C8.8 满足，证据写入 `docs/test-evidence/phase8.md`。✅ **已达成**
@@ -794,7 +794,7 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase9 --output-on
 | **C9.23** | **写入顺序不变量回归测试（自证）**：把 `syncfs` 故意移到 `rename` 之后 → 顺序检查**必须失败**；恢复 → 必须通过。依据：ADR-008 §4.2 的 R1 不变量 —— **已交付（本轮）**：`tests/integration/test_posix_batch_commit.cpp`（摊销 / 顺序不变量 / 数据正确性含正控 / 阈值例外 / `atomic_write=false` / 失败路径）+ 3 个 R1 注入实测（`docs/test-evidence/phase9.md` §13.4） |
 | **C9.24** | **`syncfs` 全局 flush 的影响评估**：多租户共盘场景下测量它对其他写入的干扰；必要时默认改为 `per_file` 或要求按 partition 分盘 |
 | **C9.25** | **GC 对残留 `.tmp_*` 的清理**：必须能识别并删除；且有"绝不把 `.tmp_*` 视为有效对象"的反向测试 |
-| **C9.26** | **多实例端到端**：2 个真实进程 + 共享 PG + 共享目录，跑完整 上传→登记→下载→删除 流程，并注入实例崩溃（验证 `claiming` 记录的租约回收） —— ⬜ **仍未验证**（本轮"容器硬化"实测**不覆盖**本条）。需要：PG 版仓储/租约（当前**未交付**，`deployment.mode=multi` 组合根直接 exit 78）+ 2 个真实进程 + 共享目录 + 实例崩溃注入。**口径差异**：本条要的是"多进程 + 共享 PG + 共享目录 + 崩溃注入"，与容器的只读 rootfs / 最小权限 / 资源上限 / 健康检查**不是同一件事**（后者见 `docs/test-evidence/phase9-image.md` §10） |
+| **C9.26** | **多实例端到端**：2 个真实进程 + 共享 PG + 共享目录，跑完整 上传→登记→下载→删除 流程，并注入实例崩溃（验证 `claiming` 记录的租约回收） —— ⬜ **仍未验证**（本轮"容器硬化"实测**不覆盖**本条）。需要：**实例崩溃注入 + 共享目录的真·多进程 E2E**（B1 已交付 PG 仓储/租约/leader election 与 `multi` 启动；本条的"崩溃注入"与共享挂载探针仍未做，见 `test-evidence/phase10.md` §17.6）。**口径差异**：本条要的是"多进程 + 共享 PG + 共享目录 + 崩溃注入"，与容器的只读 rootfs / 最小权限 / 资源上限 / 健康检查**不是同一件事**（后者见 `docs/test-evidence/phase9-image.md` §10） |
 | **C9.27** | **★ 在目标存储上验证 NFS 语义**（上生产硬前提）：`rename` 跨客户端原子性、close-to-open 一致性、`fsync`/`syncfs` 耐久性；并确认实现**不依赖** NFS 文件锁 —— ⬜ **仍未验证**（**上生产硬前提**，Docker 硬化场景不覆盖）。需要：一个可挂载的 NFS（多客户端）；本机**无 root、不能 `mount`**，也没有 NFS 服务端 |
 | **C9.28** | PG 连接预算校验：实例数 × 池上限 ≤ `max_connections`；超限**拒绝启动** —— ⬜ **仍未验证**（且**未交付**：全仓没有 PG 客户端/连接池实现；`server.http.max_connections` 是 **HTTP 并发**上限，**不是** PG 连接预算）。需要：PG 版仓储 + 连接池 + 一个可读 `max_connections` 的目标 PG |
 | **C9.29** | **io_uring 收益复核（U2/U4）**：在**目标存储**（NVMe/HDD/NFS）上复测 io_uring vs 阻塞线程池。HDD/NFS（高延迟）场景若差异 ≥1.5x 则建议启用；NVMe 级别不足则维持默认 —— ⬜ **仍未验证**（且**未交付**：`UringIoEngine::enabled()=false`，`storage.io_engine=uring` 一律 exit 78）。需要：允许 io_uring 的 seccomp profile（Docker **默认** profile 实测 `EPERM`，见 ADR-010）+ 目标存储（NVMe/HDD/NFS）+ 引擎实现 |
@@ -998,7 +998,7 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
 切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）、切片 4（数据面 PUT 上限 + SQLite PRAGMA）
 与切片 5（`self_signed` 三键：`key_id` + 自签 TTL 上界）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态：**生效 113 / 拒绝启动 18 / 已读但无效果 25**（`docs/operations.md` §1.3；ADR-008 的 P4 +1、C10.20 的 6 键）。
+三态：**生效 122 / 拒绝启动 16 / 已读但无效果 18**（`docs/operations.md` §1.3；ADR-008 的 P4 +1、C10.20 的 6 键）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
@@ -1072,7 +1072,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（**当前为 生效 113 / 拒绝启动 18 / 已读但无效果 25 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
+  `docs/operations.md` 逐键三态化（**当前为 生效 122 / 拒绝启动 16 / 已读但无效果 18 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1163,7 +1163,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   组合根三分支：`log`（默认，既有 `LogEventPublisher` 逐字不变）/ `webhook` / `none`（内联 `NoopEventPublisher`，  **显式关闭**）；横幅打印 publisher/端点/timeout/topic（**不打印密钥**）。
   `src/app/usecases/usecases.cpp` 的 `PublishStatus` 补上 `record_id`（第 10 步/幂等命中路径带真实 id；  第 1 步 IN_PROGRESS 发生在建记录前 → 空），使 `statusChanged.body.recordId` 与上游形状一致。
   用例：`tests/integration/test_webhook_publisher.cpp`（真实进程 + `mock_validators.py --mode webhook`；  `--observe-file` 新增 `bodies` 列表断言两个 kind 都发了）+ `tests/unit/test_composition_root_guard.cpp` 清单加   `WebhookEventPublisher`。**未交付**：异步有界发布队列、重试退避、投递保证、与真实消息总线/中间件联调。
-* 三态计数：**生效 113 / 拒绝启动 18 / 已读但无效果 25 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* 三态计数：**生效 122 / 拒绝启动 16 / 已读但无效果 18 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
   其中「拒绝启动」+1 来自 C10.18 的**伴随更正**（`auth.remote_entitlements.fail_closed`），
   与"6 个键接通"是两件事（落点不同：一个进「生效」、一个进「拒绝启动」）。
 

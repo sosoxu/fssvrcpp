@@ -299,6 +299,12 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | --- | --- | --- | --- |
 | 1 | 「`storage.posix.durability=batch` 映射到 `FsyncPolicy::kBySize`；语义 = **≥ 阈值**的对象单独 `fdatasync`，更小的靠批次末 `syncfs` 摊销」（`src/main/server_main.cpp` 的近似映射、`docs/operations.md` §5.1、`docs/02-design.md` §13.4） | **推翻（本轮 / C9.23）**：`kBySize` 的语义是"小于阈值的文件**不 fsync**（靠批提交摊销）"，而**批提交根本不存在**（ADR-008 的 P4 一直是"待做"）⇒ 默认配置（`config/fss.example.json` 的 `durability: "batch"`）下**小文件从不落盘**，崩溃可能丢已确认的写入。这不是"两个键没接线"，而是**默认路径的耐久性承诺与实现不符**。现在 `batch_commit=true` 打开真两阶段批提交：`write all tmp → syncfs → rename all → fsync(dir)`（`src/infra/blob/posix/posix_blob_store.cpp` 的 `JoinBatch`/`CommitBatch`，`syncfs(2)` 在 `src/infra/io/file_sync.cpp`） | ① 默认路径的耐久性承诺与实现**一致**（`sync_dir_after_batch=false` 因 R2 不变量**仍拒绝启动**，不是"未实现"）；② `storage.posix.group_commit_max_batch` 从「拒绝启动」移入「生效」→ 三态 **106/19/31 → 107/18/31**（`docs/operations.md` §1.3）；③ 新增 `fss_posix_{syncfs,group_commits,batch_objects}_total`（真实进程可观察摊销）；④ **吞吐数字不迁移**：ADR-008 的 31,478 文件/秒 / 82.3× 是**显式批量写**场景，本实现是**并发驱动**的组提交，顺序单文件写仍是一文件一次提交（`docs/operations.md` §5.2 的 `batch` 行已标**作废**）；⑤ 新增未验证项：**真实断电**（R4/R8）与 **C9.24（`syncfs` 全局 flush）**（`docs/adr/ADR-008-write-durability-protocol.md` §7.3） |
 
+### 5.t 本轮更正的既有结论（B1：`deployment.mode=multi` 从"拒绝启动"到"真的装配 PG 运行形态"）
+
+| # | 旧结论（记录于） | 现状（依据） | 影响 |
+| --- | --- | --- | --- |
+| 1 | 「`deployment.mode=multi` **拒绝启动**：需要 PG 仓储 + PG 租约 + 数据库时钟（ADR-009），本版本尚未交付」（`src/main/server_main.cpp`、`docs/operations.md` §1.3/§7.3、`docs/runbook.md` §8、`docs/02-design.md` 的 R-26） | **推翻（本轮 / B1）**：A1/A2 的三件 PG 数据层（`§15`/`§16`）本切片接进组合根——`metadata.repository=postgres`/`location.repository=postgres` 创建 PG 仓储、`leases.enabled=true` 创建 `PostgresLeaseRepository`（`staging_leases`）、`leader_election.enabled=true` 创建新增 L2 `PgLeaderElection`（**专用锁连接** + `pg_try_advisory_lock`，`IsLeader()` 每轮**验证连接健康**）；GC 的周期调度与 `POST /v2/gc:run` 由 leader 门控。任一创建/取锁失败或无 libpq → **exit 78**（可执行修复指令），绝不回退 SQLite | ① `location.postgres.*`/`metadata.postgres.*`（5 键）、`leases.enabled`、`leader_election.*`（3 键）共 **9 键**移入「生效」→ 三态 **113/18/25 → 122/16/18**（`docs/operations.md` §1.3；`test_operations_doc` 机械断言）；② `deployment.instance_id` 在 multi 下未配置/为空时**自动生成**（默认 `local` 会让多实例共享标识 → M1 静默串数据）；③ POSIX `.tmp.*` 补齐 ADR-009 §4.5 的**随机后缀**；④ 证据 `docs/test-evidence/phase10.md` §17（两引擎 + 4 条 R1 注入）；⑤ **仍未交付**：共享挂载探针、readiness PG 探活+迁移版本校验、崩溃注入/完整多实例 E2E（C9.26）、NFS 语义（C9.27）、`/v2/info` 的 `instanceId` |
+
 ## 6. 最终关键参数（默认值及其依据）
 
 | 参数 | 最终值 | 依据 |
@@ -320,7 +326,7 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | `leases.enabled` / `leader_election.enabled` | `false`（single）/ **`true`（multi 强制）** | ADR-009 |
 | `gc.require_lease_expiry` | **`true`**（**禁止**"无记录即删"） | naive GC 实测 20/20 误删在途上传 |
 | `self_signed.single_use_nonce` | **`false`** | 本地 nonce 表在多实例下不成立 |
-| `deployment.mode=multi` 强制校验 | **5 条，任一条不满足 → 拒绝启动** | 防止把 SQLite 误配进多实例 |
+| `deployment.mode=multi` 强制校验 | **7 条，任一条不满足 → 拒绝启动**（B1 起校验通过后还会**真的装配** PG 仓储/租约/leader election） | 防止把 SQLite 误配进多实例 |
 | PG `client_connection_check_interval` | **`1s`** | 默认 0 时崩溃的持锁会话不会释放锁 → leader 永久失联 |
 
 ---
@@ -338,7 +344,7 @@ P6 元数据记录语义完整化（12 步序列 + 回滚 + 版本链 + DMS + De
 P7 gRPC 适配层 + 双协议等价性            ✅ 已完成（C7.1~C7.10；17/17 RPC + 契约 §6 矩阵 + 流式 + 双协议并发；6 测试 / 5378 断言）← 此阶段"双协议"达成
 P8 认证授权与多租户                        ✅ 已完成（C8.1~C8.8；JWT + 路由预检 + 跨租户隔离 + 远端 Entitlements fail-closed + 审计覆盖 + multi 校验 + 时钟偏差；6 测试 / 1323 断言）
 P9 硬化与交付（容量基线 / 故障注入 / GC / 打包 / 定稿 ADR-006） ✅ 已完成（C9.1~C9.13/C9.15/C9.16/C9.25；6 测试 / 466 断言；`run_all_gates.sh` P0~P9 全绿 225 s / 10 阶段）
-P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3/4/5/6a + C10.16 + C10.16 续（156 键三态 **113/18/25**（C10.20 后）；切片 5 = `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 生效；切片 6a = 远端 legal/schema 校验器 6 键生效 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动；切片 6b = `events.publisher` 与 `events.webhook.*` 4 键生效（**发布失败非致命**）；见 `docs/04-implementation-plan.md` 末尾）
+P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3/4/5/6a + C10.16 + C10.16 续（156 键三态 **122/16/18**（B1 后；C10.20 后为 113/18/25）；切片 5 = `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 生效；切片 6a = 远端 legal/schema 校验器 6 键生效 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动；切片 6b = `events.publisher` 与 `events.webhook.*` 4 键生效（**发布失败非致命**）；见 `docs/04-implementation-plan.md` 末尾）
 ```
 
 **铁律**：门槛未通过 → 不得开始下一阶段。每阶段证据归档到 `docs/test-evidence/phaseN.md`。

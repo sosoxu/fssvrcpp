@@ -434,7 +434,7 @@ gc:
 | **C6.11** | **幂等性测试**：并发 2 实例提交同一 `fileSource` → 只产生 1 条记录、只发生 1 次复制（复现 M2 的对照测试） |
 | **C6.12** | **GC 租约测试**：在途对象在租约有效期内**不被删除**；租约过期且无记录时被回收；两个 GC 并发时用原子领取保证不重复删（复现 M3 的对照测试） |
 | **C6.13** | **tmp 名唯一性测试**：2 实例并发写同一业务序号 → 无内容错乱（复现 M1 的对照测试） |
-| **C8.9** | `deployment.mode=multi` 的启动校验：5 条强制项各有一个"拒绝启动"的测试 |
+| **C8.9** | `deployment.mode=multi` 的启动校验：7 条强制项各有一个"拒绝启动"的测试（B1 起校验通过后还会真的装配 PG 运行形态） |
 | **C8.10** | 时钟偏移：模拟快/慢钟实例 → 租约不误判（使用 PG `now()`） |
 | **C9.26** | 多实例端到端：2 个真实进程 + 共享 PG + 共享目录，跑完整上传→登记→下载→删除流程，并注入实例崩溃 |
 | **C9.27** | **在目标存储上验证 NFS 语义**：`rename` 原子性、close-to-open 一致性、`syncfs` 耐久性（§6.1/§6.2 的未验证项） |
@@ -447,8 +447,8 @@ gc:
 - [x] 实现 `PostgresLocationRepository` / `PostgresLeaseRepository`（L2 + libpq 薄封装；与内存/SQLite 共用 `tests/framework/port_contract.h` 的同一套契约测试；已在 PG 14.24 与 12.6 实测。证据：`docs/test-evidence/phase10.md` §15）
 - [x] 实现 `PostgresMetadataRepository`（上一项里 metadata 那一半）：`file_metadata_records` 的 L2 实现，读路径过滤 `state <> 'deleted'`，`Create` 用 `ON CONFLICT (partition_id, file_source) WHERE state <> 'deleted' AND is_latest DO NOTHING` 做**单条 INSERT 的原子领取**；与内存/SQLite 共用 `tests/framework/port_contract.h` 的同一套 `CheckMetadataRepositoryContract`，并新增"并发 Create 同一 fileSource → 恰好 1 行 / 所有调用者同一个 id"的判据。已在 PG 14.24 与 12.6 实测。证据：`docs/test-evidence/phase10.md` §16
 - [ ] 实现 `CreateFileMetadata` 的原子领取 + `claiming`→`ready` 状态机 + 崩溃回收（仓储只提供"单条 INSERT 的原子领取"，跨步骤领取与状态机仍未交付）
-- [ ] 实现 leader election（PG advisory lock）+ GC 的租约与原子领取
-- [ ] 实现 `deployment.mode=multi` 的 5 条启动校验与时钟偏移检查
-- [ ] `ObjectKeyPolicy` 的 tmp 名唯一化
+- [x] 实现 leader election（PG advisory lock）+ GC 的租约与原子领取（B1：`src/infra/postgres/pg_leader_election.*` + 组合根门控 `GcScheduler`/`GcCallbacks`；PG 租约仓储见 §15。证据：`docs/test-evidence/phase10.md` §17）
+- [x] 实现 `deployment.mode=multi` 的 7 条启动校验 + 组合根装配 PG 仓储/租约/leader election（B1）。⚠️ **PG-vs-本地时钟比较仍未实现**：`deployment.clock_skew_tolerance_seconds` 仍是非默认即 exit 78 的守卫
+- [x] tmp 名唯一化（B1 补齐 ADR-009 §4.5 的**每进程随机后缀**：`.tmp.<instance_id>.<pid>.<counter>.<random>`；判据 `tests/integration/test_posix_tmp_names.cpp`）。⚠️ 最终键的 `ObjectKeyPolicy` 生成规则未变
 - [ ] 在目标环境验证 NFS 语义（C9.27）——这是**上生产前的硬前提**
 - [ ] 更新 `docs/operations.md`：多实例部署、PG 高可用、分盘建议、滚动升级与配置版本
