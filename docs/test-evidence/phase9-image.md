@@ -159,7 +159,7 @@ ENV FSS_AUTH_MODE=jwt \
 | `FSS_DEPLOYMENT_MODE` | `single` | `multi` 会被组合根拒绝启动（ADR-009 的 PG 形态尚未交付） |
 
 `config/fss.example.json` 被复制到 `/etc/fss/fss.example.json`（fss:fss 0600）作为**带注释的参考文档**；
-**它不是生效来源**——组合根当前不读 JSON 配置（AGENTS.md §0「阶段 4 后续」）。这一点在镜像注释里写明了。
+**它不是生效来源**——组合根当前不读 JSON 配置（当时的登记见 `docs/phase-status.md` 的「阶段 4 后续」一行）。这一点在镜像注释里写明了。
 
 ---
 
