@@ -76,6 +76,22 @@ struct UseCasePorts {
   //  运维响应需要的**只读**运行时配置（`/v2/info` 的 `authMode`，C8.5）。
   //  放在端口集合里而不是各适配层，是为了让 REST 与 gRPC 返回**同一个**值。
   std::string auth_mode = "disabled";
+  //  ★ C9.30（ADR-010 的 R11）：I/O 引擎的**探测与回退结果必须可见**。
+  //    与 `auth_mode` 同理放在端口集合里：REST 的 `/v2/info` 与 gRPC 的
+  //    `InfoResponse` 都从 `GetInfo` 用例的返回结构取值 ⇒ 两条协议的一致性
+  //    是**按构造保证**的（C7.3 的等价性），而不是"两个适配器各算一遍"。
+  //
+  //  `io_engine`：**当前生效**的引擎名（组合根的 `io_engine_active`）。
+  //    当前实现下恒为 `"blocking"` —— ADR-010 的 U1~U4 未满足，`UringIoEngine`
+  //    未启用；`storage.io_engine=auto` 会回退到 blocking，`=uring` 直接拒绝启动。
+  //
+  //  `io_uring_available`：本部署的**宿主能力探测结果**（`sys::IoEngineProbe::available()`：
+  //    内核是否支持 io_uring_setup、seccomp/`kernel.io_uring_disabled` 是否放行）。
+  //    ★ **可用 ≠ 已启用**：`true` 只说明"这台机器/这个 seccomp 下能用"，
+  //      **不**代表"服务正在用 uring"（引擎实现未交付 ⇒ `io_engine` 仍是 blocking）。
+  //      这正是 R11 要的"探测结果可见"——避免运维把"可用"读成"已启用"。
+  std::string io_engine = "blocking";
+  bool io_uring_available = false;
   //  ★ C10.13：`observability.audit_fail_closed`。
   //    `true` → 审计写入失败让**请求失败**（契约 §5 → 500），绝不"审计丢了还报成功"；
   //    `false`（默认，= 接线前的行为）→ 审计失败非致命，只影响记录本身。
@@ -156,6 +172,11 @@ struct VersionInfo {
   std::vector<std::string> connected_outer_services;
   //  ★ C8.5：`auth.mode` 必须**可见** —— "忘了开鉴权"不能是静默状态
   std::string auth_mode;  // "jwt" / "remote-entitlements" / "disabled"
+  //  ★ C9.30（ADR-010 的 R11）：I/O 引擎的当前生效值与宿主能力探测结果。
+  //    语义见 `UseCasePorts` 的说明：`io_engine` = **当前生效**（本实现恒为 blocking），
+  //    `io_uring_available` = **宿主能力**（可用 ≠ 已启用）。REST 与 gRPC 同源。
+  std::string io_engine;      // → JSON `ioEngine` / proto `io_engine`
+  bool io_uring_available = false;  // → JSON `ioUringAvailable` / proto `io_uring_available`
 };
 
 // =============================================================================

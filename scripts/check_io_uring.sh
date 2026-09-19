@@ -113,7 +113,11 @@ else
       warn "本地无可用镜像且不可联网拉取，跳过容器探测"
     else
       info "镜像: ${IMAGE}"
-      if out="$(docker run --rm -v "${WORKDIR}:/w" -w /w "${IMAGE}" /w/probe 2>&1)"; then
+      #  ★ 必须显式 --entrypoint：像 fssvrcpp:verify 这类镜像自带 ENTRYPOINT，
+      #    否则 `/w/probe` 会被当作**entrypoint 的参数**吞掉 → 探针根本没执行，
+      #    脚本只能报"docker/runc 错误 → 无结论"（实测踩到；R4 的"无结论"不该由
+      #    脚本自身的调用方式造成）。
+      if out="$(docker run --rm --entrypoint /w/probe -v "${WORKDIR}:/w" -w /w "${IMAGE}" 2>&1)"; then
         if probe_verdict "$out"; then
           ok "容器(默认 seccomp): $out"
           CONT_OK=1; CONT_RAN=1
@@ -127,8 +131,8 @@ else
       else
         warn "容器(默认 seccomp): 探针未执行（docker/runc 错误）→ $(printf '%s' "$out" | tail -1)"
       fi
-      if out="$(docker run --rm --security-opt seccomp=unconfined \
-                 -v "${WORKDIR}:/w" -w /w "${IMAGE}" /w/probe 2>&1)"; then
+      if out="$(docker run --rm --security-opt seccomp=unconfined --entrypoint /w/probe \
+                 -v "${WORKDIR}:/w" -w /w "${IMAGE}" 2>&1)"; then
         if probe_verdict "$out"; then
           ok "容器(seccomp=unconfined): $out"
           [[ ${CONT_SECCOMP_BLOCKED} -eq 1 ]] && \

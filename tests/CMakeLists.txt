@@ -648,3 +648,23 @@ fss_add_test(test_webhook_publisher
   LIBS    fss_json Threads::Threads
   LABELS  "phase10;integration")
 add_dependencies(test_webhook_publisher fss_server)
+
+# =============================================================================
+#  C9.30 的**第三半**（P10 期间补交）：`/v2/info` 与指标暴露
+#  `ioEngine` / `ioUringAvailable`（ADR-010 的 R11；语义见文件头的"可用 ≠ 已启用"）。
+#    ① REST：真 JSON 解析（python3 `json`）断言字段**存在**+**类型**+取值，既有字段正控；
+#    ② gRPC 与 REST **同源**（真实进程两条协议各取一次比对 + 进程内非默认值双向对照）；
+#    ③ `/metrics`：`fss_io_uring_available 0|1` 与既有 `fss_io_engine{...}` 同时存在；
+#    ④⑤ 探测注入接缝 `FSS_IO_PROBE_INJECT=available|blocked`（环境变量，**不是配置键**）
+#       使字段**双向**翻转 ⇒ 既不是恒 false 也不是恒 true；且 `storage.io_engine=uring`
+#       在注入下**仍拒绝启动**（U1~U4 不受影响）；
+#    ⑥ 三处渲染一致（`/v2/info` 的 `ioEngine` == 启动横幅 == `fss_io_engine` 指标）；
+#    ⑦ 反向：该接缝不是配置键（`--set` 未知键 → exit 78）。
+# =============================================================================
+fss_add_test(test_io_engine_exposure
+  SOURCES integration/test_io_engine_exposure.cpp
+  LIBS    fss_app fss_grpc_adapter fss_http_adapter fss_blob_memory fss_location_memory
+          fss_metadata_memory fss_transfer Threads::Threads
+  LABELS  "phase9;integration")
+# 被测进程就是 build/bin/fss_server → 构建它必须先于本测试
+add_dependencies(test_io_engine_exposure fss_server)

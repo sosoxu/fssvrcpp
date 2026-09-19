@@ -3,7 +3,6 @@
 
 #include "app/usecases/caller_context.h"
 #include "app/usecases/wire_shapes.h"
-#include "app/version.h"
 #include "common/json/json.h"
 #include "common/time/time_format.h"
 
@@ -178,14 +177,23 @@ void Router::Register(fss::http::Server& server) {
   server.Get(base + "/v2/info", MakeRoute("ops.info", kSmallBodyLimit),
              Wrap([this](fss::http::Request&, const app::CallerContext&)
                       -> fss::Result<fss::http::Response> {
-               VersionInfoResponse info;
-               info.version = "v2";
-               info.build_version = fss::app::BuildVersion();
-               //  内置 SQLite 时记录不进 Storage Service，因此这里如实声明只有 storage
-               info.connected_outer_services = {"storage"};
-               //  ★ C8.5：与 gRPC 的 `GetInfo` 读**同一个**来源（`UseCasePorts.auth_mode`）
-               info.auth_mode = ports_.auth_mode;
-               return fss::http::Response::Json(200, fss::json::Dump(ToJson(info)));
+               //  ★ C8.5 / C9.30：**唯一来源**是 `app::GetInfo` 用例（REST 与 gRPC
+               //    从同一处取值 ⇒ 一致性按构造保证）。此前这里是就地拼 DTO 的，
+               //    于是"新增一个字段"必须改两遍适配器 —— 正是 C7.3 要避免的形态。
+               app::GetInfo usecase(ports_);
+               const auto result = usecase.Execute();
+               if (!result.ok()) return result.error();
+               const auto& info = result.value();
+               VersionInfoResponse response;
+               response.version = info.version;
+               response.build_version = info.build_version;
+               response.connected_outer_services = info.connected_outer_services;
+               //  C8.5：鉴权模式必须在 `/v2/info` 可见（与 gRPC 同源）
+               response.auth_mode = info.auth_mode;
+               //  C9.30（ADR-010 R11）：当前引擎 + 宿主能力探测结果
+               response.io_engine = info.io_engine;
+               response.io_uring_available = info.io_uring_available;
+               return fss::http::Response::Json(200, fss::json::Dump(ToJson(response)));
              }));
 
   // ---------------------------------------------------------------------------

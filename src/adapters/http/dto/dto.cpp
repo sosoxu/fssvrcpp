@@ -56,6 +56,11 @@ json::Value ToJson(const VersionInfoResponse& response) {
   body["buildVersion"] = response.build_version;
   body["connectedOuterServices"] = response.connected_outer_services;
   if (!response.auth_mode.empty()) body["authMode"] = response.auth_mode;
+  //  ★ C9.30（ADR-010 的 R11）：引擎与探测结果必须可见（camelCase，与 `authMode` 同风格）。
+  //    `ioUringAvailable` **总是**渲染（含 `false`）—— 布尔字段"缺省即 false"会让
+  //    运维分不清"探测说不可用"与"这个版本还没这个字段"。
+  if (!response.io_engine.empty()) body["ioEngine"] = response.io_engine;
+  body["ioUringAvailable"] = response.io_uring_available;
   return body;
 }
 

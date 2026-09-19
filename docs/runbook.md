@@ -267,3 +267,36 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动
 > 立刻以 exit 70 失败）。它只用于测试与故障演练；演练结束请确认该变量已从环境 / systemd unit 文件中移除。
+
+### 10.1 I/O 引擎**探测注入**接缝（C9.30；⚠️ 同样**不要在生产设置**）
+
+用来在**真实二进制**上证明 `ioUringAvailable` 真的来自能力探测（而不是硬编码），
+并且钉住"**可用 ≠ 已启用**"（判据：`tests/integration/test_io_engine_exposure.cpp`）：
+
+| 环境变量 | 取值 | 行为 |
+| --- | --- | --- |
+| `FSS_IO_PROBE_INJECT` | `available` | `sys::ProbeIoUring()` 的结果**强制为可用** ⇒ `/v2/info` 的 `ioUringAvailable=true`、`/metrics` 的 `fss_io_uring_available 1`、横幅打印 `io_uring=available(injected)` |
+| 同上 | `blocked` | 强制为 `blocked_by_policy(EPERM)`（**复刻默认容器 seccomp 的形态**）⇒ 两处为 `false` / `0`，横幅打印 `io_uring=blocked_by_policy(injected) (EPERM)` |
+| 同上 | 其它/空 | 不注入（走真实探测；未知取值**不**注入，与 `FSS_AUDIT_FAULT_INJECT` 的宽容策略一致） |
+
+```bash
+# 演练：证明字段来自探测（不是硬编码），且注入**不**启用引擎
+FSS_IO_PROBE_INJECT=available ./build/bin/fss_server &
+curl -s localhost:8080/api/file/v2/info   # → "ioEngine":"blocking","ioUringAvailable":true
+curl -s localhost:8080/metrics | grep fss_io_uring   # → fss_io_uring_available 1
+FSS_IO_PROBE_INJECT=available ./build/bin/fss_server --set storage.io_engine=uring; echo "exit=$?"
+# → **仍**拒绝启动（exit 78）：探测说可用，但 UringIoEngine 实现未启用（ADR-010 U1~U4）
+```
+
+> ⚠️ **它只改"探测结果"，不放宽任何启动判据**：`storage.io_engine=uring` 在注入下
+> **仍 exit 78**（`UringIoEngine::enabled()` 恒 false），`/v2/info` 的 `ioEngine` 仍
+> `blocking`。因此它**不是**"偷偷启用 io_uring"的后门。注入**自身可见**（横幅带
+> `(injected)` 与 `FSS_IO_PROBE_INJECT=…` 字样），避免演练结论被误读成"这台机器真的可用"。
+>
+> **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 156 键三态清单由
+> `test_operations_doc` **机械比对**；"让能力探测说假话"不是运维语义（生产上改写探测
+> 结果只会误导 R11 的可观测性）。若写成配置项会按**未知键 → exit 78** 被拒。
+>
+> **本机真值提醒**：探测真值随部署变化 —— WSL2 宿主（`kernel.io_uring_disabled=0`）
+> **可用**，Docker 默认 seccomp 下 `EPERM`（**不可用**）。所以"不注入时必须为 false"
+> **不是**合法判据；判据必须是"字段随探测结果变化"（本接缝提供）。

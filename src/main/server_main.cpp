@@ -1631,6 +1631,15 @@ static int RunServer(int argc, char** argv) {
                             "当前生效的 I/O 引擎（1 = 生效；requested=配置请求值）");
   metrics_registry.SetGauge("fss_io_engine", 1,
                             {{"engine", io_engine_active}, {"requested", io_engine}});
+  //  ★ C9.30（ADR-010 的 R11）：**宿主能力探测结果**必须与"生效引擎"分开暴露。
+  //    `fss_io_engine{engine="blocking"}` 只说明"现在跑的是阻塞路径"，回答不了
+  //    "这台机器到底能不能用 io_uring"（运维决定要不要改 seccomp profile 需要后者）。
+  //    ⚠️ `1` = 宿主允许 io_uring，**不**代表服务正在使用它（引擎实现未交付）。
+  metrics_registry.Register("fss_io_uring_available", metrics::Registry::Kind::kGauge,
+                            "宿主能力探测：io_uring_setup 是否被允许（1=可用；仅探测，"
+                            "不代表引擎已启用）");
+  metrics_registry.SetGauge("fss_io_uring_available",
+                            uring_probe.available() ? 1 : 0);
   //  ★ ADR-008 的 P4：批提交的摊销是否发生，必须能被运维观察（否则"批提交"只是文档）。
   //    判据：`fss_posix_batch_objects_total / fss_posix_group_commits_total` = 平均批大小。
   metrics_registry.Register("fss_posix_syncfs_total", metrics::Registry::Kind::kCounter,
@@ -1872,6 +1881,14 @@ static int RunServer(int argc, char** argv) {
                           issuer,            clock,
                           ids};
   ports.auth_mode = auth_mode;  // C8.5：让 `/v2/info` 与 gRPC 的 `GetInfo` 都能看到
+  //  ★ C9.30（ADR-010 的 R11）：把"当前生效引擎"与"宿主能力探测结果"交给用例 ——
+  //    REST 的 `/v2/info` 与 gRPC 的 `InfoResponse` 都从 `GetInfo` 取值，两条协议
+  //    的一致性因此按构造保证（不在适配器里各算一遍）。
+  //    ⚠️ 语义区分（契约与头文件里同样写明）：`io_engine` = **当前生效**（本实现
+  //       恒为 blocking，ADR-010 U1~U4 未满足）；`io_uring_available` = **宿主能力**
+  //       （`io_uring_setup` 是否被允许），**可用 ≠ 已启用**。
+  ports.io_engine = io_engine_active;
+  ports.io_uring_available = uring_probe.available();
   //  C10.13：审计失败是否让请求失败（用例层判定；见 usecases.cpp 的 RecordAudit）
   ports.audit_fail_closed = audit_fail_closed;
 

@@ -92,6 +92,13 @@ struct VersionInfoResponse {
   //  ★ 非 OSDU 规范字段（扩展）：`authMode`。C8.5 要求鉴权模式在 `/v2/info` 可见，
   //    否则 `auth.mode=disabled` 会变成"静默的无鉴权"。
   std::string auth_mode;
+  //  ★ 非 OSDU 规范字段（扩展）：`ioEngine` / `ioUringAvailable`（C9.30 / ADR-010 R11）。
+  //    `io_engine` = **当前生效**的引擎名（本实现恒为 "blocking"：ADR-010 的 U1~U4
+  //    未满足）；`io_uring_available` = **宿主能力探测**结果 ——
+  //    ★ **可用 ≠ 已启用**：`true` 只表示"这台机器/这个 seccomp 下能用 io_uring"，
+  //      不代表服务正在用它。两者都经 `app::GetInfo` 取值，与 gRPC 同源。
+  std::string io_engine;            // → `ioEngine`
+  bool io_uring_available = false;  // → `ioUringAvailable`
 };
 
 json::Value ToJson(const VersionInfoResponse& response);

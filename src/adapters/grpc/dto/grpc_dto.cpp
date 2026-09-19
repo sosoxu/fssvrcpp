@@ -185,6 +185,12 @@ void FillInfoProto(const fss::app::VersionInfo& info, osdu::file::v1::InfoRespon
   }
   //  扩展字段：与 REST 的 `authMode` 对齐（C8.5，两条协议同一来源）
   out->set_auth_mode(info.auth_mode);
+  //  ★ C9.30（ADR-010 的 R11）：与 REST 的 `ioEngine` / `ioUringAvailable` 对齐。
+  //    同源（都来自 `app::GetInfo` 的 `VersionInfo`）⇒ C7.3 的等价性按构造保证。
+  //    语义：`io_engine` = 当前生效引擎；`io_uring_available` = 宿主能力探测结果
+  //    （**可用 ≠ 已启用**）。
+  out->set_io_engine(info.io_engine);
+  out->set_io_uring_available(info.io_uring_available);
 }
 
 void FillMetadataProto(const fss::domain::FileMetadataRecord& record,

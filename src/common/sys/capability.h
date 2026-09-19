@@ -44,6 +44,12 @@ struct IoEngineProbe {
   std::string kernel_release; // uname -r
   long syscall_number = -1;   // __NR_io_uring_setup（-1 = 该架构没有）
   int entries_requested = 0;
+  //  ★ C9.30：本结果是否来自**探测注入接缝**（`FSS_IO_PROBE_INJECT=available`，
+  //    测试/演练用，**不是配置键**）。注入必须**自身可见** —— 否则"被注入成可用"
+  //    会伪装成"这台机器真的可用"，把演练结论污染成环境事实。
+  //    它**只**改探测结果：`UringIoEngine::enabled()` 仍为 false ⇒ 生效引擎仍是
+  //    blocking、`storage.io_engine=uring` 仍拒绝启动（ADR-010 的 U1~U4 不受影响）。
+  bool injected = false;
 
   bool available() const { return uring == UringStatus::kAvailable; }
   // 一行摘要，用于日志/`/v2/info`

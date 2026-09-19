@@ -529,6 +529,14 @@ message InfoResponse {
   //  ★ 扩展字段（非 OSDU 规范）：当前鉴权模式（C8.5）。缺少它时
   //    `auth.mode=disabled` 会变成静默的无鉴权状态。
   string auth_mode = 9 [json_name = "authMode"];
+  //  ★ 扩展字段（非 OSDU 规范，C9.30 / ADR-010 的 R11）：I/O 引擎的
+  //    **当前生效值**与**宿主能力探测结果**。两者与 REST `/v2/info` 的
+  //    `ioEngine` / `ioUringAvailable` **同源**（同一个 `app::GetInfo` 返回值）。
+  //    ⚠️ `io_uring_available=true` **不**表示服务正在使用 io_uring ——
+  //       只表示"这台机器 / 这个 seccomp 下 io_uring_setup 可用"；
+  //       引擎实现未交付（ADR-010 U1~U4）⇒ `io_engine` 仍是 "blocking"。
+  string io_engine = 10 [json_name = "ioEngine"];
+  bool io_uring_available = 11 [json_name = "ioUringAvailable"];
 }
 
 message ConnectedService {

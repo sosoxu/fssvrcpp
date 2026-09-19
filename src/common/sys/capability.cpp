@@ -1,6 +1,7 @@
 #include "common/sys/capability.h"
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -61,7 +62,11 @@ const char* UringStatusName(UringStatus status) {
 
 std::string IoEngineProbe::ToString() const {
   std::string out = "io_uring=";
-  out += UringStatusName(uring);
+  if (injected) {
+    out += available() ? "available(injected)" : "blocked_by_policy(injected)";
+  } else {
+    out += UringStatusName(uring);
+  }
   if (!available()) {
     out += " (" + errno_name + ")";
   }
@@ -74,6 +79,60 @@ IoEngineProbe ProbeIoUring(int entries) {
   IoEngineProbe probe;
   probe.entries_requested = entries;
   probe.kernel_release = KernelRelease();
+
+  //  ★ C9.30 的**探测注入接缝**（测试/演练用，环境变量，**不是配置键**）：
+  //    `FSS_IO_PROBE_INJECT=available` → 探测结果强制为**可用**；
+  //    `FSS_IO_PROBE_INJECT=blocked`   → 探测结果强制为**被策略阻断（EPERM）**。
+  //
+  //  为什么需要它（区分力论证，R1）：**接缝让"字段真的来自探测"可被证伪**。
+  //    ① `availability` 方向：若实现把 `ioUringAvailable` 硬编码成 `false`，
+  //       `=available` 这条用例必然失败；
+  //    ② `blocked` 方向：若实现把它硬编码成 `true`（或"用了就恒 true"），
+  //       `=blocked` 这条用例必然失败。
+  //    两个方向都测 ⇒ 该字段既不是恒 false 也不是恒 true。
+  //  ⚠️ 本机的**真实**真值由宿主决定，不要假设：本工作机（WSL2，kernel.io_uring_disabled=0）
+  //     实测 `available()==true`（`io_uring_setup` 直接成功），而 **Docker 默认 seccomp**
+  //     下同一调用是 `EPERM`（两种环境都已实测，见 `docs/test-evidence/phase9.md` 的 C9.30 节）。
+  //     因此"不注入 → 必须为 false"这条**不能**当判据：它会把正确实现判失败。
+  //     判据必须是"字段随探测结果变化"，这正是本接缝提供的。
+  //
+  //  ⚠️ 它**只**改"探测结果"，**不**改 `UringIoEngine::enabled()`（恒 false）：
+  //     ① `/v2/info` 的 `ioEngine` 仍是 `blocking`（生效引擎不是探测结果）；
+  //     ② `storage.io_engine=uring` 仍**拒绝启动**（ADR-010 的 U1~U4 未满足）。
+  //     `=available` 注入下拒绝启动的理由会明确写成"内核探测通过，但引擎实现尚未启用"
+  //     （就是 `=blocked` 之外的那条分支）—— 注入**不放宽任何启动判据**。
+  //
+  //  为什么不做成配置键（与 `FSS_STARTUP_FAULT_INJECT` / `FSS_AUDIT_FAULT_INJECT`
+  //  同一理由）：① `docs/operations.md` 的 156 个叶子键三态清单由
+  //  `test_operations_doc` 与 `config/fss.example.json` **机械比对**，"让探测说假话"
+  //  不是运维语义；② 生产上改写能力探测的结果只会误导 R11 的可观测性，
+  //  没有任何合法用途（真正要开 uring 得先满足 U1~U4 并交付引擎实现）。
+  //  登记：`docs/runbook.md` 的测试/演练小节（明确写"不要在生产设置"）。
+  //  未知取值 → 不注入（宽容策略，与 `FSS_AUDIT_FAULT_INJECT` 只认 "1" 一致）。
+  const char* const inject_env = std::getenv("FSS_IO_PROBE_INJECT");
+  const std::string inject = inject_env == nullptr ? std::string() : std::string(inject_env);
+  if (inject == "available") {
+    probe.injected = true;
+    probe.uring = UringStatus::kAvailable;
+    probe.errno_value = 0;
+    probe.errno_name = "OK";
+    probe.syscall_number = -1;
+    probe.detail =
+        "★ 探测注入（FSS_IO_PROBE_INJECT=available）：结果被强制为 available；"
+        "仅用于测试/演练，**不**代表真实宿主能力，**也不**启用 UringIoEngine";
+    return probe;
+  }
+  if (inject == "blocked") {
+    probe.injected = true;
+    probe.uring = UringStatus::kBlockedByPolicy;
+    probe.errno_value = EPERM;
+    probe.errno_name = "EPERM";
+    probe.syscall_number = -1;
+    probe.detail =
+        "★ 探测注入（FSS_IO_PROBE_INJECT=blocked）：结果被强制为 blocked_by_policy(EPERM)，"
+        "用于复刻默认容器 seccomp 的形态；仅用于测试/演练";
+    return probe;
+  }
 
 #if defined(__linux__) && defined(__NR_io_uring_setup)
   probe.syscall_number = __NR_io_uring_setup;

@@ -1250,7 +1250,7 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 | R-26 误用 SQLite 做多实例 | ✅ | `deployment.mode=multi` 的 5 条启动校验（含正例，C8.9）+ 组合根**拒绝启动**（`server_main.cpp`） | 多实例**运行形态未交付**（缺 PG 仓储/租约）→ C9.26 未验证 |
 | R-27 NFS 语义未验证 | ⛔ | 上生产硬前提（C9.27）；实现**不依赖** NFS 文件锁、用 PG advisory lock（ADR-009） | 本环境无 NFS/多客户端共享挂载 ⇒ **未验证**，登记为**生产门禁**：未在目标存储上验证前不得上生产 |
 | R-28 多实例 `syncfs` 干扰 | 🟡 | 部署建议"按 partition 分盘"；配置键 `shared_mount_required` / `one_filesystem_per_partition` 已在 schema 与示例中 | 干扰量级**未测**（C9.24 未验证）；组合根**未接**这两个键 → 目前只能靠部署纪律 |
-| R-29 io_uring 当必需依赖 | 🟡 | 默认 `blocking`（ADR-010）+ `scripts/check_io_uring.sh`（0/1/**2=无结论**）+ 探测失败按配置回退 | `/v2/info` 暴露 `ioEngine`/`ioUringAvailable` 未做（C9.30 未验证）；seccomp 阻断已实测 `EPERM` |
+| R-29 io_uring 当必需依赖 | ✅ | 默认 `blocking`（ADR-010）+ `scripts/check_io_uring.sh`（0/1/**2=无结论**）+ 探测失败按配置回退；**探测结果可见已交付**（C9.30：`/v2/info` 的 `ioEngine`/`ioUringAvailable` + `fss_io_engine`/`fss_io_uring_available` 指标，见 ADR-010 §7.1） | 引擎实现仍未交付（U1~U4 未满足 ⇒ `ioEngine` 恒 `blocking`）；C9.29 的收益复核仍需目标存储 |
 
 **P9 遗留（如实登记，不阻塞 C9.1~C9.10）**：① 组合根当时仍**只读环境变量**、未接
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +

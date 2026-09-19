@@ -881,3 +881,335 @@ httplib 的 **runner 线程**里（`listen_internal()` → `new_task_queue()`）
 **⑤ 未做/未验证（本轮维持）**：其它工作线程（GC 调度线程、HTTP worker、gRPC 线程）里逃出的异常
 仍会 `terminate`（不在本切片范围）；`--pids-limit=65` 未进默认断言（仅 FULL 的 H4b2）；
 K8s/containerd 未验证。
+
+---
+
+## 15. P9 补交（P10 期间完成）：`/v2/info` 与指标暴露 `ioEngine` / `ioUringAvailable`（C9.30 第三半）
+
+### 15.1 结论（先说答案）
+
+**C9.30 的三半现在全部满足**（原文：「`/v2/info` 与指标正确暴露 `ioEngine` / `ioUringAvailable`；
+在**不允许 io_uring 的部署**里所有 OSDU 端点行为不变」）。本切片交付的是**第三半**，
+并给第二半补上缺口：
+
+| 半 | 判据 | 状态 | 证据 |
+| --- | --- | --- | --- |
+| ① | 不允许 io_uring 的部署里 OSDU 端点行为不变 | ✅ 已实测（本轮**独立复验**探测事实） | `phase9-image.md` §10 H8（Docker 默认 seccomp + 上传读回 SHA-256 一致）；本轮另用 `python3` 直接 `syscall(425)` 双向复验（下 §15.3 ⑥） |
+| ② | 指标暴露 `ioEngine`/`ioUringAvailable` | ✅ **补齐**：既有 `fss_io_engine{engine,requested}` **保留**，新增 `fss_io_uring_available 0\|1`（宿主能力探测，与生效引擎**分列**） | 本文件 §15.3 ③ |
+| ③ | `/v2/info` 暴露 `ioEngine`/`ioUringAvailable` | ✅ **新交付**：REST 追加 camelCase 扩展字段；gRPC `InfoResponse` 追加字段号 **10/11**（`json_name` 对齐）；两条协议**同源**于 `app::GetInfo` | 本文件 §15.3 ①②⑤ |
+
+**语义（父代理定案，照做）**：
+- `ioEngine` = **当前生效**的引擎名。本实现恒为 `"blocking"`（ADR-010 的 U1~U4 未满足，
+  `UringIoEngine::enabled()==false`；`auto` 会回退、`uring` 直接拒绝启动）。
+- `ioUringAvailable` = 本部署的**宿主能力探测结果**（`sys::IoEngineProbe::available()`）。
+  ★ **可用 ≠ 已启用**：`true` 只表示"这台机器/这个 seccomp 下 `io_uring_setup` 允许"，
+  **不**表示服务正在用 uring。两个字段必须一起读（`ioEngine` = 现在跑什么；
+  `ioUringAvailable` = 这台机器能不能用）。
+- 两条协议**同源**：都读 `app::GetInfo` 返回的同一个 `VersionInfo`，因此 C7.3 的一致性
+  **按构造保证**（不在两个适配器里各算一遍）。
+
+### 15.2 实现点（可点击）
+
+| 位置 | 改动 |
+| --- | --- |
+| `src/app/usecases/usecases.h` | `UseCasePorts` 加 `io_engine` / `io_uring_available`（组合根填，与既有 `auth_mode` 同一先例）；`VersionInfo` 加同名字段（含"可用 ≠ 已启用"的注释） |
+| `src/app/usecases/usecases.cpp` | `GetInfo::Execute()` 从 `ports_` 转发两个字段（用例只做转发，探测与决策仍在组合根 —— R12） |
+| `src/adapters/http/dto/dto.{h,cpp}` | `VersionInfoResponse` 加 `io_engine` / `io_uring_available`；`ToJson` 渲染 `ioEngine`（非空时）与 `ioUringAvailable`（**总是**渲染，含 `false`） |
+| `src/adapters/http/router.cpp` | `/v2/info` handler **改为调 `app::GetInfo` 用例**（此前是就地拼 DTO：新增字段要改两遍适配器，正是要避免的形态） |
+| `proto/osdu/file/v1/file_service.proto` | `InfoResponse` 追加 `string io_engine = 10 [json_name = "ioEngine"]` / `bool io_uring_available = 11 [json_name = "ioUringAvailable"]`（**未改任何既有字段号**） |
+| `src/adapters/grpc/dto/grpc_dto.cpp` | `FillInfoProto` 补两行映射（C7.5 的 `json_name` 对齐） |
+| `src/common/sys/capability.{h,cpp}` | `IoEngineProbe::injected`（注入自身可见）+ **探测注入接缝** `FSS_IO_PROBE_INJECT=available\|blocked`（只改探测结果，不改 `enabled()`） |
+| `src/main/server_main.cpp` | 组合根填 `ports.io_engine = io_engine_active` / `ports.io_uring_available = uring_probe.available()`；注册并设置 gauge `fss_io_uring_available`（与 `fss_io_engine` 同处、同族） |
+| `tests/integration/test_io_engine_exposure.cpp`（新；`tests/CMakeLists.txt` 注册，`[phase9]` + `dependencies fss_server`） | 7 用例 / 159 断言：REST JSON 真解析、双协议同源（真实进程 + 进程内非默认值双向）、指标、注入接缝双向、不注入负控、三处渲染一致、proto3-JSON `json_name` |
+| 文档 | `docs/03-api-contract.md`（§2.12 字段表 + §4.2 映射表 + §7 扩展清单 + §8 测试清单）、`docs/adr/ADR-010-io-engine-choice.md`（§7.1 R11 标为已交付 + 待办勾选）、`docs/04-implementation-plan.md`（C9.30 改为完整满足）、`docs/operations.md`（指标表 + 未验证清单 + `storage.io_engine` 行）、`docs/02-design.md`（R-29 行）、`docs/runbook.md`（§10.1 新接缝 + 禁令）、`AGENTS.md` §0（P9 行三半描述）、本文件 |
+
+**为什么接缝不是配置键**（与 `FSS_STARTUP_FAULT_INJECT` / `FSS_AUDIT_FAULT_INJECT` 同一理由）：
+156 个叶子键的三态清单由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**，
+"让能力探测说假话"不是运维语义；生产上改写探测结果只会误导 R11 的可观测性，没有任何合法
+用途。写成配置项会被当未知键拒（§15.3 ⑦ 的用例钉住）。接缝**自身可见**（横幅打印
+`available(injected)` / `blocked_by_policy(injected) (EPERM)` 与 `FSS_IO_PROBE_INJECT=…` 字样），
+避免演练结论被误读成"这台机器真的可用"。
+
+### 15.3 实测命令与输出摘要
+
+**① 本机真值（先验证，别假设）**——与任务书假设**不同**，必须如实记录：
+
+```
+$ uname -r
+6.18.33.2-microsoft-standard-WSL2
+$ cat /proc/sys/kernel/io_uring_disabled
+0
+$ python3 -c "...; l.syscall(425, ...)"          # 宿主直测 io_uring_setup
+host: rc= 3 errno= 0                              # ← 宿主**可用**
+$ docker run --rm python:3-slim python3 -c "...; l.syscall(425, ...)"   # Docker 默认 seccomp
+default seccomp: rc= -1 errno= 1 Operation not permitted   # ← EPERM，不可用
+$ ./scripts/check_io_uring.sh
+  · 内核: 6.18.33.2-microsoft-standard-WSL2 / kernel.io_uring_disabled=0（内核允许）
+  ① 宿主机: ✓ AVAILABLE fd=3 features=0x3ffff
+  ② 容器（默认 seccomp）: 探针未执行（docker/runc 错误）→ U1 无结论（脚本 rc=2）
+```
+
+⇒ **本工作机的真值是 `available()==true`**（不是任务书写的"恒为 false"）；
+`false` 的真值存在于**默认 seccomp 容器**里（同一 syscall 实测 `EPERM`）。
+这条差异直接决定了判据的写法：**"不注入 → 必须 false"不是合法判据**（会把正确实现判失败，
+R4），区分力必须来自"字段随探测结果变化"。
+
+**② 不注入（真实进程）**：
+
+```
+$ ./build/bin/fss_server   # 端口 18098，posix 驱动
+$ curl -s localhost:18098/api/file/v2/info
+{"authMode":"disabled","buildVersion":"0.1.0","connectedOuterServices":["storage"],
+ "ioEngine":"blocking","ioUringAvailable":true,"version":"v2"}
+$ curl -s localhost:18098/metrics | grep -E '^# (HELP|TYPE) fss_io|^fss_io'
+# HELP fss_io_engine 当前生效的 I/O 引擎（1 = 生效；requested=配置请求值）
+# TYPE fss_io_engine gauge
+fss_io_engine{engine="blocking",requested="blocking"} 1
+# HELP fss_io_uring_available 宿主能力探测：io_uring_setup 是否被允许（1=可用；仅探测，不代表引擎已启用）
+# TYPE fss_io_uring_available gauge
+fss_io_uring_available 1
+# 启动横幅：
+  io engine      : blocking（请求 blocking） — io_uring=available kernel=6.18.33.2-microsoft-standard-WSL2 — io_uring_setup 成功（已关闭探测 fd）
+```
+
+**③ 指标断言**（`/metrics` 是 Prometheus 文本格式，逐行子串是**格式正确**的判据）：
+`fss_io_uring_available` 有 `HELP`/`TYPE`（untyped gauge，无标签），既有
+`fss_io_engine{engine="blocking",requested="blocking"} 1` **保留**；两处值与 `/v2/info`
+的 `ioUringAvailable` **同源同值**（用例里逐次比对，不写死 0/1）。
+
+**④ 接缝使其变 true（关键区分力）**：
+
+```
+$ FSS_IO_PROBE_INJECT=available ./build/bin/fss_server &   # 端口 18097
+$ curl -s localhost:18097/api/file/v2/info
+{"authMode":"disabled","buildVersion":"0.1.0","connectedOuterServices":["storage"],
+ "ioEngine":"blocking","ioUringAvailable":true,"version":"v2"}     # ← true
+$ curl -s localhost:18097/metrics | grep -E '^fss_io'
+fss_io_engine{engine="blocking",requested="blocking"} 1
+fss_io_uring_available 1
+# 横幅（注入自身可见）：
+  io engine      : blocking（请求 blocking） — io_uring=available(injected) kernel=… — ★ 探测注入（FSS_IO_PROBE_INJECT=available）：结果被强制为 available；仅用于测试/演练，**不**代表真实宿主能力，**也不**启用 UringIoEngine
+```
+
+**⑤ `blocked` 反方向注入**（证明字段**不是恒 true**；复刻默认 seccomp 的形态）：
+
+```
+$ FSS_IO_PROBE_INJECT=blocked ./build/bin/fss_server &     # 端口 18096
+$ curl -s localhost:18096/api/file/v2/info
+{…,"ioEngine":"blocking","ioUringAvailable":false,…}       # ← false（同一台机器！）
+$ curl -s localhost:18096/metrics | grep -E '^fss_io'
+fss_io_engine{engine="blocking",requested="blocking"} 1
+fss_io_uring_available 0
+  io engine      : blocking（请求 blocking） — io_uring=blocked_by_policy(injected) (EPERM) kernel=…
+```
+
+⇒ 同一台机器上 `ioUringAvailable` 随**探测结果**在 `true`/`false` 之间翻转，
+且 `ioEngine` **始终** `blocking` —— 这同时钉住"字段来自探测"与"可用 ≠ 已启用"。
+
+**⑥ 注入下 `storage.io_engine=uring` 仍拒绝启动**（证明注入不是"偷偷启用 uring"的后门）：
+
+```
+$ FSS_IO_PROBE_INJECT=available ./build/bin/fss_server --set storage.io_engine=uring; echo "exit=$?"
+拒绝启动：storage.io_engine=uring 被显式要求，但 io_uring 不可用。
+  探测结果：io_uring=available(injected) kernel=6.18.33.2-microsoft-standard-WSL2 — ★ 探测注入（…）
+  原因：内核探测通过，但 UringIoEngine 实现尚未启用（ADR-010 U1~U4）。
+  提示：在目标环境运行 scripts/check_io_uring.sh 确认可用性（退出码 0=可用 / 1=不可用 / 2=无结论）；或改用 storage.io_engine=blocking|auto。
+exit=78
+```
+
+⇒ 走的是**"探测通过但引擎实现未启用"**那条分支（不是"环境不可用"），且**没有**进入服务状态。
+
+**⑦ 不注入的负控（写成对环境的显式断言）**：用例启动真实进程 → 读 `/v2/info` + `/metrics`，
+并与**独立参照实现**（`python3` 直接 `syscall(425)`）比对：
+`ioUringAvailable == probe` ∧ `fss_io_uring_available == (probe?1:0)` ∧ 横幅无 `injected`；
+若 `probe == False` 则额外断言"**不出现** true"（R16 正例的反面）。
+在本机（probe=True）该分支不触发，但**两个方向都能因错误的硬编码实现而失败** ——
+这一点由 §15.4 的注入 ①（硬编码 false）与注入 ②（gRPC 写死 false）实测证明。
+
+**⑧ proto3-JSON 的 `json_name` 对齐（C7.5）**：`MessageToJsonString` 输出含
+`"ioEngine":"blocking"` / `"ioUringAvailable":true` / `"authMode":"jwt"`；
+并记录 proto3 的既有语义：`false` 时该键被**省略**（与其它布尔字段一致），
+而 REST **总是**渲染 `"ioUringAvailable":false` —— 两者语义一致，不是本切片的缺陷。
+
+**⑨ 三处渲染一致**：`/v2/info` 的 `ioEngine` == 启动横幅 `io engine      :` 行 ==
+`fss_io_engine{engine="…"}` 的标签值（在 `available` 与 `blocked` 两种注入下各测一次）。
+★ 诚实说明：三处都来自组合根的**同一个变量** `io_engine_active`，因此这条判据证明的是
+"三处渲染没有各写各的常量"，**不**证明该变量的取值选择正确（后者由 ADR-010 的 U1~U4 与
+C10.4 的拒绝/回退用例覆盖）。
+
+**⑩ 门槛全跑**：
+
+```
+$ cmake --build build -j4                       → [100%] Built target test_io_engine_exposure（0 error）
+$ ctest --test-dir build -j4                    → 100% tests passed, 0 tests failed out of 84
+$ ctest --test-dir build -L phase7 --output-on-failure   → phase7 = 6 tests / 0 failed
+$ ctest --test-dir build -L phase10 --output-on-failure  → phase10 = 4 tests / 0 failed
+$ ./scripts/check_docs.sh --selftest            → 自证 D1/D2/D4/D5 都能检出注入；全部检查通过（D1~D5）
+$ ./scripts/verify_config_wiring.sh             → 配置面接线：全部通过（54 条断言）
+$ ./build/bin/test_io_engine_exposure           → All tests passed (159 assertions in 7 test cases)
+$ ctest --test-dir build -L phase9              → phase9 = 10 tests（新增用例 159 断言；phase9 合计 885→892）
+```
+
+### 15.4 R1 自证（3 个注入 → 对应用例失败 → 完整还原）
+
+三个注入都**先全量重建**（`cmake --build build -j4`），每次都在**首次运行**即失败
+（没有出现"第一次全绿"）。逐个记录：
+
+**注入 ①：REST 渲染里硬编码 `ioUringAvailable=false`（忽略探测）**
+
+```cpp
+// src/adapters/http/dto/dto.cpp（注入态）
+body["ioUringAvailable"] = false;  // R1-INJECT-1: 硬编码 false（忽略探测）
+```
+```
+$ ./build/bin/test_io_engine_exposure
+★ C9.30 接缝：… available 注入 → true（证明字段来自探测，而不是硬编码 false）
+test_io_engine_exposure.cpp:434: FAILED:
+  REQUIRE( fields.Value("ioUringAvailable") == "True" )
+with expansion:
+  "False" == "True"
+★ C9.30 接缝：… 未知取值 → 不注入（宽容策略；值回到真实探测结果）
+test_io_engine_exposure.cpp:468: FAILED:
+  REQUIRE( fields.Value("ioUringAvailable") == probe )
+with expansion:
+  "False" == "True"
+test cases:   7 |   3 passed | 4 failed      assertions: 122 | 116 passed | 6 failed
+```
+⇒ 判据 ④（接缝使其变 true）与 ⑥/⑦（各处与探测一致）确实有区分力。
+
+**注入 ②：gRPC 映射写死成与 REST 不同的值（等价于"不映射"）**
+
+```cpp
+// src/adapters/grpc/dto/grpc_dto.cpp（注入态）
+out->set_io_engine(info.io_engine);
+out->set_io_uring_available(false);   // R1-INJECT-2: 忽略探测
+```
+```
+$ ./build/bin/test_io_engine_exposure
+(a) 真实二进制：两条协议各取一次，字段逐一相等
+test_io_engine_exposure.cpp:325: FAILED:
+  REQUIRE( response.io_uring_available() == (fields.Value("ioUringAvailable") == "True") )
+with expansion:
+  false == true
+with message:
+  REST： {"authMode":"jwt","buildVersion":"0.1.0","connectedOuterServices":["storage"],
+          "ioEngine":"blocking","ioUringAvailable":true,"version":"v2"}
+(b) 进程内同一份 ports：两条协议都跟着端口集合的非默认值走
+test_io_engine_exposure.cpp:353: FAILED:
+  REQUIRE( response.io_uring_available() )
+with expansion: false
+with message:  REST： {…,"ioUringAvailable":true,…}
+test cases:   7 |   6 passed | 1 failed      assertions: 139 | 137 passed | 2 failed
+```
+⇒ 判据 ②（双协议同源）在**真实进程**与**进程内非默认值**两条路径上都能抓到漏映射/写死。
+★ 这条也说明：只靠"真实进程两条协议同源"**不够** —— 若两侧默认值恰好相同，写死也能过；
+进程内非默认值（`io_uring_available=true`）那条才是决定性的。
+
+**注入 ③：去掉 `fss_io_uring_available` 指标注册**
+
+```cpp
+// src/main/server_main.cpp（注入态）
+// R1-INJECT-3: 去掉 fss_io_uring_available 指标注册（判据必须因此失败）
+```
+```
+$ ./build/bin/test_io_engine_exposure
+★ C9.30 /metrics：fss_io_uring_available 与 fss_io_engine 同时暴露
+test_io_engine_exposure.cpp:389: FAILED:
+  REQUIRE( metrics.body.find("# TYPE fss_io_uring_available gauge") != std::string::npos )
+★ C9.30 接缝：…（两个 SECTION 同时失败）
+test_io_engine_exposure.cpp:438: FAILED:  REQUIRE( MetricsHas(metrics, "fss_io_uring_available 1") )
+test_io_engine_exposure.cpp:452: FAILED:  REQUIRE( MetricsHas(metrics, "fss_io_uring_available 0") )
+test cases:   7 |   5 passed | 2 failed      assertions: 139 | 136 passed | 3 failed
+```
+⇒ 判据 ③（指标存在且随探测变化）有区分力。
+
+**还原证据**（三个文件都从改动前的副本整体恢复，不是"再改回去"）：
+
+```
+$ md5sum src/adapters/http/dto/dto.cpp src/adapters/grpc/dto/grpc_dto.cpp src/main/server_main.cpp
+17233b2fd8a8fc045ea95c7bb61f07ef  src/adapters/http/dto/dto.cpp
+cf59b0d3607e30eca617a373be82a40c  src/adapters/grpc/dto/grpc_dto.cpp
+57954cb45fc02d59d36ab7ef439daa70  src/main/server_main.cpp
+（与 /tmp 下的改动前副本逐一相同）
+$ grep -rn "R1-INJECT" src/ tests/
+（无输出，exit=1）
+$ cmake --build build -j4 && ./build/bin/test_io_engine_exposure
+All tests passed (159 assertions in 7 test cases)      # 还原后全绿
+```
+
+### 15.5 未做 / 未验证（如实登记）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| `ioUringAvailable` 的**语义边界** | 已写进契约/ADR/头文件注释 | 只表达**宿主能力**，**不**代表引擎被启用；`ioEngine` 在当前实现里恒为 `blocking`（ADR-010 U1~U4 未满足）。这不是"未验证"，而是**必须写清的口径** |
+| 真实 K8s / 允许 io_uring 的**目标环境** | **未验证** | 本切片只在 ①本工作机（WSL2，宿主可用）②Docker 默认 seccomp（`EPERM`）两种环境实测；K8s 的 `RuntimeDefault` seccomp 与自建 profile 均未验证（沿用既有登记） |
+| **容器内**读 `/v2/info` 的真实进程断言 | **本轮未做**（登记 + 下一步） | 用 `python3` 直接 syscall 已证明容器内 `EPERM`（⇒ 真值 `false`），但"容器内 `fss_server` 的 `/v2/info` 输出 `ioUringAvailable:false`"需要新建镜像（`verify_image.sh` 每次重建，约 10 分钟；本仓库现有 `fssvrcpp:verify` 镜像是**本轮改动之前**的源码构建，实测其 `/v2/info` 仍只有旧字段 —— 这本身也**反证**了字段是新增的）。建议纳入 `scripts/verify_image.sh` 的 HV 段（跑真镜像后比对 `ioUringAvailable:false` + `ioEngine:blocking`），由父代理在其收尾运行中一并覆盖 |
+| arm64 / 非 x86_64 | **未验证** | `syscall(425)` 是 x86_64 的 `__NR_io_uring_setup`（代码里用 `__NR_io_uring_setup` 宏，可移植）；用 python 探针时硬编码了 425，仅本机用 |
+| `fss_io_engine_engaged` / `fss_io_engine_probe_failures_total`（ADR-010 §5.1 初稿提过的名字） | **未交付，且判定为不需要** | 本切片采用 `fss_io_engine{engine,requested}` + `fss_io_uring_available`：前者回答"生效/请求"，后者回答"宿主能力"。ADR-010 §5.1 已同步改成实际交付的名字，避免文档与实现两张皮 |
+
+### 15.6 三态计数（未改配置面）
+
+**不新增/不改任何配置键** ⇒ 仍为 **生效 107 / 拒绝启动 18 / 已读但无效果 31 = 156**。
+两个新事实走**环境变量**接缝（`FSS_IO_PROBE_INJECT`）而非配置键；反向用例
+（`--set storage.io_probe_inject=available`）实测 **exit 78**（未知键）。
+`test_operations_doc`（156 键自动比对）与 `./scripts/check_docs.sh` 均通过。
+
+### 15.7 本次改动顺带纠正的一处环境事实
+
+`AGENTS.md` §0 与 `phase9-image.md` §10 的部分表述把"本机 seccomp 阻断"当成默认前提
+（例如本切片任务书写"本机真值恒为 `false`（默认 seccomp 阻断）"）。**实测不成立**：
+本工作机是 WSL2 宿主，`kernel.io_uring_disabled=0`，`io_uring_setup` **成功**；
+"被阻断"的是 **Docker 默认 seccomp 容器**。这两条已分别用 `python3` 直接 syscall
+与 `check_io_uring.sh` 双向确认，并在 `docs/operations.md` / ADR-010 §7.1 写明。
+★ 这条纠正**不放宽**任何结论：探测真值随环境变化，所以判据必须是"字段随探测变化"
+（接缝双向 + 独立 syscall 参照），而不是"必须为某个固定值"。
+
+### 15.8 父代理独立复核（并修掉一处**探针脚本自身的缺陷**）
+
+**① 环境事实我自己复现了三态**（这是本切片最容易搞错的前提，实现者纠正得对）：
+
+```
+$ python3 -c "...syscall(425, 8, byref(buf))..."     # 宿主（注意：必须传合法的 io_uring_params）
+io_uring_setup(8) -> rc=3 errno=0                     ⇒ 宿主可用
+
+$ docker run --rm -v $W:/w -w /w --entrypoint /w/probe fssvrcpp:verify
+UNAVAILABLE errno=1(Operation not permitted) EPERM:被 seccomp/权限策略阻断
+$ docker run --rm --security-opt seccomp=unconfined ... --entrypoint /w/probe ...
+AVAILABLE fd=3 features=0x3ffff                        ⇒ 确认**就是 seccomp 拦的**
+```
+⇒ 「宿主可用 / 容器默认 seccomp 阻断」**成立**；我原规格里"不注入时必须为 `false`"**是错的**
+（会把正确实现判成失败）——实现者改成"字段随探测结果双向变化 + 独立 syscall 参照"是对的。
+（我自己第一次的 python 探针写错了：`params` 传了 NULL → `EFAULT`，看上去像"不可用"；
+这正是"探针本身也要能自证"的又一例。）
+
+**② 顺手修掉 `scripts/check_io_uring.sh` 的一处真实缺陷**：它的两次 `docker run` **没有 `--entrypoint`**，
+而像 `fssvrcpp:verify` 这类镜像自带 ENTRYPOINT ⇒ `/w/probe` 被当成 entrypoint 的参数吞掉，
+探针根本没执行，脚本只能报"docker/runc 错误 → **无结论**"。后果是：**ADR-010 的容器证据在一段
+时间里无法被脚本复现**（而它其实完全可复现）。修法：两处补 `--entrypoint /w/probe`。修后实测：
+
+```
+$ ./scripts/check_io_uring.sh
+① 宿主机: AVAILABLE fd=3 features=0x3ffff
+② 容器(默认 seccomp): UNAVAILABLE errno=1(Operation not permitted) EPERM:被 seccomp/权限策略阻断
+   容器(seccomp=unconfined): AVAILABLE fd=3 features=0x3ffff → 确认是 seccomp 拦的
+结论：仅宿主机可用，容器内不可用 → **不满足 U1**（rc=1，与 ADR-010 一致）
+```
+（R4 的"无结论"不应由**脚本自身的调用方式**造成——这与 P2-D07 的"空集合通过"同族。）
+
+**③ 真实进程三态我自己跑了一遍**（`build/bin/fss_server` + 临时配置）：
+
+```
+不注入          → {"ioEngine":"blocking","ioUringAvailable":true,...}   fss_io_uring_available 1
+FSS_IO_PROBE_INJECT=blocked   → {"ioEngine":"blocking","ioUringAvailable":false,...}  0
+FSS_IO_PROBE_INJECT=available → {"ioEngine":"blocking","ioUringAvailable":true,...}   1
+三态下 fss_io_engine{engine="blocking",requested="blocking"} 1 始终在；既有字段(authMode/version/…)未破坏
+```
+
+**④ 我自己重做了一条注入**：把 REST `dto.cpp` 的 `body["ioUringAvailable"]` 硬编码为 `false`
+→ `test_io_engine_exposure` **4 条断言失败**（260/324/343/402，即 seam=`available` 的那些）；
+还原后 `All tests passed (159 assertions in 7 test cases)` ⇒ 字段确实由探测驱动，判据有区分力。
+
+**⑤ 结论**：C9.30 三半**完整满足**（①端点行为不变：Docker H8 + 本轮 syscall 三态；
+②指标：`fss_io_engine` + 新增 `fss_io_uring_available`；③`/v2/info` 两字段：REST+gRPC 同源）。
+独立事实保持不变：`ioUringAvailable` 只表达**宿主能力**，**引擎实现仍未交付**（`ioEngine` 恒 blocking）。
+**仍未验证**：容器内真镜像读 `/v2/info`（镜像需重建）、K8s/目标环境、arm64。

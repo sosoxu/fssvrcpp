@@ -116,7 +116,7 @@ io_uring 的最大价值之一是"网络 + 文件合并提交、共享一个 rin
 | 抽象 | 新增 `IIoEngine` 端口（L3），数据面只依赖该端口，不直接调 `pread`/io_uring |
 | 探测 | 启动时做**能力探测**：内核版本 + `io_uring_setup` 是否 `EPERM`/`ENOSYS` + `IORING_REGISTER` 可用性 |
 | 配置语义 | `blocking`：不探测；`uring`：探测失败则**拒绝启动**（避免"以为开了其实没开"）；`auto`：探测失败则回退并在日志/指标中标注 |
-| 可观测 | `/v2/info` 暴露 `ioEngine` 与 `ioUringAvailable`；指标 `fss_io_engine_engaged`、`fss_io_engine_probe_failures_total` |
+| 可观测 | `/v2/info` 暴露 `ioEngine` 与 `ioUringAvailable`；指标 `fss_io_engine`（生效引擎）+ `fss_io_uring_available`（宿主能力探测） |
 | 回退 | `blocking` 路径**始终可用且被测试**（它不是"降级"，而是一等公民） |
 
 ### 5.2 启用 io_uring 的前置条件（全部满足才考虑）
@@ -185,13 +185,49 @@ P9   ：C9.12 受控复核 ADR-006 是否值得做独立数据面
 **验证工具**：本 ADR 的容器实验可脚本化为 `scripts/check_io_uring.sh`
 （宿主机探测 + 容器内探测 + 回退行为验证），作为 C1.15/C9.29 的执行体。
 
+### 7.1 R11 的"探测结果可见" —— **已交付**（C9.30 的第三半，P10 期间补交）
+> **父代理复核时修掉的一处探针脚本缺陷**：`scripts/check_io_uring.sh` 的两次
+> `docker run` 原先**没有 `--entrypoint`**，而 `fssvrcpp:verify` 自带 ENTRYPOINT ⇒ 挂进去的
+> `/w/probe` 被当作 entrypoint 的参数吞掉，探针**根本没执行**，脚本只能报"docker/runc 错误
+> → 无结论"。于是本 ADR 的容器证据在一段时间里**无法由脚本复现**（其实完全可复现）。
+> 已补 `--entrypoint /w/probe`（两处）；修后 `./scripts/check_io_uring.sh` 输出：宿主 `AVAILABLE`、
+> 容器（默认 seccomp）`EPERM`、容器（`seccomp=unconfined`）`AVAILABLE`，结论"仅宿主机可用 →
+> 不满足 U1"（rc=1）。R4 的"无结论"不应由脚本自身的调用方式造成。
+
+
+R11（`AGENTS.md` §3）要求"可选加速能力必须先有无依赖的默认路径，且**探测结果要可见**
+（`/v2/info` + 指标）"。本节 §5.1 的"可观测"一行现在**全部落地**：
+
+| 出口 | 内容 | 证据 |
+| --- | --- | --- |
+| REST `GET /api/file/v2/info` | `"ioEngine":"blocking"` + `"ioUringAvailable":<bool>`（camelCase 追加字段） | 契约 §2.12 字段表 + §4.2 映射表；`tests/integration/test_io_engine_exposure.cpp` ① |
+| gRPC `InfoResponse` | `io_engine`（字段号 **10**，`json_name="ioEngine"`）+ `io_uring_available`（字段号 **11**，`json_name="ioUringAvailable"`） | 同上 ②（两条协议**同源**：都读 `app::GetInfo` 的同一个 `VersionInfo`，C7.3 按构造保证） |
+| 指标 | `fss_io_engine{engine="…",requested="…"} 1`（**当前生效**引擎）+ `fss_io_uring_available 0\|1`（**宿主能力探测**） | 同上 ③ |
+| 启动横幅 | `io engine : <生效>（请求 <配置>）— io_uring=<状态> kernel=…` | 同上 ⑥（三处渲染一致） |
+
+**★ "可用 ≠ 已启用"（本 ADR 必须写清的口径）**：`ioUringAvailable=true`（以及
+`fss_io_uring_available 1`）**只**表示"这台机器 / 这个 seccomp 下 `io_uring_setup` 允许"，
+**不**表示"服务正在使用 io_uring"。当前 `UringIoEngine::enabled()==false`（§5.2 的 U1~U4
+未满足）⇒ `ioEngine` 恒为 `blocking`，且 `storage.io_engine=uring` 一律 **exit 78**。
+两个出口必须**一起读**：`ioEngine` 回答"现在跑的是什么"，`ioUringAvailable` 回答
+"这台机器到底能不能用"（后者才是运维决定要不要改 seccomp profile 的依据）。
+
+**区分力的来源（诚实登记）**：探测真值随部署环境变化 —— 本工作机（WSL2，
+`kernel.io_uring_disabled=0`）实测 `true`，而 Docker 默认 seccomp 下同一调用是
+`EPERM`（⇒ `false`）。因此**不能**用"不注入时必须为 false"当判据（会把正确实现判失败）。
+真正的区分力来自**探测注入接缝** `FSS_IO_PROBE_INJECT=available|blocked`（环境变量，
+**不是配置键**，登记在 `docs/runbook.md` 的测试/演练小节）：两个方向都断言 ⇒ 该字段
+既不是恒 `false` 也不是恒 `true`；且注入下 `ioEngine` 仍 `blocking`、`uring` 仍 exit 78。
+容器内（默认 seccomp）的真值差异另由 `scripts/check_io_uring.sh` 覆盖。
+
 ---
 
 ## 8. 待办
 
 - [ ] `IIoEngine` 端口签名定稿（`read`/`write`/`sync`/`stat`，含 64 位偏移与区间读）
 - [ ] `BlockingIoEngine` 实现（P3）+ 与 POSIX 驱动共用契约测试
-- [ ] `UringIoEngine` 骨架 + 能力探测（**可在不启用的情况下先交付探测与回退**）
-- [ ] `scripts/check_io_uring.sh`：宿主机/容器/回退三态验证
-- [ ] 在 `docs/operations.md` 写明：**启用 io_uring 需要修改容器 seccomp profile**，以及为什么默认不开
+- [x] `UringIoEngine` 骨架 + 能力探测（**可在不启用的情况下先交付探测与回退**）
+- [x] `scripts/check_io_uring.sh`：宿主机/容器/回退三态验证
+- [x] 在 `docs/operations.md` 写明：**启用 io_uring 需要修改容器 seccomp profile**，以及为什么默认不开
+- [x] R11 的"探测结果可见"：`/v2/info` 的 `ioEngine`/`ioUringAvailable` + `fss_io_engine`/`fss_io_uring_available` 指标（C9.30 第三半，见 §7.1）
 - [ ] 把本 ADR 的实测数据补进 `docs/appendix/posix-io-probe/RESULTS.txt`

@@ -869,6 +869,12 @@ fss::Result<VersionInfo> GetInfo::Execute() {
 #endif
   info.connected_outer_services = {"storage"};
   info.auth_mode = ports_.auth_mode;  // C8.5：鉴权模式必须在 `/v2/info` 可见
+  //  ★ C9.30（ADR-010 的 R11）：I/O 引擎的两项事实必须可见，且两条协议同源。
+  //    · `io_engine`        = **当前生效**的引擎（组合根算出的 `io_engine_active`）；
+  //    · `io_uring_available`= **宿主能力探测**结果（不是"引擎被启用"）。
+  //    这里只做转发：探测与决策发生在组合根（R12），用例与适配层都不重算。
+  info.io_engine = ports_.io_engine;
+  info.io_uring_available = ports_.io_uring_available;
   return info;
 }
 

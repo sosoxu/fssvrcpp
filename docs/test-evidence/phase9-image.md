@@ -780,10 +780,12 @@ docker run -d --read-only -v <data>:/data -e FSS_SELF_BASE_URL=http://127.0.0.1:
 | C9.27 NFS 语义 | 目标存储上的 `rename` 原子性 / close-to-open / `fsync`·`syncfs` 耐久性 | ❌ 不能（本机无 root、不能 `mount`，无 NFS 服务端） | ⬜ **仍未验证**（**上生产硬前提**） |
 | C9.28 PG 连接预算 | 实例数 × 池上限 ≤ `max_connections`，超限拒绝启动 | ❌ 不能（**无 PG 客户端/连接池实现**；`server.http.max_connections` 是 HTTP 并发上限，不是 PG 预算） | ⬜ **仍未验证 + 未交付** |
 | C9.29 io_uring 收益复核 | 目标存储（NVMe/HDD/NFS）上 uring vs 阻塞 | ❌ 不能（`UringIoEngine::enabled()=false`，`storage.io_engine=uring` 一律 exit 78；默认 seccomp 实测 `EPERM`） | ⬜ **仍未验证 + 未交付** |
-| C9.30 `/v2/info` 与指标暴露；不允许 io_uring 的部署里端点行为不变 | ①端点行为不变 ②指标暴露 `ioEngine`/`ioUringAvailable` ③`/v2/info` 字段 | **部分能**：① ✅ 已实测（H8：默认 seccomp + 上传读回）；② ⚠ **部分**实测（`fss_io_engine{engine,requested}` 有，**没有** `ioUringAvailable` 指标）；③ ❌ 实测 `/v2/info` **没有** `ioEngine`/`ioUringAvailable` | ① **已实测**；② **部分实测**；③ **未交付** ⇒ 判据**未满足** |
+| C9.30 `/v2/info` 与指标暴露；不允许 io_uring 的部署里端点行为不变 | ①端点行为不变 ②指标暴露 `ioEngine`/`ioUringAvailable` ③`/v2/info` 字段 | **部分能**：① ✅ 已实测（H8：默认 seccomp + 上传读回）；② 当时**部分**实测（`fss_io_engine{engine,requested}` 有，**没有** `ioUringAvailable` 指标）；③ 当时实测 `/v2/info` **没有** `ioEngine`/`ioUringAvailable` | ① **已实测**；②③ **已交付（P9 补交，P10 期间完成）** ⇒ 判据**已满足**。②追加指标 `fss_io_uring_available 0\|1`；③REST/gRPC 同源暴露两个字段；判据 `tests/integration/test_io_engine_exposure.cpp`（7 用例 / 159 断言）+ 探测注入接缝 `FSS_IO_PROBE_INJECT=available\|blocked`。**本行的 ②③ 是当时的实测事实，保留为历史记录** |
 
 > C9.26~C9.30 的逐条标注同步写进了 [`docs/04-implementation-plan.md`](../04-implementation-plan.md)
 > 的对应判据行；运维侧清单同步写进 [`docs/operations.md`](../operations.md) §8。
+> **C9.30 的 ②③ 已在 P10 期间补齐**：详见 [`docs/test-evidence/phase9.md`](phase9.md) §15
+> （含本机真值与 Docker 默认 seccomp 真值的 **syscall 级**双向复验）。
 
 ### 10.10 本轮对既有脚本/文档的附带修正（都已在本次运行中生效）
 
