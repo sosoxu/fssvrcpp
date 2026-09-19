@@ -94,12 +94,30 @@ find_package(CURL REQUIRED)
 target_link_libraries(fss_auth_remote PUBLIC CURL::libcurl)
 
 # -----------------------------------------------------------------------------
+#  L2 远端校验器（P10 切片 6a / ADR-013）：legal / schema，HTTP + libcurl，fail-closed
+#    与 fss_auth_remote 同一套写法（NOSIGNAL / FOLLOWLOCATION=0 / 连接超时 +
+#    整体超时 / 所有依赖故障 → kUnavailable）。**平台外扩展**端点：`base_url`
+#    就是完整端点 URL，不追加路径（配置里没有 path 键，见 ADR-013）。
+#    目录与类名取自 `docs/02-design.md` 的 L2 模块表。
+# -----------------------------------------------------------------------------
+add_library(fss_legal_remote STATIC
+  infra/legal/remote_legal_validator.cpp)
+target_include_directories(fss_legal_remote PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fss_legal_remote PUBLIC fss_domain fss_json CURL::libcurl)
+
+add_library(fss_schema_remote STATIC
+  infra/schema/remote_schema_validator.cpp)
+target_include_directories(fss_schema_remote PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fss_schema_remote PUBLIC fss_domain fss_json CURL::libcurl)
+
+# -----------------------------------------------------------------------------
 #  组合根（唯一实例化具体实现的地方；R12）
 # -----------------------------------------------------------------------------
 add_executable(fss_server
   main/server_main.cpp)
 target_link_libraries(fss_server PRIVATE
-  fss_http_adapter fss_grpc_adapter fss_auth_local fss_auth_remote fss_blob_posix fss_blob_s3
+  fss_http_adapter fss_grpc_adapter fss_auth_local fss_auth_remote fss_legal_remote
+  fss_schema_remote fss_blob_posix fss_blob_s3
   fss_blob_metered fss_metrics fss_location_sqlite fss_location_memory fss_metadata_sqlite
   fss_transfer fss_metadata_memory fss_logging fss_config Threads::Threads)
 

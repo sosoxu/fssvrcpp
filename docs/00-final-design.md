@@ -225,6 +225,7 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | [ADR-010](adr/ADR-010-io-engine-choice.md) | I/O 引擎：**阻塞线程池为默认**，io_uring 为可选加速引擎（默认容器 seccomp 阻断，实测 EPERM） | 已采纳 |
 | [ADR-011](adr/ADR-011-logging-library.md) | 日志：**保留自研最小实现**（spdlog 只覆盖约 3% 的耗时与 0% 的核心需求），并把热路径优化到实测地板的同一量级 | 已采纳（附 4 条重开触发条件） |
 | [ADR-012](adr/ADR-012-auth-and-tenant-binding.md) | 认证与租户绑定：**本地 JWT 校验（HS256）+ `partition` claim 绑定 + fail-closed**；不假设"前面一定有可信网关"；远端 Entitlements / RS256-JWKS 登记为未实现（`remote-entitlements` 模式**拒绝启动**而不是静默放行） | 已采纳（P8；证据 `docs/test-evidence/phase8.md`） |
+| [ADR-013](adr/ADR-013-file-service-extension-endpoints.md) | 平台外扩展端点约定：**远端 legal/schema 校验器**（`base_url` = 完整端点 URL、不追加路径；**fail-closed**：依赖故障一律 503；**不透传调用方身份** → 端点须允许无 per-request 认证）；为后续 webhook 立同一套规矩 | 已采纳（P10 切片 6a；证据 `docs/test-evidence/phase10.md` §11） |
 
 ---
 
@@ -319,7 +320,7 @@ P6 元数据记录语义完整化（12 步序列 + 回滚 + 版本链 + DMS + De
 P7 gRPC 适配层 + 双协议等价性            ✅ 已完成（C7.1~C7.10；17/17 RPC + 契约 §6 矩阵 + 流式 + 双协议并发；6 测试 / 5378 断言）← 此阶段"双协议"达成
 P8 认证授权与多租户                        ✅ 已完成（C8.1~C8.8；JWT + 路由预检 + 跨租户隔离 + 远端 Entitlements fail-closed + 审计覆盖 + multi 校验 + 时钟偏差；6 测试 / 1323 断言）
 P9 硬化与交付（容量基线 / 故障注入 / GC / 打包 / 定稿 ADR-006） ✅ 已完成（C9.1~C9.13/C9.15/C9.16/C9.25；6 测试 / 466 断言；`run_all_gates.sh` P0~P9 全绿 225 s / 10 阶段）
-P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3/4/5 + C10.16 + C10.16 续（156 键三态 **96/21/39**；切片 5 = `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 生效；见 `docs/04-implementation-plan.md` 末尾）
+P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3/4/5/6a + C10.16 + C10.16 续（156 键三态 **102/20/34**；切片 5 = `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 生效；切片 6a = 远端 legal/schema 校验器 6 键生效 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动；见 `docs/04-implementation-plan.md` 末尾）
 ```
 
 **铁律**：门槛未通过 → 不得开始下一阶段。每阶段证据归档到 `docs/test-evidence/phaseN.md`。

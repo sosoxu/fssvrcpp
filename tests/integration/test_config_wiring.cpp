@@ -797,8 +797,12 @@ TEST_CASE("★ C10.11：未实现能力的非默认值必须拒绝启动（exit 
         {"leases.enabled", "true", "leases.enabled=true"},
         {"leader_election.enabled", "true", "leader_election.enabled=true"},
         {"events.publisher", "webhook", "events.publisher=webhook"},
-        {"legal.validator", "remote", "legal.validator=remote"},
-        {"schema.validator", "remote", "schema.validator=remote"},
+        //  ★ P10 切片 6a：`legal.validator=remote` / `schema.validator=remote` 已**不再是**
+        //    "未实现 → 拒绝启动"，而是真接通的远端校验器。它们各自的"缺 base_url →
+        //    exit 78"反向用例在 `tests/integration/test_remote_validators.cpp`（C10.18）。
+        //    这里改为断言**枚举**仍会拒绝未知取值（不许静默降级）。
+        {"legal.validator", "bogus", "legal.validator"},
+        {"schema.validator", "bogus", "schema.validator"},
         {"self_signed.single_use_nonce", "true", "single_use_nonce=true"},
         {"self_signed.nonce_store", "postgres", "nonce_store=postgres"},
         {"partition.registry", "remote", "partition.registry=remote"},
@@ -812,6 +816,49 @@ TEST_CASE("★ C10.11：未实现能力的非默认值必须拒绝启动（exit 
       REQUIRE(outcome.output.find("拒绝启动") != std::string::npos);
       REQUIRE(outcome.output.find(test_case.needle) != std::string::npos);
       REQUIRE(outcome.output.find("已启动") == std::string::npos);
+    }
+
+    //  ★ 独立理由的更正（P10 切片 6a 的伴随项）：`auth.remote_entitlements.fail_closed`
+    //    此前被登记为「已读但无效果」，但它其实有一条**真实可观测**的效果 ——
+    //    `core_schema.cpp` 的跨字段校验规定 `auth.mode=remote-entitlements` 且
+    //    `fail_closed != true` → **exit 78**（"依赖不可用不可降级为放行"）。
+    //    触发条件是**模式相关**的：`jwt`/`disabled` 下 `false` 仍然被接受且无影响。
+    //    这里用真实二进制把两侧都钉住（R16：不能只断言"被拒"）。
+    SECTION("auth.remote_entitlements.fail_closed：远端模式下 false → 78；true → 不因该键拒绝") {
+      SECTION("反例：remote-entitlements + fail_closed=false → exit 78 + 可读原因") {
+        const ProcessOutcome outcome = RunServerForExit(
+            {"--set", "auth.mode=remote-entitlements",
+             "--set", "auth.remote_entitlements.base_url=http://127.0.0.1:1",
+             "--set", "auth.remote_entitlements.fail_closed=false"});
+        CAPTURE(outcome.exit_code, outcome.output);
+        REQUIRE(outcome.exit_code == 78);
+        REQUIRE(outcome.output.find("auth.remote_entitlements.fail_closed") != std::string::npos);
+        REQUIRE(outcome.output.find("不可降级为放行") != std::string::npos);
+        REQUIRE(outcome.output.find("已启动") == std::string::npos);
+      }
+      SECTION("R16 正例：remote-entitlements + fail_closed=true + 有地址 → 不因该键拒绝") {
+        //  ★ 这里刻意**只**断言"不是因为 fail_closed 被拒"：其余键（存储路径等）走组合根
+        //    默认值，进程会正常启动，但我们不需要它真正就绪 —— 用 --print-config 走
+        //    "只校验配置、不起服务"的路径，能把"配置层接受"与"启动成功"分开断言。
+        const ProcessOutcome outcome = RunServerForExit(
+            {"--print-config", "--set", "auth.mode=remote-entitlements",
+             "--set", "auth.remote_entitlements.base_url=http://127.0.0.1:1",
+             "--set", "auth.remote_entitlements.fail_closed=true"});
+        CAPTURE(outcome.exit_code, outcome.output);
+        REQUIRE(outcome.exit_code != 78);
+        //  确实**不是**因为 fail_closed 被拒（该键在远端模式下必须为 true 是唯一约束）
+        const bool blamed_fail_closed =
+            outcome.output.find("fail_closed") != std::string::npos &&
+            outcome.output.find("必须为 true") != std::string::npos;
+        REQUIRE_FALSE(blamed_fail_closed);
+      }
+      SECTION("模式无关性：jwt + fail_closed=false → 不因该键被拒（触发条件确有前提）") {
+        const ProcessOutcome outcome =
+            RunServerForExit({"--print-config", "--set", "auth.mode=disabled",
+                              "--set", "auth.remote_entitlements.fail_closed=false"});
+        CAPTURE(outcome.exit_code, outcome.output);
+        REQUIRE(outcome.exit_code != 78);
+      }
     }
   }
 }

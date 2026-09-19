@@ -6,11 +6,11 @@
 | 状态 | ✅ **切片 1/2/3/4/5 全部完成 + C10.16 + C10.16 续**：C10.1~C10.17 满足；**切片 4** 接通数据面 PUT 上限与 SQLite PRAGMA（见 §9）；**切片 5（C10.17）** 接通 `self_signed` 三键（见 §10） |
 | 门槛命令 | `ctest -L phase10 && scripts/verify_config_wiring.sh` |
 | 退出码 | `0` |
-| 新测试 | `tests/integration/test_config_wiring.cpp`：**31 个 TEST_CASE / 692 断言**（真实 `build/bin/fss_server` + 驱动层；切片 5 新增 2 用例 / 81 断言，父代理 §10.6 再 +3 断言）+ `tests/unit/test_transfer_token_key_id.cpp`：**4 个 TEST_CASE / 29 断言**（C10.17 codec 边界） |
+| 新测试 | `tests/integration/test_config_wiring.cpp`：**31 个 TEST_CASE / 692 断言**（真实 `build/bin/fss_server` + 驱动层；切片 5 新增 2 用例 / 81 断言，父代理 §10.6 再 +3 断言）+ `tests/unit/test_transfer_token_key_id.cpp`：**4 个 TEST_CASE / 29 断言**（C10.17 codec 边界 + **切片 6a**：`tests/integration/test_remote_validators.cpp`（真实进程 + mock；见 §11）+ `tests/unit/test_composition_root_guard.cpp` 的清单纯增加 2 个类型；`test_config_wiring.cpp` 新增 C10.11 的 `fail_closed` 三 SECTION（+159 断言，见 §11.3） |
 | 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
 | 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **77/77** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 96 / 拒绝启动（触发条件）21 / 已读但无效果 39**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键；**切片 5** 接通 3 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 102 / 拒绝启动（触发条件）20 / 已读但无效果 34**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键；**切片 5** 接通 3 键；**切片 6a（C10.18）** 接通 6 键 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
 | 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
@@ -565,7 +565,8 @@ $ ./build/bin/test_sqlite_metadata_repository "★ 切片 4*"  → All tests pas
 
 **背景**：`docs/operations.md` §1.3.3 的 156 键三态里，`self_signed` 段仍有 3 个键是「已读但无效果」：
 `key_id`（密钥标识）、`default_ttl_seconds`、`max_ttl_seconds`。本轮把这 3 个键接通成**生效**，
-最终三态为 **生效 96 / 拒绝启动 21 / 已读但无效果 39 = 156**。
+最终三态为生效 **96** 个 / 拒绝启动（触发条件）**21** 个 / 已读但无效果 **39** 个（**96** + **21** + **39** = 156）。
+> 本数字是切片 5 收尾时的**历史快照**，**已被 §11 的切片 6a 取代**（+6 键生效、`auth.remote_entitlements.fail_closed` 更正为拒绝启动）。
 
 ### 10.1 逐键结论（3 个键）
 
@@ -597,7 +598,7 @@ $ ./build/bin/test_sqlite_metadata_repository "★ 切片 4*"  → All tests pas
 * 文档：`docs/operations.md`（§1.2.5 三行、§1.3 三态与三个清单、§1.3.3 的 `self_signed` 行与"下一步"）、
   `docs/02-design.md`（T3/T4 载荷字段 + 计数）、`docs/adr/ADR-003-storage-abstraction.md`（token 载荷字段）、
   `docs/00-final-design.md`、`docs/04-implementation-plan.md`（C10.17 门槛 + 三态计数）、`AGENTS.md`、
-  `tests/unit/test_operations_doc.cpp`（期望值 96/21/39）。
+  `tests/unit/test_operations_doc.cpp`（期望值 96 / 21 / 39 —— **切片 6a 已改为 102 / 20 / 34**，见 §11）。
 
 ### 10.3 实测命令与输出摘要
 
@@ -729,3 +730,253 @@ $ ./build/bin/test_location_issuer "★ C10.17*"           → All tests passed 
 修后实测：`./build/bin/test_config_wiring "★ C10.17*"` → **All tests passed (85 assertions in 2 test cases)**；
 `"★ C10.12*"` → **All tests passed (19 assertions in 1 test case)**（C10.12 用例体仍未改）；
 `ctest` **77/77**；`./build/bin/test_config_wiring` 全量 **692 断言 / 31 用例**。
+
+---
+
+## 11. 切片 6a（本轮）：接通「远端法务校验器」与「远端 schema 校验器」（C10.18 / ADR-013）
+
+**背景**：`docs/operations.md` §1.3.3 的三态里，`legal.validator` / `schema.validator` 是
+「拒绝启动（`remote` → exit 78）」，四个 `*.remote.{base_url,timeout_ms}` 是「已读但无效果」。
+本轮把这 **6 个键**接通成**生效**：新增两个 L2 适配器（`RemoteLegalValidator` /
+`RemoteSchemaValidator`），组合根按 `*.validator` 选择 `noop`（默认，行为逐字不变、**不发请求**）
+或 `remote`。
+
+### 11.1 逐键结论（6 个键）
+
+| 键 | 最终状态 | 判据 / 证据 |
+| --- | --- | --- |
+| `legal.validator` | **生效** | `noop`（默认）只保留本地空值防线（`legaltags` 为空 → 400）且**不发起任何请求**（mock `requests == 0`，C10.18 ⑤）；`remote` → 组合根装配 `RemoteLegalValidator`；非法取值由 schema 的 `Enum({"noop","remote"})` 拒绝 → exit 78（C10.11 的 `bogus` 反向用例）。横幅打印 `validators : legal=remote（端点 …，timeout=…ms …）` |
+| `legal.remote.base_url` | **生效** | → `RemoteLegalValidatorOptions.base_url`；**POST 到该 URL，不追加任何路径**（与 `auth.remote_entitlements` 有 `authorize_path` 不同，见 ADR-013 §2）。真实进程证据：mock 收到的请求体恰好是 `{"partition","legaltags"}` 且**不含** `record`（C10.18 ①）；空值 + `remote` → **exit 78** + 可读原因（C10.18 ⑦） |
+| `legal.remote.timeout_ms` | **生效** | → `CURLOPT_TIMEOUT_MS`。C10.18 ④：**同一个 mock**（delay 800ms）在 `timeout_ms=300` → **503**、`timeout_ms=3000` → **201**（证明配置真的在起作用，而不是"永远 503"） |
+| `schema.validator` | **生效** | 同 `legal.validator` 的对称语义（`noop` 不发请求；`remote` 装配 `RemoteSchemaValidator`；非法值 → exit 78） |
+| `schema.remote.base_url` | **生效** | → `RemoteSchemaValidatorOptions.base_url`；请求体为 `{"kind","record"（完整记录）}` 且**不含** `partition`/`legaltags`（C10.18 ⑥）；空值 + `remote` → exit 78 |
+| `schema.remote.timeout_ms` | **生效** | → `CURLOPT_TIMEOUT_MS`；超时 → 503（与 legal 同一套 fail-closed 矩阵） |
+
+### 11.2 实现点（可点击）
+
+* 新增 `src/infra/legal/remote_legal_validator.{h,cpp}` 与 `src/infra/schema/remote_schema_validator.{h,cpp}`：
+  与 `RemoteEntitlementsAuthorizer` **同一套写法**（`CURLOPT_NOSIGNAL` / `FOLLOWLOCATION=0` /
+  `CONNECTTIMEOUT_MS` + `TIMEOUT_MS` / `WriteToString` / 状态码判定 / **所有依赖故障 → `kUnavailable`** /
+  `Ready()` + `NotReadyReason()`）。文件头写明"这是**本项目的约定**、未与真实服务联调"，
+  以及"端口签名不带 bearer token → 端点必须允许无 per-request 认证访问"。
+* `src/CMakeLists.txt`：新增 L2 目标 `fss_legal_remote` / `fss_schema_remote`（`fss_domain` + `fss_json` +
+  `CURL::libcurl`），并链进 `fss_server`。
+* `src/main/server_main.cpp`：读 6 个键 + 按选择器装配（**R12：只在组合根创建具体实现**）；
+  `base_url` 为空 → `拒绝启动：…（fail-closed）` + `kExitConfigError`；横幅新增
+  `validators : legal=… | schema=…`（**不打印任何密钥**）。
+* `src/common/config/core_schema.cpp`：**无需改动** —— `legal.validator` / `schema.validator` 早就有
+  `.Enum({"noop","remote"})`（本轮确认，并把它写进注释与文档）。
+* `src/app/usecases/usecases.cpp`：第 3c 步的注释「失败即 400」**过时**（远端依赖故障是 503）→
+  改为"失败方向由 `ErrorKind` 决定"（代码路径不变，`FSS_TRY` 已透传 ErrorKind）。
+* `tests/unit/test_composition_root_guard.cpp`：具体实现清单加 `RemoteLegalValidator` / `RemoteSchemaValidator`
+  （否则"组合根装配了几个"的非空洞性断言看不到它们）。
+* 测试：新增 `tests/tools/mock_validators.py` + `tests/framework/mock_validators.h`（照
+  `mock_entitlements` 的做法：`--port 0` 打印 `LISTENING <port>`、`popen` 取 pid、析构 kill、轮询就绪；
+  额外 `--observe-file` 原子落盘请求计数与请求体）+ `tests/integration/test_remote_validators.cpp`
+  （真实 `build/bin/fss_server`）。
+* 文档：`docs/adr/ADR-013-file-service-extension-endpoints.md`（新）、`docs/03-api-contract.md` §7/§7.1、
+  `docs/operations.md` §1.2.11 + §1.3、`docs/02-design.md`（L2 模块表 + §17 索引）、
+  `docs/00-final-design.md` §4、`docs/04-implementation-plan.md`、`AGENTS.md`、`config/fss.example.json` 注释。
+
+### 11.3 实测命令与输出摘要
+
+```
+$ cmake --build build -j4                 # ★ 用 -j4（AGENTS §4.3 的 OOM 陷阱）
+[100%] Built target test_remote_validators
+$ ./build/bin/test_remote_validators
+All tests passed (464 assertions in 8 test cases)
+$ ./build/bin/test_config_wiring "★ C10.11*"
+All tests passed (244 assertions in 1 test case)     # 该 TEST_CASE 原有 85 断言 + 新增 fail_closed 三个 SECTION
+$ ./build/bin/test_operations_doc
+All tests passed (24 assertions in 2 test cases)     # 三态 102/20/34
+$ ./build/bin/test_composition_root_guard
+All tests passed (17 assertions in 2 test cases)
+$ ctest --test-dir build -L phase10 --output-on-failure
+100% tests passed, 0 tests failed out of 3            # test_config_wiring / test_operations_doc / test_remote_validators
+$ ctest --test-dir build -j4
+100% tests passed, 0 tests failed out of 78
+$ ./scripts/check_docs.sh --selftest
+  ✓ 自证：D1/D2/D4/D5 都能检出注入的错误（检查器有效）
+  D3 ADR 文件 13 个，被引用 13 个编号
+  D5 门槛编号检查：11 个阶段，共 144 条门槛
+  全部检查通过（D1~D5）
+$ ./scripts/verify_config_wiring.sh
+配置面接线：全部通过（54 条断言）
+```
+
+**fail-closed 矩阵逐条实测**（C10.18 ③ 的五态 + 400 两侧；每条都断言**无残留**）
+`RequireNoPersistentSideEffect()` 的判据：`uploadURL` 返回的 `Location` 仍指向 **staging**
+容器，且对应的 **persistent** 文件不存在（校验在用例第 3c 步、复制/落库之前）。
+
+| 依赖侧事实 | 期望 | 实测 |
+| --- | --- | --- |
+| `200 + {"valid":true}` | 201 | **201**（C10.18 ①，legal / ⑥ schema） |
+| `200 + {"valid":false,"message":"bad tag"}` | 400 + 消息含 `bad tag` | **400**，body `"message":"bad tag"`；staging 仍在、persistent 无文件（C10.18 ②） |
+| 超时（mock delay 2000ms > timeout 300ms） | 503 | **503**（C10.18 ③-①），无残留 |
+| 非 200（`--status 500`） | 503 | **503**（③-②），无残留 |
+| 200 但非 JSON（`--malformed`） | 503 | **503**（③-③），无残留 |
+| 200 但缺 `valid`（`--no-valid-field` → `{}`） | 503 | **503**（③-④），无残留 |
+| 连不上（指向未监听端口） | 503 | **503**（③-⑤），无残留 |
+| `base_url` 为空 + `validator=remote` | exit 78 + 可读原因 | **exit 78**，输出含 `legal.remote.base_url` / `schema.remote.base_url`（C10.18 ⑦） |
+| `noop` + `*.remote.*` 配了地址 | 不发起请求、行为不变 | **201** + mock `requests == 0`（400ms 窗口）+ schema 侧指向未监听端口也 201（C10.18 ⑤） |
+| `timeout_ms` 真的来自配置 | 300ms → 503；3000ms → 201 | **503 / 201**（同一个 mock，C10.18 ④） |
+
+### 11.4 R1 自证（注入 → 用例失败 → 还原 → 实测输出）
+
+三个"错误实现"各注入一次，都让对应用例**失败**；随后**完整还原**，
+`grep -rn "R1-INJECT" src/` 无输出（rc=1）。
+
+**① 把 fail-closed 分支改成 fail-open**（在 `curl_easy_perform` 之后插入：传输失败 / 非 200 /
+缺 valid → `return fss::Ok();`）→ 四态用例必须失败：
+
+```
+$ ./build/bin/test_remote_validators
+tests/integration/test_remote_validators.cpp:408: FAILED:
+  REQUIRE( result.create_status == 503 )
+with expansion:
+  201 == 503 (0x1f7)
+with messages:
+  test_case.name := "超时"
+  result.create_status := 201
+tests/integration/test_remote_validators.cpp:447: FAILED:   REQUIRE( result.create_status == 503 )
+tests/integration/test_remote_validators.cpp:569: FAILED:   REQUIRE( result.create_status == 503 )
+test cases:   8 |   5 passed | 3 failed
+assertions: 265 | 262 passed | 3 failed
+```
+
+**② 把"缺 `valid` 字段"读成 `true`**（`if (!root.contains("valid")) return fss::Ok();`）
+→ `--no-valid-field` 用例必须失败：
+
+```
+$ ./build/bin/test_remote_validators "★ C10.18 ③*"
+tests/integration/test_remote_validators.cpp:408: FAILED:
+  REQUIRE( result.create_status == 503 )
+with expansion:
+  201 == 503 (0x1f7)
+with messages:
+  fail-closed 形态：缺 valid 字段
+  test_case.name := "缺 valid 字段"
+  result.create_status := 201
+test cases:  1 |  0 passed | 1 failed
+assertions: 142 | 141 passed | 1 failed
+```
+
+**③ 让适配器忽略 `timeout_ms`（硬编码 30000）** → timeout 用例必须失败：
+
+```
+$ ./build/bin/test_remote_validators "★ C10.18 ④*"
+tests/integration/test_remote_validators.cpp:447: FAILED:
+  REQUIRE( result.create_status == 503 )
+with expansion:
+  201 == 503 (0x1f7)
+  timeout_ms := 300 (0x12c)
+  result.create_status := 201
+test cases:  1 |  0 passed | 1 failed
+assertions: 26 | 25 passed | 1 failed
+```
+
+还原后的实测：
+
+```
+$ grep -rn "R1-INJECT" src/                          # 无输出（rc=1）
+$ ./build/bin/test_remote_validators                  → 9 用例（含父代理补的 ⑧）；见 §11.4.1
+$ ./scripts/run_all_gates.sh                          # 父代理在最终工作树上重跑
+  汇总
+    失败: 无
+  ⏱  总耗时: 5 分 15 秒（315 s，阶段数 11）
+```
+
+**父代理独立复核**：`cmake --build build -j4`、`ctest` **78/78**、`check_docs.sh --selftest`
+（13 ADR / 144 门槛）、`test_operations_doc` 24 断言、`run_all_gates.sh` 全绿（315 s / 11 阶段）。
+
+#### 11.4.1 父代理复核：注入自证**第一次没失败**，抓到一个判据缺口（已修）
+
+复核时我按 R1 自己重做了一遍注入，**第一次全绿**（用例没失败）—— 这本身就是"判据无效"的信号，
+追下去发现两处**真实缺口**：
+
+**① `--status 500` 的响应体让"状态码检查"无法被单独证明。** mock 当时返回
+`{"error":"injected"}`（没有 `valid`），于是"非 200 必须 fail-closed"与"缺 `valid` 必须
+fail-closed"**两条防线同时触发**：把状态码检查改成 `if (false)`，用例照样 503 通过。
+判据无法区分"状态码真的被检查了"与"只是恰好缺 `valid`"。
+
+修法：mock 的失败状态码改为回一个**伪装成通过**的体 `{"valid":true,"note":"injected status"}`
+（`--fail-file` 同理），并在 mock 里写明理由。修后再做同一个注入：
+
+```
+# 注入：remote_legal_validator.cpp 的 if (status != 200) → if (false)
+$ cmake --build build -j4 && ./build/bin/test_remote_validators "★ C10.18 ③*"
+  result.create_status := 201        # 依赖回了 500 却说"通过"，而我们没检查状态码 → 记录被建出来
+tests/integration/test_remote_validators.cpp:408: FAILED: REQUIRE( result.create_status == 503 )
+test cases:  1 |  0 passed | 1 failed      assertions: 66 | 65 passed | 1 failed
+# 还原后：All tests passed (185 assertions in 1 test case)
+```
+即：**现在这条判据真的能失败**。（顺便修正了一个更早的版本：只 `--target test_remote_validators`
+重建是**不够的** —— 用例拉起的是 `build/bin/fss_server`，必须全量重建，否则注入根本没进被测二进制。）
+
+**② `--fail-file` 是"声明了但没人用"的开关。** 规格要求"删掉控制文件 = 依赖恢复"，
+但没有任何用例使用它。补 `C10.18 ⑧`：控制文件存在 → **503 且无残留**；**同一个服务进程**、
+不重启、只删掉文件 → 下一次请求立刻 **201**。这条同时锁住"不缓存依赖结论"这个真实性质
+（若实现第一次失败就记住，或成功一次就不再问，它必然失败）。反向验证：
+
+```
+# 注入：忽略依赖的回答（200 时直接 return Unavailable）
+$ ./build/bin/test_remote_validators "★ C10.18 ⑧*"
+  up.create_body := {"code":503,"message":"R1-INJECT: 忽略依赖的回答",...}
+tests/integration/test_remote_validators.cpp:...: FAILED: REQUIRE( up.create_status == 201 )
+test cases:  1 |  0 passed | 1 failed      assertions: 53 | 52 passed | 1 failed
+# 还原后：All tests passed (54 assertions in 1 test case)
+```
+
+**③（撤回的错误做法）**用 `--status 500` 那条用例去证明"状态码被检查"的**原始**尝试不成立 ——
+上面 ① 已给出真正的证明方式。这两条都记在这里，因为它们正是 R1 存在的意义：
+"用例通过了"与"用例能失败"是两件事。
+
+### 11.5 规格勘误与一处**独立理由的更正**（都必须写清楚）
+
+**① 规格勘误（父代理确认）**：本切片的规格原写"把 **7** 个键变成生效，最终三态
+生效 103 / 拒绝启动 19 / 已读但无效果 34"。这是**父代理规格里的算术错误** —— 实际只有
+**6 个键**（`legal.validator`、`schema.validator` 来自「拒绝启动」= 2 个；
+四个 `*.remote.{base_url,timeout_ms}` 来自「已读但无效果」= 4 个），正确落点是
+**102 / 19 / 35**。实测机械核对：HEAD 为 `EFF 96 / REJ 21 / INE 39`，接线后
+`EFF 102 / REJ 19 / INE 35`，逐键 diff **恰好只有这 6 个键改变**。
+
+**② 独立理由的更正**：`auth.remote_entitlements.fail_closed` 从「已读但无效果」更正为
+「拒绝启动（触发条件）」。理由**不是**凑数字，而是原登记**自相矛盾**：`operations.md` 那一行
+自己写着"`remote` 模式下 schema 会拒绝 `false`"，却把该键标成"无效果"。
+`core_schema.cpp` 的跨字段校验确实有**真实、可观测**的效果：
+`auth.mode=remote-entitlements` 且该键非 `true` → `problems` 带
+"必须为 true：依赖不可用不可降级为放行" → **exit 78**。
+**触发条件是模式相关的**：`auth.mode=jwt`/`disabled` 时 `false` 被接受且无任何影响
+（实现内恒为 fail-closed，不存在"失败即放行"的分支）。
+真实进程用例：`tests/integration/test_config_wiring.cpp` 的 C10.11 新增三个 SECTION ——
+反例（`remote-entitlements` + `false` → exit 78 + 可读原因）、R16 正例（同模式 + `true` + 有地址
+→ **不因该键**被拒）、模式无关性（`disabled` + `false` → 不因该键被拒）。
+**它不做也不影响切片 6a 的正确性**（落点不同：一个进「生效」+6，一个进「拒绝启动」+1）。
+
+### 11.6 三态计数（切片 6a 收尾；**最终**）
+
+`config/fss.example.json` 的 **156** 个叶子键：生效 **102** / 拒绝启动（触发条件）**20** /
+已读但无效果 **34**（**102** + **20** + **34** = 156），由 `tests/unit/test_operations_doc.cpp`
+的 C10.11 用例从 §1.2 的 156 行程序化提取并机械断言（表格计数 + 正文两处字符串同时断言）。
+净变化：6 个键移入「生效」（+6）；`auth.remote_entitlements.fail_closed` 移入「拒绝启动」（+1）。
+
+### 11.7 未做 / 降级 / 未验证（如实登记）
+
+* **未与真实 Legal / Schema 服务联调**（本环境没有该服务、外网受限）：协议形状见 ADR-013 §2，
+  是本项目与运维方的约定；`base_url` 由运维给出正是为了适配真实路由。上游**没有**这条调用链
+  （`docs/01-osdu-research.md:110`：legal tag 由 Storage Service 的 PUT /records 内部校验），
+  所以**不存在**"与上游对齐"这回事 —— 这是本服务的扩展。
+* **不透传调用方身份**：端口签名 `Validate(partition, tags)` / `Validate(kind, record)` 没有
+  bearer token 参数 → 端点必须允许**无 per-request 认证**访问（集群内网 / mTLS 终结 /
+  网络策略白名单）。若真实服务要求鉴权，必须**改端口契约**（新增参数 + 同步契约 §5/§6 与
+  两个适配器）——本切片不做，也不假装做了。
+* **不做校验结果缓存**（每请求一次远端 RTT）；**不做重试/退避**（失败即 503，重试会把"依赖降级"
+  伪装成"只是慢"）。
+* **`*.remote.connect_timeout_ms` 未暴露为配置键**（固定 1000ms；与 Entitlements 的键集不同）。
+* **webhook（`events.publisher=webhook`）仍拒绝启动**：ADR-013 §5.3-⑥ 已为它立好"完整 URL +
+  fail-closed + 不透传身份"三条规矩，但**方向不同**（出站通知），落地时要单独定"通知失败是否致命"。
+* 本轮**未**跑 `run_all_gates.sh` 全量（由父代理收尾跑）；上面与本切片相关的命令全绿。
+* **一处测试自身的假判据（本轮实测抓到并修掉）**：最初用"`getFileList` 必须 400（无记录）"
+  证明"503 后没有记录被建出来"，但 `getFileList` 列的是**位置仓储**而不是元数据 ——
+  `uploadURL` 一旦签发就已经写了一条 staging 位置记录，所以该断言拿到 **200**。
+  改成两条**可证**的副作用：`Location` 仍指向 **staging** 容器 且 persistent 侧**没有**对应文件。

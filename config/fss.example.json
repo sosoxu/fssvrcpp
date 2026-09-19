@@ -271,13 +271,37 @@
   },
 
   "legal": {
+    // noop（默认，不发起任何请求）| remote（远端法务校验；ADR-013）
     "validator": "noop",
-    "remote": { "base_url": "", "timeout_ms": 3000 }
+    "remote": {
+      // ★ 与 auth.remote_entitlements 不同：这里**没有** path 键 ——
+      //   base_url 就是**完整端点 URL**（POST 到它，不追加任何路径）。
+      //   理由见 ADR-013 §2：legal/schema 在上游没有对应路径，与其发明一个，
+      //   不如把完整 URL 的控制权交给运维。
+      //   validator=remote 时该键必须非空（否则组合根**拒绝启动**，exit 78）。
+      //   ⚠️ 端口签名不带 bearer token（Validate(partition, tags)），因此本适配器
+      //      不透传调用方身份 —— 端点必须允许**无 per-request 认证**访问
+      //      （集群内网 / mTLS 终结 / 网络策略白名单）。
+      //   线协议：POST <base_url>，body {"partition":"...","legaltags":[...]}；
+      //   200+{"valid":true} = 通过；200+{"valid":false,"message":"..."} = 不通过（400）；
+      //   其余一切（连不上/超时/非 200/非 JSON/缺 valid）= 依赖故障 → 503（fail-closed）。
+      "base_url": "",
+      "timeout_ms": 3000
+    }
   },
 
   "schema": {
+    // noop（默认，不发起任何请求）| remote（远端 schema 校验；ADR-013）
     "validator": "noop",
-    "remote": { "base_url": "", "timeout_ms": 3000 }
+    "remote": {
+      // 同 legal.remote.base_url：**完整端点 URL**，POST 到它，不追加路径。
+      // validator=remote 时必须非空（否则 exit 78）；端点须允许无 per-request 认证。
+      // 线协议：POST <base_url>，body {"kind":"...","record":{...完整记录...}}；
+      // 200+{"valid":true} = 通过；{"valid":false,"message":"..."} = 不通过（400）；
+      // 其余一切 = 依赖故障 → 503（fail-closed）。
+      "base_url": "",
+      "timeout_ms": 3000
+    }
   },
 
   "events": {

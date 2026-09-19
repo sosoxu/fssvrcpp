@@ -994,7 +994,7 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
 切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）、切片 4（数据面 PUT 上限 + SQLite PRAGMA）
 与切片 5（`self_signed` 三键：`key_id` + 自签 TTL 上界）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态：**生效 96 / 拒绝启动 21 / 已读但无效果 39**（`docs/operations.md` §1.3）。
+三态：**生效 102 / 拒绝启动 20 / 已读但无效果 34**（`docs/operations.md` §1.3）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
@@ -1055,7 +1055,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 | --- | --- |
 | **C10.9** | **GC 真正跑起来**：组合根装配 `GcTask`（此前只在测试里被构造）+ **周期调度**（`gc.interval_seconds`；`gc.enabled=false` 或 `interval=0` → 不启动调度，横幅显式说明）；`gc.dry_run`/`require_lease_expiry`/`staging_ttl_hours`/`orphan_grace_hours` 生效；调度循环**可优雅停止**（与 `Stop`/join 同一退出路径，AGENTS 陷阱：不得留下 joinable thread）；GC 指标在**真实进程**的 `/metrics` 可见（`fss_gc_*`）；`--once`（或等价开关）支持"跑一轮就退出"便于 cron |
 | **C10.10** | **样例配置真的能起来**：用 `config/fss.example.json` 作为 `--config`（仅覆盖路径/密钥等环境相关项）**启动成功**并 `readiness_check` 200 —— 这条把"156 键的文档"变成"可执行的事实"；同时在测试里断言"故意改坏一个键 → 拒绝启动" |
-| **C10.11** | **不许"读了但静默无效"**：对每个键，`docs/operations.md` 必须标注三态之一 —— `生效` / `拒绝启动（列出触发条件）` / `已读但无效果（必须给出理由与下一步）`；对**未实现**的键（`large_file_plane.enabled=true`、`storage.io_engine=uring`、`metadata.repository=postgres|remote`、`leases.*`/`leader_election.*` 在 single 模式、`events.publisher=webhook`、`legal/schema.validator=remote`、`self_signed.single_use_nonce=true`）**非默认值必须拒绝启动**而不是被忽略 |
+| **C10.11** | **不许"读了但静默无效"**：对每个键，`docs/operations.md` 必须标注三态之一 —— `生效` / `拒绝启动（列出触发条件）` / `已读但无效果（必须给出理由与下一步）`；对**未实现**的键（`large_file_plane.enabled=true`、`storage.io_engine=uring`、`metadata.repository=postgres|remote`、`leases.*`/`leader_election.*` 在 single 模式、`events.publisher=webhook`、`self_signed.single_use_nonce=true`）**非默认值必须拒绝启动**而不是被忽略 （`legal/schema.validator=remote` 已在**切片 6a（C10.18 / ADR-013）**接通为**生效**，不再属于本清单） |
 | **C10.12** | `expiry.default`/`expiry.max` 接通（`app::ExpiryPolicy`），并有正/反用例（超上限拒绝、边界通过） |
 
 **状态：🚧 切片 2（C10.9~C10.12）完成**。
@@ -1068,7 +1068,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（**当前为 生效 96 / 拒绝启动 21 / 已读但无效果 39 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
+  `docs/operations.md` 逐键三态化（**当前为 生效 102 / 拒绝启动 20 / 已读但无效果 34 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1090,7 +1090,14 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 | --- | --- |
 | **C10.17** | **`self_signed` 三键接通**：① `self_signed.key_id` 进**被签名的 token 载荷**，解码侧在验签通过后要求载荷里的 `key_id` 与当前配置**完全相等**（**缺失也拒绝** → `kUnauthenticated` / HTTP **401**）；真实进程正例（`k1` 签发的 URL PUT/GET 200）+ 反例（以 `k2` 重启后重放同一 URL → 401）；**多密钥轮换未交付**（ADR-009:227 的"多 key 并存"仍是待办，只做标识绑定）。② `self_signed.{default_ttl_seconds,max_ttl_seconds}` 是**自签分支（`!native_presign`）的 TTL 上界**（`ttl = min(ttl, max)`；请求未给 `expiryTime` 时再 `min(ttl, default)`），`expiry.*` 的既定语义（= `expiryTime` 参数的解析规则与缺省，C10.12）**不变**；`native_presign` 分支**完全不受影响**（进程内断言 `PresignOptions.expires_in_seconds` 仍等于 `expiry` 的结果）。若要把语义改成「`self_signed.*` 覆盖 `expiry.default` 作缺省」，必须先推翻 C10.12 并同步契约与测试 |
 
-**状态：✅ 切片 1/2/3 完成（含 C10.16）**。
+**切片 6a（判据）** —— 远端 legal / schema 校验器（ADR-013）
+
+| # | 判据 |
+| --- | --- |
+| **C10.18** | **远端 legal / schema 校验器接通（6 个键）**：`legal.validator` / `legal.remote.{base_url,timeout_ms}` 与 `schema.validator` / `schema.remote.{base_url,timeout_ms}` → **生效**。线协议（ADR-013）：`*.remote.base_url` 就是**完整端点 URL**（POST 到它，**不追加路径**）；legal body `{"partition","legaltags"}`、schema body `{"kind","record"}`；`200+{"valid":true}` → 通过、`200+{"valid":false,"message":M}` → **400**（带上 M）。**fail-closed 矩阵逐条实现 + 逐条测试**：连接失败 / 超时 / 非 200（含 401/403/500）/ 非 JSON / 缺 `valid` / `valid` 非 bool → 一律 **503**（`kUnavailable`），**绝不**降级成"通过"或"不通过"；校验发生在用例第 **3c** 步（持久化之前）→ 503 后**不留残留**（staging 对象在原位、persistent 侧无文件）。`base_url` 为空且选择器为 `remote` → **exit 78** + 可读原因（`Ready()`/`NotReadyReason()`）；`noop`（默认）**不发起任何请求**。测试：真实 `build/bin/fss_server` + 独立进程 mock（`tests/tools/mock_validators.py` + `tests/framework/mock_validators.h`，含 `--observe-file` 断言请求体形状与"有没有发请求"）。⚠️ **未与真实 Legal/Schema 服务联调**；端口签名不带 bearer token → 端点须允许无 per-request 认证访问。 |
+| **C10.18 伴随更正** | `auth.remote_entitlements.fail_closed` 从「已读但无效果」更正为「拒绝启动（触发条件）」：`auth.mode=remote-entitlements` 且该键非 `true` → **exit 78**（`core_schema.cpp` 跨字段校验，ADR-012 §5.1）；**模式相关**（`jwt`/`disabled` 下 `false` 被接受）。真实进程用例：C10.11 的两个 SECTION（反例 78 + R16 正例不被拒 + 模式无关性） |
+
+**状态：✅ 切片 1/2/3/4/5/6a 完成（含 C10.16/C10.17/C10.18）**。
 * **C10.13**：`observability.audit_fail_closed` 真的决定"审计写入失败是否让请求失败"。
   用例层 `RecordAudit()` 现在返回 `Result<void>`，`AuditGuard::Success()` 在**返回前**记录成功审计
   并把结果交回（`FSS_TRY(audit.Success())`）——析构无法改状态码，那正是"审计失败却报 200"的静默缺陷。
@@ -1132,9 +1139,22 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   （codec 边界 4 用例）、`tests/unit/test_location_issuer.cpp` 的 C10.17、`tests/integration/test_config_wiring.cpp`
   的 C10.17 两用例（真实进程正例 + 换 `key_id` 重启后 401 反例 + TTL 上界）。**未交付**：多密钥轮换
   （ADR-009:227 的"多 key 并存"）。
-* 三态计数：**生效 96 / 拒绝启动 21 / 已读但无效果 39 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* **切片 6a（远端 legal / schema 校验器，C10.18 / ADR-013）**：新增 L2 适配器
+  `src/infra/legal/remote_legal_validator.{h,cpp}` 与 `src/infra/schema/remote_schema_validator.{h,cpp}`
+  （与 `RemoteEntitlementsAuthorizer` 同一套写法：`NOSIGNAL`/`FOLLOWLOCATION=0`/连接超时+整体超时/
+  所有依赖故障 → `kUnavailable`/`Ready()`+`NotReadyReason()`）；组合根按
+  `legal.validator`/`schema.validator` 选择 `noop`（默认）或 `remote` 并打印端点与超时（**不打印密钥**）；
+  用例第 3c 步的注释更正（失败方向由 `ErrorKind` 决定：本地/远端"不通过" → 400、依赖故障 → 503）。
+  用例：`tests/integration/test_remote_validators.cpp`（真实进程 + mock；正例 / 400 带 message /
+  fail-closed 五态 / 无残留 / 启动拒绝 / noop 不发请求 / `timeout_ms` 真生效）+ `tests/tools/mock_validators.py`。
+  **规格勘误（父代理已确认）**：本切片涉及 **6 个键**（2 个来自「拒绝启动」+ 4 个来自「已读但无效果」），
+  不是最初写的 7 个。**未交付**：与真实 Legal/Schema 服务联调、调用方身份透传（需改端口契约）、
+  校验结果缓存、重试/退避、`connect_timeout_ms` 配置键。
+* 三态计数：**生效 102 / 拒绝启动 20 / 已读但无效果 34 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+  其中「拒绝启动」+1 来自 C10.18 的**伴随更正**（`auth.remote_entitlements.fail_closed`），
+  与"6 个键接通"是两件事（落点不同：一个进「生效」、一个进「拒绝启动」）。
 
-**未做（本阶段不承诺）**：`events.publisher=webhook`（需新增 L2 webhook 发布器）、`legal/schema.validator=remote`、
+**未做（本阶段不承诺）**：`events.publisher=webhook`（需新增 L2 webhook 发布器；ADR-013 §5.3 已为它立好"完整 URL + fail-closed + 不透传身份"三条规矩，但方向不同、需单独定"通知失败是否致命"）、
 `metadata/location.repository=postgres|remote`、`leader_election.*`/`leases.*` 的 PG 语义、
 `storage.proxy_mode`/`driver_report_override`/`provider_key_override`（DMS 响应整形，需先定契约）、
 `gc` 的 HTTP 端点。这些仍为"拒绝启动"或"已读但无效果（附理由与下一步）"，**不得**改成静默忽略。
@@ -1142,4 +1162,4 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 **未做（本阶段不承诺）**：`gc.*` 的 HTTP 端点（只做周期调度与一次性运行）；
 PG 仓储/租约与 `mode=multi` 运行形态、`storage.proxy_mode`/远端 Storage Service、
 `leader_election.*`/`leases.*`（依赖 PG）、sendfile 数据面（ADR-006 §6）、
-`observability.audit_fail_closed` 的"致命审计"行为（已读但行为未实现，见 `operations.md` §8）。
+`observability.audit_fail_closed` 的"致命审计"行为**已在 C10.13 交付**（见 §8 的 `operations.md` 说明）。

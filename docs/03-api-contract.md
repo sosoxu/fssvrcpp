@@ -958,9 +958,58 @@ REST 与 RPC 两次调用会生成**不同的**签名 URL（含不同时间戳/n
 | 驱动上报覆盖 | `storage.driver_report_override` | 配置驱动，默认读真实驱动 | 关闭 |
 | providerKey 覆盖 | `storage.provider_key_override` | 配置驱动 | 关闭 |
 | 健康/就绪的依赖明细 | `X-FSS-Dependencies` 响应头 | 响应头（不影响 body） | 启用 |
+| 远端 legal 校验器 | **出站** POST 到 `legal.remote.base_url`（运维给的完整 URL） | 配置驱动（`legal.validator=remote`）；不新增入站路径 | 关闭（`noop`，不发任何请求） |
+| 远端 schema 校验器 | **出站** POST 到 `schema.remote.base_url`（运维给的完整 URL） | 配置驱动（`schema.validator=remote`）；不新增入站路径 | 关闭（`noop`，不发请求） |
 
 **原则**：任何扩展都**不得**修改 OSDU 端点的既有状态码、字段名或字段语义。
 扩展只能以"新端口 / 新路径段 / 新响应头 / 配置开关"的形式存在。
+
+### 7.1 远端 legal / schema 校验器（出站扩展；ADR-013）
+
+> **上游没有这两条调用链**（必须如实标注）：`docs/01-osdu-research.md:110` 的结论是
+> "legal tag 的合规性由 Storage Service 的 PUT /records 内部校验"。上游 File Service
+> **不直接调用** Legal/Schema 服务。因此本节的端点与 `/v1/transfer` 同类，是**本服务的扩展**，
+> 协议由本项目和运维约定（ADR-013），**未与真实 Legal/Schema 服务联调**。
+
+| 项 | legal | schema |
+| --- | --- | --- |
+| 触发时机 | `POST /api/file/v2/files/metadata` 的用例第 **3c** 步（持久化之前） | 同左 |
+| 开关 | `legal.validator=remote`（默认 `noop`） | `schema.validator=remote`（默认 `noop`） |
+| 端点 | `legal.remote.base_url`（**完整 URL**，POST 到它，**不追加路径**） | `schema.remote.base_url`（同左） |
+| 超时 | `legal.remote.timeout_ms`（整体；另固定 1000ms 连接超时） | `schema.remote.timeout_ms` |
+| 请求 | `Content-Type: application/json`<br>`{"partition":"<p>","legaltags":["<t>",...]}` | `Content-Type: application/json`<br>`{"kind":"<kind>","record":{ ...完整记录 JSON... }}` |
+| 通过 | `200` + `{"valid":true}` | 同左 |
+| 不通过 | `200` + `{"valid":false,"message":"<原因>"}` → 本服务回 **400**，message 原样透传 | 同左 |
+
+**为什么端点 URL 是完整的、没有 `*_path` 键**：`auth.remote_entitlements` 有 `authorize_path`
+是因为 Entitlements 是**上游真实存在的服务**、路径有一手依据；legal/schema 的路径**没有**任何
+依据，再造一个 path 键等于把"我们编出来的路径"伪装成约定（ADR-013 §2）。把完整 URL 交给运维，
+协议形状由本节与 ADR-013 定义、路由由部署决定。
+
+**fail-closed 矩阵（逐条实现 + 逐条测试）**——所有依赖故障 → **503（`kUnavailable`）**，
+**绝不**降级为"通过"（安全缺陷）或"不通过（400）"（误导排障）：
+
+| 依赖侧事实 | 本服务回应 |
+| --- | --- |
+| 连接失败 / DNS / TLS | **503** |
+| 超时（`timeout_ms` 或连接超时） | **503** |
+| 非 200（含 401/403/500；`FOLLOWLOCATION=0` 故 3xx 也算） | **503** |
+| 200 但响应不是 JSON | **503** |
+| 200 + JSON 但缺 `valid` 字段 | **503** |
+| 200 + JSON 且 `valid` 不是 bool | **503** |
+| `validator=remote` 且 `base_url` 为空 | **exit 78**（组合根 `Ready()`/`NotReadyReason()`，可读原因） |
+| `legaltags` 为空（**本地**，仅 legal） | **400** + `legal tags 不能为空`（逐字同 `NoopLegalValidator`；**不发起请求**） |
+| 远端明确 `{"valid":false,"message":M}` | **400**，message = `M`（本地既有 400 的**固定消息**不受影响） |
+
+**身份**：两个端口的签名是 `Validate(partition, legal_tags)` / `Validate(kind, record)`，
+**没有** bearer token 参数 → 适配器**不透传调用方身份**。运维前提：端点必须允许
+**无 per-request 认证**的访问（集群内网 / mTLS 终结 / 网络策略白名单）。
+若真实服务要求鉴权，属于**改端口契约**的动作（新增参数 + 同步 §5/§6 与双协议适配器），
+不要在本适配器里偷偷塞凭证。
+
+**测试**：`tests/integration/test_remote_validators.cpp`（真实 `build/bin/fss_server` +
+独立进程 mock `tests/tools/mock_validators.py`）+ `tests/tools/mock_validators.py` 的
+`--observe-file`（断言请求体形状与"有没有发请求"）。
 
 ---
 

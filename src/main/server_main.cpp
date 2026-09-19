@@ -47,7 +47,9 @@
 #include "infra/location/memory/memory_lease_repository.h"
 #include "infra/location/sqlite/sqlite_location_repository.h"
 #include "infra/io/file_sync.h"
+#include "infra/legal/remote_legal_validator.h"
 #include "infra/metadata/sqlite/sqlite_metadata_repository.h"
+#include "infra/schema/remote_schema_validator.h"
 #include "infra/transfer/blob_byte_source.h"
 #include "infra/transfer/transfer_endpoint.h"
 #include "infra/transfer/transfer_token.h"
@@ -1118,8 +1120,17 @@ int main(int argc, char** argv) {
       resolver.Int("leases.renew_interval_seconds", 20);
   const std::string leases_time_source = resolver.Str("leases.time_source", "database");
   const bool leader_election_enabled = resolver.Bool("leader_election.enabled", false);
-  const std::string legal_validator = resolver.Str("legal.validator", "noop");
+  //  ---- 阶段 10 切片 6a：远端 legal / schema 校验器（ADR-013）----
+  //  ★ `*.remote.base_url` 就是**完整端点 URL**（POST 到它，不追加路径）—— 与
+  //    `auth.remote_entitlements` 不同（后者另有 `authorize_path` 键）。理由：
+  //    legal/schema 没有 path 键，"与其发明一个路径，不如把控制权交给运维"（ADR-013 §2）。
+  //  ★ 非法取值由 schema 的 enum 拒绝（`core_schema.cpp` 已声明 `Enum({"noop","remote"})`）。
+  const std::string legal_validator_kind = resolver.Str("legal.validator", "noop");
+  const std::string legal_remote_base_url = resolver.Str("legal.remote.base_url", "");
+  const long legal_remote_timeout_ms = resolver.Int("legal.remote.timeout_ms", 3000);
   const std::string schema_validator_kind = resolver.Str("schema.validator", "noop");
+  const std::string schema_remote_base_url = resolver.Str("schema.remote.base_url", "");
+  const long schema_remote_timeout_ms = resolver.Int("schema.remote.timeout_ms", 3000);
   const std::string events_publisher = resolver.Str("events.publisher", "log");
   const bool single_use_nonce = resolver.Bool("self_signed.single_use_nonce", false);
   const std::string nonce_store = resolver.Str("self_signed.nonce_store", "memory");
@@ -1190,6 +1201,7 @@ int main(int argc, char** argv) {
   //  ★ `auth.remote_entitlements.fail_closed` 已读，但实现**恒为** fail-closed（不可关）：
   //    schema 对 remote 模式强制 true，因此这里只登记来源，不参与分支。
   (void)resolver.Bool("auth.remote_entitlements.fail_closed", true);
+
 
   //  ---- 可观测性（observability.*，C10.6）----
   const std::string log_level_text = resolver.Str("observability.log_level", "info");
@@ -1269,16 +1281,6 @@ int main(int argc, char** argv) {
         "events.publisher=" + events_publisher +
         " —— 事件发布只实现了写日志（log）。webhook 未交付；none 也无法真正关闭"
         "（组合根固定装配 LogEventPublisher）。下一步：保持 log，或先实现 webhook/none 分支。");
-  }
-  if (legal_validator == "remote") {
-    return reject_startup(
-        "legal.validator=remote —— 远端法务校验未交付（实现内固定 noop）。"
-        "下一步：保持 noop，或先实现 legal.remote.* 的调用。");
-  }
-  if (schema_validator_kind == "remote") {
-    return reject_startup(
-        "schema.validator=remote —— 远端 schema 校验未交付（实现内固定 noop）。"
-        "下一步：保持 noop，或先实现 schema.remote.* 的调用。");
   }
   if (single_use_nonce) {
     return reject_startup(
@@ -1640,8 +1642,55 @@ int main(int argc, char** argv) {
                                                                  : -1;
   StaticPartitionRegistry partitions(partition);
 
-  NoopLegalValidator legal;
-  NoopSchemaValidator schema_validator;
+  //  ---- 可选校验器（legal / schema；P10 切片 6a / ADR-013）----
+  //  ★ R12：具体实现只能在**组合根**创建 —— 用例层只见 `ILegalValidator` /
+  //    `ISchemaValidator` 端口。`noop`（默认）逐字保持接线前的行为。
+  //  ★ 非法取值由 schema 的 enum 拒绝（`core_schema.cpp` 已声明 `Enum({"noop","remote"})`
+  //    → exit 78）；这里的 `else` 分支只是防御性的第二道（枚举被改宽时不会静默降级）。
+  NoopLegalValidator noop_legal;
+  NoopSchemaValidator noop_schema;
+  std::unique_ptr<infra::RemoteLegalValidator> remote_legal;
+  std::unique_ptr<infra::RemoteSchemaValidator> remote_schema;
+  domain::ILegalValidator* legal = &noop_legal;
+  domain::ISchemaValidator* schema_validator_port = &noop_schema;
+  if (legal_validator_kind == "remote") {
+    infra::RemoteLegalValidatorOptions options;
+    options.base_url = legal_remote_base_url;
+    options.timeout_ms = static_cast<int>(legal_remote_timeout_ms);
+    remote_legal = std::make_unique<infra::RemoteLegalValidator>(options);
+    legal = remote_legal.get();
+    //  ★ 没配地址就**拒绝启动**（与 RemoteEntitlementsAuthorizer 一致）：起来之后
+    //    "每次校验都 503"只会制造误导性的排障路径。
+    if (!remote_legal->Ready()) {
+      std::cerr << "拒绝启动：" << remote_legal->NotReadyReason() << "\n";
+      return kExitConfigError;
+    }
+    logging::Warn(logger,
+                  "legal.validator=remote：依赖不可用时 fail-closed（503），绝不放过",
+                  {{"component", "server_main"}, {"endpoint", legal_remote_base_url}});
+  } else if (legal_validator_kind != "noop") {
+    std::cerr << "拒绝启动：未知的 legal.validator：" << legal_validator_kind
+              << "（可选：noop | remote）\n";
+    return kExitConfigError;
+  }
+  if (schema_validator_kind == "remote") {
+    infra::RemoteSchemaValidatorOptions options;
+    options.base_url = schema_remote_base_url;
+    options.timeout_ms = static_cast<int>(schema_remote_timeout_ms);
+    remote_schema = std::make_unique<infra::RemoteSchemaValidator>(options);
+    schema_validator_port = remote_schema.get();
+    if (!remote_schema->Ready()) {
+      std::cerr << "拒绝启动：" << remote_schema->NotReadyReason() << "\n";
+      return kExitConfigError;
+    }
+    logging::Warn(logger,
+                  "schema.validator=remote：依赖不可用时 fail-closed（503），绝不放过",
+                  {{"component", "server_main"}, {"endpoint", schema_remote_base_url}});
+  } else if (schema_validator_kind != "noop") {
+    std::cerr << "拒绝启动：未知的 schema.validator：" << schema_validator_kind
+              << "（可选：noop | remote）\n";
+    return kExitConfigError;
+  }
 
   //  ★ 阶段 10：把租户注册表交给 LocationIssuer —— 否则 uploadURL 签发的容器名与
   //    用例/GC 解析出的容器名会不一致（`partition.file.*.staging_container` 只对
@@ -1653,7 +1702,7 @@ int main(int argc, char** argv) {
                           *metadata_repository_handle.value(),
                           *authorizer,       events,
                           *audit_logger,     partitions,
-                          legal,             schema_validator,
+                          *legal,            *schema_validator_port,
                           issuer,            clock,
                           ids};
   ports.auth_mode = auth_mode;  // C8.5：让 `/v2/info` 与 gRPC 的 `GetInfo` 都能看到
@@ -1893,6 +1942,19 @@ int main(int argc, char** argv) {
             << "\n"
             << "  auth claims    : roles_claim=" << jwt_roles_claim << "，local_roles="
             << local_roles.size() << " 个用户（auth.mode=jwt 时参与角色判定）\n"
+            << "  validators     : legal=" << legal_validator_kind
+            << (legal_validator_kind == "remote"
+                    ? "（端点 " + legal_remote_base_url + "，timeout=" +
+                          std::to_string(legal_remote_timeout_ms) +
+                          "ms；fail-closed → 503；端点须允许无 per-request 认证）"
+                    : "（空值防线：legaltags 为空 → 400；不发请求）")
+            << " | schema=" << schema_validator_kind
+            << (schema_validator_kind == "remote"
+                    ? "（端点 " + schema_remote_base_url + "，timeout=" +
+                          std::to_string(schema_remote_timeout_ms) +
+                          "ms；fail-closed → 503；端点须允许无 per-request 认证）"
+                    : "（不校验 schema；不发请求）")
+            << "\n"
             << "  environment    : " << deployment_environment << "\n"
             << "  gc             : " << gc_banner << "\n"
             << "  expiry         : default=" << expiry_default_text << "（"

@@ -61,6 +61,10 @@ const std::vector<ConcreteType>& Inventory() {
       {"BlobByteSource", "infra/transfer/", false},
       {"BlockingIoEngine", "infra/io/", false},
       {"UringIoEngine", "infra/io/", false},
+      //  ★ P10 切片 6a（ADR-013）：远端 legal / schema 校验器也是"只能在组合根装配"的
+      //    具体实现 —— 用例层只依赖 `ILegalValidator` / `ISchemaValidator` 端口。
+      {"RemoteLegalValidator", "infra/legal/", false},
+      {"RemoteSchemaValidator", "infra/schema/", false},
       //  ⚠️ 刻意**不**收录 L1 的注入点（`SystemClock` / `UuidGenerator` / `StreamLogger`）：
       //     C4.9 的判据范围是"基础设施实现（blob store / repository / driver）"，
       //     而 L1 的注入点与使用者在同一层。已知的既有偏离如实记录（不静默）：

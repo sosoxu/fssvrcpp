@@ -104,7 +104,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 > | **拒绝启动（触发条件）** | 该键在组合根里**唯一**的作用就是"非默认/不支持的值 → exit 78"；默认/合法值不产生额外行为。触发条件与"下一步"逐条写在该单元格里 |
 > | **已读但无效果** | 组合根**不接线**该键（或读了但行为未实现）→ 改它对真实进程没有影响。必须给出**理由与下一步** |
 >
-> 三态计数见 §1.3（**生效 96 / 拒绝启动 21 / 已读但无效果 39；合计 156**，与 `config/fss.example.json` 的叶子键一一对应）。
+> 三态计数见 §1.3（**生效 102 / 拒绝启动 20 / 已读但无效果 34；合计 156**，与 `config/fss.example.json` 的叶子键一一对应）。
 
 
 #### 1.2.1 `deployment`
@@ -281,18 +281,18 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `auth.remote_entitlements.authorize_path` | authorizeAny 路径 | `/api/entitlements/v2/authorizeAny` | string；默认 `/api/entitlements/v2/authorizeAny` | **生效**：已接通（`auth.remote_entitlements.authorize_path`；旧别名 `FSS_ENTITLEMENTS_AUTHORIZE_PATH`） |
 | `auth.remote_entitlements.connect_timeout_ms` | 连接超时 | `1000` | int 1..600000；默认 `1000` | **生效**：已接通（`auth.remote_entitlements.connect_timeout_ms`）→ `RemoteEntitlementsOptions.connect_timeout_ms` |
 | `auth.remote_entitlements.timeout_ms` | 整体超时 | `3000` | int 1..600000；默认 `3000` | **生效**：已接通（`auth.remote_entitlements.timeout_ms`；旧别名 `FSS_ENTITLEMENTS_TIMEOUT_MS`）→ `RemoteEntitlementsOptions.timeout_ms` |
-| `auth.remote_entitlements.fail_closed` | 依赖不可用不得降级为放行 | `true` | bool；默认 `true`；必须 true | **已读但无效果**：实现内**恒为** fail-closed，该键不产生分支；`remote` 模式下 schema 会拒绝 `false`。下一步：等「可配置的降级策略」有明确需求时再实现（当前语义是 ADR-012 §5.1 的硬约束） |
+| `auth.remote_entitlements.fail_closed` | 依赖不可用不得降级为放行 | `true` | bool；默认 `true`；**`auth.mode=remote-entitlements` 时必须 true** | **拒绝启动（触发条件）**：`auth.mode=remote-entitlements` **且** 该键非 `true` → **exit 78** + 「必须为 true：依赖不可用不可降级为放行」（`core_schema.cpp` 的跨字段校验；ADR-012 §5.1）。**触发条件是模式相关的**：`auth.mode=jwt`/`disabled` 时 `false` 被接受且**无任何影响**（实现内恒为 fail-closed，不存在"失败即放行"的分支）。证据：`tests/integration/test_config_wiring.cpp` 的 C10.11 两个 SECTION（反例 exit 78 + R16 正例不被拒 + 模式无关性） |
 
 #### 1.2.11 `legal` / `schema` / `events`
 
 | JSON 路径 | 含义 | 示例值 | 取值约束 | 接通状态（三态：生效 / 拒绝启动 / 已读但无效果） |
 | --- | --- | --- | --- | --- |
-| `legal.validator` | 法务标签校验器 | `noop` | enum `noop` / `remote`；默认 `noop` | **拒绝启动（触发条件）**：`remote` → exit 78（远端法务校验未交付）。下一步：保持 `noop` |
-| `legal.remote.base_url` | 远端法务校验地址 | `""` | string；默认 `""` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `legal.remote.timeout_ms` | 远端法务校验超时 | `3000` | int 1..600000；默认 `3000` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `schema.validator` | schema 校验器 | `noop` | enum `noop` / `remote`；默认 `noop` | **拒绝启动（触发条件）**：`remote` → exit 78（远端 schema 校验未交付）。下一步：保持 `noop` |
-| `schema.remote.base_url` | 远端 schema 校验地址 | `""` | string；默认 `""` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `schema.remote.timeout_ms` | 远端 schema 校验超时 | `3000` | int 1..600000；默认 `3000` | **已读但无效果**：组合根未接线（登记为未实现） |
+| `legal.validator` | 法务标签校验器 | `noop` | enum `noop` / `remote`；默认 `noop` | **生效**：已接通（`legal.validator`）。`noop`（默认）= 只保留本地空值防线（`legaltags` 为空 → 400），**不发起任何请求**（行为与接线前逐字一致）；`remote` = 装配 `RemoteLegalValidator`（ADR-013），校验请求发到 `legal.remote.base_url`（**完整端点**）。非法取值由 schema 的 enum 拒绝 → exit 78 |
+| `legal.remote.base_url` | 远端法务校验**完整端点 URL** | `""` | string；默认 `""`；`validator=remote` 时必须非空 | **生效**：已接通（`legal.remote.base_url`）→ `RemoteLegalValidatorOptions.base_url`。**POST 到该 URL，不追加任何路径**（与 `auth.remote_entitlements.authorize_path` 那种"base_url + path"不同：legal 没有 path 键，见 ADR-013 §2）。空值 + `validator=remote` → **exit 78**（`Ready()`/`NotReadyReason()`）。⚠️ 端口签名不带 bearer token → 端点必须允许**无 per-request 认证**访问（集群内网 / mTLS 终结），且**未与真实 Legal 服务联调** |
+| `legal.remote.timeout_ms` | 远端法务校验整体超时 | `3000` | int 1..600000；默认 `3000` | **生效**：已接通（`legal.remote.timeout_ms`）→ `RemoteLegalValidatorOptions.timeout_ms`（libcurl `CURLOPT_TIMEOUT_MS`）。超时 → **503**（fail-closed）。证据：**同一个 mock** 下 `300ms` → 503、`3000ms` → 201（证明配置真的在起作用，而不是"永远 503"） |
+| `schema.validator` | schema 校验器 | `noop` | enum `noop` / `remote`；默认 `noop` | **生效**：已接通（`schema.validator`）。`noop`（默认）**不发起任何请求**；`remote` = 装配 `RemoteSchemaValidator`（ADR-013），请求发到 `schema.remote.base_url`（**完整端点**）。非法取值 → exit 78 |
+| `schema.remote.base_url` | 远端 schema 校验**完整端点 URL** | `""` | string；默认 `""`；`validator=remote` 时必须非空 | **生效**：已接通（`schema.remote.base_url`）→ `RemoteSchemaValidatorOptions.base_url`。**POST 到该 URL，不追加任何路径**。空值 + `validator=remote` → **exit 78**。⚠️ 同样不透传调用方身份 → 端点必须允许**无 per-request 认证**访问；**未与真实 Schema 服务联调** |
+| `schema.remote.timeout_ms` | 远端 schema 校验整体超时 | `3000` | int 1..600000；默认 `3000` | **生效**：已接通（`schema.remote.timeout_ms`）→ `RemoteSchemaValidatorOptions.timeout_ms`（`CURLOPT_TIMEOUT_MS`）。超时 → **503**（fail-closed） |
 | `events.publisher` | 事件发布器 | `log` | enum `log` / `webhook` / `none`；默认 `log` | **拒绝启动（触发条件）**：`webhook` / `none` → exit 78（只实现了写日志）。下一步：保持 `log` |
 | `events.webhook.url` | webhook 地址 | `""` | string；默认 `""` | **已读但无效果**：组合根未接线（登记为未实现） |
 | `events.webhook.timeout_ms` | webhook 超时 | `3000` | int 1..600000；默认 `3000` | **已读但无效果**：组合根未接线（登记为未实现） |
@@ -336,33 +336,32 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 ### 1.3 接通状态三态（逐键核对；合计 **156** 个叶子键）
 
 > 口径：**组合根在真实进程里对每个键做了什么**。三态的定义见 §1.2 开头的表。
-> 计数由本节的三个清单逐条相加得出：**96 + 21 + 39 = 156**。
+> 计数由本节的三个清单逐条相加得出：**102 + 20 + 34 = 156**。
 
 | 状态 | 键数 | 说明 |
 | --- | --- | --- |
-| **生效** | **96** | 读取后真的改变运行行为（含"非法值拒绝启动"的触发条件，写在 §1.2 对应行） |
-| **拒绝启动（触发条件）** | **21** | 非默认/不支持的值 → **exit 78（EX_CONFIG）** + 「未实现 + 下一步」 |
-| **已读但无效果** | **39** | 组合根未接线（或读了但行为未实现）→ 改它对真实进程没有影响；理由与下一步逐个登记 |
+| **生效** | **102** | 读取后真的改变运行行为（含"非法值拒绝启动"的触发条件，写在 §1.2 对应行） |
+| **拒绝启动（触发条件）** | **20** | 非默认/不支持的值 → **exit 78（EX_CONFIG）** + 「未实现 + 下一步」 |
+| **已读但无效果** | **34** | 组合根未接线（或读了但行为未实现）→ 改它对真实进程没有影响；理由与下一步逐个登记 |
 
-#### 1.3.1 生效（96）
+#### 1.3.1 生效（102）
 
-`auth.jwt.audience`、`auth.jwt.hmac_secret`、`auth.jwt.issuer`、`auth.jwt.partition_claim`、`auth.jwt.require_partition_claim`、`auth.jwt.roles_claim`、`auth.jwt.user_id_claim`、`auth.jwt.verify_signature`、`auth.local_roles.admin@example.com`、`auth.local_roles.editor@example.com`、`auth.local_roles.viewer@example.com`、`auth.mode`、`auth.remote_entitlements.authorize_path`、`auth.remote_entitlements.base_url`、`auth.remote_entitlements.connect_timeout_ms`、`auth.remote_entitlements.timeout_ms`、`deployment.environment`、`deployment.instance_id`、`deployment.max_clock_skew_seconds`、`deployment.mode`、`expiry.default`、`expiry.max`、`gc.dry_run`、`gc.enabled`、`gc.interval_seconds`、`gc.orphan_grace_hours`、`gc.require_lease_expiry`、`gc.staging_ttl_hours`、`http.error_format`、`location.repository`、`location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`、`location.sqlite.path`、`location.sqlite.synchronous`、`metadata.repository`、`metadata.sqlite.busy_timeout_ms`、`metadata.sqlite.journal_mode`、`metadata.sqlite.path`、`metadata.sqlite.synchronous`、`observability.audit_enabled`、`observability.audit_fail_closed`、`observability.log_format`、`observability.log_level`、`observability.metrics_enabled`、`observability.metrics_path`、`observability.redact_keys`、`partition.file.opendes.max_file_bytes`、`partition.file.opendes.persistent_container`、`partition.file.opendes.staging_container`、`self_signed.default_ttl_seconds`、`self_signed.enabled`、`self_signed.key_id`、`self_signed.max_ttl_seconds`、`self_signed.public_base_url`、`self_signed.signing_key`、`server.grpc.bind`、`server.grpc.enabled`、`server.grpc.port`、`server.http.base_path`、`server.http.bind`、`server.http.idle_timeout_seconds`、`server.http.json_request_timeout_seconds`、`server.http.max_body_bytes`、`server.http.max_connections`、`server.http.max_header_bytes`、`server.http.max_uri_bytes`、`server.http.port`、`server.http.tcp_nodelay`、`server.http.transfer_buffer_bytes`、`server.http.transfer_idle_timeout_seconds`、`server.http.transfer_max_body_bytes`、`server.http.transfer_memory_budget_bytes`、`server.http.worker_threads`、`storage.driver_report_override`、`storage.driver`、`storage.io_engine`、`storage.io_uring.queue_depth`、`storage.posix.atomic_write`、`storage.posix.dir_mode`、`storage.posix.durability`、`storage.posix.fadvise_dontneed_after_large_read`、`storage.posix.fadvise_random`、`storage.posix.file_mode`、`storage.posix.fsync_threshold_bytes`、`storage.posix.root`、`storage.provider_key_override`、`storage.s3.access_key`、`storage.s3.connect_timeout_ms`、`storage.s3.endpoint`、`storage.s3.force_path_style`、`storage.s3.presign_default_seconds`、`storage.s3.presign_max_seconds`、`storage.s3.region`、`storage.s3.secret_key`、`storage.s3.total_timeout_ms`、`storage.s3.verify_tls`
+`auth.jwt.audience`、`auth.jwt.hmac_secret`、`auth.jwt.issuer`、`auth.jwt.partition_claim`、`auth.jwt.require_partition_claim`、`auth.jwt.roles_claim`、`auth.jwt.user_id_claim`、`auth.jwt.verify_signature`、`auth.local_roles.admin@example.com`、`auth.local_roles.editor@example.com`、`auth.local_roles.viewer@example.com`、`auth.mode`、`auth.remote_entitlements.authorize_path`、`auth.remote_entitlements.base_url`、`auth.remote_entitlements.connect_timeout_ms`、`auth.remote_entitlements.timeout_ms`、`deployment.environment`、`deployment.instance_id`、`deployment.max_clock_skew_seconds`、`deployment.mode`、`expiry.default`、`expiry.max`、`gc.dry_run`、`gc.enabled`、`gc.interval_seconds`、`gc.orphan_grace_hours`、`gc.require_lease_expiry`、`gc.staging_ttl_hours`、`http.error_format`、`location.repository`、`location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`、`location.sqlite.path`、`legal.remote.base_url`、`legal.remote.timeout_ms`、`legal.validator`、`location.sqlite.synchronous`、`metadata.repository`、`metadata.sqlite.busy_timeout_ms`、`metadata.sqlite.journal_mode`、`metadata.sqlite.path`、`metadata.sqlite.synchronous`、`observability.audit_enabled`、`observability.audit_fail_closed`、`observability.log_format`、`observability.log_level`、`observability.metrics_enabled`、`observability.metrics_path`、`observability.redact_keys`、`partition.file.opendes.max_file_bytes`、`partition.file.opendes.persistent_container`、`partition.file.opendes.staging_container`、`schema.remote.base_url`、`schema.remote.timeout_ms`、`schema.validator`、`self_signed.default_ttl_seconds`、`self_signed.enabled`、`self_signed.key_id`、`self_signed.max_ttl_seconds`、`self_signed.public_base_url`、`self_signed.signing_key`、`server.grpc.bind`、`server.grpc.enabled`、`server.grpc.port`、`server.http.base_path`、`server.http.bind`、`server.http.idle_timeout_seconds`、`server.http.json_request_timeout_seconds`、`server.http.max_body_bytes`、`server.http.max_connections`、`server.http.max_header_bytes`、`server.http.max_uri_bytes`、`server.http.port`、`server.http.tcp_nodelay`、`server.http.transfer_buffer_bytes`、`server.http.transfer_idle_timeout_seconds`、`server.http.transfer_max_body_bytes`、`server.http.transfer_memory_budget_bytes`、`server.http.worker_threads`、`storage.driver_report_override`、`storage.driver`、`storage.io_engine`、`storage.io_uring.queue_depth`、`storage.posix.atomic_write`、`storage.posix.dir_mode`、`storage.posix.durability`、`storage.posix.fadvise_dontneed_after_large_read`、`storage.posix.fadvise_random`、`storage.posix.file_mode`、`storage.posix.fsync_threshold_bytes`、`storage.posix.root`、`storage.provider_key_override`、`storage.s3.access_key`、`storage.s3.connect_timeout_ms`、`storage.s3.endpoint`、`storage.s3.force_path_style`、`storage.s3.presign_default_seconds`、`storage.s3.presign_max_seconds`、`storage.s3.region`、`storage.s3.secret_key`、`storage.s3.total_timeout_ms`、`storage.s3.verify_tls`
 
-#### 1.3.2 拒绝启动（触发条件）（21）
+#### 1.3.2 拒绝启动（触发条件）（20）
 
 | 键 | 触发条件（非默认/不支持的值） |
 | --- | --- |
+| `auth.remote_entitlements.fail_closed` | `auth.mode=remote-entitlements` 且该键非 `true` → exit 78（"依赖不可用不可降级为放行"，ADR-012 §5.1；`core_schema.cpp` 跨字段校验）。**模式相关**：`jwt`/`disabled` 下 `false` 被接受且无影响。下一步：保持 `true` |
 | `auth.jwt.jwks_url` | 非空 → exit 78（RS256/JWKS 未实现，ADR-012 §5.3）。下一步：保持空的字符串，只用 HS256 |
 | `deployment.clock_skew_tolerance_seconds` | 非默认（`60`）→ exit 78（数据库时钟未交付；单实例用本地钟）。下一步：保持 `60` |
 | `events.publisher` | `webhook` / `none` → exit 78（只实现了写日志）。下一步：保持 `log` |
 | `leader_election.enabled` | `true` → exit 78（领导者选举依赖 PG advisory lock）。下一步：保持 `false`（单实例无需选举） |
 | `leases.enabled` | `true` → exit 78（PG 租约未交付；单实例装配的是内存租约）。下一步：保持 `false` |
-| `legal.validator` | `remote` → exit 78（远端法务校验未交付）。下一步：保持 `noop` |
 | `partition.registry` | `remote` → exit 78（远端租户注册表未交付）。下一步：保持 `file` |
 | `partition.file.opendes.allowed_checksum_algorithms` | 含未知算法名（不在 SHA-256 / SHA-1 / MD5 内）→ exit 78。下一步：保持这三个名字的子集（大小写与 `-`/`_` 不计） |
 | `partition.file.opendes.default_checksum_algorithm` | 未知算法名，或不在 `allowed_checksum_algorithms` 内 → exit 78。下一步：保证它属于 allowed 集合 |
 | `partition.file.opendes.storage_driver` | 与顶层 `storage.driver` 不一致 → exit 78（分区级驱动覆盖未交付；等于顶层值或为空 → 正常启动）。下一步：删除该键（跟随顶层），或等按 partition/zone 分盘的工厂交付 |
-| `schema.validator` | `remote` → exit 78（远端 schema 校验未交付）。下一步：保持 `noop` |
 | `self_signed.nonce_store` | 非 `memory` → exit 78（只有内存 nonce 存储，且 `single_use_nonce=false` 时不用它）。下一步：保持 `memory` |
 | `self_signed.single_use_nonce` | `true` → exit 78（nonce 存储未交付，ADR-009 M5）。下一步：保持 `false` |
 | `server.grpc.max_message_bytes` | 非默认（`4194304`）→ exit 78（gRPC 侧消息上限未接通）。下一步：保持默认 |
@@ -374,7 +373,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `storage.posix.group_commit_max_batch` | 非默认（`500`）→ exit 78（**批提交协议未实现（ADR-008 的 P4 待做）**）。下一步：保持 `500` |
 | `storage.posix.sync_dir_after_batch` | 非默认（`true`）→ exit 78（同上，ADR-008 的 P4 待做）。下一步：保持 `true` |
 
-#### 1.3.3 已读但无效果（39）
+#### 1.3.3 已读但无效果（34）
 
 > 这些键**改了不生效**（组合根不读，或读了但没有行为分支）。每一条都给出**下一步**；
 > 其中 8 个键（`expiry.*` 与 `gc.*`）在切片 2、**9 个键**在切片 3 已从本清单移入「生效」，见 §1.3.1
@@ -383,8 +382,10 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 > **C10.16 续（本轮）的净变化**：`storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 与 `partition.file.opendes.{staging,persistent}_container` 移入「生效」（+7，§1.3.1）；`storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 未实现）与 `partition.file.opendes.storage_driver`（与顶层驱动冲突）移入「拒绝启动」（+3，§1.3.2）。此前「这 10 个键没有对应结构体字段」的结论**已被本轮推翻**：`PosixBlobStoreOptions` / `PartitionConfig` 已加上真实字段（记录见 `docs/00-final-design.md` §5）。
 > **切片 4（本轮）的净变化**：`server.http.transfer_max_body_bytes`、`metadata.sqlite.{journal_mode,synchronous}`、`location.sqlite.synchronous` 移入「生效」（+4，§1.3.1）。两个 `Sqlite*RepositoryOptions` 新增了 `wal` / `synchronous_level` 真实字段并真的执行 PRAGMA；`synchronous` **不落盘**，用新增的同连接访问器 `AppliedPragma("synchronous")` 断言（"另开 sqlite3 连接读回"对它无效）。此前「元数据仓储内硬编码 WAL、Options 里没有这些字段」的结论**已被本轮推翻**。
 > **切片 5（本轮）的净变化**：`self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 移入「生效」（+3，§1.3.1）。`key_id` 进**被签名的 token 载荷**并在解码侧 fail-closed；两个 TTL 键是**自签分支的上界**（`expiry.*` 语义不变）。
+> **切片 6a（C10.18）的净变化**：`legal.validator` / `schema.validator` 移出「拒绝启动」（不再是"未实现 → exit 78"），`legal.remote.{base_url,timeout_ms}` / `schema.remote.{base_url,timeout_ms}` 移出本清单 —— **6 个键**（2 个来自「拒绝启动」+ 4 个来自本清单）全部移入「生效」（+6，§1.3.1）。实现是新增的 L2 适配器 `src/infra/legal/remote_legal_validator.*` 与 `src/infra/schema/remote_schema_validator.*`（ADR-013；**平台外扩展**端点，`base_url` 即完整 URL，不追加路径）。⚠️ **未与真实 Legal/Schema 服务联调**；端口签名不带 bearer token → 端点必须允许无 per-request 认证访问（见 §1.2.11 的逐行说明与契约 §7）。
+> **伴随更正（独立理由，与切片 6a 的 6 个键无关）**：`auth.remote_entitlements.fail_closed` 从本清单移入「拒绝启动」（§1.3.2）—— 它有一条**真实可观测**的效果：`auth.mode=remote-entitlements` 且该键非 `true` → exit 78（`core_schema.cpp` 的跨字段校验）。触发条件是**模式相关**的（`jwt`/`disabled` 下 `false` 无影响）。原先标成「已读但无效果」与同一行里"`remote` 模式下 schema 会拒绝 `false`"的说明**自相矛盾**，这才是更正的理由；它**不是**为了凑任何数字（落点也不同：本清单 −1、拒绝启动 +1）。
 
-`auth.remote_entitlements.fail_closed`、`events.webhook.timeout_ms`、`events.webhook.topic`、`events.webhook.url`、`leader_election.backend`、`leader_election.lock_key`、`leases.renew_interval_seconds`、`leases.time_source`、`leases.ttl_seconds`、`legal.remote.base_url`、`legal.remote.timeout_ms`、`location.postgres.dsn`、`location.postgres.max_connections`、`location.sqlite.group_commit`、`location.sqlite.group_commit_max_batch`、`location.sqlite.group_commit_max_wait_ms`、`location.sqlite.max_write_concurrency`、`metadata.postgres.dsn`、`metadata.postgres.max_connections`、`metadata.postgres.schema_version_check`、`metadata.postgres.statement_timeout_ms`、`metadata.remote.base_url`、`metadata.remote.static_token`、`metadata.remote.timeout_ms`、`metadata.remote.token_provider`、`metadata.sqlite.group_commit`、`metadata.sqlite.group_commit_max_batch`、`metadata.sqlite.group_commit_max_wait_ms`、`metadata.sqlite.max_write_concurrency`、`schema.remote.base_url`、`schema.remote.timeout_ms`、`server.http.large_file_plane.bind`、`server.http.large_file_plane.max_connections`、`server.http.large_file_plane.port`、`server.http.large_file_plane.sendfile_chunk_bytes`、`server.http.large_file_plane.use_sendfile`、`server.http.large_file_plane.workers`、`storage.posix.one_filesystem_per_partition`、`storage.posix.shared_mount_required`
+`events.webhook.timeout_ms`、`events.webhook.topic`、`events.webhook.url`、`leader_election.backend`、`leader_election.lock_key`、`leases.renew_interval_seconds`、`leases.time_source`、`leases.ttl_seconds`、`location.postgres.dsn`、`location.postgres.max_connections`、`location.sqlite.group_commit`、`location.sqlite.group_commit_max_batch`、`location.sqlite.group_commit_max_wait_ms`、`location.sqlite.max_write_concurrency`、`metadata.postgres.dsn`、`metadata.postgres.max_connections`、`metadata.postgres.schema_version_check`、`metadata.postgres.statement_timeout_ms`、`metadata.remote.base_url`、`metadata.remote.static_token`、`metadata.remote.timeout_ms`、`metadata.remote.token_provider`、`metadata.sqlite.group_commit`、`metadata.sqlite.group_commit_max_batch`、`metadata.sqlite.group_commit_max_wait_ms`、`metadata.sqlite.max_write_concurrency`、`server.http.large_file_plane.bind`、`server.http.large_file_plane.max_connections`、`server.http.large_file_plane.port`、`server.http.large_file_plane.sendfile_chunk_bytes`、`server.http.large_file_plane.use_sendfile`、`server.http.large_file_plane.workers`、`storage.posix.one_filesystem_per_partition`、`storage.posix.shared_mount_required`
 
 **理由与下一步（按前缀归类）**
 
@@ -397,9 +398,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `location` | 6 | `busy_timeout_ms`/`journal_mode`（切片 3）与 `synchronous`（**切片 4**）已接通（§1.3.1）；`max_write_concurrency`/`group_commit*`（4）未接线 —— 单连接串行实现下 `max_write_concurrency` 不改变行为，且没有组提交实现。`postgres.*`（2）依赖 PG 仓储。下一步：实现组提交 / 连接池后再接 |
 | `leases` | 3 | `ttl_seconds`/`renew_interval_seconds`/`time_source`：当前产品里没有用例 `Acquire` 租约，内存租约表恒空，因此这三个值不生效。下一步：PG 租约交付后接通（`enabled` 见 §1.3.2） |
 | `leader_election` | 2 | `backend`/`lock_key` 随选举一起未交付。下一步：PG advisory lock 落地后接通（`enabled` 见 §1.3.2） |
-| `auth` | 1 | `jwt.roles_claim` 与 `local_roles.*`（3 个）已在切片 3 接通；只剩 `remote_entitlements.fail_closed` 已读但无分支（实现恒为 fail-closed）。下一步：等「可配置的降级策略」有明确需求时再实现（`jwt.jwks_url` 见 §1.3.2） |
-| `legal` | 2 | `remote.base_url`/`remote.timeout_ms` 随远端校验器一起未交付。下一步：实现远端校验调用（`validator` 见 §1.3.2） |
-| `schema` | 2 | 同 `legal`。下一步：实现远端 schema 校验调用 |
+| `auth` | 0 | **已清空**：`jwt.roles_claim` 与 `local_roles.*`（3 个）在切片 3 接通（§1.3.1）；`remote_entitlements.fail_closed` 在切片 6a 的**伴随更正**中移入「拒绝启动」（模式相关的 exit 78，§1.3.2）；`jwt.jwks_url` 见 §1.3.2 |
 | `events` | 3 | `webhook.url`/`webhook.timeout_ms`/`webhook.topic` 随 webhook 发布器一起未交付。下一步：实现 webhook 发布（`publisher` 见 §1.3.2） |
 
 ---
@@ -924,7 +923,7 @@ find /var/lib/fss/data/blobs -name '*.tmp.*' -mmin +1440 -delete
 
 | 项 | 状态 | 说明 / 证据 |
 | --- | --- | --- |
-| 组合根接 `config/fss.example.json` | **切片 1/2/3/4/5 已接通（含 C10.16）** | `--config`/`FSS_CONFIG` + `--set` + 环境变量；156 键的三态计数为 **生效 96 / 拒绝启动 21 / 已读但无效果 39**（逐键见 §1.3；样例配置在 C10.10 用例里真的启动成功）。切片 3 新接通 9 键：`observability.audit_fail_closed`、`metadata.sqlite.busy_timeout_ms`、`location.sqlite.{busy_timeout_ms,journal_mode}`、`auth.jwt.roles_claim`、`auth.local_roles.*`（3）、`server.grpc.enabled`；C10.16 新增：`partition.file.opendes.max_file_bytes` → 生效，`partition.file.opendes.{allowed,default}_checksum_algorithm` → 拒绝启动。**C10.16 续**：`storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 与 `partition.file.opendes.{staging,persistent}_container` → 生效（+7）；`storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 未实现）与 `partition.file.opendes.storage_driver`（驱动冲突）→ 拒绝启动（+3）。**切片 4**：`server.http.transfer_max_body_bytes`（数据面 PUT 上限 = 全局键与 `partition.file.<p>.max_file_bytes` 取较小者）、`metadata.sqlite.{journal_mode,synchronous}`、`location.sqlite.synchronous` → 生效（+4）。**切片 5（本轮）**：`self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` → 生效（+3）：`key_id` 进被签名载荷并在解码侧 fail-closed（换 id → 旧 URL 401），两个 TTL 键是**自签分支的上界**（`expiry.*` 语义不变） |
+| 组合根接 `config/fss.example.json` | **切片 1/2/3/4/5 已接通（含 C10.16）** | `--config`/`FSS_CONFIG` + `--set` + 环境变量；156 键的三态计数为 **生效 102 / 拒绝启动 20 / 已读但无效果 34**（逐键见 §1.3；样例配置在 C10.10 用例里真的启动成功）。**切片 6a（C10.18）**：`legal.{validator,remote.base_url,remote.timeout_ms}` 与 `schema.{validator,remote.base_url,remote.timeout_ms}` → **生效**（+6；ADR-013 远端校验器，fail-closed → 503）；**伴随更正**：`auth.remote_entitlements.fail_closed` → **拒绝启动**（`remote-entitlements` 模式下非 true → exit 78，模式相关）。切片 3 新接通 9 键：`observability.audit_fail_closed`、`metadata.sqlite.busy_timeout_ms`、`location.sqlite.{busy_timeout_ms,journal_mode}`、`auth.jwt.roles_claim`、`auth.local_roles.*`（3）、`server.grpc.enabled`；C10.16 新增：`partition.file.opendes.max_file_bytes` → 生效，`partition.file.opendes.{allowed,default}_checksum_algorithm` → 拒绝启动。**C10.16 续**：`storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 与 `partition.file.opendes.{staging,persistent}_container` → 生效（+7）；`storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 未实现）与 `partition.file.opendes.storage_driver`（驱动冲突）→ 拒绝启动（+3）。**切片 4**：`server.http.transfer_max_body_bytes`（数据面 PUT 上限 = 全局键与 `partition.file.<p>.max_file_bytes` 取较小者）、`metadata.sqlite.{journal_mode,synchronous}`、`location.sqlite.synchronous` → 生效（+4）。**切片 5（本轮）**：`self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` → 生效（+3）：`key_id` 进被签名载荷并在解码侧 fail-closed（换 id → 旧 URL 401），两个 TTL 键是**自签分支的上界**（`expiry.*` 语义不变） |
 | `observability.audit_fail_closed` | **已接通（C10.13）** | `UseCasePorts.audit_fail_closed`：`true` 时审计写入失败让请求以 **500** 结束；`false`（默认）保持非致命。真实进程用例：`FSS_AUDIT_FAULT_INJECT=1` 注入"必然失败"的审计后端（**故障注入开关，不是配置键**）→ `fail_closed=true` 时 `uploadURL` = 500、`false` 时 = 200（正例对照，R16）。★ 该注入开关只用于测试/演练：生产环境**不要**设置 `FSS_AUDIT_FAULT_INJECT` |
 | `storage.io_engine=uring` | **不可用（引擎未启用）** | 组合根会真实探测（`sys::ProbeIoUring`）并按 ADR-010 拒绝/回退；但 `UringIoEngine::enabled()=false`（U1~U4 未满足）→ 显式要求 `uring` 一律 **exit 78**，`auto` 回退 blocking（横幅 + `fss_io_engine` 可见） |
 | `metadata.repository`/`location.repository` 的 `postgres`/`remote` | **未实现（显式拒绝）** | 配成非 `sqlite` → **exit 78**，绝不静默降级为 SQLite |

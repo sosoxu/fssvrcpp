@@ -576,3 +576,15 @@ fss_add_test(test_config_wiring
 # C10.15：本文件用真实 gRPC channel 调 GetInfo → 需要 gRPC/proto 头与库；
 # 同时被测进程就是 build/bin/fss_server，构建它必须先于本测试
 add_dependencies(test_config_wiring fss_server)
+
+# =============================================================================
+#  阶段 10 切片 6a：远端 legal / schema 校验器（C10.18 / ADR-013）
+#    真实 `build/bin/fss_server` + 独立进程 mock（`tests/tools/mock_validators.py`）：
+#    正例 / 远端不通过 / fail-closed 五态 / 无残留 / 启动拒绝 / noop 不发请求 /
+#    timeout_ms 真的来自配置。
+# =============================================================================
+fss_add_test(test_remote_validators
+  SOURCES integration/test_remote_validators.cpp
+  LIBS    fss_json Threads::Threads
+  LABELS  "phase10;integration")
+add_dependencies(test_remote_validators fss_server)

@@ -475,7 +475,12 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   if (file_source.empty()) {
     return Err(fss::ErrorKind::kFileSourceEmpty, "FileSource can not be empty");
   }
-  // 3c. 可选校验器（legal / schema）；失败即 400
+  // 3c. 可选校验器（legal / schema）。**失败方向由 ErrorKind 决定，不是恒定的 400**：
+  //      · 本地空值防线 / 远端明确"不通过" → kInvalidArgument → **400**
+  //        （400 的固定消息来自本地校验，逐字保留；远端 message 只用于"不通过"）
+  //      · 远端**依赖故障**（超时 / 连不上 / 非 200 / 坏 JSON / 缺 valid）→
+  //        `kUnavailable` → **503**（fail-closed，绝不降级成"通过"或"不通过"）
+  //     `FSS_TRY` 把 ErrorKind 原样透传，所以这里不需要分支（P10 切片 6a / ADR-013）。
   FSS_TRY(ports_.legal.Validate(caller.partition, record.legal.legaltags));
   FSS_TRY(ports_.schema.Validate(record.kind, ToJson(record)));
 
