@@ -45,6 +45,9 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -544,6 +547,88 @@ Result<void> ValidateOptions(const ServerOptions& options) {
 // =============================================================================
 //  Server::Impl
 // =============================================================================
+//  SafeThreadPool（C9.32）—— `httplib::ThreadPool` 的**安全替代**（同语义）
+// =============================================================================
+//  为什么不能直接用 `httplib::ThreadPool`：
+//    · 它由 `new_task_queue()` 在 **runner 线程**里构造（见 httplib.h 的
+//      `listen_internal()`），`ThreadPool` 的构造函数用
+//      `threads_.emplace_back(worker(*this))` 逐个起线程；
+//    · 一旦某次 `pthread_create` 返回 `EAGAIN`（容器 `--pids-limit` 不足；实测下界
+//      66 = 64 worker + 主/监听），异常从构造函数抛出时，**已建好的 joinable
+//      `std::thread` 向量会在栈展开中被析构** → `std::terminate` → 进程中止
+//      （容器 `ExitCode=139`，**不是 OOM**）。
+//    · 这个 terminate 发生在 **runner 线程**里，`main()` 的顶层 catch 看不到它
+//      —— 单靠顶层兜底**修不了**这条真实缺陷（实测：加了顶层 catch 仍是 139）。
+//  本类做两件事，让失败变成**可传播的异常**：
+//    ① 逐个建线程；任一失败就把**已建线程 join 干净**再重抛（绝不留 joinable thread）；
+//    ② `Server::Start()` 在 runner 线程上捕获该异常并在**主线程重抛**，于是它走
+//       `RunServer` 的栈展开（RAII stop/join）→ `main()` 顶层 catch → exit 70。
+//  语义与 `httplib::ThreadPool(workers)`（`max_queued_requests=0` = 无上限）等价。
+// =============================================================================
+class SafeThreadPool final : public httplib::TaskQueue {
+ public:
+  explicit SafeThreadPool(std::size_t n) {
+    try {
+      threads_.reserve(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        threads_.emplace_back([this] { Worker(); });
+      }
+    } catch (...) {
+      // ★ 关键：先把已建线程停掉并 join（不留 joinable thread → 不 terminate），再重抛。
+      StopAndJoin();
+      throw;
+    }
+  }
+
+  ~SafeThreadPool() override { StopAndJoin(); }
+
+  bool enqueue(std::function<void()> fn) override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_) return false;
+      jobs_.push_back(std::move(fn));
+    }
+    cond_.notify_one();
+    return true;
+  }
+
+  void shutdown() override { StopAndJoin(); }
+
+ private:
+  void StopAndJoin() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_) return;
+      shutdown_ = true;
+    }
+    cond_.notify_all();
+    for (auto& worker_thread : threads_) {
+      if (worker_thread.joinable()) worker_thread.join();
+    }
+  }
+
+  void Worker() {
+    for (;;) {
+      std::function<void()> fn;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cond_.wait(lock, [this] { return shutdown_ || !jobs_.empty(); });
+        if (shutdown_ && jobs_.empty()) return;
+        fn = std::move(jobs_.front());
+        jobs_.pop_front();
+      }
+      fn();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cond_;
+  std::deque<std::function<void()>> jobs_;
+  std::vector<std::thread> threads_;
+  bool shutdown_ = false;
+};
+
+// =============================================================================
 struct Server::Impl {
   ServerOptions options;
   const logging::ILogger* logger;
@@ -552,6 +637,15 @@ struct Server::Impl {
   std::string last_error;
   int bound_port = 0;
   std::thread runner;
+  //  ★ C9.32：runner 线程里的异常经这里回到主线程（跨线程异常不能直接抛出）
+  std::mutex start_mutex;
+  std::exception_ptr start_error;
+  //  ★ C9.32：`new_task_queue()` 成功返回后才置位。**不能只等 `is_running()`**：
+  //    httplib 的 `listen_internal()` 在调用 `new_task_queue()` **之前**就把
+  //    `is_running_` 置 true，于是"线程池正在创建、尚未失败"的窗口里主线程会误判
+  //    "已启动"，随后 runner 线程失败、主线程却已进入 serve 循环 → 挂死
+  //    （实测 5 次里 1 次；见 `Server::Start` 的说明）。
+  std::atomic<bool> pool_ready{false};
   std::atomic<bool> stopping{false};
   std::atomic<int> in_flight{0};
   UuidGenerator ids;
@@ -1147,7 +1241,15 @@ struct Server::Impl {
     server.set_payload_max_length(static_cast<size_t>(options.payload_ceiling_bytes));
     const int workers =
         options.worker_threads > 0 ? options.worker_threads : DefaultWorkerThreads(options);
-    server.new_task_queue = [workers] { return new httplib::ThreadPool(workers); };
+    //  ★ C9.32：用 SafeThreadPool 而不是 httplib::ThreadPool —— 后者在"线程创建失败"
+    //    时会因析构 joinable 线程而 terminate（详见 SafeThreadPool 的说明）。
+    //    `pool_ready` 必须在**构造成功之后**才置位（构造失败会抛，不置位）。
+    server.new_task_queue = [this, workers] {
+      std::unique_ptr<httplib::TaskQueue> queue(
+          new SafeThreadPool(static_cast<std::size_t>(workers)));
+      pool_ready.store(true, std::memory_order_release);
+      return queue.release();
+    };
     {
       std::lock_guard<std::mutex> lock(stats_mu);
       stats.worker_threads = workers;
@@ -1233,10 +1335,34 @@ bool Server::Listen() {
 
 bool Server::Start() {
   if (!Bind()) return false;
-  impl_->runner = std::thread([this] { impl_->server.listen_after_bind(); });
-  // 等端口真正可连（轮询而不是 sleep：AGENTS §4.3）
+  //  ★ C9.32：runner 线程里也会"抛异常"（典型是 httplib 在 `listen_internal()` 里
+  //    构造线程池时 `pthread_create` 失败）。异常**不能跨线程传播** —— 逃出
+  //    `std::thread` 的启动例程会直接 `terminate`（AGENTS §4.3 / C9.32 的实测教训）。
+  //    这里把它捕获到 `start_error`，再在**主线程**重抛：这样 `RunServer` 的栈展开
+  //    （RAII：`~GcScheduler`/`~Server` 各自 Stop+join）与 `main()` 的顶层 catch
+  //    都能正常工作，最终给出可读原因 + 退出码 70。
+  impl_->runner = std::thread([this] {
+    try {
+      impl_->server.listen_after_bind();
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(impl_->start_mutex);
+      impl_->start_error = std::current_exception();
+    }
+  });
+  //  ★ C9.32：等到**线程池真的建好**（`new_task_queue()` 成功返回）才算启动成功。
+  //    为什么不能只等 `is_running()`：httplib 的 `listen_internal()` 先置
+  //    `is_running_ = true`、后调 `new_task_queue()`；若线程池正在创建而尚未失败，
+  //    主线程会看到 `is_running()==true` 并**误判启动成功**，随后 runner 线程抛出、
+  //    主线程却已进入 serve 循环 → 永久挂死（实测 5 次里 1 次）。这里改为等
+  //    `pool_ready`，失败则把 runner 线程的异常在主线程重抛。
   for (int i = 0; i < 500; ++i) {
-    if (impl_->server.is_running()) return true;
+    {
+      std::lock_guard<std::mutex> lock(impl_->start_mutex);
+      if (impl_->start_error != nullptr) std::rethrow_exception(impl_->start_error);
+    }
+    if (impl_->pool_ready.load(std::memory_order_acquire) && impl_->server.is_running()) {
+      return true;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   impl_->last_error = "服务端未能在 1 秒内进入运行状态";

@@ -122,6 +122,7 @@ header-only 且质量高，但属 Asio 低层 API：路由、`Range`/`206`/`416`
 | **H-4** | 非法 `Range` 在**解析阶段**直接回 416 并**跳过路由**（`httplib.h:8337`） | 与 RFC 7233 §4.4（非法 → 忽略）冲突；`bytes = 0-1`、`bytes=10-5` 这类写法会拿到 416，客户端可能陷入重试 | 包装层在 `error_handler` 里重新分发为 200 全量，并记警告 |
 | **H-5** | 后缀区间 `bytes=-N` 在 `N ≥ 总长` 时算出负起点 → 416（RFC 7233 §2.1 要求按整个表示处理） | 大后缀请求（合法）被误拒 | 包装层用自己的 `bytes::ParseRangeHeader` 归一化后**覆盖** `req.ranges`，库只按绝对区间切数据 |
 | **H-6** | 多段的判定与 `res.status == 206` 强耦合：handler 自己设了 200 则 Range **完全不生效** | 越界/合法 Range 都被静默忽略 | 包装层对"已知长度的流式响应"把状态留给库决定（`dst.status = -1`），并在交给库之前完成归一化 |
+| **H-7**（C9.32） | `httplib::ThreadPool` 的构造函数用 `threads_.emplace_back(...)` 逐个建线程；任一次 `pthread_create` 返回 `EAGAIN` 时，**已建好的 joinable `std::thread` 向量在栈展开中被析构** → `std::terminate`（实测容器 `--pids-limit=64` 下 `ExitCode=139`，**不是 OOM**）。该 terminate 发生在 `listen_internal()` 的 **runner 线程**里，`main()` 的顶层 catch 看不到 | 资源耗尽时进程以不可读的 139 结束；且**只加顶层 catch 修不了**（实测仍是 139 / 偶发挂死） | 包装层用自己的 `SafeThreadPool`（同语义）：任一失败先 `join` 已建线程再重抛；`Server::Start()` 再把 runner 线程的异常**在主线程重抛**；并且只等 `pool_ready`（`new_task_queue()` 成功返回）才算启动成功，避免与 `is_running_` 竞态挂死。见 `docs/test-evidence/phase9.md` §14 / `phase9-image.md` §10.12 |
 
 **契约定义（按实测行为固化，避免"想当然"）**：
 

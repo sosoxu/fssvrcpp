@@ -19,7 +19,9 @@
 #     H1  --read-only（**不带** --tmpfs /tmp）：记录真实结果 + 根文件系统写入探测
 #     H2  --read-only + --tmpfs /tmp:rw,size=64m,mode=1777
 #     H3  --cap-drop=ALL --security-opt no-new-privileges（**Docker 默认 seccomp**）
-#     H4a --memory=128m --pids-limit=64（任务原文形态：**真实结果记录**，非断言）
+#     H4a --memory=128m --pids-limit=64（任务原文形态：**C9.32 之后是断言** ——
+#         启动期线程创建 EAGAIN 必须被顶层接住 → ExitCode==70 + 可读「未预期异常」，
+#         **不是** terminate/139）；H4a2 = pids=66 的**下界正控**（必须正常启动）
 #     H4b --memory=128m --pids-limit=256 下的 **1 GiB** 上传+读回 + 峰值内存
 #         （★ 较慢，默认跳过；FSS_VERIFY_IMAGE_FULL=1 才跑，并附 pids 下界探测）
 #     H5  --restart=on-failure + HEALTHCHECK healthy + SIGTERM 优雅退出
@@ -254,7 +256,9 @@ echo "fail-closed ✅"
 #  8) 容器硬化运行形态（[H*] 段）—— 证据：docs/test-evidence/phase9-image.md §10
 # =============================================================================
 #  每个场景：自己起容器 → 断言 readiness/uid/上传读回/峰值内存 → 自己清理。
-#  ★ H4a 与 H1 是"记录真实结果"的场景，不作为断言失败（它们的失败本身就是发现）。
+#  ★ H1 是"记录真实结果"的场景，不作为断言失败（它的失败本身就是发现）。
+#  ★ H4a / H4a2（C9.32）是**断言**场景：pids=64 → ExitCode==70 + 可读原因；
+#    pids=66 → 正常启动（下界正控）。两者一起才有区分力。
 #  ★ H4b（1 GiB 流式）默认跳过：FSS_VERIFY_IMAGE_FULL=1 启用。
 # =============================================================================
 HARD_DIR="${REPO_ROOT}/build/image-verify-hardening"
@@ -519,9 +523,15 @@ record_scenario "H3 cap-drop=ALL + NNP" "${H3_CODE}" "${H3_UID}" "${H3_E2E}" "$(
 end_scenario
 
 # -----------------------------------------------------------------------------
-#  H4a：资源上限的**任务原文形态** --memory=128m --pids-limit=64（记录真实结果）
+#  H4a：资源上限的**任务原文形态** --memory=128m --pids-limit=64
+#  ★ C9.32 之后这里从"记录真实结果"**升级为断言**：pids=64 < 默认线程数 66 →
+#    启动期 `pthread_create` 返回 EAGAIN → `std::thread` 抛 `std::system_error`
+#    → 被 `main()` 顶层 catch 接住 → **ExitCode=70（EX_SOFTWARE）+ 可读原因**；
+#    **不再是** `terminate called` / 139。
+#  ★ 下界正控见紧随其后的 H4a2（pids=66 必须正常启动）—— 否则"pids=64 失败"可能
+#    只是"容器根本没起来"（AGENTS §4.3：否定判据必须配正控）。
 # -----------------------------------------------------------------------------
-hard_log H4a "资源上限（任务原文形态）：--memory=128m --pids-limit=64"
+hard_log H4a "资源上限（任务原文形态）：--memory=128m --pids-limit=64 → 期望 exit 70 + 可读原因"
 start_hardened limits_128m_64pids --memory=128m --pids-limit=64
 H4A_CODE=""
 for _ in $(seq 1 40); do
@@ -533,20 +543,47 @@ for _ in $(seq 1 40); do
 done
 H4A_EXIT="$(docker inspect -f '{{.State.ExitCode}}' "${HARD_CID}" 2>/dev/null || echo NA)"
 H4A_OOM="$(docker inspect -f '{{.State.OOMKilled}}' "${HARD_CID}" 2>/dev/null || echo NA)"
-H4A_ERR="$(docker logs "${HARD_CID}" 2>&1 | grep -m2 -E 'terminate called|what\(\)' | tr '\n' ' ' || true)"
+H4A_LOG="$(docker logs "${HARD_CID}" 2>&1 || true)"
+H4A_ERR="$(printf '%s' "${H4A_LOG}" | grep -m2 '未预期异常' | tr '\n' ' ' || true)"
+H4A_TERM="$(printf '%s' "${H4A_LOG}" | grep -c 'terminate called' || true)"
 printf '   readiness=%s  ExitCode=%s  OOMKilled=%s\n' "${H4A_CODE}" "${H4A_EXIT}" "${H4A_OOM}"
-printf '   日志: %s\n' "${H4A_ERR:-（无 terminate/what 行）}"
-if [ "${H4A_CODE}" = "200" ]; then
-  hard_ok "该上限下服务正常（readiness=200）"
-  H4A_UID="$(docker exec "${HARD_CID}" id -u 2>/dev/null || echo NA)"
-  record_scenario "H4a 128m + pids=64" "200" "${H4A_UID}" "$(hard_vmhwm_mib "${HARD_CID}")" "通过"
-  end_scenario
-else
-  H4A_UID="NA"
-  hard_note "任务原文形态 --memory=128m --pids-limit=64 **起不来**：ExitCode=${H4A_EXIT} OOMKilled=${H4A_OOM}；日志=[${H4A_ERR}]（详见证据 §10：pids-limit 64 < 默认线程数 66 → 线程创建 EAGAIN → 未捕获的 std::system_error → 进程终止；**不是内存不足**）"
-  record_scenario "H4a 128m + pids=64" "${H4A_CODE}" "${H4A_UID}" "未做（容器未就绪）" "-" "**失败（真实发现）**：pids=64<66 线程 → 启动即终止 exit ${H4A_EXIT}（非 OOM）"
-  end_scenario
-fi
+printf '   日志: %s\n' "${H4A_ERR:-（没有「未预期异常」行）}"
+#  ① 退出码必须是 70（EX_SOFTWARE），不是 terminate 的 139/134
+[ "${H4A_EXIT}" = "70" ] && hard_ok "ExitCode=70（EX_SOFTWARE；不再是 terminate/139）" \
+                         || hard_bad "ExitCode=${H4A_EXIT}（期望 70）"
+#  ② stderr 必须给出可读原因（只有退出码、没有原因 = 对运维仍不可读）
+printf '%s' "${H4A_LOG}" | grep -q '未预期异常' \
+  && hard_ok "stderr 含「未预期异常」（异常被顶层接住，原因可读）" \
+  || hard_bad "stderr 没有「未预期异常」"
+#  ③ 绝不能出现原始 terminate 文案
+[ "${H4A_TERM}" -eq 0 ] && hard_ok "stderr **不含** terminate called" \
+                        || hard_bad "stderr 出现 ${H4A_TERM} 处 terminate called"
+#  ④ 不是 OOM（与 exit 70 一起排除"内存不足"这个错误归因）
+[ "${H4A_OOM}" = "false" ] && hard_ok "OOMKilled=false（确实不是内存不足）" \
+                           || hard_bad "OOMKilled=${H4A_OOM}"
+#  ⑤ 该上限下服务**没有**起来（66 个任务装不进 64 的 pids cgroup）
+[ "${H4A_CODE}" = "200" ] && hard_bad "pids=64 竟然 readiness=200（下界结论需修正）" \
+                          || hard_ok "readiness=${H4A_CODE}（未进入服务状态，符合预期）"
+H4A_UID="NA"
+record_scenario "H4a 128m + pids=64" "${H4A_CODE}" "${H4A_UID}" "-" "-" \
+  "**已修（C9.32）**：exit ${H4A_EXIT}（EX_SOFTWARE）+ 可读「未预期异常」；无 terminate/139（非 OOM）"
+end_scenario
+
+# -----------------------------------------------------------------------------
+#  H4a2：下界**正控** —— pids=66 必须正常启动（默认线程数下界未变）
+# -----------------------------------------------------------------------------
+hard_log H4a2 "pids 下界正控：--pids-limit=66 必须正常启动（下界=66 未变）"
+start_hardened limits_pids_66 --pids-limit=66
+H4A2_CODE="$(wait_hard_readiness "${HARD_PORT}" 30)"
+H4A2_EXIT="$(docker inspect -f '{{.State.ExitCode}}' "${HARD_CID}" 2>/dev/null || echo NA)"
+H4A2_TERM="$(docker logs "${HARD_CID}" 2>&1 | grep -c 'terminate called' || true)"
+printf '   pids=66 → readiness=%s  ExitCode=%s  terminate=%s\n' \
+  "${H4A2_CODE}" "${H4A2_EXIT}" "${H4A2_TERM}"
+[ "${H4A2_CODE}" = "200" ] && hard_ok "pids=66 readiness=200（下界=66 未变）" \
+                           || hard_bad "pids=66 readiness=${H4A2_CODE}（下界结论需修正）"
+record_scenario "H4a2 128m + pids=66" "${H4A2_CODE}" "10001" "-" "-" \
+  "下界正控：pids=66 正常启动（下界=66 未变）"
+end_scenario
 
 # -----------------------------------------------------------------------------
 #  H4b（FULL）：--memory=128m --pids-limit=256 下的 1 GiB 上传+读回 + 峰值内存

@@ -14,6 +14,9 @@
 > 见 §1.2 与 §1.3 的逐键清单）。这是一条**如实登记**。
 > 配置非法（未知键 / 类型不符 / 越界 / 跨字段冲突 / 生产强校验不过）→ 打印全部问题并
 > **以退出码 78（EX_CONFIG）拒绝启动**。
+> **未预期异常**（资源耗尽，如容器 `--pids-limit` 过小导致线程创建 `EAGAIN`；或
+> `std::bad_alloc`）→ `main()` **顶层兜底**打印可读原因并
+> **以退出码 70（EX_SOFTWARE）结束**（C9.32；**不再是** `terminate` / 139）。
 
 ---
 
@@ -62,6 +65,8 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | 默认存储驱动 | `posix`（`storage.driver` / `FSS_STORAGE_DRIVER`） |
 | 默认鉴权 | 组合根默认 `disabled`（`auth.mode`，**与 schema 默认 `jwt` 不同** —— 见 §1.4）；生产必须 `jwt` |
 | 配置非法 | 打印全部问题 + **退出码 78（EX_CONFIG）** |
+| 未知命令行参数 | 打印用法 + **退出码 2** |
+| **未预期异常**（线程创建 `EAGAIN` / `bad_alloc` 等） | 顶层 catch → 打印可读原因（`未预期异常（exit 70）：…`）+ **退出码 70（EX_SOFTWARE）**；**不再**是 `terminate` / 139 |
 
 ---
 
@@ -84,6 +89,11 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
   与每项来源（`cli` / `env` / `file` / `default`，旧别名额外标注 `别名 FSS_XXX`），随后退出 0。
 * **失败语义**：配置非法 → 一次性打印**全部**问题（`path + 原因 + 来源`）→ **退出码 78（EX_CONFIG）**。
   这条对运维很重要：只报第一个问题会导致"改一个、重启、再发现一个"的迭代。
+* **未预期异常**（`main()` 顶层兜底，C9.32）→ `未预期异常（exit 70）：<what()>` + 一行静态提示
+  → **退出码 70（EX_SOFTWARE）**。典型触发是容器 `--pids-limit` 过小（见 §8）或内存耗尽。
+  **绝不**把这类异常归到 78（那是配置问题，会误导排查方向）或 2（那是命令行用法错误）。
+  可直接驱动这条路径的故障注入接缝：环境变量 `FSS_STARTUP_FAULT_INJECT`
+  （取值与禁令见 [`runbook.md`](runbook.md) 的测试/演练小节；**不要在生产设置**）。
 * **`${ENV:VAR}` 引用**：示例文件里的密文键写成 `${ENV:VAR_NAME}` —— 现在由
   `fss::config` 加载器解析（组合根走的就是加载器），因此这些引用**已生效**。
 * 示例文件里的内嵌 `${ENV:...}` 名与组合根支持的别名**不完全一致**（3 处），见 §1.4 的别名表。
@@ -982,7 +992,7 @@ find /var/lib/fss/data/blobs -name '*.tmp.*' -mmin +1440 -delete
 | 真实 NFS / 多客户端共享挂载语义 | **未验证** | ADR-009 登记为**上生产硬前提**（C9.27 未验证）；实现不依赖 NFS 文件锁 |
 | 容器镜像 | **已验证（Docker 实测）** | [`docs/test-evidence/phase9-image.md`](test-evidence/phase9-image.md)（C9.8 基础断言：构建 / 启动 / `readiness_check` 200 / 强制 jwt（无 token、伪 token 均 401）/ 非 root uid 10001 / HEALTHCHECK `healthy` / `auth.mode=disabled` 与空密钥 exit 64）**+ 同文件 §10 容器硬化实测**（只读 rootfs、最小权限、资源上限下的 1 GiB 流式、HEALTHCHECK + `--restart=on-failure` + SIGTERM 优雅退出、健康检查负控、反向对照；命令 = `scripts/verify_image.sh` 的 `[H*]` 段） |
 | **容器硬化运行形态（`--read-only` / `--cap-drop=ALL` / 资源上限 / 重启 + SIGTERM）** | **已在 Docker 上实测** | 证据 §10。要点：`--read-only`（**不带** `--tmpfs /tmp`）即可 readiness 200 + 上传读回，根文件系统 `touch` 被 `Read-only file system` 拒绝 ⇒ **本服务不需要可写 rootfs，也不需要可写 `/tmp`**；`--read-only --tmpfs /tmp:rw,size=64m,mode=1777` 同样通过；`--cap-drop=ALL --security-opt no-new-privileges`（**Docker 默认 seccomp**，未用 `unconfined`）下 `CapBnd=0`/`NoNewPrivs=1` 且通过；`--memory=128m --pids-limit=256` 下 **1 GiB** 上传+读回 SHA-256 一致（5.1 s）、**进程峰值 RSS 20.9 MiB**（cgroup `memory.peak` 128.1 MiB 是写 1 GiB 的页缓存记账后被回收，非进程占用）；`--restart=on-failure` + HEALTHCHECK `healthy` + `docker stop -t 10` → `ExitCode=0`、**0.30 s** < grace、`RestartCount=0`、无 terminate/死锁痕迹（GC 周期调度线程在跑） |
-| **容器 `--pids-limit` 过小（< 66）** | **已实测的部署陷阱（未修，登记）** | `--memory=128m --pids-limit=64` **启动即终止**：`terminate called after throwing an instance of 'std::system_error'` / `what(): Resource temporarily unavailable`、`ExitCode=139`、`OOMKilled=false`。根因：默认 `server.http.worker_threads = max(16, 4×nproc)` ⇒ 本机 16 核 = **64 个 HTTP 工作线程 + 主/监听线程 = 66 个任务**，pids cgroup 上限先于内存耗尽。实测下界：`--pids-limit=65` 失败、**66 成功**。建议 `--pids-limit ≥ 128`（或显式调小 `server.http.worker_threads`）。最小修法（留给后续切片）：`main()` 顶层 catch `std::exception` → 干净退出码 + 消息，而不是 `terminate`/139 |
+| **容器 `--pids-limit` 过小（< 66）** | **已实测的部署陷阱（已修，C9.32）** | 现象（修复前）：`--memory=128m --pids-limit=64` **启动即终止**：`terminate called after throwing an instance of 'std::system_error'` / `what(): Resource temporarily unavailable`、`ExitCode=139`、`OOMKilled=false`。根因：默认 `server.http.worker_threads = max(16, 4×nproc)` ⇒ 本机 16 核 = **64 个 HTTP 工作线程 + 主/监听线程 = 66 个任务**，pids cgroup 上限先于内存耗尽。**修复后（C9.32）**：`main()` 顶层 `catch (std::exception)` + `catch (...)` → **ExitCode=70（EX_SOFTWARE）+ 可读 `未预期异常（exit 70）：…`**，**不再出现 `terminate`/139**（容器回归断言见 `scripts/verify_image.sh` 的 H4a/H4a2）。实测下界**未变**：`--pids-limit=65` 失败、**66 成功**。建议 `--pids-limit ≥ 128`（或显式调小 `server.http.worker_threads`） |
 | **`/v2/info` 暴露 `ioEngine`/`ioUringAvailable`（C9.30 的"暴露"部分）** | **未交付** | 容器实测 `/v2/info` = `{"authMode":"jwt","buildVersion":"0.1.0","connectedOuterServices":["storage"],"version":"v2"}`（**正控**：`version` 在，避免"没有该字段"恒真）；全仓 `ioEngine`/`ioUringAvailable` 源码零命中。**`/metrics` 的 `fss_io_engine{engine="blocking",requested="blocking"} 1` 是有的**（已实测，见 §3 指标表）。补字段会改契约响应形状 + gRPC `GetInfo` 等价性，须按 `AGENTS.md` §2.2 同步 |
 | **K8s（`readOnlyRootFilesystem` / restricted PodSecurity / `runAsNonRoot` / `fsGroup`）** | **未验证** | 无集群。Docker 的 `--read-only` / `--cap-drop=ALL` / 默认 seccomp 与 K8s 的对应项**等价但非同一实现**；K8s restricted 的 seccomp 是 `RuntimeDefault`（≈ Docker 默认 profile），但**不等价于**自建/更严的 profile。需：真实集群 + 目标运行时 |
 | **镜像 CVE 扫描 / 多架构（arm64）** | **未验证** | 本机无 trivy/grype/syft/clair，且 **Docker registry 不可达**（拉不到扫描器镜像）→ 需要"能拉 registry 的环境 + 扫描器"；多架构需要 qemu/binfmt 或原生 arm64 构建器（本机无，未做 `--platform`） |

@@ -543,6 +543,10 @@ H8 默认 seccomp + 暴露面  | 200       | 10001  | PUT=200 GET=200 sha=一致
 
 > 表头"进程峰值RSS"= 传输后的 `/proc/1/status` `VmHWM`（KiB/1024），**不是** cgroup `memory.peak`
 > —— 两者含义不同，见 §10.5。
+>
+> ⚠️ 上表是**本轮（P9 当时）运行的原始输出**，其中 H4a 的行为（`exit 139` + terminate）
+> 已在 **C9.32** 中修复：现在 `--pids-limit=64` 应为 **`ExitCode=70` + 可读「未预期异常」**，
+> 且 H4a 从"记录真实结果"升级为**断言**（另加 H4a2 = pids=66 正控）。修复后的真实输出见 **§10.12**。
 
 ### 10.3 逐场景：命令 + 真实输出
 
@@ -720,7 +724,7 @@ docker run -d --read-only -v <data>:/data -e FSS_SELF_BASE_URL=http://127.0.0.1:
   报 `curl: option --data-binary: out of memory`，rc=2）—— 那样测的是 curl 而不是服务端。
   大文件必须用 `-T`（流式上传）；脚本已改用 `-T` 并在注释里写明。
 
-### 10.6 pids 上限的实测下界与**新登记的部署陷阱**
+### 10.6 pids 上限的实测下界与**已修的部署陷阱（C9.32）**
 
 * 默认 `server.http.worker_threads` = `max(16, 4 × nproc)`（`src/common/http/server.cpp` 的
   `DefaultWorkerThreads`）⇒ 本机 16 核 = **64 个 HTTP 工作线程**，加主/监听线程 ⇒ `ls /proc/1/task | wc -l`
@@ -731,9 +735,13 @@ docker run -d --read-only -v <data>:/data -e FSS_SELF_BASE_URL=http://127.0.0.1:
 * 实测下界：**65 失败 / 66 成功**（恰好等于默认线程数）。
 * **建议**：`--pids-limit ≥ 128`（留余量），或显式调小 `server.http.worker_threads`（它是 HTTP
   并发上限；调小会同时降低并发能力）。
-* **未修的最小改法（留给后续切片，登记在 `operations.md` §8）**：在 `main()` 顶层 catch
-  `std::exception` → 打印一行并返回干净退出码（而不是 `terminate`/139）。本轮**只登记不修**：
-  那属于产品代码的退出路径改动，需要独立的自证（R1）与回归。
+* **已修（C9.32，P10 期间补交）**：`main()` 变成**薄包装** —— 函数体搬进
+  `static int RunServer(...)`，外面套 `catch (const std::exception&)` + `catch (...)`，
+  打印可读原因并以 **`exit 70`（EX_SOFTWARE）** 结束（不再是 `terminate`/139）。
+  `--pids-limit=64` 的**回归断言**见 `scripts/verify_image.sh` 的 H4a（`ExitCode==70` +
+  stderr 含「未预期异常」+ **不含** `terminate called`）与 H4a2（`--pids-limit=66` 正控）。
+  本轮实测输出、R1 自证与未验证项见本文 **§10.12**；运维侧登记见 `operations.md` §8 与
+  `runbook.md` §1/§10。
 
 ### 10.7 EROFS 反向对照的**区分力**（R1 自证结论，如实写）
 
@@ -810,3 +818,55 @@ C9.8 + 容器硬化                 ✅ 全部断言通过
 另外我核实了子代理对我两处前提的更正，**它是对的**：① `scripts/run_all_gates.sh`
 **不调用** `verify_image.sh`/docker（只跑 `ctest -L phaseN` 与少数 `verify_*.sh`），因此本切片
 不改变门槛时长；② `C9.26~C9.30` 的原文与"容器硬化"无关（我的规格写错，已按原文改正标注）。
+
+### 10.12 C9.32：`--pids-limit=64` 从"终止/139"变成"**干净退出码 70 + 可读原因**"（本轮补交）
+
+> 本节是 §10.6 那条"未修陷阱"的**修复后证据**，对应 C9.32；进程内判据与 R1 自证见
+> `docs/test-evidence/phase9.md` §14。命令：`./scripts/verify_image.sh`（H4a/H4a2）。
+
+**结论**：`--memory=128m --pids-limit=64` 现在以 **`ExitCode=70`（EX_SOFTWARE）+ 可读
+`未预期异常（exit 70）：Resource temporarily unavailable`** 结束，**不再出现 `terminate called`**，
+`OOMKilled=false`；`--pids-limit=66` 仍**正常启动**（下界未变）。
+
+**命令与真实输出**（`./scripts/verify_image.sh`，rc=0）：
+
+```
+-- [H4a] 资源上限（任务原文形态）：--memory=128m --pids-limit=64 → 期望 exit 70 + 可读原因
+   container=36abf0751547 host_port=42977
+   readiness=000  ExitCode=70  OOMKilled=false
+   日志: 未预期异常（exit 70）：Resource temporarily unavailable
+   ✅ ExitCode=70（EX_SOFTWARE；不再是 terminate/139）
+   ✅ stderr 含「未预期异常」（异常被顶层接住，原因可读）
+   ✅ stderr **不含** terminate called
+   ✅ OOMKilled=false（确实不是内存不足）
+   ✅ readiness=000（未进入服务状态，符合预期）
+
+-- [H4a2] pids 下界正控：--pids-limit=66 必须正常启动（下界=66 未变）
+   container=03036d10c846 host_port=59329
+   pids=66 → readiness=200  ExitCode=0  terminate=0
+   ✅ pids=66 readiness=200（下界=66 未变）
+```
+
+汇总表新增行：
+
+```
+H4a 128m + pids=64             | 000  | NA    | - | - | **已修（C9.32）**：exit 70（EX_SOFTWARE）+ 可读「未预期异常」；无 terminate/139（非 OOM）
+H4a2 128m + pids=66            | 200  | 10001 | - | - | 下界正控：pids=66 正常启动（下界=66 未变）
+```
+
+**⚠️ 第一次 H4a 复跑是失败的（如实记录，不许放过）**：只加 `main()` 顶层 catch 后重跑 H4a，
+结果**仍是** `ExitCode=139` + `terminate called ... std::system_error`。根因不在 `main`：
+64 个工作线程是 `httplib` 在 **runner 线程**里（`listen_internal()` → `new_task_queue()`）
+创建的，`httplib::ThreadPool` 在部分创建失败时会**析构 joinable 的 `std::thread` 向量** →
+`terminate`，而它发生在非主线程，顶层 catch 看不到。修法是 `fss_http` 包装层的
+`SafeThreadPool`（失败先 join 已建线程再重抛）+ `Server::Start()` 把 runner 异常在主线程
+重抛 + 只等 `pool_ready`（`new_task_queue()` 成功返回）—— 详见
+`docs/test-evidence/phase9.md` §14 与 `docs/adr/ADR-002-http-framework.md` §4.1 的 H-7。
+
+**未验证项**（与 §10.8 同口径）：
+
+| 项 | 状态 |
+| --- | --- |
+| 其它容器运行时（K8s / containerd / Podman）的 pids 限制 | ⬜ 未验证（只测 Docker + cgroup pids controller） |
+| `--pids-limit=65` 在新代码下的逐点行为 | ⚠ 默认路径未断言（历史下界"65 失败/66 成功"保留记载）；`FSS_VERIFY_IMAGE_FULL=1` 的 H4b2 仍会探 65/66 |
+| 其它线程里逃出的异常 | ⬜ **不在本切片范围**（仍会 terminate），见 `phase9.md` §14.5 |

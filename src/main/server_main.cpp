@@ -69,6 +69,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -83,6 +84,15 @@ namespace {
 //  EX_CONFIG（sysexits.h）：配置/部署形态非法 → 拒绝启动。写进 docs/operations.md。
 constexpr int kExitConfigError = 78;
 
+//  EX_SOFTWARE（sysexits.h）：**未预期异常**逃到顶层 → 干净退出（C9.32）。
+//  ★ 为什么不复用 78（EX_CONFIG）：78 的语义是"这份配置/部署形态不合法，改配置再来"。
+//    线程创建 EAGAIN、bad_alloc 这类**运行期资源耗尽**与配置文件无关 —— 归到 78 会把
+//    运维引向错误的排查方向（反复改配置文件），而真实原因在容器 `--pids-limit` / 内存。
+//  ★ 为什么不复用 2：2 在本程序里是"未知命令行参数 / 用法错误"（`ParseCli` 失败），
+//    而且 2 是 shell 内建命令误用的通用保留码；把异常折进 2 就无法区分这两类。
+//  70 = EX_SOFTWARE 是唯一"内部软件错误"的标准退出码，且不与 78/2 冲突。
+constexpr int kExitInternalError = 70;
+
 const char* const kUsage =
     "用法: fss_server [选项]\n"
     "  --config <path>          加载带注释的 JSON 配置文件（等价环境变量 FSS_CONFIG）\n"
@@ -96,6 +106,71 @@ const char* const kUsage =
 std::string Env(const char* key, const std::string& fallback) {
   if (const char* value = std::getenv(key); value != nullptr && *value != '\0') return value;
   return fallback;
+}
+
+// =============================================================================
+//  启动/运行期**故障注入接缝**（测试/演练用；**不是配置键**）
+// =============================================================================
+//  环境变量 `FSS_STARTUP_FAULT_INJECT` 的取值：
+//    ""                     → 不注入（默认；**生产绝不设置**）
+//    "throw_system_error"   → 精确复刻容器 `--pids-limit` 过小时的失败形态：
+//                             `pthread_create` 返回 `EAGAIN` → `std::thread` 抛
+//                             `std::system_error(resource_unavailable_try_again,
+//                             "Resource temporarily unavailable")`
+//    "throw_bad_alloc"      → `std::bad_alloc{}`（内存耗尽）
+//    "throw_unknown"        → 一个**非 std** 类型的自定义结构（唯一目的是驱动顶层
+//                             `catch (...)`）
+//    "throw_after_start"    → HTTP 服务器已 `Start()`、GC 调度线程已 `Start()`
+//                             **之后**再抛（证明异常路径上 RAII 清理真的发生：
+//                             `GcScheduler::~GcScheduler → Stop()+join`、
+//                             `http::Server::~Server → Stop()`）
+//  未知取值 → **不注入**（与 `FSS_AUDIT_FAULT_INJECT` 只认 `"1"` 同一宽容策略；这是
+//  测试接缝，不做配置级 fail-fast，避免误伤）。
+//
+//  ★ 为什么不做成配置键（与 `FSS_AUDIT_FAULT_INJECT` / P9 的 `mock_entitlements
+//    --fail-file` 同一理由）：
+//    ① 156 个叶子键的三态清单（生效 107 / 拒绝启动 18 / 已读但无效果 31）是
+//       `test_operations_doc` **机械比对** `config/fss.example.json` 与
+//       `docs/operations.md` 的；凭空加一个键会让计数与逐键语义双双失真；
+//    ② 它也不是运维语义 —— 没有"生产上要不要让启动抛异常"这种配置项；
+//       `--pids-limit` 才是真实的那条路径（容器层，不在应用配置面）。
+//  ⚠️ **不要在生产设置** `FSS_STARTUP_FAULT_INJECT`（见 docs/runbook.md 的测试/演练小节）。
+// =============================================================================
+struct StartupFaultUnknown {};  // 非 std 类型：唯一的用途是驱动顶层 `catch (...)`
+
+std::string StartupFaultInjection() {
+  const char* value = std::getenv("FSS_STARTUP_FAULT_INJECT");
+  return (value == nullptr) ? std::string() : std::string(value);
+}
+
+//  按取值抛出对应异常（`which` 必须是上面登记的取值之一；调用点已判定）。
+[[noreturn]] void ThrowStartupFault(const std::string& which) {
+  if (which == "throw_system_error") {
+    throw std::system_error(
+        std::make_error_code(std::errc::resource_unavailable_try_again),
+        "Resource temporarily unavailable");
+  }
+  if (which == "throw_bad_alloc") {
+    throw std::bad_alloc{};
+  }
+  //  `throw_unknown` 与 `throw_after_start` 都抛**非 std** 类型：前者覆盖
+  //  `catch (...)`，后者覆盖"晚注入点上 RAII 清理完成、随后仍被顶层接住"。
+  throw StartupFaultUnknown{};
+}
+
+//  早注入点：**CLI 解析之后、任何资源装配之前**。与 pids 那次故障的发生时机同段
+//  （都发生在装配期线程创建），因此注入形态与真实故障同族。
+void MaybeInjectStartupFaultEarly() {
+  const std::string which = StartupFaultInjection();
+  if (which == "throw_system_error" || which == "throw_bad_alloc" || which == "throw_unknown") {
+    ThrowStartupFault(which);
+  }
+}
+
+//  晚注入点：HTTP 服务器已 `Start()`、GC 调度线程已 `Start()` 之后。
+//  ★ **只在主线程抛**：跨线程逃出的异常会直接 `terminate`（那是另一个话题，不在本切片）。
+void MaybeInjectStartupFaultAfterStart() {
+  if (StartupFaultInjection() == "throw_after_start") ThrowStartupFault("throw_after_start");
 }
 
 //  schema 默认的脱敏键清单（与 config/fss.example.json 的 `observability.redact_keys`
@@ -946,7 +1021,15 @@ extern "C" void HandleStopSignal(int) { g_stop_requested = 1; }
 
 }  // namespace
 
-int main(int argc, char** argv) {
+// =============================================================================
+//  RunServer —— 原来的 `main()` 全文（C9.32：整段搬进来，函数体逐字不变）
+// =============================================================================
+//  为什么要把函数体搬出来：`main()` 必须是**薄包装**，才能在它外面套一层
+//  `try/catch` 把"未捕获异常 → terminate/139"变成"可读原因 + 确定退出码 70"。
+//  这一层**不做任何清理**：`RunServer` 的局部对象（`GcScheduler`/`http::Server`/
+//  gRPC 句柄/仓储/驱动）在栈展开时按 RAII 完成 stop/join/close（见测试
+//  `throw_after_start` 的墙钟断言）。
+static int RunServer(int argc, char** argv) {
   using namespace fss;
   using namespace fss::infra;
 
@@ -966,6 +1049,10 @@ int main(int argc, char** argv) {
   //  `--config` 优先于 `FSS_CONFIG`（CLI > env）。
   const std::string config_path =
       cli.config_from_cli ? cli.config_path : Env("FSS_CONFIG", std::string());
+
+  //  ---- 故障注入接缝的**早注入点**（测试/演练用；**不是配置键**）----
+  //  ★ 位置：CLI 解析之后、任何资源装配之前（见 MaybeInjectStartupFaultEarly 的说明）。
+  MaybeInjectStartupFaultEarly();
 
   // ===========================================================================
   //  ② 配置加载（C10.1/C10.2）：cli(--set) > env(通用名) > file > schema 默认
@@ -2126,6 +2213,12 @@ int main(int argc, char** argv) {
     gc_scheduler->Start();
   }
 
+  //  ---- 故障注入接缝的**晚注入点**（测试/演练用；**不是配置键**）----
+  //  ★ 此时 HTTP 服务器已 `Start()`、GC 调度线程已在跑 —— 用于证明"异常路径上 RAII
+  //    清理真的发生且不挂死"（`GcScheduler::~GcScheduler → Stop()+join`、
+  //    `http::Server::~Server → Stop()`）。★ 只在主线程抛。
+  MaybeInjectStartupFaultAfterStart();
+
   //  ★ 优雅停止（C10.9）：SIGINT/SIGTERM 只置位；主循环**轮询**该标志
   //    （不用固定 sleep 等状态 —— AGENTS §4.3），随后走**唯一的**退出路径。
   std::signal(SIGINT, HandleStopSignal);
@@ -2148,4 +2241,25 @@ int main(int argc, char** argv) {
   }
   grpc_service.reset();
   return 0;
+}
+
+// =============================================================================
+//  main —— **薄包装**：只负责"未预期异常 → 可读原因 + 确定退出码 70"（C9.32）
+// =============================================================================
+//  ★ 这一层**不做清理**：所有资源都在 `RunServer` 的局部对象里，栈展开时 RAII 已完成。
+//  ★ 消息里**不得**出现任何配置值/密钥：只允许 `what()` 与这段**静态**提示
+//    （`what()` 可能含路径，但绝不含 `storage.s3.secret_key` 之类的配置值 ——
+//    组合根从不把密钥放进异常消息；本文件里唯一的异常构造是故障注入接缝）。
+int main(int argc, char** argv) {
+  try {
+    return RunServer(argc, argv);
+  } catch (const std::exception& e) {
+    std::cerr << "未预期异常（exit " << kExitInternalError << "）：" << e.what() << "\n"
+              << "常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；"
+                 "或内存不足（bad_alloc）。\n";
+    return kExitInternalError;
+  } catch (...) {
+    std::cerr << "未预期异常（未知类型，exit " << kExitInternalError << "）\n";
+    return kExitInternalError;
+  }
 }

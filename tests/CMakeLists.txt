@@ -585,6 +585,25 @@ fss_add_test(test_gc_endpoint
 # 被测进程就是 build/bin/fss_server → 构建它必须先于本测试
 add_dependencies(test_gc_endpoint fss_server)
 
+# =============================================================================
+#  C9.32（P9 补交，P10 期间完成）：**未预期异常必须以干净退出码结束**
+#    真实 `build/bin/fss_server` + 故障注入接缝 `FSS_STARTUP_FAULT_INJECT`
+#    （环境变量，**不是配置键**）：
+#    ① `throw_system_error`（复刻 pids EAGAIN）→ exit 70 + 可读原因 + 无 terminate
+#    ② `throw_bad_alloc` → exit 70 + 可读原因
+#    ③ `throw_unknown`（非 std 类型）→ exit 70 + 「未知类型」（证明 catch (...) 生效）
+#    ④ **不注入** → readiness 200 且不出现「未预期异常」（R16 正例）
+#    ⑤ `throw_after_start`（服务器已起 + GC 调度已在跑之后抛）→ exit 70、<5 s 退出
+#       （证明 RAII 清理不卡 join）
+#    ⑥ 注入点在 CLI 解析之后（`--help` 仍 exit 0）
+# =============================================================================
+fss_add_test(test_startup_faults
+  SOURCES integration/test_startup_faults.cpp
+  LIBS    Threads::Threads
+  LABELS  "phase9;integration")
+# 被测进程就是 build/bin/fss_server → 构建它必须先于本测试
+add_dependencies(test_startup_faults fss_server)
+
 # C9.31（P9 补交）：`GcTask::Run` 的**单飞护栏**（L4 单测；用会阻塞的 blob store 替身
 # 把"确实还在跑"变成确定性判据，而不是 sleep 猜时序）
 fss_add_test(test_gc_task_single_flight

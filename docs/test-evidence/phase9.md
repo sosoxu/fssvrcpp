@@ -651,3 +651,233 @@ assertions: 122 | 121 passed | 1 failed
 **R2 不变量未被放宽**（已核对代码）：`src/main/server_main.cpp:1331` 仍对
 `storage.posix.sync_dir_after_batch=false` 拒绝启动（ADR-008 §5 的 R2：rename 之后必须
 fsync 目录），**没有**为了多一个"生效"键去放宽它 —— 这是本切片刻意保留的拒绝项。
+
+---
+
+## 14. P9 补交（P10 期间完成）：未预期异常必须以**干净退出码**结束（C9.32）
+
+> **指针**：判据编号 **C9.32**（`docs/04-implementation-plan.md` 的 P9 段）；故障接缝的运维登记
+> 在 `docs/runbook.md` §10；容器侧真实回归见 `docs/test-evidence/phase9-image.md` §10.12；
+> HTTP 包装层的新增偏离见 `docs/adr/ADR-002-http-framework.md` §4.1 的 **H-7**。
+
+### 14.1 结论（先说答案）
+
+* **顶层兜底**：`main()` 变成**薄包装**（函数体搬进 `static int RunServer`），外面套
+  `catch (const std::exception&)` + `catch (...)`：
+  * 退出码 **70（EX_SOFTWARE）**，消息 `未预期异常（exit 70）：<what()>` + 一行静态提示；
+  * **不复用 78**（那是"配置/部署形态非法"，会把运维引向改配置）与 **2**（命令行用法错误）；
+  * 既有退出码逐字不变：配置非法 **78**、未知 CLI 参数 **2**。
+  这一层**不做清理** —— 所有资源在 `RunServer` 的局部对象里，栈展开时 RAII 完成
+  （`GcScheduler::~GcScheduler` → `Stop()+join`、`http::Server::~Server` → `Stop()`、
+  gRPC 句柄 → `Shutdown()`），实测 `throw_after_start` 的墙钟退出 < 0.1 s。
+* **故障注入接缝**：环境变量 `FSS_STARTUP_FAULT_INJECT`（**不是配置键**，三态 107/18/31 不变），
+  取值 `throw_system_error` / `throw_bad_alloc` / `throw_unknown`（早注入点：CLI 解析之后、装配之前）
+  与 `throw_after_start`（晚注入点：服务器已 `Start()`、GC 调度线程已在跑之后）。
+* **★ 根因（本轮最重要的发现）**：**只加顶层 catch 修不了这条真实缺陷**。
+  容器 `--pids-limit=64` 的实测结果是 **仍然是 `ExitCode=139` + `terminate`**（第一次 H4a 复跑
+  如实记录），因为 64 个工作线程是 `httplib` 在 **runner 线程**里（`listen_internal()` →
+  `new_task_queue()`）创建的：
+  1. `httplib::ThreadPool` 用 `threads_.emplace_back(...)` 逐个建线程；某次 `pthread_create`
+     返回 `EAGAIN` 时，**已建好的 joinable `std::thread` 向量在栈展开中被析构** → `terminate`；
+  2. 该 terminate 发生在**非主线程**，`main()` 的顶层 catch 看不到。
+  修法（`fss_http` 包装层，ADR-002 H-7）：`SafeThreadPool`（失败先 `join` 已建线程再重抛）
+  + `Server::Start()` 把 runner 线程的异常**在主线程重抛**；并且只等 `pool_ready`
+  （`new_task_queue()` 成功返回）才算启动成功，消除与 `is_running_` 的竞态挂死。
+* **实测**：容器 `--pids-limit=64` → **`ExitCode=70` + 可读「未预期异常」、无 `terminate`、
+  `OOMKilled=false`**；`--pids-limit=66` 仍正常启动（下界未变）。
+
+### 14.2 实现点（可点击）
+
+| 位置 | 内容 |
+| --- | --- |
+| `src/main/server_main.cpp:94` | `constexpr int kExitInternalError = 70;`（注释写明为什么不复用 78/2） |
+| `src/main/server_main.cpp:139` | `struct StartupFaultUnknown {}`（非 std 类型，唯一用途是驱动顶层 `catch (...)`） |
+| `src/main/server_main.cpp:163` / `:172` | 早/晚注入点：`MaybeInjectStartupFaultEarly()` / `MaybeInjectStartupFaultAfterStart()` |
+| `src/main/server_main.cpp:1055` | 早注入点调用（CLI 解析之后、配置加载/装配之前） |
+| `src/main/server_main.cpp:2220` | 晚注入点调用（HTTP 已 Start、GC 调度已 Start 之后） |
+| `src/main/server_main.cpp:1032` | `static int RunServer(...)`（原 `main()` 全文，函数体逐字不变） |
+| `src/main/server_main.cpp:2253` | `main()` 薄包装（`catch (const std::exception&)` + `catch (...)`） |
+| `src/common/http/server.cpp:568` | `SafeThreadPool`：任一 `emplace_back` 失败 → `StopAndJoin()`（join 已建线程）→ 重抛 |
+| `src/common/http/server.cpp:641`/`:642` | `Impl::start_mutex` / `start_error`（runner 线程的异常回到主线程） |
+| `src/common/http/server.cpp:648` | `Impl::pool_ready`（`new_task_queue()` 成功返回后才置位） |
+| `src/common/http/server.cpp:1247` | `new_task_queue` 工厂改用 `SafeThreadPool` + 置位 `pool_ready` |
+| `src/common/http/server.cpp:1336` | `Server::Start()`：捕获 runner 异常并在主线程重抛；等 `pool_ready` 而非 `is_running` |
+| `tests/integration/test_startup_faults.cpp` | 真实 `build/bin/fss_server`：**7 用例 / 42 断言** |
+| `tests/CMakeLists.txt`（`test_startup_faults`） | `LABELS "phase9;integration"` + `add_dependencies(... fss_server)` |
+| `tests/framework/server_process.h` | `RunServerForExit` 的 `timeout` 增加 `--kill-after=5`（挂死时强制收尸，不再拖到 CTest 300 s） |
+| `scripts/verify_image.sh`（H4a / H4a2） | H4a 从"记录真实结果"升级为**断言**（`ExitCode==70` + stderr 含「未预期异常」+ 无 `terminate called` + `OOMKilled=false` + 未进服务状态）；H4a2 = pids=66 **正控** |
+
+### 14.3 实测命令与输出摘要
+
+```
+$ cmake --build build -j4
+[100%] Built target test_startup_faults
+
+$ ctest --test-dir build -j4
+100% tests passed, 0 tests failed out of 83
+  phase9         =   3.65 sec*proc (9 tests)      # C9.32 前是 8 tests
+
+$ ./build/bin/test_startup_faults
+All tests passed (42 assertions in 7 test cases)
+
+$ ./scripts/check_docs.sh --selftest
+  ✓ 自证：D1/D2/D4/D5 都能检出注入的错误（检查器有效）
+  D5 门槛编号检查：11 个阶段，共 147 条门槛           # C9.32 前是 146
+  全部检查通过（D1~D5）
+
+$ ./build/bin/test_operations_doc
+All tests passed (24 assertions in 2 test cases)     # 156 键三态 107/18/31 未变
+
+$ ./scripts/verify_image.sh
+-- [H4a] 资源上限（任务原文形态）：--memory=128m --pids-limit=64 → 期望 exit 70 + 可读原因
+   readiness=000  ExitCode=70  OOMKilled=false
+   日志: 未预期异常（exit 70）：Resource temporarily unavailable
+   ✅ ExitCode=70（EX_SOFTWARE；不再是 terminate/139）
+   ✅ stderr 含「未预期异常」（异常被顶层接住，原因可读）
+   ✅ stderr **不含** terminate called
+   ✅ OOMKilled=false（确实不是内存不足）
+   ✅ readiness=000（未进入服务状态，符合预期）
+-- [H4a2] pids 下界正控：--pids-limit=66 必须正常启动（下界=66 未变）
+   pids=66 → readiness=200  ExitCode=0  terminate=0
+   ✅ pids=66 readiness=200（下界=66 未变）
+...
+C9.8 + 容器硬化 ✅ 全部断言通过
+$ echo $?
+0
+```
+
+**逐条判据的实测**（`test_startup_faults.cpp`；每条都能因注入而失败）：
+
+| # | 判据 | 断言要点 |
+| --- | --- | --- |
+| ① | 注入 `throw_system_error`（复刻 pids EAGAIN） | `exit_code == 70`；输出含「未预期异常」+「Resource temporarily unavailable」+「pids-limit」；**不含** `terminate` / `what():` / `config sources` / `secret`；**不含**「已启动」（未进入服务状态） |
+| ② | 注入 `throw_bad_alloc` | `exit_code == 70` +「未预期异常」+「bad_alloc」，无 `terminate`，无「已启动」 |
+| ③ | 注入**非 std** 类型 | `exit_code == 70` +「未知类型」+「未预期异常」，无 `terminate`（证明 `catch (...)` 生效） |
+| ④ | **不注入**（R16 正例） | readiness **200** + body `File service is ready`；日志含「fss_server 已启动」（**正控**）且**不含**「未预期异常」 |
+| ⑤ | `throw_after_start`（服务器已起 + GC 调度已跑后抛） | `exit_code == 70`；**墙钟 < 5 s**（实测 < 0.1 s，证明 RAII stop/join 不卡）；无 `terminate`；横幅含「fss_server 已启动」与「gc : 已启动」（证明晚注入点确实在启动之后） |
+| ⑥ | **真实**线程创建 EAGAIN（部分创建） | `ulimit -u` 压到"当前数 + 500"，`worker_threads=20000` ⇒ 线程池建到一半才 EAGAIN；`exit_code == 70` +「未预期异常」+「Resource temporarily unavailable」，无 `terminate`，无「已启动」 |
+| ⑦ | 注入点在 CLI 解析之后 | `FSS_STARTUP_FAULT_INJECT=throw_system_error --help` → `exit_code == 0` + 用法，且**不含**「未预期异常」 |
+
+### 14.4 R1 自证（5 个注入 → 对应用例失败 → 完整还原）
+
+> 与 §11.4.1 的教训一致：**第一次实现"全绿"不代表判据有区分力**。本切片的"第一次"就是
+> 一个真实反例 —— **只加顶层 catch 时容器 H4a 仍是 139**（见 §14.1），因此我追到了 runner
+> 线程的根因，并补了用例⑥（真 EAGAIN）与注入④⑤。所有注入后都执行了**全量重建**
+> （`cmake --build build -j4`），还原后 `grep -rn "R1-INJECT" src/ tests/` **无输出**。
+
+**注入 ①：去掉顶层 catch**（`main` 直接 `return RunServer(...)`）→ `test_startup_faults`：
+
+```
+test cases:  7 |  2 passed |  5 failed
+  test_startup_faults.cpp:137: FAILED  outcome.exit_code := 134
+    outcome.output := "terminate called after throwing an instance of 'std::system_error'"
+  test_startup_faults.cpp:253: FAILED  outcome.exit_code := 134
+    ("真实线程创建 EAGAIN" 用例也是 134 + std::system_error terminate)
+```
+即：用例①②③⑤⑥全部失败 —— **异常逃出 main 就是 134/139**，判据有区分力。
+
+**注入 ②：`kExitInternalError` 改成 0** → 用例①②③⑤⑥在退出码断言上失败：
+
+```
+test_startup_faults.cpp:137 / :160 / :175 / :227 / :253: FAILED  outcome.exit_code := 0
+test cases:  7 |  2 passed |  5 failed
+```
+只有"不注入（正例）"和"--help"仍然通过 —— 正例的作用正在于此（证明 0 不是"恰好也满足"）。
+
+**注入 ③：删掉 `catch (...)`** → 用例③⑤失败：
+
+```
+test_startup_faults.cpp:175: FAILED  outcome.exit_code := 134
+  outcome.output := "terminate called after throwing an instance of '(anonymous namespace)::StartupFaultUnknown'"
+test cases:  7 |  5 passed |  2 failed
+```
+`catch (const std::exception&)` 接不住非 std 类型 —— 这条证明第二层 catch 是**必需**的。
+
+**注入 ④：把 `SafeThreadPool` 换回 `httplib::ThreadPool`**（保留顶层 catch 与 runner 捕获）→ 用例⑥失败：
+
+```
+test_startup_faults.cpp:267: FAILED
+  outcome.exit_code := 124          # timeout 收尸（进程打印「监听失败」后挂死）
+test cases:  7 |  6 passed |  1 failed
+```
+顶层 catch 全部就位、其余 6 条用例全过，**只有"真 EAGAIN"那条失败** —— 这正是"第一次
+全绿会漏掉根因"的证据：合成注入（①~③）无法覆盖 runner 线程的 terminate。
+
+**注入 ⑤：`Server::Start()` 退回"只等 `is_running()`"**（去掉 `pool_ready`）→ 用例⑥失败（3/3）：
+
+```
+test_startup_faults.cpp:269: FAILED  outcome.exit_code := 124
+# 直连复现：headroom=4000 时主线程在 runner 建池期间看到 is_running()==true →
+# 打印「fss_server 已启动」并进入 serve 循环 → 永久挂死（rc=124）
+```
+这条把"竞态导致偶发挂死"钉成确定性判据（headroom=500 时 3/3 复现）。
+
+**还原证据**：
+
+```
+$ grep -rn "R1-INJECT" src/ tests/
+（无输出；grep rc=1）
+$ ./build/bin/test_startup_faults
+All tests passed (42 assertions in 7 test cases)
+```
+
+### 14.5 未做 / 未验证（如实登记）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| **其它线程里抛出的异常** | ⬜ **不在本切片范围** | 本切片只处理"顶层能接住的异常"与"runner 线程经由 `Server::Start()` 转交的异常"。任何**其它**工作线程（GC 调度、HTTP worker、gRPC）里逃出的异常仍会 `terminate` —— 修法要在每个线程入口各自 `try/catch`，属另一个话题（未做） |
+| **`std::terminate` 仍可能出现在 `SafeThreadPool` 之外** | ⚠ 部分覆盖 | 已覆盖"线程池构造失败"这一条真实路径；`std::thread` 析构 joinable 的**其它**位置未逐一排查（本仓库"先 stop 再 join"的纪律在 §4.3 已登记） |
+| **`--pids-limit` 的真实下界在新代码下重测** | ⚠ 部分 | 默认路径只断言 pids=64（→70）与 pids=66（→200）；**65 未在默认路径断言**（`FSS_VERIFY_IMAGE_FULL=1` 的 H4b2 仍会探 65/66）。下界"65 失败/66 成功"的**历史记载保留**，未在 C9.32 下逐点重测 |
+| **K8s / 其它容器运行时的 pids 限制** | ⬜ 未验证 | 与 `docs/test-evidence/phase9-image.md` §10.8 同口径：只测了 Docker（cgroup v2 + pids controller） |
+| **ASan/UBSan 下的这条路径** | ✅ **已覆盖**（父代理复核时更正） | 上一版这里写"未在 sanitizer 构建里跑（标签范围是 phase0~7）"——**理由与结论都不对**：`run_sanitizers.sh` 的标签是从 `run_all_gates.sh` 的 `IMPLEMENTED_PHASES` **推导**的，`IMPLEMENTED_PHASES` 早已含 10 ⇒ 实际覆盖 **phase0~phase10**。父代理在最终门槛里实测：覆盖标签 `phase0|phase1|…|phase10`，其中 **phase1 = 18 个测试**（`fss_http` / `SafeThreadPool` 所在层）、phase9 = 9 个测试（含 `test_startup_faults`），全部在 ASan+UBSan+LSan 下通过。（旧文"phase0~7 全绿"是 AGENTS 里的陈旧描述，已一并修正。） |
+
+### 14.6 三态计数（未改配置面）
+
+**未新增/删除/修改任何配置键**：`FSS_STARTUP_FAULT_INJECT` 是**环境变量接缝**（与
+`FSS_AUDIT_FAULT_INJECT` 同族），不进入 schema/`config/fss.example.json`。三态仍为
+**生效 107 / 拒绝启动 18 / 已读但无效果 31 = 156**（`test_operations_doc` 通过）。
+
+### 14.7 父代理独立复核（含对规格与两处文档表述的更正）
+
+**① 独立复跑**：`cmake --build build -j4` 0 error；`ctest` **83/83**；
+`./scripts/verify_image.sh` **rc=0**，其中
+```
+-- [H4a] --memory=128m --pids-limit=64   readiness=000  ExitCode=70  OOMKilled=false
+   ✅ ExitCode=70（EX_SOFTWARE；不再是 terminate/139）
+   ✅ stderr 不含 terminate called
+-- [H4a2] --pids-limit=66               readiness=200  ExitCode=0（下界=66 未变）
+```
+与我自己的日志 `build/parent-verify-image-c932.log` 逐项一致。
+
+**② 我自己重做了"根因"那条注入**（本切片最关键的主张：**只加顶层 catch 不够**）：
+把 `src/common/http/server.cpp` 的 `new SafeThreadPool(...)` 换回 `new httplib::ThreadPool(...)`
+（顶层 catch 全就位）→ 真实 EAGAIN 用例**失败**：
+
+```
+$ ./build/bin/test_startup_faults "★ C9.32：真实线程创建 EAGAIN*"
+  监听失败: 服务端未能在 1 秒内进入运行状态
+test cases: 1 | 1 failed      assertions: 1 | 1 failed
+# 还原后：All tests passed (5 assertions in 1 test case)
+```
+即：**包装层（`SafeThreadPool` + 把 runner 线程异常在主线程重抛）确实是修好这条缺陷的必要条件**，
+不是"顺手改的"。这条独立复现写在这里，替代"实现者说它必要"的转述。
+
+**③ 我的规格漏了根因（如实记录）**：我只要求"给 `main` 加顶层兜底"，没有意识到失败发生在
+httplib 的 **runner 线程**里（`listen_internal()` → `new_task_queue()`），而 `httplib::ThreadPool`
+在部分创建失败时会因析构 joinable `std::thread` 而 `terminate`——那是**线程内**的 terminate，
+`main` 的 catch 看不到。实现者追到了这一层，并覆盖了 `is_running()` 与建池的竞态（只等 `pool_ready`）。
+这正是"照规格做不够、必须追根因"的实例。
+
+**④ 两处文档表述更正（父代理改）**：
+- `AGENTS.md` 的"`run_sanitizers.sh`（ASan+UBSan+LSan，**phase0~7** 全绿）"是**陈旧**的：脚本的标签是从
+  `run_all_gates.sh` 的 `IMPLEMENTED_PHASES` **推导**的，早已含 10 ⇒ 实际覆盖 **phase0~phase10**。
+  已在门槛里实测：`覆盖标签： phase0|phase1|…|phase10`，其中 **phase1 = 18 个测试**（`fss_http` /
+  `SafeThreadPool` 所在层）、phase9 = 9 个测试（含 `test_startup_faults`），ASan+UBSan+LSan 全绿。
+  ⇒ §14.5 里"`SafeThreadPool` 未在 sanitizer 下跑"的登记**作废并已更正**（详见本轮 §14.5 的表格行）。
+- `docs/04-implementation-plan.md` 的 P10 行与"当前为…"句、`docs/test-evidence/phase10.md` 的配置键三态
+  表头，仍写着**当前值** 106/19/31 —— ADR-008 的 P4 交付后应为 **107/18/31**。已改（历史切片里的
+  106/19/31 保留为当时事实，属上下文正确的历史记录）。
+
+**⑤ 未做/未验证（本轮维持）**：其它工作线程（GC 调度线程、HTTP worker、gRPC 线程）里逃出的异常
+仍会 `terminate`（不在本切片范围）；`--pids-limit=65` 未进默认断言（仅 FULL 的 H4b2）；
+K8s/containerd 未验证。

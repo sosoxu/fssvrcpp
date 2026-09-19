@@ -203,13 +203,17 @@ struct ProcessOutcome {
 };
 
 //  `timeout` 是兜底：坏配置必须**立刻**退出，真挂死了这里会给出 124 而不是无限等待。
+//  ★ `--kill-after=5`：`timeout` 默认只发 SIGTERM，若进程忽略它（或卡在 join/死锁里
+//    —— C9.32 的 `throw_after_start` 用例正是要测这一点），`timeout` 会**一直等**下去。
+//    加 `--kill-after` 后超时进程必被 SIGKILL 收尸（退出码 137），测试不会拖到 CTest 的
+//    300 s 上限才失败。
 inline ProcessOutcome RunServerForExit(const std::vector<std::string>& args,
                                        const std::vector<std::pair<std::string, std::string>>& env = {},
                                        int timeout_seconds = 30) {
   ProcessOutcome outcome;
   fss::test::TempDir dir("fss_server_once");
   const std::string log_path = dir.child("out.log");
-  std::string command = "timeout " + std::to_string(timeout_seconds) + " env ";
+  std::string command = "timeout --kill-after=5 " + std::to_string(timeout_seconds) + " env ";
   for (const auto& [key, value] : env) {
     command += key;
     command += '=';

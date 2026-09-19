@@ -46,6 +46,8 @@ ss -ltnp | grep -E ':(8080|50051)'        # 端口是否真的在听
 | `未知的 storage.posix.durability: X` | 档位拼错 | 只允许 `per_file` / `batch` / `never` |
 | `打开位置仓储失败` / `打开元数据仓储失败` | 数据目录不可写或 SQLite 文件损坏 | §2 |
 | `deployment.mode=multi` 相关校验失败 | **本版本不交付多实例运行形态**（缺 PG 仓储/租约） | 改回 `single`；多实例见 §8 |
+| **`ExitCode=139/134` 且 stderr 有 `terminate called`** | **升级前**的表现：资源耗尽（典型是容器 `--pids-limit` 过小）时启动期线程创建抛 `std::system_error`，异常逃出 `main` → `terminate`。`139` 看起来像段错误，**很容易被误判为"进程崩了"**（实测 `OOMKilled=false`，不是 OOM） | 升级到含 **C9.32** 的版本：同一场景应变成 **`ExitCode=70`（EX_SOFTWARE）+ `未预期异常（exit 70）：…`**。容器 **`--pids-limit` 建议 ≥ 128**（默认线程数 66：`server.http.worker_threads = max(16, 4×nproc)`），或显式调小 `server.http.worker_threads`（会同时降低并发上限） |
+| **`ExitCode=70` + `未预期异常`** | 顶层兜底接住了一个未预期异常；`what()` 给出直接原因（`Resource temporarily unavailable` = 线程/进程数耗尽；`std::bad_alloc` = 内存不足） | 按 `what()` 定位：线程数 → 调 `--pids-limit` / `worker_threads`；内存 → `--memory` / `transfer_memory_budget_bytes`。**不要**把它当成配置错误（那是 78）或参数错误（那是 2） |
 
 **不要**为了"先起来"把 `FSS_AUTH_MODE` 改回 `disabled` 上线 —— 那等于无鉴权（`/v2/info` 会如实显示）。
 
@@ -236,3 +238,32 @@ scripts/bench_baseline.sh --check    # 退化 >20% 直接失败（退出码 1）
 5. 环境：`uname -sr`、容器/裸机、存储类型（本地盘/NFS/对象存储）。
 
 **不要**在生产上"先关鉴权再复现"——那会把一个可诊断的问题变成安全事故。
+
+---
+
+## 10. 测试/演练用的故障注入接缝（⚠️ **不要在生产设置**）
+
+组合根有一个**环境变量**故障注入接缝，用来在**真实二进制**上驱动"未捕获异常"这条路径
+（C9.32 的回归判据：`tests/integration/test_startup_faults.cpp`）：
+
+| 环境变量 | 取值 | 行为 |
+| --- | --- | --- |
+| `FSS_STARTUP_FAULT_INJECT` | `throw_system_error` | 在 **CLI 解析之后、装配服务器之前**抛 `std::system_error(resource_unavailable_try_again, "Resource temporarily unavailable")` —— **精确复刻容器 `--pids-limit` 过小时的形态** |
+| 同上 | `throw_bad_alloc` | 同位置抛 `std::bad_alloc{}`（内存耗尽） |
+| 同上 | `throw_unknown` | 同位置抛一个**非 std** 类型 → 只能被顶层 `catch (...)` 接住 |
+| 同上 | `throw_after_start` | **服务器已 `Start()`、GC 调度线程已在跑之后**再抛（用于证明异常路径上 RAII 清理真的发生、不卡 join） |
+| 同上 | 其它/空 | 不注入 |
+
+```bash
+# 演练：不启容器也能复现"pids 不足"的干净退出（期望 exit 70 + 可读原因）
+FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$?"
+# → 未预期异常（exit 70）：Resource temporarily unavailable: Resource temporarily unavailable
+#   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
+```
+
+**为什么它不是配置键**：`docs/operations.md` 的 156 个叶子键三态清单（生效 107 / 拒绝启动 18 /
+已读但无效果 31）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
+
+> **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动
+> 立刻以 exit 70 失败）。它只用于测试与故障演练；演练结束请确认该变量已从环境 / systemd unit 文件中移除。
