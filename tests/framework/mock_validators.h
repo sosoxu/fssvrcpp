@@ -6,13 +6,15 @@
 //  C10.18 要求的故障形态（超时 / 连不上 / 5xx）只有真实进程才能确定性注入。
 //
 //  额外能力：`--observe-file`（mock 每次请求后把请求计数与请求体原子写进该文件）。
-//  测试用它断言两件事：
-//    ① **请求体形状**（legal 有 partition/legaltags；schema 有 kind/record）——
-//       否则"客户端确实按约定发了"只是文档里的一句话（R15）；
-//    ② **"不发请求"**（`requests == 0`）—— noop 模式下"不发起任何请求"必须可证。
+//  测试用它断言三件事：
+//    ① **请求体形状**（legal 有 partition/legaltags；schema 有 kind/record；
+//       webhook 有 topic/kind/body）—— 否则"客户端确实按约定发了"只是文档里的一句话（R15）；
+//    ② **"不发请求"**（`requests == 0`）—— noop / none 模式下"不发起任何请求"必须可证；
+//    ③ **"两个事件都发了"**（`bodies`，切片 6b 新增）—— 一次 createMetadata 会产生
+//       statusChanged 与 datasetDetails 两个事件，只看 `last_body` 无法断言这件事。
 //
 //  ⚠️ 本文件只在**真实进程**用例里用（`build/bin/fss_server` + 本 mock），
-//     不测进程内假对象：判据是"真实二进制按配置选择了远端校验器"。
+//     不测进程内假对象：判据是"真实二进制按配置选择了远端校验器 / webhook 发布器"。
 // =============================================================================
 #pragma once
 
@@ -30,17 +32,19 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace fss::test {
 
 class MockValidators {
  public:
   struct Options {
-    std::string mode = "legal";  // legal | schema（同时决定请求体形状）
+    std::string mode = "legal";  // legal | schema | webhook（同时决定默认响应语义）
     bool valid = false;          // 返回 {"valid":true}
     std::string invalid_message; // 返回 {"valid":false,"message":M}
     int delay_ms = 0;            // 响应前睡多久（用于触发客户端超时）
@@ -124,7 +128,25 @@ class MockValidators {
   struct Observation {
     int requests = 0;
     json::Value body = json::Value::object();  // last_body（解析后的 JSON）
+    //  ★ 切片 6b：**全部**请求体（按到达顺序）。一次 createMetadata 产生的
+    //    statusChanged / datasetDetails 都在这里；`last_body` 只保留兼容。
+    std::vector<json::Value> bodies;
+    //  最后一次请求的表头（切片 6b 用它断言 `Content-Type: application/json`）
+    std::map<std::string, std::string> last_headers;
     std::string raw;                           // 整个观测文件的文本（诊断用）
+
+    //  ★ 切片 6b：按 `kind` 过滤 webhook 载荷（`{"topic","kind","body"}`）。
+    //    没有它就只能在测试里手写循环；把它放这里让"两个 kind 都发了"的断言更直白。
+    std::vector<json::Value> BodiesOfKind(const std::string& kind) const {
+      std::vector<json::Value> out;
+      for (const auto& entry : bodies) {
+        if (entry.is_object() && entry.contains("kind") && entry["kind"].is_string() &&
+            entry["kind"].get<std::string>() == kind) {
+          out.push_back(entry);
+        }
+      }
+      return out;
+    }
   };
 
   Observation ReadObservation() const {
@@ -143,6 +165,14 @@ class MockValidators {
       out.requests = root["requests"].get<int>();
     }
     if (root.contains("last_body")) out.body = root["last_body"];
+    if (root.contains("last_headers") && root["last_headers"].is_object()) {
+      for (auto it = root["last_headers"].begin(); it != root["last_headers"].end(); ++it) {
+        if (it.value().is_string()) out.last_headers[it.key()] = it.value().get<std::string>();
+      }
+    }
+    if (root.contains("bodies") && root["bodies"].is_array()) {
+      for (const auto& entry : root["bodies"]) out.bodies.push_back(entry);
+    }
     return out;
   }
 

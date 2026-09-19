@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""mock 远端 legal / schema 校验器 —— 用于证明**远端校验失败时既不建记录也不放行**。
+"""mock 远端 legal / schema 校验器 + **事件 webhook 接收端** —— 用于证明
+**远端校验失败时既不建记录也不放行**，以及**事件发布失败绝不致命**。
 
 为什么需要它（阶段 10 切片 6a）
     远端 legal/schema 校验有两个必须被机械验证的性质：
@@ -8,6 +9,13 @@
          "通过"或"不通过" —— 一律 503（fail-closed）。
     ②无法用"真实 Legal/Schema 服务"验证（我们无法让它按需超时），只能用一个**可控的**
     mock 把每一种失败形态注入出来。
+
+为什么 webhook 也用它（阶段 10 切片 6b / ADR-013 §9）
+    事件发布的方向与校验**相反**（`docs/03-api-contract.md` §2.6 第 4/10 步：上游只
+    `log.warning("Failed to publish ...")`）：webhook 连不上/超时/非 2xx/坏响应
+    **绝不能**让 HTTP 请求失败 —— 建记录请求必须照常 201，且记录必须真的落库。
+    这需要同一个可控 mock 把"发布端故障"注入出来，同时**记录每一次收到的请求体**
+    （`--mode webhook` 默认回 200 `{"ok":true}`）。
 
 ⚠️ 本端点**没有上游路径依据**（这是本服务的**扩展**，与 `/v1/transfer` 同类）：
     `docs/01-osdu-research.md:110` 明确"legal tag 的合规性由 Storage Service 的
@@ -25,7 +33,10 @@
     其余一切（非 200 / 非 JSON / 缺 valid / valid 非 bool）→ 依赖故障（调用方 fail-closed → 503）
 
 可注入的失败形态（都是命令行开关，便于单测确定性构造）
-    --mode legal|schema  请求体形状（同时决定默认的响应语义，二者一致）
+    --mode legal|schema|webhook
+                         请求体形状（同时决定默认的响应语义，三者一致地"成功"）
+                         · legal/schema：按下面的开关回答 `{"valid":...}`
+                         · webhook：默认回 200 `{"ok":true}`（只认 2xx = 成功）
     --valid              一律返回 200 + {"valid": true}
     --invalid-message M  一律返回 200 + {"valid": false, "message": M}
     --delay-ms N         响应前睡 N 毫秒（用于触发客户端超时）
@@ -36,8 +47,10 @@
     --malformed          返回非 JSON
     --no-valid-field     返回 200 + {}（合法 JSON 但缺 `valid`）
     --fail-file PATH     该文件**存在**时一律返回 500（删掉它 = 故障恢复）
-    --observe-file PATH  每次请求后把 {"requests": N, "last_body": ..., "last_headers": ...}
-                         写进该文件（供测试断言"客户端发了什么"与"有没有发请求"）
+    --observe-file PATH  每次请求后把 {"requests": N, "last_body": ..., "last_headers": ...,
+                         "bodies": [...]} 写进该文件。`bodies` 是**全部**请求体
+                         （按到达顺序）；一次 createMetadata 会产生 2~3 个事件，
+                         只看 `last_body` 无法断言"两个都发了"（切片 6b 新增）。
 
 用法：`python3 tests/tools/mock_validators.py --port 0 --mode legal [开关...]`
       `--port 0` 时向 stdout 打印一行 `LISTENING <port>`。
@@ -69,12 +82,19 @@ class Config:
         self.last_body: object = None
         self.last_headers: dict[str, str] = {}
         self.last_method = ""
+        #  ★ 切片 6b：**全部**请求体（按到达顺序）。一次 createMetadata 会发
+        #    statusChanged(IN_PROGRESS) / statusChanged(SUCCESS) / datasetDetails
+        #    三个事件 —— 只看 `last_body` 无法断言"两个 kind 都发了"。
+        self.bodies: list[object] = []
 
     def observe(self, method: str, headers: dict[str, str], body: object) -> None:
         self.requests += 1
         self.last_method = method
         self.last_headers = headers
         self.last_body = body
+        #  body 为 None 表示"这次请求的体没读到"（例如故障短路分支），不进 bodies
+        if body is not None:
+            self.bodies.append(body)
         if not self.observe_file:
             return
         #  ★ 原子落盘：测试侧轮询这个文件，绝不能让读到半个 JSON
@@ -84,6 +104,7 @@ class Config:
             "last_method": self.last_method,
             "last_headers": self.last_headers,
             "last_body": self.last_body,
+            "bodies": self.bodies,
         }
         with open(temp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
@@ -107,26 +128,9 @@ class Handler(BaseHTTPRequestHandler):
         config: Config = self.server.config  # type: ignore[attr-defined]
         if config.delay_ms > 0:
             time.sleep(config.delay_ms / 1000.0)
-        #  ★ 故障控制文件：存在 = 依赖不可用；删除 = 恢复
-        if config.fail_file and os.path.exists(config.fail_file):
-            config.observe("POST", {}, None)
-            self._reply(500, b'{"valid":true,"note":"injected failure"}')
-            return
-        if config.force_status != 0:
-            config.observe("POST", {}, None)
-            #  ★ 关键：失败状态码配一个**伪装成通过**的体（`{"valid":true}`）。
-            #    早前这里是 `{"error":"injected"}` → "非 200 必须 fail-closed"与
-            #    "缺 valid 必须 fail-closed"两条防线**同时**触发，判据无法区分
-            #    "状态码真的被检查了"与"只是恰好缺 valid"（父代理注入自证时抓到：
-            #    把状态码检查改成 `if (false)`，用例照样全绿）。现在体是"谎报通过"，
-            #    只有真的检查了状态码才可能 503。
-            self._reply(config.force_status, b'{"valid":true,"note":"injected status"}')
-            return
-        if config.malformed:
-            config.observe("POST", {}, None)
-            self._reply(200, b"this is not json")
-            return
 
+        #  ★ 先把请求体读进来并**观测**，再做故障短路：切片 6b 需要断言
+        #    "失败形态下 mock 也真的收到了事件体"（例如 `--status 500`）。
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length) if length > 0 else b"{}"
         if len(raw) > MAX_BODY:
@@ -142,6 +146,28 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         config.observe("POST", dict(self.headers), payload)
+
+        #  ★ 故障控制文件：存在 = 依赖不可用；删除 = 恢复
+        if config.fail_file and os.path.exists(config.fail_file):
+            self._reply(500, b'{"valid":true,"note":"injected failure"}')
+            return
+        if config.force_status != 0:
+            #  ★ 关键：失败状态码配一个**伪装成通过**的体（`{"valid":true}`）。
+            #    早前这里是 `{"error":"injected"}` → "非 200 必须 fail-closed"与
+            #    "缺 valid 必须 fail-closed"两条防线**同时**触发，判据无法区分
+            #    "状态码真的被检查了"与"只是恰好缺 valid"（父代理注入自证时抓到：
+            #    把状态码检查改成 `if (false)`，用例照样全绿）。现在体是"谎报通过"，
+            #    只有真的检查了状态码才可能 503。
+            self._reply(config.force_status, b'{"valid":true,"note":"injected status"}')
+            return
+        if config.malformed:
+            self._reply(200, b"this is not json")
+            return
+
+        #  ★ 切片 6b：webhook 接收端 —— 只认 2xx = 成功，体内容无关紧要
+        if config.mode == "webhook":
+            self._reply(200, b'{"ok":true}')
+            return
 
         if config.no_valid_field:
             self._reply(200, b"{}")
@@ -162,9 +188,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="mock 远端 legal/schema 校验器（ADR-013）")
+    parser = argparse.ArgumentParser(description="mock 远端 legal/schema 校验器 + 事件 webhook（ADR-013）")
     parser.add_argument("--port", type=int, default=0)
-    parser.add_argument("--mode", choices=["legal", "schema"], default="legal")
+    parser.add_argument("--mode", choices=["legal", "schema", "webhook"], default="legal")
     parser.add_argument("--valid", action="store_true", help='返回 200 + {"valid":true}')
     parser.add_argument("--invalid-message", default="", help='返回 200 + {"valid":false,"message":M}')
     parser.add_argument("--delay-ms", type=int, default=0)

@@ -173,7 +173,7 @@ RegisterResult UploadAndRegister(int port, const std::string& body, const std::s
 //  指向 **staging** 对象；只有第 6 步（`CreateFileMetadata` 的复制）会把它带到
 //  **persistent**，而校验发生在第 3c 步 —— 因此"校验失败后 staging 对象仍在原位、
 //  persistent 侧没有对应文件"才是"没有记录被建出来"的可证事实。
-void RequireNoPersistentSideEffect(int port) {
+void RequireNoPersistentSideEffect(int port, const std::string& blob_root) {
   const auto list = HttpDo(port, "POST", "/api/file/v2/getFileList", Authed(),
                            R"({"PageNum":0,"Items":50})");
   CAPTURE(list.status, list.body);
@@ -188,13 +188,23 @@ void RequireNoPersistentSideEffect(int port) {
   const std::string location = content[0]["Location"].get<std::string>();
   CAPTURE(location);
   REQUIRE(location.find("opendes-staging/") != std::string::npos);
-  //  ③ 对应的 persistent 文件**不存在**（复制/落库都没发生）
+  //  ③ 物理路径必须**拼出真实根**再断言。
+  //  ★ 父代理复核抓到的**假判据**（与切片 6b 同一处教训，见 phase10 §12.5/§11.4.1）：
+  //    `getFileList` 的 `Location` 是**容器相对路径**（`opendes-staging/...`），而 POSIX
+  //    驱动的物理根是 `<storage.posix.root>/blobs`。早前这里直接 `exists(location)`，
+  //    在测试进程的 CWD 下**恒为 false** —— 于是 `REQUIRE_FALSE(...)` 恒真，
+  //    "persistent 侧没有文件"其实从未被验证。现在两条都拼真实根：
+  //      ① 正控：staging 文件**必须存在**（证明路径解析是对的、这条判据有牙齿）；
+  //      ② 目标：persistent 文件**必须不存在**（第 6 步的复制没有发生）。
+  const std::filesystem::path staging_path = std::filesystem::path(blob_root) / location;
   std::string persistent = location;
   const auto pos = persistent.find("opendes-staging/");
   persistent.replace(pos, std::string("opendes-staging/").size(), "opendes-persistent/");
-  const std::filesystem::path persistent_path(persistent);
+  const std::filesystem::path persistent_path = std::filesystem::path(blob_root) / persistent;
+  INFO("staging 侧应当存在的文件：" << staging_path.string());
   INFO("persistent 侧不应存在的文件：" << persistent_path.string());
-  REQUIRE_FALSE(std::filesystem::exists(persistent_path));
+  REQUIRE(std::filesystem::exists(staging_path));          // ★ 正控（防"路径恒假"再次发生）
+  REQUIRE_FALSE(std::filesystem::exists(persistent_path));  // 目标判据
 }
 
 //  自签 URL 的 `<base>` 取自 `self_signed.public_base_url`（默认用的是配置端口），
@@ -319,7 +329,7 @@ TEST_CASE("★ C10.18 ② legal.validator=remote：远端不通过 → 400 且�
   REQUIRE(result.create_body.find("bad tag") != std::string::npos);
   //  "不通过"**不是**依赖故障：mock 收到了请求，记录**没有**被建出来
   REQUIRE(mock.WaitRequests(1).requests == 1);
-  RequireNoPersistentSideEffect(port);
+  RequireNoPersistentSideEffect(port, data_dir.child("store") + "/blobs");
 }
 
 // =============================================================================
@@ -407,7 +417,7 @@ TEST_CASE("★ C10.18 ③ legal fail-closed：超时 / 非 200 / 非 JSON / 缺 
     //  ★ fail-closed：503（**不是** 400，也**不是** 201）
     REQUIRE(result.create_status == 503);
     //  ★ 不留残留：没有位置记录（校验失败发生在持久化之前）
-    RequireNoPersistentSideEffect(port);
+    RequireNoPersistentSideEffect(port, data_dir.child("store") + "/blobs");
     //  依赖确实被调用过（"连不上"那条没有 mock，跳过）
     if (mock) REQUIRE(mock->WaitRequests(1).requests >= 1);
   }
@@ -445,7 +455,7 @@ TEST_CASE("★ C10.18 ④ timeout_ms 真的生效：同一个 mock，300ms → 5
     CAPTURE(timeout_ms, result.create_status, result.create_body);
     if (timeout_ms == 300) {
       REQUIRE(result.create_status == 503);  // 超时 → fail-closed
-      RequireNoPersistentSideEffect(port);
+      RequireNoPersistentSideEffect(port, data_dir.child("store") + "/blobs");
     } else {
       REQUIRE(result.create_status == 201);  // 超时放大后**同一个 mock** 就通过了
       REQUIRE(mock.ReadObservation().requests > before);
@@ -548,7 +558,7 @@ TEST_CASE("★ C10.18 ⑥ schema.validator=remote：不通过 → 400 带 messag
     CAPTURE(result.create_status, result.create_body);
     REQUIRE(result.create_status == 400);
     REQUIRE(result.create_body.find("missing required field: data.Name") != std::string::npos);
-    RequireNoPersistentSideEffect(port);
+    RequireNoPersistentSideEffect(port, data_dir.child("store") + "/blobs");
   }
   SECTION("依赖故障（非 JSON）→ 503 + 无残留") {
     TempDir cfg_dir("fss_c10_18_schema_fc");
@@ -568,7 +578,7 @@ TEST_CASE("★ C10.18 ⑥ schema.validator=remote：不通过 → 400 带 messag
     CAPTURE(result.create_status, result.create_body);
     REQUIRE(result.create_status == 503);
     REQUIRE(mock.WaitRequests(1).requests == 1);
-    RequireNoPersistentSideEffect(port);
+    RequireNoPersistentSideEffect(port, data_dir.child("store") + "/blobs");
   }
 }
 
@@ -643,7 +653,7 @@ TEST_CASE("★ C10.18 ⑧ 依赖恢复：--fail-file → 503；删掉后同一�
   const auto down = UploadAndRegister(port, "c10-18-recover-1", "recover1.txt");
   CAPTURE(down.create_status, down.create_body);
   REQUIRE(down.create_status == 503);
-  RequireNoPersistentSideEffect(port);
+  RequireNoPersistentSideEffect(port, data_dir.child("store") + "/blobs");
   REQUIRE(mock.WaitRequests(1).requests >= 1);
 
   //  ② 删掉控制文件 = 依赖恢复；**同一个进程**、不重启、下一次请求必须成功

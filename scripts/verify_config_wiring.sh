@@ -374,7 +374,10 @@ assert_reject() {  # $1=key=value $2=needle $3=desc
   assert_contains "${out}" "$2" "$3（原因指向该键）"
 }
 assert_reject "leases.enabled=true" "leases.enabled=true" "leases.enabled=true"
-assert_reject "events.publisher=webhook" "events.publisher=webhook" "events.publisher=webhook"
+#  ★ 切片 6b：`events.publisher=webhook` 已是**生效**能力，"没有 url 才拒绝"才是真实语义
+#    （断言原因指向 `events.webhook.url`，而不是"未实现"）。
+assert_reject "events.publisher=webhook" "events.webhook.url" \
+  "events.publisher=webhook + 空 url"
 assert_reject "self_signed.single_use_nonce=true" "single_use_nonce=true" \
   "self_signed.single_use_nonce=true"
 assert_reject "server.http.large_file_plane.enabled=true" "large_file_plane" \

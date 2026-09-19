@@ -588,3 +588,16 @@ fss_add_test(test_remote_validators
   LIBS    fss_json Threads::Threads
   LABELS  "phase10;integration")
 add_dependencies(test_remote_validators fss_server)
+
+# =============================================================================
+#  阶段 10 切片 6b：事件发布器 `events.publisher` / `events.webhook.*`（C10.19 / ADR-013 §9）
+#    真实 `build/bin/fss_server` + 独立进程 mock（同一个 `mock_validators.py`，
+#    `--mode webhook`）：正例（两个事件 + 配置 topic）/ **非致命三态**（连不上、非 2xx、
+#    超时 → 请求仍 201 且记录真的建出来）/ `none` 不发请求 / `log` 不受影响 /
+#    空 url → exit 78 / `timeout_ms` 真的来自配置。
+# =============================================================================
+fss_add_test(test_webhook_publisher
+  SOURCES integration/test_webhook_publisher.cpp
+  LIBS    fss_json Threads::Threads
+  LABELS  "phase10;integration")
+add_dependencies(test_webhook_publisher fss_server)

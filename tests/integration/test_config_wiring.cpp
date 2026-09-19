@@ -796,7 +796,11 @@ TEST_CASE("★ C10.11：未实现能力的非默认值必须拒绝启动（exit 
         {"deployment.mode", "multi", "multi"},
         {"leases.enabled", "true", "leases.enabled=true"},
         {"leader_election.enabled", "true", "leader_election.enabled=true"},
-        {"events.publisher", "webhook", "events.publisher=webhook"},
+        //  ★ P10 切片 6b：`events.publisher=webhook` / `none` 已**不再是**"未实现 → 拒绝启动"，
+        //    而是真接通的事件发布器（ADR-013 §9）。"webhook + 空 `events.webhook.url` →
+        //    exit 78" 的反向用例在 `tests/integration/test_webhook_publisher.cpp`（C10.19 ⑤）。
+        //    这里改为断言**枚举**仍会拒绝未知取值（不许静默降级）。
+        {"events.publisher", "bogus", "events.publisher"},
         //  ★ P10 切片 6a：`legal.validator=remote` / `schema.validator=remote` 已**不再是**
         //    "未实现 → 拒绝启动"，而是真接通的远端校验器。它们各自的"缺 base_url →
         //    exit 78"反向用例在 `tests/integration/test_remote_validators.cpp`（C10.18）。

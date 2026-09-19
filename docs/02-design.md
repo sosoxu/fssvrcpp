@@ -118,7 +118,7 @@
 │   infra/legal/           NoopLegalValidator / RemoteLegalValidator             │
 │   infra/schema/          RemoteSchemaValidator                                 │
 │   infra/partition/       FilePartitionRegistry / RemotePartitionRegistry       │
-│   infra/event/           LogEventPublisher / HttpWebhookEventPublisher          │
+│   infra/event/           LogEventPublisher / WebhookEventPublisher          │
 │   infra/transfer/        SelfSignedUrlIssuer + TransferTokenCodec ★ 集中存储数据面│
 │                                    │                                          │
 │                                    ▼  只依赖 L1                                 │
@@ -348,7 +348,7 @@ struct FileMetadataRecord {
 | `IAuthorizer` | 鉴权（角色判定） | `LocalJwtAuthorizer`、`RemoteEntitlementsAuthorizer`、`AllowAllAuthorizer`（仅测试） | ✅ |
 | `ILegalValidator` | legal tag 校验 | `NoopLegalValidator`、`RemoteLegalValidator` | 可选 |
 | `ISchemaValidator` | kind/schema 校验 | `NoopSchemaValidator`、`RemoteSchemaValidator` | 可选 |
-| `IEventPublisher` | 状态变更事件（`status-changed` 语义） | `LogEventPublisher`、`HttpWebhookEventPublisher` | 可选 |
+| `IEventPublisher` | 状态变更事件（`status-changed` 语义） | `LogEventPublisher`、`WebhookEventPublisher`（P10 切片 6b） | 可选 |
 | `IAuditLogger` | 审计事件（对齐参考实现的 `AuditLogger`） | `StructuredLogAuditLogger` | ✅ |
 | `IClock` ⓛ | 可注入时间（可测试性关键） | `SystemClock`、`ManualClock` | ✅ ⓛ |
 | `IIdGenerator` ⓛ | fileID / recordID 生成 | `UuidGenerator`、`SequentialIdGenerator` | ✅ ⓛ |
@@ -1254,7 +1254,7 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
 exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、`expiry.*` 接进组合根，
 并把 16 个未实现键改为"非默认值 → 拒绝启动"（后续切片与 C10.16 / C10.16 续 / 切片 4 / 切片 5 / **切片 6a（C10.18）** 继续收敛，当前三态为
-**生效 102 / 拒绝启动 20 / 已读但无效果 34**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
+**生效 106 / 拒绝启动 19 / 已读但无效果 31**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
 ② 多实例相关的 `shared_mount_required`/`one_filesystem_per_partition` 仍不可配（在 §1.3 的
 34 个"已读但无效果"键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
 实现（ADR-006 §6 的门槛）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
@@ -1277,7 +1277,7 @@ exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、
 | [ADR-010](adr/ADR-010-io-engine-choice.md) | I/O 引擎：阻塞线程池为默认；io_uring 为可选引擎（默认容器 seccomp 阻断） | 已采纳 |
 | [ADR-011](adr/ADR-011-logging-library.md) | 日志实现：自研最小实现（spdlog 评估后不采用，附重开触发条件） | 已采纳 |
 | [ADR-012](adr/ADR-012-auth-and-tenant-binding.md) | 认证与租户绑定：本地 JWT（HS256）+ `partition` claim 绑定 + fail-closed；远端 Entitlements 与 RS256/JWKS 登记为未实现 | 已采纳（P8 切片 1；未实现项见其 §5.3） |
-| [ADR-013](adr/ADR-013-file-service-extension-endpoints.md) | 平台外扩展端点约定：远端 legal/schema 校验器（完整 URL + fail-closed + 不透传身份），为后续 webhook 立同一套规矩 | 已采纳（P10 切片 6a；未验证项见其 §5.3） |
+| [ADR-013](adr/ADR-013-file-service-extension-endpoints.md) | 平台外扩展端点约定：远端 legal/schema 校验器（完整 URL + fail-closed + 不透传身份）与事件 webhook（完整 URL + **非致命**，§9） | 已采纳（P10 切片 6a/6b；未验证项见其 §5.3、§9.4） |
 
 ---
 

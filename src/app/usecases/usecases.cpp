@@ -132,9 +132,12 @@ class AuditGuard {
 };
 
 //  状态变更事件（契约 §2.6 的第 1/10/12 步）：**非致命**
+//  ★ `record_id` 是"记录 id 已知时"才填的（第 1 步 IN_PROGRESS 发生在建记录之前，
+//    此时为空；第 10 步 SUCCESS 与幂等命中路径都带着真实记录 id）—— 事件形状与上游一致。
 void PublishStatus(UseCasePorts& ports, const CallerContext& caller, std::string_view status,
-                   std::int64_t version) {
+                   std::int64_t version, std::string_view record_id = {}) {
   domain::StatusChangedEvent event;
+  event.record_id = std::string(record_id);
   event.partition = caller.partition;
   event.status = std::string(status);
   event.dataset_sync = "DATASET_SYNC";
@@ -272,7 +275,7 @@ void RollbackCreatedObject(UseCasePorts& ports, const CallerContext& caller,
       (void)to_store.value()->remove(to_ref);
     }
   }
-  PublishStatus(ports, caller, "FAILED", 0);
+  PublishStatus(ports, caller, "FAILED", 0, record_id);
   (void)RecordAudit(ports, "createMetadataFailure", caller, record_id, false);
 }
 
@@ -281,7 +284,7 @@ void RollbackCreatedObject(UseCasePorts& ports, const CallerContext& caller,
 //    上一个成功请求清理掉而报错（ADR-009 M2）。
 fss::Result<std::string> ReturnExistingRecord(UseCasePorts& ports, const CallerContext& caller,
                                               const domain::FileMetadataRecord& existing) {
-  PublishStatus(ports, caller, "SUCCESS", existing.version);
+  PublishStatus(ports, caller, "SUCCESS", existing.version, existing.id);
   PublishDatasetDetails(ports, caller, existing.id, existing.version);
   FSS_TRY(RecordAudit(ports, "createMetadataSuccess", caller, existing.id, true));
   return existing.id;
@@ -616,7 +619,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   }
 
   // 10. 成功事件（非致命）：**两个**事件，顺序与上游一致（先 status，再 datasetDetails）
-  PublishStatus(ports_, caller, "SUCCESS", created.value().version);
+  PublishStatus(ports_, caller, "SUCCESS", created.value().version, created.value().id);
   PublishDatasetDetails(ports_, caller, created.value().id, created.value().version);
 
   // 位置记录迁到 persistent（zone 更新）并记上传者（getFileList 的 UserID 过滤）

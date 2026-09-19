@@ -960,6 +960,7 @@ REST 与 RPC 两次调用会生成**不同的**签名 URL（含不同时间戳/n
 | 健康/就绪的依赖明细 | `X-FSS-Dependencies` 响应头 | 响应头（不影响 body） | 启用 |
 | 远端 legal 校验器 | **出站** POST 到 `legal.remote.base_url`（运维给的完整 URL） | 配置驱动（`legal.validator=remote`）；不新增入站路径 | 关闭（`noop`，不发任何请求） |
 | 远端 schema 校验器 | **出站** POST 到 `schema.remote.base_url`（运维给的完整 URL） | 配置驱动（`schema.validator=remote`）；不新增入站路径 | 关闭（`noop`，不发请求） |
+| 事件 webhook（出站） | **出站** POST 到 `events.webhook.url`（运维给的完整 URL，**不追加路径**） | 配置驱动（`events.publisher=webhook`）；不新增入站路径 | 关闭（`events.publisher=log`，默认；`none` = 显式关闭且不发请求） |
 
 **原则**：任何扩展都**不得**修改 OSDU 端点的既有状态码、字段名或字段语义。
 扩展只能以"新端口 / 新路径段 / 新响应头 / 配置开关"的形式存在。
@@ -1010,6 +1011,59 @@ REST 与 RPC 两次调用会生成**不同的**签名 URL（含不同时间戳/n
 **测试**：`tests/integration/test_remote_validators.cpp`（真实 `build/bin/fss_server` +
 独立进程 mock `tests/tools/mock_validators.py`）+ `tests/tools/mock_validators.py` 的
 `--observe-file`（断言请求体形状与"有没有发请求"）。
+
+### 7.2 事件 webhook 发布器（出站扩展；ADR-013 §9）
+
+> **上游没有 webhook 传输形态**：上游 File Service 通过消息总线（Kafka 类）发布
+> `statusChanged` / `datasetDetails`。本节的 HTTP POST 是**本项目的约定**，
+> 与 `/v1/transfer`、§7.1 同类，**未与真实消息总线/中间件联调**。
+
+| 项 | 内容 |
+| --- | --- |
+| 触发时机 | `POST /api/file/v2/files/metadata` 的用例第 **1** 步（`statusChanged` = `IN_PROGRESS`）与第 **10** 步（`statusChanged` = `SUCCESS` + `datasetDetails`），与 §2.6 的两个事件同源 |
+| 开关 | `events.publisher=webhook`（默认 `log`；`none` = 显式关闭，不发任何请求） |
+| 端点 | `events.webhook.url`（**完整 URL**，POST 到它，**不追加路径**）；`Content-Type: application/json` |
+| 超时 | `events.webhook.timeout_ms`（整体；连接超时 = `min(1000, timeout_ms)`） |
+| topic | 载荷里的 `topic` 取**配置值** `events.webhook.topic`（两个事件都用它） |
+
+**载荷（镜像上游事件形状）**：
+
+```
+statusChanged  : {"topic":T,"kind":"statusChanged",
+                  "body":{"recordId","partition","status","datasetSync","version"}}
+datasetDetails : {"topic":T,"kind":"datasetDetails",
+                  "body":[{"properties":{"correlationId","datasetId","datasetType":"FILE",
+                          "datasetVersionId","recordCount":1,"timestamp"}}]}
+```
+
+`datasetDetails` 的 `body` 是**长度为 1 的数组**（对齐上游 `FileDatasetDetailsPublisher.java`）。
+`statusChanged.body.recordId` 在记录 id 已知时带上真实 id（第 1 步 `IN_PROGRESS` 发生在建记录
+之前，此时为空串）。
+
+**失败语义：非致命（与 §7.1 方向相反）**——依据是上游只
+`log.warning("Failed to publish ...")`（契约 §2.6 第 4/10 步）：
+
+| 依赖侧事实 | 本服务行为 |
+| --- | --- |
+| `2xx` | 成功（无额外日志） |
+| 非 2xx（含 3xx：`FOLLOWLOCATION=0`） | 记一条可读 `Warn`，**继续** |
+| 连接失败 / DNS / TLS | 同上，**继续** |
+| 超时（`timeout_ms` 或连接超时） | 同上，**继续** |
+| 坏响应（我们只判 2xx；体不解析） | 同上，**继续** |
+| `publisher=webhook` 且 `events.webhook.url` 为空 | **exit 78**（组合根 `Ready()`/`NotReadyReason()`，可读原因） |
+
+★ **发布失败绝不能让 HTTP 请求失败**：建记录请求照常 **201**，且记录**真的建出来**
+（persistent 侧有文件）。用例层保持 `(void)ports.events.Publish...`，**不得**改成 `FSS_TRY`。
+`publisher=none` 是**显式关闭**（不是"没实现"），配了 url 也一个请求都不发。
+
+⚠️ **同步发布的延迟代价**：本实现是**内联同步** POST（上游是异步消息总线）。一次
+`createMetadata` 会发 2~3 个事件，因此一个慢 webhook 最多给请求路径增加
+**事件数 × `events.webhook.timeout_ms`**。**异步有界发布队列 / 重试退避 / 投递保证未交付**
+（ADR-013 §9.4）。
+
+**测试**：`tests/integration/test_webhook_publisher.cpp`（真实 `build/bin/fss_server` +
+`tests/tools/mock_validators.py --mode webhook`；`--observe-file` 的 `bodies` 列表断言
+"两个 kind 都发了"）。
 
 ---
 

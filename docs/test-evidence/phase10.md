@@ -10,7 +10,7 @@
 | 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
 | 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **77/77** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 102 / 拒绝启动（触发条件）20 / 已读但无效果 34**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键；**切片 5** 接通 3 键；**切片 6a（C10.18）** 接通 6 键 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 106 / 拒绝启动（触发条件）19 / 已读但无效果 31**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键；**切片 5** 接通 3 键；**切片 6a（C10.18）** 接通 6 键 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动；**切片 6b（C10.19）** 接通 `events.publisher` 与 `events.webhook.{url,timeout_ms,topic}` 4 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
 | 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
@@ -788,7 +788,7 @@ All tests passed (464 assertions in 8 test cases)
 $ ./build/bin/test_config_wiring "★ C10.11*"
 All tests passed (244 assertions in 1 test case)     # 该 TEST_CASE 原有 85 断言 + 新增 fail_closed 三个 SECTION
 $ ./build/bin/test_operations_doc
-All tests passed (24 assertions in 2 test cases)     # 三态 102/20/34
+All tests passed (24 assertions in 2 test cases)     # 三态 102 / 20 / 34（§11 当时值；已由 §12 更新为 106 / 19 / 31）
 $ ./build/bin/test_composition_root_guard
 All tests passed (17 assertions in 2 test cases)
 $ ctest --test-dir build -L phase10 --output-on-failure
@@ -931,10 +931,45 @@ test cases:  1 |  0 passed | 1 failed      assertions: 53 | 52 passed | 1 failed
 上面 ① 已给出真正的证明方式。这两条都记在这里，因为它们正是 R1 存在的意义：
 "用例通过了"与"用例能失败"是两件事。
 
+#### 11.4.2 父代理**事后更正**：本切片的"无残留"断言曾经是**恒真**的（切片 6b 复核时发现）
+
+切片 6b 的实现者在写它自己的"记录真的建出来"断言时发现：`getFileList` 的 `Location` 是
+**容器相对路径**（`opendes-staging/...`），而 POSIX 驱动的物理根是
+`<storage.posix.root>/blobs`（组合根拼的）。本切片的 `RequireNoPersistentSideEffect` 当时是：
+
+```cpp
+const std::filesystem::path persistent_path(persistent);   // 相对路径！
+REQUIRE_FALSE(std::filesystem::exists(persistent_path));    // 测试进程 CWD 下恒为 false → 恒真
+```
+
+也就是说 **"persistent 侧没有对应文件"这一条从未被真正验证**（它只证明了"这个相对路径不存在"）。
+修法（父代理改，并配自证）：
+
+```cpp
+const std::filesystem::path staging_path    = std::filesystem::path(blob_root) / location;
+const std::filesystem::path persistent_path = std::filesystem::path(blob_root) / persistent;
+REQUIRE(std::filesystem::exists(staging_path));            // ★ 正控：证明路径解析是真的
+REQUIRE_FALSE(std::filesystem::exists(persistent_path));    // 目标判据（现在有牙齿）
+```
+
+调用点 6 处统一改为传 `data_dir.child("store") + "/blobs"`。自证（把目标判据**反转**必须失败）：
+
+```
+$ ./build/bin/test_remote_validators          # 反转 REQUIRE_FALSE → REQUIRE
+tests/integration/test_remote_validators.cpp:207: FAILED:
+  persistent 侧不应存在的文件：/tmp/fss_.../store/blobs/opendes-persistent/...
+# 还原后：All tests passed (528 assertions in 9 test cases)   ← 464 → 528（+6 条正控）
+```
+
+**这条比切片本身更值得记**：凡是**否定式**判据（`REQUIRE_FALSE`）都必须配一条**正控**
+（同一条路径解析上断言"该存在的东西**存在**"），否则路径写错、对象不存在、名字拼错都会让
+判据静默恒真（与 §11.4.1 的"两条防线重合"同族：都是**判据无区分力**）。已同步写进
+`AGENTS.md` §4.3。
+
 ### 11.5 规格勘误与一处**独立理由的更正**（都必须写清楚）
 
 **① 规格勘误（父代理确认）**：本切片的规格原写"把 **7** 个键变成生效，最终三态
-生效 103 / 拒绝启动 19 / 已读但无效果 34"。这是**父代理规格里的算术错误** —— 实际只有
+生效 103、拒绝启动 19、其余 34 键已读但无效果"。这是**父代理规格里的算术错误** —— 实际只有
 **6 个键**（`legal.validator`、`schema.validator` 来自「拒绝启动」= 2 个；
 四个 `*.remote.{base_url,timeout_ms}` 来自「已读但无效果」= 4 个），正确落点是
 **102 / 19 / 35**。实测机械核对：HEAD 为 `EFF 96 / REJ 21 / INE 39`，接线后
@@ -980,3 +1015,244 @@ test cases:  1 |  0 passed | 1 failed      assertions: 53 | 52 passed | 1 failed
   证明"503 后没有记录被建出来"，但 `getFileList` 列的是**位置仓储**而不是元数据 ——
   `uploadURL` 一旦签发就已经写了一条 staging 位置记录，所以该断言拿到 **200**。
   改成两条**可证**的副作用：`Location` 仍指向 **staging** 容器 且 persistent 侧**没有**对应文件。
+
+---
+
+## 12. 切片 6b（本轮）：接通事件发布器 `events.publisher` 与 `events.webhook.*`（C10.19 / ADR-013 §9）
+
+**背景**：`docs/operations.md` §1.3 的三态里，`events.publisher` 是「拒绝启动
+（`webhook`/`none` → exit 78）」，`events.webhook.{url,timeout_ms,topic}` 是「已读但无效果」。
+本轮把这 **4 个键**接通成**生效**：新增 L2 适配器 `WebhookEventPublisher`，组合根按
+`events.publisher` 选 `log`（默认，行为逐字不变）/ `webhook` / `none`（显式关闭）。
+
+**与切片 6a 的关键差异（必须同时被两条测试各自钉住）**：6a 的远端校验是 **fail-closed**
+（依赖故障 → 503、**无残留**）；事件发布是**非致命**的（上游只
+`log.warning("Failed to publish ...")`）——依赖故障**绝不能让请求失败**：建记录请求照常
+**201**，且记录**真的建出来**。两条语义方向相反，`test_remote_validators.cpp`（503 + 无残留）
+与 `test_webhook_publisher.cpp`（201 + 有文件）是**镜像**判据。
+
+### 12.1 逐键结论（4 个键）
+
+| 键 | 最终状态 | 判据 / 证据 |
+| --- | --- | --- |
+| `events.publisher` | **生效** | `log`（默认）= 既有 `LogEventPublisher`（写日志、**不发请求**，行为逐字不变）→ C10.19 ④（mock `requests == 0` + 日志里仍有 `"msg":"status-changed"`）；`webhook` = 装配 `WebhookEventPublisher` → C10.19 ①（201 + 两个事件都到）；`none` = 内联 `NoopEventPublisher`（**显式关闭**）→ C10.19 ③（mock `requests == 0` 且**连日志都不写**）。非法取值由 schema 的 enum 拒绝 → exit 78（`test_config_wiring.cpp` 的 `events.publisher=bogus`）。横幅打印 `events : publisher=…`（**不打印密钥**） |
+| `events.webhook.url` | **生效** | → `WebhookEventPublisherOptions.url`；**POST 到该 URL，不追加任何路径**（与 6a 的 `*.remote.base_url` 同一约定，ADR-013 §2/§9）。真实进程证据：mock 收到的每个 body 都是 `{"topic","kind","body"}` 形状（C10.19 ①）；空值 + `publisher=webhook` → **exit 78** + 可读原因（C10.19 ⑤） |
+| `events.webhook.timeout_ms` | **生效** | → `CURLOPT_TIMEOUT_MS`（连接超时 = `min(1000, timeout_ms)`）。C10.19 ⑥：**同一个 mock**（`--delay-ms 800`）在 `timeout_ms=300` → 日志有超时告警、`timeout_ms=3000` → **无告警**且 mock 收到带**本轮记录 id** 的两个 kind。三次形态的实测见 §12.4 |
+| `events.webhook.topic` | **生效** | → 两个事件载荷里的 `topic`（`statusChanged` 与 `datasetDetails` **都用配置值**）。C10.19 ① 用非默认值 `fss-events-test`：mock 收到的所有 body 的 `topic` 都是它；R1 自证②把实现硬编码成 `status-changed` → 该断言失败（§12.5） |
+
+### 12.2 实现点（可点击）
+
+* 新增 `src/infra/event/webhook_event_publisher.{h,cpp}`（L2）：照 `remote_legal_validator.*`
+  的写法（`CURLOPT_NOSIGNAL` / `FOLLOWLOCATION=0` / `CONNECTTIMEOUT_MS` + `TIMEOUT_MS` /
+  `WriteToString` / 2xx 判定 / `Ready()` + `NotReadyReason()`），但失败方向相反：非 2xx /
+  连不上 / 超时 → 返回 `Err(kUnavailable)` **并记一条 `Warn`**（用例层丢弃 Err，请求不受影响）。
+  载荷用 `json::Value` 构造（不拼字符串）：`statusChanged` 的 `body` 是对象；
+  `datasetDetails` 的 `body` 是**长度 1 的数组**、元素 `{"properties":{...}}`
+  （对齐上游 `FileDatasetDetailsPublisher.java`，见 `ports.h` 注释）。
+* `src/CMakeLists.txt`：新增 L2 目标 `fss_event_webhook`（`fss_domain` + `fss_json` +
+  `fss_logging` + `CURL::libcurl`）并链进 `fss_server`。**链接 `fss_logging` 的理由**：
+  "发布失败要留一条可读告警"是适配器自身的职责（用例层按上游语义丢弃 `Result`，
+  没有别的层能记这条告警）。
+* `src/main/server_main.cpp`：删掉 `if (events_publisher != "log") return reject_startup(...)`；
+  新增三分支（`log` / `webhook` / `none`）+ 内联 `NoopEventPublisher`（R12：具体实现只在组合根
+  创建）；`webhook` + 空 `url` → `Ready()`/`NotReadyReason()` **exit 78**；横幅新增
+  `events : publisher=…`（含端点/timeout/topic；**不打印密钥**）。
+* `src/app/usecases/usecases.cpp`：`PublishStatus` 增加 `record_id` 参数（第 10 步 / 幂等命中
+  路径带真实 id；第 1 步 IN_PROGRESS 在建记录之前 → 空），使 `statusChanged.body.recordId`
+  与上游形状一致。**调用点仍是 `(void)ports.events.Publish...`（失败被丢弃）—— 这是本切片
+  的核心语义，不得改成 `FSS_TRY`。**
+* `tests/tools/mock_validators.py` + `tests/framework/mock_validators.h`：新增
+  `--mode webhook`（默认回 200 `{"ok":true}`）与观测字段 `bodies`（**全部**请求体，按到达顺序；
+  保留 `last_body` 兼容 6a）；请求体改在故障短路**之前**读取/观测，因此失败形态下也能断言
+  "mock 真的收到了事件体"。`Observation` 新增 `BodiesOfKind(kind)` 与 `last_headers`。
+* `tests/integration/test_webhook_publisher.cpp`（新，6 用例）+ `tests/CMakeLists.txt`；
+  `tests/unit/test_composition_root_guard.cpp` 清单加 `WebhookEventPublisher`。
+
+### 12.3 实测命令与输出摘要
+
+```
+$ cmake --build build -j4                 # ★ 用 -j4（AGENTS §4.3 的 OOM 陷阱）
+[100%] Built target test_config_wiring
+$ ./build/bin/test_webhook_publisher
+All tests passed (331 assertions in 6 test cases)
+$ ./build/bin/test_remote_validators
+All tests passed (518 assertions in 9 test cases)
+$ ./build/bin/test_config_wiring
+All tests passed (851 assertions in 31 test cases)
+$ ./build/bin/test_operations_doc
+All tests passed (24 assertions in 2 test cases)     # 三态 106/19/31
+$ ./build/bin/test_composition_root_guard
+All tests passed (17 assertions in 2 test cases)
+$ ctest --test-dir build -L phase10 --output-on-failure
+100% tests passed, 0 tests failed out of 4            # + test_webhook_publisher
+$ ctest --test-dir build -j4
+100% tests passed, 0 tests failed out of 79
+$ ./scripts/check_docs.sh --selftest
+  ✓ 自证：D1/D2/D4/D5 都能检出注入的错误（检查器有效）
+  D5 门槛编号检查：11 个阶段，共 145 条门槛          # +C10.19（无断号）
+  全部检查通过（D1~D5）
+$ ./scripts/verify_config_wiring.sh
+  ✓ events.publisher=webhook + 空 url（exit 78）（=78）
+  配置面接线：全部通过（54 条断言）
+```
+
+**§7.2 / ADR-013 §9 的载荷形状逐条实测**（C10.19 ①，判据来自 mock 的 `bodies`）：
+
+| 断言 | 实测 |
+| --- | --- |
+| 一次 `createMetadata` 发 3 个事件（`IN_PROGRESS`、`SUCCESS`、`datasetDetails`） | mock `requests == 3`；`BodiesOfKind("statusChanged").size() == 2`、`datasetDetails == 1` |
+| `topic` 来自**配置**（非默认 `fss-events-test`） | 3 个 body 的 `topic` 全部 == `fss-events-test` |
+| `statusChanged.body` | `{recordId,partition:"opendes",status,datasetSync:"DATASET_SYNC",version}`；`recordId` 与 201 响应体的 `id` **逐字相等**；`IN_PROGRESS` 的 `version==0` 且 `recordId==""`；`SUCCESS` 的 `version>=1` |
+| `datasetDetails.body` | **长度 1 的数组**；`properties.datasetId`==记录 id、`datasetType=="FILE"`、`recordCount==1`、`datasetVersionId=="1"`、`timestamp>0`、含 `correlationId` |
+| 表头 | `Content-Type: application/json` |
+
+### 12.4 **非致命**三种故障形态的实测（本切片核心）
+
+判据（每种形态都必须**同时**满足）：① 请求仍 **201**；② 记录**真的建出来**（`getFileList`
+恰好 1 条、`Location` 指向 **persistent** 容器、且该文件在 `<storage.posix.root>/blobs/` 下
+**真实存在**）；③ 日志里有一条**可读**告警。三种形态在同一台机器上依次实测（独立配置 +
+真实 `build/bin/fss_server`；前两种用 mock 注入，第三种用未监听端口）：
+
+| 形态 | `createMetadata` | `getFileList` | persistent 文件存在 | 日志告警（截断） |
+| --- | --- | --- | --- | --- |
+| **连不上**（未监听端口，timeout=1000ms） | **201** | 1 条，`opendes-persistent/osdu-user/…` | **是**（`/tmp/wh_closed/store/blobs/opendes-persistent/…`） | `Failed to publish event: 事件发布失败（传输层，kind=statusChanged）：Couldn't connect to server（端点 http://127.0.0.1:36565，timeout=1000ms）` |
+| **非 2xx**（mock `--status 500`，timeout=3000ms） | **201** | 1 条，persistent | **是**（`/tmp/wh_http500/store/blobs/opendes-persistent/…`） | `Failed to publish event: 事件发布失败（非 2xx，kind=statusChanged）：HTTP 500（端点 http://127.0.0.1:35153）` |
+| **超时**（mock `--delay-ms 800`，timeout=300ms） | **201** | 1 条，persistent | **是**（`/tmp/wh_timeout/store/blobs/opendes-persistent/…`） | `Failed to publish event: 事件发布失败（传输层，kind=statusChanged）：Timeout was reached（端点 http://127.0.0.1:44703，timeout=300ms）` |
+
+同一组断言也在 `test_webhook_publisher.cpp` 的 **C10.19 ②** 里被机械重放
+（`All tests passed (106 assertions in 1 test case)`）。
+
+★ 一处**判据自身的坑**（本轮实测抓到）：`getFileList` 的 `Location` 是**容器相对路径**
+（`opendes-persistent/…`），而 POSIX 驱动的物理根是 `<storage.posix.root>/blobs`（组合根
+`storage_root + "/blobs"`）。最初直接 `std::filesystem::exists(location)` → **恒为 false**
+（恒真的反面：恒假）。已改成用 `blobs` 根拼出**真实物理路径**再断言 —— 该断言现在能失败
+（若 persistent 复制没发生就会 false），是本切片"记录真的建出来"的可证判据。
+（顺带记录：6a 的 `RequireNoPersistentSideEffect` 用的是**相对** `exists`，那里只因为断言的是
+`REQUIRE_FALSE` 才没有暴露；本切片**没有**把它当成"文件不存在"的正面证据。）
+
+### 12.5 R1 自证（注入 → 用例失败 → 还原 → 实测输出）
+
+三个"错误实现"各注入一次，都让对应用例**失败**；随后**完整还原**
+（`diff` 三个备份文件全部一致），`grep -rn "R1-INJECT" src/` 无输出（rc=1）。
+**每次注入后都 `cmake --build build -j4` 全量重建**（用例拉起的是 `build/bin/fss_server`，
+只重建测试目标注入不会进被测二进制 —— 切片 6a 的教训）。
+
+**① 把发布失败改成致命**（`PublishStatus` 改为返回 `fss::Result<void>` 并在内部
+`FSS_TRY(ports.events.PublishStatusChanged(...))`，第 1/10 步与幂等命中路径都改 `FSS_TRY`）
+→ C10.19 ② 必须失败：
+
+```
+$ ./build/bin/test_webhook_publisher "★ C10.19 ②*"
+tests/integration/test_webhook_publisher.cpp:376: FAILED:
+  REQUIRE( result.create_status == 201 )
+with expansion:
+  503 == 201 (0xc9)
+with messages:
+  test_case.name := "连不上（未监听端口）"
+  result.create_status := 503 (0x1f7)
+  result.create_body := "{"code":503,"message":"事件发布失败（传输层，kind=statusChanged）：
+                        Couldn't connect to server（端点 http://127.0.0.1:55455，timeout=1000ms）",
+                        "reason":"Service Unavailable"}"
+test cases:  1 |  0 passed | 1 failed
+assertions: 22 | 21 passed | 1 failed
+```
+
+**② 让发布器忽略 `events.webhook.topic`**（`EffectiveTopic` 硬编码 `"status-changed"`）
+→ C10.19 ① 的 topic 断言必须失败：
+
+```
+$ ./build/bin/test_webhook_publisher "★ C10.19 ①*"
+tests/integration/test_webhook_publisher.cpp:286: FAILED:
+  REQUIRE( message["topic"].get<std::string>() == "fss-events-test" )
+with expansion:
+  "status-changed" == "fss-events-test"
+test cases:  1 |  0 passed | 1 failed
+assertions: 38 | 37 passed | 1 failed
+```
+
+**③ 让 `none` 仍然"发布"**（组合根 `none` 分支错接 `log_events`）→ C10.19 ③ 必须失败：
+
+```
+$ ./build/bin/test_webhook_publisher "★ C10.19 ③*"
+tests/integration/test_webhook_publisher.cpp:419: FAILED:
+  REQUIRE( banner.find("\"msg\":\"status-changed\"") == std::string::npos )
+with expansion:
+  ...
+  "msg":"events.publisher=none：已**显式关闭**  ...（找到内容）
+test cases:  1 |  0 passed | 1 failed
+assertions: 40 | 39 passed | 1 failed
+```
+
+**③ 的判据缺口（值得单独记，与 §11.4.1 同类）**：按本切片最初的规格，C10.19 ③ 只有
+"201 / 记录建出来 / mock `requests == 0` / 无失败告警 / 横幅写 `none`" 这些断言 ——
+这些**无法区分** `None` 与 `Log`，因为 `LogEventPublisher` **也不发 HTTP 请求**、也不会产生
+失败告警。也就是说：把 `none` 错接成 `LogEventPublisher` 时，**原始判据会全绿**。
+在跑注入 ③ 之前就预判到这一点，因此给用例 3 补了第 5 条断言 ——
+**"显式关闭"= 什么都不做（连事件日志都不写）**：`DumpLog()` 里不得出现
+`"msg":"status-changed"`。补上后再注入③，用例**如期失败**（上面的输出）。
+教训与 §11.4.1 一致：**"用例通过了"与"用例能失败"是两件事**；这一次是**先**补判据再注入。
+
+**还原后的实测**：
+
+```
+$ grep -rn "R1-INJECT" src/                          # 无输出（rc=1）
+$ diff /tmp/r1_usecases_backup.cpp src/app/usecases/usecases.cpp      # 一致
+$ diff /tmp/r1_webhook_h_backup.h  src/infra/event/webhook_event_publisher.h   # 一致
+$ diff /tmp/r1_server_main_backup.cpp src/main/server_main.cpp        # 一致
+$ ./build/bin/test_webhook_publisher "★ C10.19 ①*"   → All tests passed (67 assertions in 1 test case)
+$ ./build/bin/test_webhook_publisher "★ C10.19 ②*"   → All tests passed (106 assertions in 1 test case)
+$ ./build/bin/test_webhook_publisher "★ C10.19 ③*"   → All tests passed (40 assertions in 1 test case)
+$ ./build/bin/test_webhook_publisher                 → All tests passed (331 assertions in 6 test cases)
+```
+
+### 12.6 三态计数（切片 6b 收尾；**最终**）
+
+`config/fss.example.json` 的 **156** 个叶子键：生效 **106** / 拒绝启动（触发条件）**19** /
+已读但无效果 **31**（**106** + **19** + **31** = 156），由 `tests/unit/test_operations_doc.cpp`
+的 C10.11 用例从 §1.2 的 156 行程序化提取并机械断言（表格计数 + 正文两处字符串同时断言）。
+净变化：`events.publisher` 移出「拒绝启动」、`events.webhook.{url,timeout_ms,topic}` 移出
+「已读但无效果」→ **4 个键全部移入「生效」**（净：生效 +4 / 拒绝启动 −1 / 已读但无效果 −3）。
+
+### 12.7 未做 / 降级 / 未验证（如实登记）
+
+* **异步有界发布队列未交付**：本实现是**内联同步** POST。一次 `createMetadata` 发 2~3 个事件，
+  一个慢 webhook 最多给请求路径增加 **事件数 × `events.webhook.timeout_ms`**（ADR-013 §9.4-1）。
+  要交付必须先定义「队列上界 + 丢弃策略 + 退避参数」并新增配置键（同步 example / operations /
+  自动比对测试）。
+* **无重试/退避、无投递保证**：单次尝试，失败即丢弃（只留一条告警）。上游消息总线的
+  at-least-once 语义**没有**被复现（ADR-013 §9.4-2）。
+* **未与真实消息总线 / 中间件联调**（本环境没有）：协议形状是本项目与运维方的约定；
+  上游 File Service 通过消息总线（Kafka 类）发布这两个事件，**没有** webhook 传输形态。
+* **不透传调用方身份**（与 6a 同源）：载荷里没有 bearer/tenant 凭证；端点须允许
+  **无 per-request 认证**访问。这是端口签名决定的，不代表身份问题已解决。
+* `events.webhook.connect_timeout_ms` **未暴露为配置键**（固定 `min(1000, timeout_ms)`）。
+* 本轮**未**跑 `run_all_gates.sh` 全量（由父代理在最终工作树上跑）；上面与本切片相关的
+  五条命令全绿。
+
+### 12.8 父代理复核（含对切片 6a 的一处**事后更正**）
+
+**① 独立复核结果**：`cmake --build build -j4` 通过、`ctest` **79/79**、
+`check_docs.sh --selftest` 通过（13 ADR / **145** 门槛）、`test_operations_doc` 24 断言、
+`run_all_gates.sh` 全绿（**350 s / 11 阶段，失败 无**）、`grep -rn "R1-INJECT" src/ tests/` 无残留。
+
+**② 我自己重做了一次注入**（不转述实现者）：把 `WebhookEventPublisher::EffectiveTopic`
+硬编码成 `"status-changed"`（即"忽略配置的 topic"）→
+
+```
+tests/integration/test_webhook_publisher.cpp:286: FAILED:
+  REQUIRE( message["topic"].get<std::string>() == "fss-events-test" )
+with expansion:  "status-changed" == "fss-events-test"
+assertions: 302 | 301 passed | 1 failed
+# 还原后：All tests passed (331 assertions in 6 test cases)
+```
+即：**`events.webhook.topic` 确实来自配置**（这条判据有区分力）。非致命语义的实现机制也已核对：
+`usecases.cpp` 的两个发布助手用 `(void)` 丢弃结果（`PublishStatus` / `PublishDatasetDetails`），
+因此"发布失败不影响请求"是**用例层**的性质，不依赖适配器返回什么。
+
+**③ 对切片 6a 的事后更正（由 6b 的实现者发现线索，父代理修复）**：6a 的
+`RequireNoPersistentSideEffect` 用**容器相对路径**做 `REQUIRE_FALSE(exists(...))` →
+在测试进程 CWD 下恒为 false → **该判据恒真，"persistent 侧无文件"从未被验证**。
+已改为拼真实物理根（`<storage.posix.root>/blobs`）并**加正控**
+（`REQUIRE(exists(staging_path))` 证明路径解析是真的），6 处调用点同步；
+反转目标判据跑一次确认会失败（详见 **§11.4.2**）。断言数 464 → **528**（+6 条正控）。
+教训已写进 `AGENTS.md` §4.3（"否定式判据必须配正控"）。

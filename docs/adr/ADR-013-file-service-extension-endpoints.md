@@ -1,6 +1,6 @@
 # ADR-013：本服务的**平台外扩展端点**约定 —— 远端 legal / schema 校验器（为后续 webhook 立同一套规矩）
 
-- 状态：**已采纳（Accepted）**（P10 切片 6a 落地；未验证项见 §5.3）
+- 状态：**已采纳（Accepted）**（P10 切片 6a 落地；webhook 同类扩展见 §9；未验证项见 §5.3 与 §9.4）
 - 日期：2026-09
 - 相关：`docs/01-osdu-research.md:110`（上游不调用 Legal/Schema）、`docs/03-api-contract.md` §7（扩展清单）、
   `docs/operations.md` §1.2.11（7 个键的三态）、`docs/02-design.md` §L2（模块布局）与 §17（索引）；
@@ -135,10 +135,10 @@ mTLS 终结 / 网络策略白名单）。若将来需要在协议里带上身份
    伪装成"只是慢"，与 fail-closed 的初衷冲突。
 5. **`connect_timeout_ms` 未暴露为配置键**：目前固定 1000ms（与 Entitlements 的键不同）。
    需要时再加键（要同步 `config/fss.example.json` + `operations.md` + 自动比对测试）。
-6. **webhook（`events.publisher=webhook`）仍拒绝启动**：本 ADR §2 的约定是给"后续 webhook"
-   立的同一套规矩（完整 URL、fail-closed、不透传身份），但 webhook 的**方向不同**
-   （出站通知，失败是否致命取决于调用方），落地时**需要单独一份 ADR 或本 ADR 的修订**，
-   不要直接照抄 §5.1 的矩阵。
+6. **webhook（`events.publisher=webhook`）已落地，但方向相反**（见 **§9**）：它复用 §2 的
+   「完整 URL + 不透传身份」两条规矩，**不**照抄 §5.1 的 fail-closed 矩阵 —— 事件发布是
+   **非致命**的（连不上/超时/非 2xx 只记告警，请求照常 201）。**异步有界发布队列 /
+   重试退避 / 投递保证**仍未交付（§9.4）。
 
 ---
 
@@ -172,5 +172,81 @@ mTLS 终结 / 网络策略白名单）。若将来需要在协议里带上身份
   与等价性矩阵。
 * 若接入点的延迟成为瓶颈：评估"按 (partition, tags) 的有界 TTL 缓存"，并**先定义**
   撤权延迟的可接受上界（不要默认缓存）。
-* webhook 发布器落地时复用 §2 的"完整 URL + fail-closed + 不透传身份"三条，
-  但**单独定"通知失败是否致命"**。
+* webhook 发布器**已落地**（见 **§9**）：复用 §2 的「完整 URL + 不透传身份」，
+  但**失败方向相反**（非致命）；异步有界队列/重试退避/投递保证仍未交付（§9.4）。
+
+---
+
+## 9. 事件 webhook（同类扩展；切片 6b / C10.19）
+
+§2 的三条约定（**完整 URL**、不透传身份、协议形状由本 ADR 定义）在 webhook 上**继续适用**，
+但**失败方向相反**：事件发布是**非致命**的。本节是它的定案。
+
+### 9.1 线协议
+
+```
+POST <events.webhook.url>              Content-Type: application/json
+                                       （url 就是完整端点，不追加路径）
+
+statusChanged  : {"topic":T,"kind":"statusChanged",
+                  "body":{"recordId","partition","status","datasetSync","version"}}
+datasetDetails : {"topic":T,"kind":"datasetDetails",
+                  "body":[{"properties":{"correlationId","datasetId","datasetType":"FILE",
+                          "datasetVersionId","recordCount":1,"timestamp"}}]}
+
+2xx            → 成功
+其余一切（非 2xx / 连不上 / 超时 / 坏响应）→ **非致命**：记一条可读 Warn 并继续
+```
+
+* `T` 取**配置值** `events.webhook.topic`（两个事件都用它）。
+* `datasetDetails` 的 `body` 是**长度为 1 的数组**（对齐上游 `FileDatasetDetailsPublisher.java`）。
+* 超时 = `events.webhook.timeout_ms`（整体）+ 连接超时 `min(1000, timeout_ms)`。
+* `statusChanged.body.recordId` 在记录 id 已知时带真实 id（第 1 步 `IN_PROGRESS` 在建记录之前 → 空）。
+
+**为什么是"完整 URL"**：与 §2 同源 —— 上游**没有** webhook 路径依据，不发明 `*_path` 键。
+
+**为什么"非致命"（一手依据）**：`docs/03-api-contract.md` §2.6 第 4/10 步 +
+`src/domain/ports/ports.h` —— 上游只 `log.warning("Failed to publish ...")`。因此即使 webhook
+完全不可达，`createMetadata` 仍必须 **201**、记录仍必须**真的建出来**。用例层保持
+`(void)ports.events.Publish...`（**不得**改成 `FSS_TRY`）。这与 §5.1 的 fail-closed 矩阵
+**方向相反**，两条语义各自被测（`test_webhook_publisher.cpp` vs `test_remote_validators.cpp`）。
+
+### 9.2 三态选择器
+
+| `events.publisher` | 行为 |
+| --- | --- |
+| `log`（默认） | 既有 `LogEventPublisher`（写日志，**不发请求**），行为逐字不变 |
+| `webhook` | 本节的 POST；`url` 为空 → **exit 78**（`Ready()` / `NotReadyReason()`） |
+| `none` | 组合根内联 `NoopEventPublisher` —— **显式关闭**（不发请求），不是"没实现" |
+
+### 9.3 备选方案（≥3）
+
+| # | 方案 | 优点 | 代价 / 不选的理由 | 实测？ |
+| --- | --- | --- | --- | --- |
+| 1 | 保持 `webhook`/`none` **拒绝启动**（不实现） | 零出站依赖 | 能力锁死；需要事件通知的部署只能在别处再写消费者与配置；"拒绝启动"只是把问题推到部署期 | ✅ 已实测：这就是接线前的状态 |
+| 2 | **复用真实消息总线客户端**（Kafka 类） | 与上游形态一致，天然异步 | 引入重依赖与 broker/序列化契约；本环境**没有** broker，无法联调，等于交付未验证的东西 | ⬜ **未实测**（无 broker；不引入新依赖） |
+| 3 | **本服务自定义 webhook + 非致命**（**采纳**） | 零新依赖；协议可被可控 mock 精确注入故障；失败方向与上游一致（非致命） | **同步发布**增加请求延迟；异步队列/重试/**投递保证未交付** | ✅ 已实测：`tests/integration/test_webhook_publisher.cpp`（真实二进制 + mock） |
+| 4 | 在网关/边车侧做事件转发 | 本服务零出站依赖 | 需要本服务把事件交给边车（又回到"消息总线/队列"）；且与 ADR-012 拒绝过的"假设前面一定有可信组件"同族（R8） | ⬜ 未实测（也不需要：它只是把方案 2 的依赖挪走） |
+
+选方案 3 并如实登记它的代价（同步延迟、无投递保证），不假装它是消息总线。
+
+### 9.4 未实现 / 未验证（如实登记，不静默降级）
+
+1. **异步有界发布队列未交付**：本实现是**内联同步** POST。一次 `createMetadata` 发 2~3 个事件，
+   一个慢 webhook 最多给请求路径增加 **事件数 × `events.webhook.timeout_ms`**。要交付必须先定义
+   「队列上界 + 丢弃策略 + 退避参数」并新增配置键（同步 `config/fss.example.json`、
+   `docs/operations.md`、`test_operations_doc`）。
+2. **无重试 / 退避、无投递保证**：单次尝试，失败即丢弃（只留一条告警）。上游消息总线的
+   at-least-once 语义**没有**被复现。
+3. **未与真实消息总线 / 中间件联调**（本环境没有）：协议形状是本项目与运维方的约定。
+4. **不透传调用方身份**（与 §2 同源）：载荷里没有 bearer/tenant 凭证；端点须允许
+   无 per-request 认证访问。这是端口签名决定的，不代表身份问题已被解决。
+5. `connect_timeout_ms` **未暴露为配置键**（固定 `min(1000, timeout_ms)`）。
+
+### 9.5 门槛（新增）
+
+| 判据 | 内容 |
+| --- | --- |
+| **C10.19** | **4 个键**（`events.publisher` 来自「拒绝启动」；`events.webhook.{url,timeout_ms,topic}` 来自「已读但无效果」）接通为**生效**；真实二进制 + 可控 mock 验证：正例 201（`statusChanged` 的 `IN_PROGRESS`/`SUCCESS` 与 `datasetDetails` 都收到、`topic` 来自**配置**、字段逐个断言、datasetDetails 的 `body` 是长度 1 的数组）、**非致命三态**（连不上 / 非 2xx / 超时 → 请求仍 **201** 且 persistent 侧**有文件**）、`none` 一个请求都不发、`log` 不受影响、空 `url` → **exit 78**、`timeout_ms` 真的来自配置；R1 自证：①把发布失败改**致命**、②忽略 `events.webhook.topic`、③让 `none` 仍然发布 —— 三种错误实现都必须让对应用例**失败** |
+
+证据：`docs/test-evidence/phase10.md` §12。

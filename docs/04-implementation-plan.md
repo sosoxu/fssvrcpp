@@ -994,7 +994,7 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
 切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）、切片 4（数据面 PUT 上限 + SQLite PRAGMA）
 与切片 5（`self_signed` 三键：`key_id` + 自签 TTL 上界）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态：**生效 102 / 拒绝启动 20 / 已读但无效果 34**（`docs/operations.md` §1.3）。
+三态：**生效 106 / 拒绝启动 19 / 已读但无效果 31**（`docs/operations.md` §1.3）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
@@ -1068,7 +1068,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（**当前为 生效 102 / 拒绝启动 20 / 已读但无效果 34 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
+  `docs/operations.md` 逐键三态化（**当前为 生效 106 / 拒绝启动 19 / 已读但无效果 31 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1096,8 +1096,9 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 | --- | --- |
 | **C10.18** | **远端 legal / schema 校验器接通（6 个键）**：`legal.validator` / `legal.remote.{base_url,timeout_ms}` 与 `schema.validator` / `schema.remote.{base_url,timeout_ms}` → **生效**。线协议（ADR-013）：`*.remote.base_url` 就是**完整端点 URL**（POST 到它，**不追加路径**）；legal body `{"partition","legaltags"}`、schema body `{"kind","record"}`；`200+{"valid":true}` → 通过、`200+{"valid":false,"message":M}` → **400**（带上 M）。**fail-closed 矩阵逐条实现 + 逐条测试**：连接失败 / 超时 / 非 200（含 401/403/500）/ 非 JSON / 缺 `valid` / `valid` 非 bool → 一律 **503**（`kUnavailable`），**绝不**降级成"通过"或"不通过"；校验发生在用例第 **3c** 步（持久化之前）→ 503 后**不留残留**（staging 对象在原位、persistent 侧无文件）。`base_url` 为空且选择器为 `remote` → **exit 78** + 可读原因（`Ready()`/`NotReadyReason()`）；`noop`（默认）**不发起任何请求**。测试：真实 `build/bin/fss_server` + 独立进程 mock（`tests/tools/mock_validators.py` + `tests/framework/mock_validators.h`，含 `--observe-file` 断言请求体形状与"有没有发请求"）。⚠️ **未与真实 Legal/Schema 服务联调**；端口签名不带 bearer token → 端点须允许无 per-request 认证访问。 |
 | **C10.18 伴随更正** | `auth.remote_entitlements.fail_closed` 从「已读但无效果」更正为「拒绝启动（触发条件）」：`auth.mode=remote-entitlements` 且该键非 `true` → **exit 78**（`core_schema.cpp` 跨字段校验，ADR-012 §5.1）；**模式相关**（`jwt`/`disabled` 下 `false` 被接受）。真实进程用例：C10.11 的两个 SECTION（反例 78 + R16 正例不被拒 + 模式无关性） |
+| **C10.19** | **事件发布器 `events.publisher` 与 `events.webhook.*` 接通（4 个键）**：`events.publisher`（1 个来自「拒绝启动」）与 `events.webhook.{url,timeout_ms,topic}`（3 个来自「已读但无效果」）→ **生效**。线协议（ADR-013 §9）：`events.webhook.url` 就是**完整端点 URL**（POST 到它，**不追加路径**，与 C10.18 同一约定）；`Content-Type: application/json`；`topic` 取**配置值** `events.webhook.topic`。载荷镜像上游事件形状：`statusChanged` = `{"topic","kind":"statusChanged","body":{recordId,partition,status,datasetSync,version}}`；`datasetDetails` = `{"topic","kind":"datasetDetails","body":[{properties:{correlationId,datasetId,datasetType,datasetVersionId,recordCount,timestamp}}]}`（**长度为 1 的数组**，对齐 `FileDatasetDetailsPublisher.java`）。**2xx = 成功；其余一切（非 2xx / 连不上 / 超时 / 坏响应）→ 记一条可读告警并继续** —— **发布失败绝不能**让 HTTP 请求失败：请求照常 **201** 且记录**真的建出来**（这是 C10.18「无残留」的**镜像**语义，两条方向相反、必须各自被测；用例层保持 `(void)ports.events.Publish...`，**不得**改成 `FSS_TRY`）。`events.publisher=none` → 组合根内联 `NoopEventPublisher`（**显式关闭**，不发请求）；`log`（默认）→ 既有 `LogEventPublisher`（行为逐字不变、不发请求）；`webhook` + 空 `url` → **exit 78** + 可读原因。测试：`tests/integration/test_webhook_publisher.cpp`（真实 `build/bin/fss_server` + `tests/tools/mock_validators.py --mode webhook`，`--observe-file` 新增 `bodies` 列表以断言"两个 kind 都发了"）—— 正例 / **非致命三态**（连不上、非 2xx、超时）/ `none` 不发请求 / `log` 不受影响 / 空 url → 78 / `timeout_ms` 真生效。⚠️ **内联同步发布**（上游是异步消息总线）：慢 webhook 给请求路径增加 **事件数 × timeout_ms**；**异步有界队列 / 重试退避 / 投递保证未交付**（ADR-013 §9.4）；**未与真实消息总线/中间件联调** |
 
-**状态：✅ 切片 1/2/3/4/5/6a 完成（含 C10.16/C10.17/C10.18）**。
+**状态：✅ 切片 1/2/3/4/5/6a/6b 完成（含 C10.16/C10.17/C10.18/C10.19）**。
 * **C10.13**：`observability.audit_fail_closed` 真的决定"审计写入失败是否让请求失败"。
   用例层 `RecordAudit()` 现在返回 `Result<void>`，`AuditGuard::Success()` 在**返回前**记录成功审计
   并把结果交回（`FSS_TRY(audit.Success())`）——析构无法改状态码，那正是"审计失败却报 200"的静默缺陷。
@@ -1150,11 +1151,17 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   **规格勘误（父代理已确认）**：本切片涉及 **6 个键**（2 个来自「拒绝启动」+ 4 个来自「已读但无效果」），
   不是最初写的 7 个。**未交付**：与真实 Legal/Schema 服务联调、调用方身份透传（需改端口契约）、
   校验结果缓存、重试/退避、`connect_timeout_ms` 配置键。
-* 三态计数：**生效 102 / 拒绝启动 20 / 已读但无效果 34 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* **切片 6b（事件发布器，C10.19 / ADR-013 §9）**：新增 L2 适配器 `src/infra/event/webhook_event_publisher.{h,cpp}`（与 C10.18 的远端校验器同一套写法：
+  `NOSIGNAL`/`FOLLOWLOCATION=0`/连接超时 `min(1000, timeout_ms)` + 整体超时/2xx 判定/  `Ready()`+`NotReadyReason()`），但失败**方向相反**：
+  发布失败只记一条 `Warn` 并返回 `Err(kUnavailable)`，**用例层丢弃它**（保持 `(void)ports.events.Publish...`，  **不是** `FSS_TRY`），请求照常 201、记录照常落库。
+  组合根三分支：`log`（默认，既有 `LogEventPublisher` 逐字不变）/ `webhook` / `none`（内联 `NoopEventPublisher`，  **显式关闭**）；横幅打印 publisher/端点/timeout/topic（**不打印密钥**）。
+  `src/app/usecases/usecases.cpp` 的 `PublishStatus` 补上 `record_id`（第 10 步/幂等命中路径带真实 id；  第 1 步 IN_PROGRESS 发生在建记录前 → 空），使 `statusChanged.body.recordId` 与上游形状一致。
+  用例：`tests/integration/test_webhook_publisher.cpp`（真实进程 + `mock_validators.py --mode webhook`；  `--observe-file` 新增 `bodies` 列表断言两个 kind 都发了）+ `tests/unit/test_composition_root_guard.cpp` 清单加   `WebhookEventPublisher`。**未交付**：异步有界发布队列、重试退避、投递保证、与真实消息总线/中间件联调。
+* 三态计数：**生效 106 / 拒绝启动 19 / 已读但无效果 31 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
   其中「拒绝启动」+1 来自 C10.18 的**伴随更正**（`auth.remote_entitlements.fail_closed`），
   与"6 个键接通"是两件事（落点不同：一个进「生效」、一个进「拒绝启动」）。
 
-**未做（本阶段不承诺）**：`events.publisher=webhook`（需新增 L2 webhook 发布器；ADR-013 §5.3 已为它立好"完整 URL + fail-closed + 不透传身份"三条规矩，但方向不同、需单独定"通知失败是否致命"）、
+**未做（本阶段不承诺）**：**异步有界事件发布队列 / 重试退避 / 投递保证**与真实消息总线联调（同步 webhook 发布器已在**切片 6b（C10.19）**交付；ADR-013 §9.4 登记了未交付项）、
 `metadata/location.repository=postgres|remote`、`leader_election.*`/`leases.*` 的 PG 语义、
 `storage.proxy_mode`/`driver_report_override`/`provider_key_override`（DMS 响应整形，需先定契约）、
 `gc` 的 HTTP 端点。这些仍为"拒绝启动"或"已读但无效果（附理由与下一步）"，**不得**改成静默忽略。

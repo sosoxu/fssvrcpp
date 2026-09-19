@@ -65,6 +65,9 @@ const std::vector<ConcreteType>& Inventory() {
       //    具体实现 —— 用例层只依赖 `ILegalValidator` / `ISchemaValidator` 端口。
       {"RemoteLegalValidator", "infra/legal/", false},
       {"RemoteSchemaValidator", "infra/schema/", false},
+      //  ★ P10 切片 6b（ADR-013 §9）：事件 webhook 发布器同样是"只能在组合根装配"的
+      //    具体实现 —— 用例层只依赖 `IEventPublisher` 端口。
+      {"WebhookEventPublisher", "infra/event/", false},
       //  ⚠️ 刻意**不**收录 L1 的注入点（`SystemClock` / `UuidGenerator` / `StreamLogger`）：
       //     C4.9 的判据范围是"基础设施实现（blob store / repository / driver）"，
       //     而 L1 的注入点与使用者在同一层。已知的既有偏离如实记录（不静默）：

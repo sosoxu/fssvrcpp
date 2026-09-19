@@ -111,13 +111,27 @@ target_include_directories(fss_schema_remote PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fss_schema_remote PUBLIC fss_domain fss_json CURL::libcurl)
 
 # -----------------------------------------------------------------------------
+#  L2 事件发布器（P10 切片 6b / ADR-013 §9）：webhook，HTTP + libcurl
+#    与上面的远端校验器**同一套写法**（NOSIGNAL / FOLLOWLOCATION=0 / 连接超时 +
+#    整体超时 / 2xx 才算成功），但失败**方向相反**：事件发布是**非致命**的 ——
+#    失败只记一条 Warn，用例层丢弃 Err，HTTP 请求照常 201（ADR-013 §9.2）。
+#    目录与类名取自 `docs/02-design.md` 的 L2 模块表（`event/`）。
+#    链接 fss_logging（L1）是因为"发布失败要留一条可读告警"是适配器自身的职责：
+#    用例层按上游语义丢弃 `Result`，没有别的层能记这条告警。
+# -----------------------------------------------------------------------------
+add_library(fss_event_webhook STATIC
+  infra/event/webhook_event_publisher.cpp)
+target_include_directories(fss_event_webhook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fss_event_webhook PUBLIC fss_domain fss_json fss_logging CURL::libcurl)
+
+# -----------------------------------------------------------------------------
 #  组合根（唯一实例化具体实现的地方；R12）
 # -----------------------------------------------------------------------------
 add_executable(fss_server
   main/server_main.cpp)
 target_link_libraries(fss_server PRIVATE
   fss_http_adapter fss_grpc_adapter fss_auth_local fss_auth_remote fss_legal_remote
-  fss_schema_remote fss_blob_posix fss_blob_s3
+  fss_schema_remote fss_event_webhook fss_blob_posix fss_blob_s3
   fss_blob_metered fss_metrics fss_location_sqlite fss_location_memory fss_metadata_sqlite
   fss_transfer fss_metadata_memory fss_logging fss_config Threads::Threads)
 

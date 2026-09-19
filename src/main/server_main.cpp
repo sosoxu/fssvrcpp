@@ -43,6 +43,7 @@
 #include "infra/blob/metered/metered_blob_store.h"
 #include "infra/blob/posix/posix_blob_store.h"
 #include "infra/blob/s3/s3_blob_store.h"
+#include "infra/event/webhook_event_publisher.h"
 #include "infra/io/uring_io_engine.h"
 #include "infra/location/memory/memory_lease_repository.h"
 #include "infra/location/sqlite/sqlite_location_repository.h"
@@ -795,6 +796,22 @@ class LogEventPublisher final : public fss::domain::IEventPublisher {
   const fss::logging::ILogger& logger_;
 };
 
+//  `events.publisher=none` → **显式关闭**事件发布（不是"没实现"）：
+//  端口必须有实现（否则用例层要判空），但两个方法什么都不做、**不发任何请求**。
+//  ★ 与 `NoopAuditLogger` 同风格；`publisher=webhook` 的空 URL 是**拒绝启动**，
+//    而不是静默退化成 noop（运维必须显式写出 none 才能关掉事件）。
+class NoopEventPublisher final : public fss::domain::IEventPublisher {
+ public:
+  fss::Result<void> PublishStatusChanged(
+      std::string_view, const fss::domain::StatusChangedEvent&) override {
+    return fss::Ok();
+  }
+  fss::Result<void> PublishDatasetDetails(
+      std::string_view, const fss::domain::DatasetDetailsEvent&) override {
+    return fss::Ok();
+  }
+};
+
 class LogAuditLogger final : public fss::domain::IAuditLogger {
  public:
   explicit LogAuditLogger(const fss::logging::ILogger& logger) : logger_(logger) {}
@@ -1132,6 +1149,15 @@ int main(int argc, char** argv) {
   const std::string schema_remote_base_url = resolver.Str("schema.remote.base_url", "");
   const long schema_remote_timeout_ms = resolver.Int("schema.remote.timeout_ms", 3000);
   const std::string events_publisher = resolver.Str("events.publisher", "log");
+  //  ---- 阶段 10 切片 6b：事件发布器（ADR-013 §9）----
+  //  ★ `events.webhook.url` 就是**完整端点 URL**（POST 到它，不追加路径）——与
+  //    切片 6a 的 `*.remote.base_url` **同一约定**（ADR-013 §2）：没有上游路径依据时，
+  //    把完整 URL 的控制权交给运维。
+  //  ★ 事件发布是**非致命**的（上游只 `log.warning`）：webhook 失败绝不让请求失败。
+  const std::string events_webhook_url = resolver.Str("events.webhook.url", "");
+  const long events_webhook_timeout_ms = resolver.Int("events.webhook.timeout_ms", 3000);
+  const std::string events_webhook_topic =
+      resolver.Str("events.webhook.topic", "status-changed");
   const bool single_use_nonce = resolver.Bool("self_signed.single_use_nonce", false);
   const std::string nonce_store = resolver.Str("self_signed.nonce_store", "memory");
   const std::string partition_registry = resolver.Str("partition.registry", "file");
@@ -1275,12 +1301,6 @@ int main(int argc, char** argv) {
     return reject_startup(
         "leader_election.enabled=true —— 领导者选举依赖 PG advisory lock，尚未交付（ADR-009）。"
         "下一步：保持 false（单实例下 GC 只有一个实例在跑，无需选举）。");
-  }
-  if (events_publisher != "log") {
-    return reject_startup(
-        "events.publisher=" + events_publisher +
-        " —— 事件发布只实现了写日志（log）。webhook 未交付；none 也无法真正关闭"
-        "（组合根固定装配 LogEventPublisher）。下一步：保持 log，或先实现 webhook/none 分支。");
   }
   if (single_use_nonce) {
     return reject_startup(
@@ -1598,7 +1618,43 @@ int main(int argc, char** argv) {
                   {{"component", "server_main"}});
   }
 
-  LogEventPublisher events(logger);
+  //  ---- 事件发布器（P10 切片 6b / ADR-013 §9）----
+  //  ★ R12：具体实现只能在**组合根**创建 —— 用例层只见 `IEventPublisher` 端口。
+  //  ★ 三分支：`log`（默认，行为逐字不变）/ `webhook`（出站 POST，失败**非致命**）/
+  //    `none`（**显式关闭**，不发任何请求）。非法取值由 schema 的 enum 拒绝，
+  //    这里的 `else` 只是防御性的第二道（枚举被改宽时不会静默降级）。
+  LogEventPublisher log_events(logger);
+  NoopEventPublisher noop_events;
+  std::unique_ptr<infra::WebhookEventPublisher> webhook_events;
+  domain::IEventPublisher* events = &log_events;
+  if (events_publisher == "webhook") {
+    infra::WebhookEventPublisherOptions options;
+    //  ★ `url` 就是**完整端点 URL**（POST 到它，不追加路径）—— 与切片 6a 同一约定
+    options.url = events_webhook_url;
+    options.timeout_ms = static_cast<int>(events_webhook_timeout_ms);
+    options.topic = events_webhook_topic;
+    webhook_events = std::make_unique<infra::WebhookEventPublisher>(options, logger);
+    events = webhook_events.get();
+    //  ★ 没配地址就**拒绝启动**（与远端校验器一致）：起来之后"每个事件都发不出去"
+    //    只会制造误导性的排障路径；要关掉事件必须显式写 `publisher=none`。
+    if (!webhook_events->Ready()) {
+      std::cerr << "拒绝启动：" << webhook_events->NotReadyReason() << "\n";
+      return kExitConfigError;
+    }
+    logging::Warn(logger,
+                  "events.publisher=webhook：发布失败**非致命**（连不上/超时/非 2xx 只告警，"
+                  "请求照常成功；同步发布 → 慢 webhook 会增加请求延迟）",
+                  {{"component", "server_main"}, {"endpoint", events_webhook_url}});
+  } else if (events_publisher == "none") {
+    events = &noop_events;
+    logging::Warn(logger, "events.publisher=none：已**显式关闭**事件发布（不发任何请求）",
+                  {{"component", "server_main"}});
+  } else if (events_publisher != "log") {
+    std::cerr << "拒绝启动：未知的 events.publisher：" << events_publisher
+              << "（可选：log | webhook | none）\n";
+    return kExitConfigError;
+  }
+
   LogAuditLogger log_audit(logger);
   NoopAuditLogger noop_audit;
   FailingAuditLogger failing_audit;
@@ -1700,7 +1756,7 @@ int main(int argc, char** argv) {
 
   app::UseCasePorts ports{blob_factory,      *location_repository.value(),
                           *metadata_repository_handle.value(),
-                          *authorizer,       events,
+                          *authorizer,       *events,
                           *audit_logger,     partitions,
                           *legal,            *schema_validator_port,
                           issuer,            clock,
@@ -1954,6 +2010,17 @@ int main(int argc, char** argv) {
                           std::to_string(schema_remote_timeout_ms) +
                           "ms；fail-closed → 503；端点须允许无 per-request 认证）"
                     : "（不校验 schema；不发请求）")
+            << "\n"
+            << "  events         : publisher=" << events_publisher
+            << (events_publisher == "webhook"
+                    ? "（端点 " + events_webhook_url + "，timeout=" +
+                          std::to_string(events_webhook_timeout_ms) + "ms，topic=" +
+                          events_webhook_topic +
+                          "；**发布失败非致命**：连不上/超时/非 2xx 只告警，请求照常成功；"
+                          "同步发布 → 慢端点按「事件数 × timeout」增加请求延迟）"
+                    : (events_publisher == "none"
+                           ? std::string("（**显式关闭**：不发任何请求）")
+                           : std::string("（写日志：status-changed / datasetDetails；不发请求）")))
             << "\n"
             << "  environment    : " << deployment_environment << "\n"
             << "  gc             : " << gc_banner << "\n"
