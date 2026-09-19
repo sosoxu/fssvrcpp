@@ -114,7 +114,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 > | **拒绝启动（触发条件）** | 该键在组合根里**唯一**的作用就是"非默认/不支持的值 → exit 78"；默认/合法值不产生额外行为。触发条件与"下一步"逐条写在该单元格里 |
 > | **已读但无效果** | 组合根**不接线**该键（或读了但行为未实现）→ 改它对真实进程没有影响。必须给出**理由与下一步** |
 >
-> 三态计数见 §1.3（**生效 107 / 拒绝启动 18 / 已读但无效果 31；合计 156**，与 `config/fss.example.json` 的叶子键一一对应）。
+> 三态计数见 §1.3（**生效 113 / 拒绝启动 18 / 已读但无效果 25；合计 156**，与 `config/fss.example.json` 的叶子键一一对应）。
 
 
 #### 1.2.1 `deployment`
@@ -229,10 +229,10 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `metadata.sqlite.busy_timeout_ms` | SQLite busy 超时 | `5000` | int 0..600000；默认 `5000` | **生效**：已接通（`metadata.sqlite.busy_timeout_ms`）→ `SqliteMetadataRepositoryOptions.busy_timeout_millis`（`sqlite3_busy_timeout`）；启动横幅打印实际取值 |
 | `metadata.sqlite.journal_mode` | SQLite journal 模式 | `WAL` | enum `WAL` / `DELETE` / `TRUNCATE`；默认 `WAL` | **生效**：已接通（`metadata.sqlite.journal_mode`）→ `SqliteMetadataRepositoryOptions.wal`：`WAL`→`PRAGMA journal_mode=WAL`、`DELETE`→不执行 PRAGMA（SQLite 默认 `DELETE`，可用 `python3 sqlite3` 从库文件读回）；`TRUNCATE` **未接通** → exit 78（不静默当成 DELETE） |
 | `metadata.sqlite.synchronous` | SQLite 同步级别 | `NORMAL` | enum `NORMAL` / `FULL` / `OFF`；默认 `NORMAL` | **生效**：已接通（`metadata.sqlite.synchronous`）→ `SqliteMetadataRepositoryOptions.synchronous_level`（`NORMAL`→1 / `FULL`→2 / `OFF`→0）→ `PRAGMA synchronous=<n>`；启动横幅打印实际取值。⚠ 该 PRAGMA **不落盘**，只能用**同连接**访问器 `SqliteMetadataRepository::AppliedPragma("synchronous")` 读回（另开 sqlite3 连接读到的是新连接默认值 FULL=2）；进程内断言见 `tests/integration/test_sqlite_metadata_repository.cpp` |
-| `metadata.sqlite.max_write_concurrency` | 有界写并发 | `8` | int 1..256；默认 `8` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `metadata.sqlite.group_commit` | 组提交 | `true` | bool；默认 `true` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `metadata.sqlite.group_commit_max_wait_ms` | 组提交最大等待 | `5` | int 0..1000；默认 `5` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `metadata.sqlite.group_commit_max_batch` | 组提交最大批 | `64` | int 1..100000；默认 `64` | **已读但无效果**：组合根未接线（登记为未实现） |
+| `metadata.sqlite.max_write_concurrency` | 有界写并发 | `8` | int 1..256；默认 `8` | **已读但无效果**：写入并发的**上限**；当前实现是「单连接 + 互斥」（实际并发恒为 1 ≤ 上限），改它无从观测（§1.3.3）。下一步：连接池交付后才有意义 |
+| `metadata.sqlite.group_commit` | 组提交 | `true` | bool；默认 `true` | **生效**（C10.20）：接通 `SqliteMetadataRepositoryOptions.group_commit` → 共用协调器 `src/infra/sqlite/sqlite_group_commit.h`。`true`（默认）= 并发写操作凑成**一批**、**一个事务一次 `COMMIT`**（批由 `group_commit_max_batch` / `group_commit_max_wait_ms` 决定）；`false` = **逐操作**提交（与接线前逐字一致：一次 `BEGIN IMMEDIATE…COMMIT`）。⚠️ **读路径会多等**：批事务期间领队持有连接互斥 ⇒ 同仓储的读最坏多等 ≤ `group_commit_max_wait_ms`。真实进程证据：`--set metadata.sqlite.group_commit_max_wait_ms=400` 时一次 `createMetadata` 时延 = **416ms**，同窗口 + `group_commit=false` = **14ms**（`tests/integration/test_config_wiring.cpp` 的 C10.20）；进程内确定性判据见 `tests/integration/test_sqlite_group_commit.cpp`（N=6/B=3 → 2 次提交） |
+| `metadata.sqlite.group_commit_max_wait_ms` | 组提交最大等待 | `5` | int 0..1000；默认 `5` | **生效**（C10.20）：从**第一个待处理操作**起算的等待窗口；窗口到期即提交（批不满也提交），`0` → 立即提交。★ 这个窗口是**读可能多等的上界**，也是**顺序单文件写**的额外时延（每操作最多多等一个窗口，见 §1.3.1 的取舍说明） |
+| `metadata.sqlite.group_commit_max_batch` | 组提交最大批 | `64` | int 1..100000；默认 `64` | **生效**（C10.20）：一票一批的**操作数上限**（批满立即提交，批不会超过上限）；`1` = 每操作一批（无摊销）。可观测：`/metrics` 的 `fss_sqlite_ops_total{repo="metadata"} / fss_sqlite_group_commits_total{repo="metadata"}` = 平均批大小 |
 | `metadata.postgres.dsn` | PG 连接串（密文） | `${ENV:FSS_PG_DSN}` | string，secret；默认 `""` | **已读但无效果**：组合根未接线（登记为未实现；`multi` 运行形态未交付） |
 | `metadata.postgres.max_connections` | PG 连接数（实例数 × 该值 ≤ PG `max_connections`） | `16` | int 1..10000；默认 `16` | **已读但无效果**：组合根未接线（登记为未实现） |
 | `metadata.postgres.statement_timeout_ms` | 语句超时 | `5000` | int 1..600000；默认 `5000` | **已读但无效果**：组合根未接线（登记为未实现） |
@@ -251,10 +251,10 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `location.sqlite.busy_timeout_ms` | SQLite busy 超时 | `10000` | int 0..600000；默认 `10000` | **生效**：已接通（`location.sqlite.busy_timeout_ms`）→ `SqliteLocationRepositoryOptions.busy_timeout_millis`（`sqlite3_busy_timeout`）；启动横幅打印实际取值 |
 | `location.sqlite.journal_mode` | journal 模式 | `WAL` | enum `WAL` / `DELETE` / `TRUNCATE`；默认 `WAL` | **生效**：已接通（`location.sqlite.journal_mode`）→ `SqliteLocationRepositoryOptions.wal`：`WAL`→`PRAGMA journal_mode=WAL`、`DELETE`→`DELETE`（可用 `python3 sqlite3` 从库文件读回）；`TRUNCATE` **未接通** → exit 78（不静默当成 DELETE）。`metadata.sqlite.journal_mode` 同样已接通（见 §1.2.7） |
 | `location.sqlite.synchronous` | 同步级别 | `NORMAL` | enum `NORMAL` / `FULL` / `OFF`；默认 `NORMAL` | **生效**：已接通（`location.sqlite.synchronous`）→ `SqliteLocationRepositoryOptions.synchronous_level`（`NORMAL`→1 / `FULL`→2 / `OFF`→0）→ `PRAGMA synchronous=<n>`；启动横幅打印实际取值。⚠ 该 PRAGMA **不落盘**，只能用**同连接**访问器 `SqliteLocationRepository::AppliedPragma("synchronous")` 读回；进程内断言见 `tests/integration/test_sqlite_location_repository.cpp` |
-| `location.sqlite.max_write_concurrency` | 有界写并发 | `8` | int 1..256；默认 `8` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `location.sqlite.group_commit` | 组提交 | `true` | bool；默认 `true` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `location.sqlite.group_commit_max_wait_ms` | 组提交最大等待 | `5` | int 0..1000；默认 `5` | **已读但无效果**：组合根未接线（登记为未实现） |
-| `location.sqlite.group_commit_max_batch` | 组提交最大批 | `64` | int 1..100000；默认 `64` | **已读但无效果**：组合根未接线（登记为未实现） |
+| `location.sqlite.max_write_concurrency` | 有界写并发 | `8` | int 1..256；默认 `8` | **已读但无效果**：写入并发的**上限**；当前实现是「单连接 + 互斥」（实际并发恒为 1 ≤ 上限），改它无从观测（§1.3.3）。下一步：连接池交付后才有意义 |
+| `location.sqlite.group_commit` | 组提交 | `true` | bool；默认 `true` | **生效**（C10.20）：接通 `SqliteLocationRepositoryOptions.group_commit` → 同一个共用协调器。`true`（默认）= 并发写操作凑成**一批**、**一个事务一次 `COMMIT`**（每操作 `SAVEPOINT` 保原子性）；`false` = **逐操作**提交（与接线前逐字一致：单条自动提交语句 / 一次 `BEGIN IMMEDIATE…COMMIT`）。⚠️ **读路径会多等**：批事务期间领队持有连接互斥 ⇒ 同仓储的读最坏多等 ≤ `group_commit_max_wait_ms`。进程内确定性判据：N=8、B=4 → **2 次提交**（== `ceil(N/B)`）；B=1 → 8 次（`tests/integration/test_sqlite_group_commit.cpp`） |
+| `location.sqlite.group_commit_max_wait_ms` | 组提交最大等待 | `5` | int 0..1000；默认 `5` | **生效**（C10.20）：从**第一个待处理操作**起算的等待窗口；窗口到期即提交（批不满也提交），`0` → 立即提交。★ 该窗口是**读可能多等的上界**，也是顺序单写的额外时延（`tests/integration/test_sqlite_group_commit.cpp` 用 `0` 与 `400` 两档断言等待窗口真的生效） |
+| `location.sqlite.group_commit_max_batch` | 组提交最大批 | `64` | int 1..100000；默认 `64` | **生效**（C10.20）：一票一批的**操作数上限**（批满立即提交）；`1` = 每操作一批。可观测：`/metrics` 的 `fss_sqlite_ops_total{repo="location"} / fss_sqlite_group_commits_total{repo="location"}` = 平均批大小 |
 | `location.postgres.dsn` | PG 连接串（密文） | `${ENV:FSS_PG_DSN}` | string，secret；默认 `""` | **已读但无效果**：组合根未接线（登记为未实现） |
 | `location.postgres.max_connections` | PG 连接数 | `8` | int 1..10000；默认 `8` | **已读但无效果**：组合根未接线（登记为未实现） |
 
@@ -346,7 +346,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 ### 1.3 接通状态三态（逐键核对；合计 **156** 个叶子键）
 
 > 口径：**组合根在真实进程里对每个键做了什么**。三态的定义见 §1.2 开头的表。
-> 计数由本节的三个清单逐条相加得出：**107 + 18 + 31 = 156**。
+> 计数由本节的三个清单逐条相加得出：**113 + 18 + 25 = 156**。
 >
 > ⚠️ **C9.31（按需 GC 端点）不改这个计数**：它是**能力补齐**（把已实现的 `GcTask` 接到
 > HTTP 上），**没有新增/删除任何配置键**，`gc.*` 5 个键的三态与接线前完全一致。
@@ -355,11 +355,11 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 
 | 状态 | 键数 | 说明 |
 | --- | --- | --- |
-| **生效** | **107** | 读取后真的改变运行行为（含"非法值拒绝启动"的触发条件，写在 §1.2 对应行） |
+| **生效** | **113** | 读取后真的改变运行行为（含"非法值拒绝启动"的触发条件，写在 §1.2 对应行） |
 | **拒绝启动（触发条件）** | **18** | 非默认/不支持的值 → **exit 78（EX_CONFIG）** + 「未实现 + 下一步」 |
-| **已读但无效果** | **31** | 组合根未接线（或读了但行为未实现）→ 改它对真实进程没有影响；理由与下一步逐个登记 |
+| **已读但无效果** | **25** | 组合根未接线（或读了但行为未实现）→ 改它对真实进程没有影响；理由与下一步逐个登记 |
 
-#### 1.3.1 生效（107）
+#### 1.3.1 生效（113）
 
 `auth.jwt.audience`、`auth.jwt.hmac_secret`、`auth.jwt.issuer`、`auth.jwt.partition_claim`、`auth.jwt.require_partition_claim`、`auth.jwt.roles_claim`、`auth.jwt.user_id_claim`、`auth.jwt.verify_signature`、`auth.local_roles.admin@example.com`、`auth.local_roles.editor@example.com`、`auth.local_roles.viewer@example.com`、`auth.mode`、`auth.remote_entitlements.authorize_path`、`auth.remote_entitlements.base_url`、`auth.remote_entitlements.connect_timeout_ms`、`auth.remote_entitlements.timeout_ms`、`deployment.environment`、`deployment.instance_id`、`deployment.max_clock_skew_seconds`、`deployment.mode`、`events.publisher`、`events.webhook.topic`、`events.webhook.timeout_ms`、`events.webhook.url`、`expiry.default`、`expiry.max`、`gc.dry_run`、`gc.enabled`、`gc.interval_seconds`、`gc.orphan_grace_hours`、`gc.require_lease_expiry`、`gc.staging_ttl_hours`、`http.error_format`、`location.repository`、`location.sqlite.busy_timeout_ms`、`location.sqlite.journal_mode`、`location.sqlite.path`、`legal.remote.base_url`、`legal.remote.timeout_ms`、`legal.validator`、`location.sqlite.synchronous`、`metadata.repository`、`metadata.sqlite.busy_timeout_ms`、`metadata.sqlite.journal_mode`、`metadata.sqlite.path`、`metadata.sqlite.synchronous`、`observability.audit_enabled`、`observability.audit_fail_closed`、`observability.log_format`、`observability.log_level`、`observability.metrics_enabled`、`observability.metrics_path`、`observability.redact_keys`、`partition.file.opendes.max_file_bytes`、`partition.file.opendes.persistent_container`、`partition.file.opendes.staging_container`、`schema.remote.base_url`、`schema.remote.timeout_ms`、`schema.validator`、`self_signed.default_ttl_seconds`、`self_signed.enabled`、`self_signed.key_id`、`self_signed.max_ttl_seconds`、`self_signed.public_base_url`、`self_signed.signing_key`、`server.grpc.bind`、`server.grpc.enabled`、`server.grpc.port`、`server.http.base_path`、`server.http.bind`、`server.http.idle_timeout_seconds`、`server.http.json_request_timeout_seconds`、`server.http.max_body_bytes`、`server.http.max_connections`、`server.http.max_header_bytes`、`server.http.max_uri_bytes`、`server.http.port`、`server.http.tcp_nodelay`、`server.http.transfer_buffer_bytes`、`server.http.transfer_idle_timeout_seconds`、`server.http.transfer_max_body_bytes`、`server.http.transfer_memory_budget_bytes`、`server.http.worker_threads`、`storage.driver_report_override`、`storage.driver`、`storage.io_engine`、`storage.io_uring.queue_depth`、`storage.posix.atomic_write`、`storage.posix.dir_mode`、`storage.posix.durability`、`storage.posix.fadvise_dontneed_after_large_read`、`storage.posix.fadvise_random`、`storage.posix.file_mode`、`storage.posix.fsync_threshold_bytes`、`storage.posix.group_commit_max_batch`、`storage.posix.root`、`storage.provider_key_override`、`storage.s3.access_key`、`storage.s3.connect_timeout_ms`、`storage.s3.endpoint`、`storage.s3.force_path_style`、`storage.s3.presign_default_seconds`、`storage.s3.presign_max_seconds`、`storage.s3.region`、`storage.s3.secret_key`、`storage.s3.total_timeout_ms`、`storage.s3.verify_tls`
 
@@ -386,7 +386,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `storage.proxy_mode` | `always` → exit 78（「强制服务代理所有字节」未实现）。下一步：保持 `auto` |
 | `storage.posix.sync_dir_after_batch` | `false` → exit 78（**ADR-008 §5 的 R2 是**不变量**：rename 之后必须 `fsync(目录)`**，schema 描述也写明必须 `true`）。下一步：保持 `true` |
 
-#### 1.3.3 已读但无效果（31）
+#### 1.3.3 已读但无效果（25）
 
 > 这些键**改了不生效**（组合根不读，或读了但没有行为分支）。每一条都给出**下一步**；
 > 其中 8 个键（`expiry.*` 与 `gc.*`）在切片 2、**9 个键**在切片 3 已从本清单移入「生效」，见 §1.3.1
@@ -398,6 +398,8 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 > **切片 6a（C10.18）的净变化**：`legal.validator` / `schema.validator` 移出「拒绝启动」（不再是"未实现 → exit 78"），`legal.remote.{base_url,timeout_ms}` / `schema.remote.{base_url,timeout_ms}` 移出本清单 —— **6 个键**（2 个来自「拒绝启动」+ 4 个来自本清单）全部移入「生效」（+6，§1.3.1）。实现是新增的 L2 适配器 `src/infra/legal/remote_legal_validator.*` 与 `src/infra/schema/remote_schema_validator.*`（ADR-013；**平台外扩展**端点，`base_url` 即完整 URL，不追加路径）。⚠️ **未与真实 Legal/Schema 服务联调**；端口签名不带 bearer token → 端点必须允许无 per-request 认证访问（见 §1.2.11 的逐行说明与契约 §7）。
 > **伴随更正（独立理由，与切片 6a 的 6 个键无关）**：`auth.remote_entitlements.fail_closed` 从本清单移入「拒绝启动」（§1.3.2）—— 它有一条**真实可观测**的效果：`auth.mode=remote-entitlements` 且该键非 `true` → exit 78（`core_schema.cpp` 的跨字段校验）。触发条件是**模式相关**的（`jwt`/`disabled` 下 `false` 无影响）。原先标成「已读但无效果」与同一行里"`remote` 模式下 schema 会拒绝 `false`"的说明**自相矛盾**，这才是更正的理由；它**不是**为了凑任何数字（落点也不同：本清单 −1、拒绝启动 +1）。
 > **切片 6b（C10.19）的净变化**：`events.publisher` 移出「拒绝启动」（不再是「`webhook`/`none` → exit 78」），`events.webhook.{url,timeout_ms,topic}` 移出本清单 —— **4 个键**（1 个来自「拒绝启动」+ 3 个来自本清单）全部移入「生效」（+4，§1.3.1）。实现是新增的 L2 适配器 `src/infra/event/webhook_event_publisher.*`（ADR-013 §9）＋组合根内联的 `NoopEventPublisher`（`publisher=none` 的**显式关闭**）。⚠️ **发布失败非致命**（连不上 / 超时 / 非 2xx → 只记告警，请求照常 **201** 且记录真的落库）；**内联同步发布**（一个慢 webhook 给请求路径增加 事件数 × timeout；异步队列 / 重试退避 / 投递保证**未交付**）；**未与真实消息总线 / 中间件联调**。
+> **C10.20（本切片）的净变化**：`metadata.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}` 与 `location.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}` —— **6 个键**从本清单移入「生效」（+6，§1.3.1）；三态从 **107/18/31** 变为 **113/18/25**。实现是新增的 L2 共用小工具 `src/infra/sqlite/sqlite_group_commit.h`：并发写操作凑成一批 → **一个事务一次 `COMMIT`**；批内每操作 `SAVEPOINT`（**每操作原子性**：只有失败的那个操作回滚）；整批 `COMMIT` 失败 → 批内**所有**操作返回该错误（**有意的语义**，见该文件头注释）。⚠️ **代价**：批事务期间领队持有连接互斥 ⇒ 同仓储的**读可能多等 ≤ `group_commit_max_wait_ms`**；且顺序单文件写每操作最多多等一个窗口（并发才有摊销）——**组提交不是纯免费收益**。`*.sqlite.max_write_concurrency` **仍留本清单**：单连接 + 互斥 ⇒ 实际并发恒为 1，改它无可观测效果。
+> 可观测性新增两族 `fss_sqlite_{group_commits,ops}_total{repo=...}`（§4）；真实进程证据见 `docs/test-evidence/phase10.md` 的 C10.20 一节。
 > **ADR-008 的 P4 / C9.23（本切片）的净变化**：`storage.posix.group_commit_max_batch` 从「拒绝启动」移入「生效」（+1，§1.3.1）；三态从 **106/19/31** 变为 **107/18/31**。`storage.posix.durability=batch` 从"近似成 `kBySize`"改为**真两阶段批提交**；`sync_dir_after_batch=false` **仍是拒绝启动**（R2 不变量，§1.3.2，理由与"未实现"无关）。可观测性新增三族 `fss_posix_{syncfs,group_commits,batch_objects}_total`（§4）。
 
 `leader_election.backend`、`leader_election.lock_key`、`leases.renew_interval_seconds`、`leases.time_source`、`leases.ttl_seconds`、`location.postgres.dsn`、`location.postgres.max_connections`、`location.sqlite.group_commit`、`location.sqlite.group_commit_max_batch`、`location.sqlite.group_commit_max_wait_ms`、`location.sqlite.max_write_concurrency`、`metadata.postgres.dsn`、`metadata.postgres.max_connections`、`metadata.postgres.schema_version_check`、`metadata.postgres.statement_timeout_ms`、`metadata.remote.base_url`、`metadata.remote.static_token`、`metadata.remote.timeout_ms`、`metadata.remote.token_provider`、`metadata.sqlite.group_commit`、`metadata.sqlite.group_commit_max_batch`、`metadata.sqlite.group_commit_max_wait_ms`、`metadata.sqlite.max_write_concurrency`、`server.http.large_file_plane.bind`、`server.http.large_file_plane.max_connections`、`server.http.large_file_plane.port`、`server.http.large_file_plane.sendfile_chunk_bytes`、`server.http.large_file_plane.use_sendfile`、`server.http.large_file_plane.workers`、`storage.posix.one_filesystem_per_partition`、`storage.posix.shared_mount_required`
@@ -409,8 +411,8 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | server.http | 6 | `large_file_plane.bind/port/use_sendfile/sendfile_chunk_bytes/workers/max_connections`（6 个）随 sendfile 数据面一起未交付；`transfer_max_body_bytes` 已在**切片 4** 接通（§1.3.1）。下一步：ADR-006 §6 落地数据面后才接通（`large_file_plane.enabled` 见 §1.3.2） |
 | `storage` | 2 | 只剩 `shared_mount_required`/`one_filesystem_per_partition`（依赖 multi 运行形态）。C10.16 续已把 `atomic_write`/`dir_mode`/`file_mode`/`fadvise_random`/`fadvise_dontneed_after_large_read` 接到驱动层（§1.3.1）；**本切片**把 `group_commit_max_batch` 也接通（ADR-008 的 P4，§1.3.1），`sync_dir_after_batch=false` 保持拒绝启动（R2 不变量，§1.3.2）。下一步：multi 运行形态交付后接通这两个 |
 | `self_signed` | 0 | **切片 5 已清空**：`key_id`/`default_ttl_seconds`/`max_ttl_seconds` 全部接通（§1.3.1），`single_use_nonce`/`nonce_store` 见 §1.3.2。⚠️ **下一步（有界差异）**：多密钥轮换（ADR-009:227 的"多 key 并存"）**未交付** —— 当前 `key_id` 只是"绑定 + 解码侧拒绝不匹配"，**没有**"按 id 选密钥"。若要做轮换，必须把 `key_id → 密钥` 表引入 codec 并同步契约/文档/测试。另：**若要改成「`self_signed.*` 覆盖 `expiry.default` 作缺省」，必须先推翻 C10.12 的既定语义**（`expiry.default`/`expiry.max` = `expiryTime` 参数的解析规则与缺省）并同步契约与 `tests/integration/test_config_wiring.cpp` 的 C10.12 用例 —— 本切片刻意**不**这么做，改用「上界夹紧」以免静默改变已定稿语义 |
-| `metadata` | 12 | `busy_timeout_ms`（切片 3）与 `journal_mode`/`synchronous`（**切片 4**）已接通（§1.3.1）；`max_write_concurrency`/`group_commit*`（4）未接线 —— 实现是"单连接 + 互斥"（`max_write_concurrency` 不改变行为），且没有组提交实现。`postgres.*`（4）/`remote.*`（4）依赖未交付的仓储。下一步：实现组提交 / 连接池后再接 |
-| `location` | 6 | `busy_timeout_ms`/`journal_mode`（切片 3）与 `synchronous`（**切片 4**）已接通（§1.3.1）；`max_write_concurrency`/`group_commit*`（4）未接线 —— 单连接串行实现下 `max_write_concurrency` 不改变行为，且没有组提交实现。`postgres.*`（2）依赖 PG 仓储。下一步：实现组提交 / 连接池后再接 |
+| `metadata` | 9 | `busy_timeout_ms`（切片 3）、`journal_mode`/`synchronous`（**切片 4**）与 `group_commit*` 三键（**C10.20**）已接通（§1.3.1）；`max_write_concurrency`（1）仍未接线 —— 单连接 + 互斥 ⇒ 实际并发恒为 1，改它无可观测效果。`postgres.*`（4）/`remote.*`（4）依赖未交付的仓储。下一步：连接池交付后 `max_write_concurrency` 才有意义 |
+| `location` | 3 | `busy_timeout_ms`/`journal_mode`（切片 3）、`synchronous`（**切片 4**）与 `group_commit*` 三键（**C10.20**）已接通（§1.3.1）；`max_write_concurrency`（1）仍未接线 —— 单连接串行实现下它不改变行为。`postgres.*`（2）依赖 PG 仓储。下一步：连接池交付后才接通 |
 | `leases` | 3 | `ttl_seconds`/`renew_interval_seconds`/`time_source`：当前产品里没有用例 `Acquire` 租约，内存租约表恒空，因此这三个值不生效。下一步：PG 租约交付后接通（`enabled` 见 §1.3.2） |
 | `leader_election` | 2 | `backend`/`lock_key` 随选举一起未交付。下一步：PG advisory lock 落地后接通（`enabled` 见 §1.3.2） |
 | `auth` | 0 | **已清空**：`jwt.roles_claim` 与 `local_roles.*`（3 个）在切片 3 接通（§1.3.1）；`remote_entitlements.fail_closed` 在切片 6a 的**伴随更正**中移入「拒绝启动」（模式相关的 exit 78，§1.3.2）；`jwt.jwks_url` 见 §1.3.2 |
@@ -592,6 +594,19 @@ for i in $(seq 1 30); do ss -ltn | grep -q ':8080 ' || break; sleep 1; done
 > ⚠️ 三族只在 `storage.driver=posix` 且 `durability=batch` 下真的增长（`per_file`/`never`
 > 不产生 `syncfs`，值恒为 0）。真实进程证据见 `tests/integration/test_config_wiring.cpp`
 > 的 C9.23 用例（上传后 `/metrics` 的 `fss_posix_syncfs_total >= 1`）。
+
+**SQLite 组提交（C10.20；两个仓储共用 `SqliteGroupCommitter`）**
+
+| 指标名 | 类型 | 标签 | 含义 |
+| --- | --- | --- | --- |
+| `fss_sqlite_group_commits_total` | counter | `repo` ∈ `metadata` / `location` | 组提交的**批次数**（每批 1 次事务 `COMMIT`；`group_commit=false` 时每操作一批） |
+| `fss_sqlite_ops_total` | counter | `repo` ∈ `metadata` / `location` | 交给协调器的**写操作数** |
+
+> **怎么看摊销是否发生**：`fss_sqlite_ops_total{repo} / fss_sqlite_group_commits_total{repo}`
+> = 平均批大小。**顺序**单文件写下平均批大小 ≈ 1（每操作一次提交，`group_commit=false` 时
+> 恒等于 1）；**并发**写下才会接近 `*.sqlite.group_commit_max_batch`。
+> 真实进程证据：`tests/integration/test_config_wiring.cpp` 的 C10.20 用例
+> （`--set metadata.sqlite.group_commit=false` 后 `commits == ops`）。
 
 **GC 层（`GcTask`）**
 
@@ -973,14 +988,14 @@ find /var/lib/fss/data/blobs -name '*.tmp.*' -mmin +1440 -delete
 
 | 项 | 状态 | 说明 / 证据 |
 | --- | --- | --- |
-| 组合根接 `config/fss.example.json` | **切片 1/2/3/4/5/6a/6b 已接通（含 C10.16/C10.17/C10.18/C10.19）+ ADR-008 的 P4（C9.23）** | `--config`/`FSS_CONFIG` + `--set` + 环境变量；156 键的三态计数为 **生效 107 / 拒绝启动 18 / 已读但无效果 31**（逐键见 §1.3；样例配置在 C10.10 用例里真的启动成功）。**切片 6a（C10.18）**：`legal.{validator,remote.base_url,remote.timeout_ms}` 与 `schema.{validator,remote.base_url,remote.timeout_ms}` → **生效**（+6；ADR-013 远端校验器，fail-closed → 503）；**伴随更正**：`auth.remote_entitlements.fail_closed` → **拒绝启动**（`remote-entitlements` 模式下非 true → exit 78，模式相关）。切片 3 新接通 9 键：`observability.audit_fail_closed`、`metadata.sqlite.busy_timeout_ms`、`location.sqlite.{busy_timeout_ms,journal_mode}`、`auth.jwt.roles_claim`、`auth.local_roles.*`（3）、`server.grpc.enabled`；C10.16 新增：`partition.file.opendes.max_file_bytes` → 生效，`partition.file.opendes.{allowed,default}_checksum_algorithm` → 拒绝启动。**C10.16 续**：`storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 与 `partition.file.opendes.{staging,persistent}_container` → 生效（+7）；`storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 未实现）与 `partition.file.opendes.storage_driver`（驱动冲突）→ 拒绝启动（+3）。**切片 4**：`server.http.transfer_max_body_bytes`（数据面 PUT 上限 = 全局键与 `partition.file.<p>.max_file_bytes` 取较小者）、`metadata.sqlite.{journal_mode,synchronous}`、`location.sqlite.synchronous` → 生效（+4）。**切片 5（本轮）**：`self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` → 生效（+3）：`key_id` 进被签名载荷并在解码侧 fail-closed（换 id → 旧 URL 401），两个 TTL 键是**自签分支的上界**（`expiry.*` 语义不变）。**切片 6b（C10.19）**：`events.publisher` 与 `events.webhook.{url,timeout_ms,topic}` → **生效**（+4；ADR-013 §9 的 webhook 发布器，**发布失败非致命** —— 连不上/超时/非 2xx 只告警，请求照常 201；`none` 显式关闭）。**ADR-008 的 P4（C9.23，本切片）**：`storage.posix.group_commit_max_batch` → **生效**（+1）；`storage.posix.durability=batch` 从 `FsyncPolicy::kBySize` 近似改为**真两阶段批提交**（此前小文件从不落盘 = 耐久性谎言）；`sync_dir_after_batch=false` 仍拒绝启动（R2 不变量）。三态 **107/18/31** |
+| 组合根接 `config/fss.example.json` | **切片 1/2/3/4/5/6a/6b 已接通（含 C10.16/C10.17/C10.18/C10.19）+ ADR-008 的 P4（C9.23）** | `--config`/`FSS_CONFIG` + `--set` + 环境变量；156 键的三态计数为 **生效 113 / 拒绝启动 18 / 已读但无效果 25**（逐键见 §1.3；样例配置在 C10.10 用例里真的启动成功）。**切片 6a（C10.18）**：`legal.{validator,remote.base_url,remote.timeout_ms}` 与 `schema.{validator,remote.base_url,remote.timeout_ms}` → **生效**（+6；ADR-013 远端校验器，fail-closed → 503）；**伴随更正**：`auth.remote_entitlements.fail_closed` → **拒绝启动**（`remote-entitlements` 模式下非 true → exit 78，模式相关）。切片 3 新接通 9 键：`observability.audit_fail_closed`、`metadata.sqlite.busy_timeout_ms`、`location.sqlite.{busy_timeout_ms,journal_mode}`、`auth.jwt.roles_claim`、`auth.local_roles.*`（3）、`server.grpc.enabled`；C10.16 新增：`partition.file.opendes.max_file_bytes` → 生效，`partition.file.opendes.{allowed,default}_checksum_algorithm` → 拒绝启动。**C10.16 续**：`storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read}` 与 `partition.file.opendes.{staging,persistent}_container` → 生效（+7）；`storage.posix.{group_commit_max_batch,sync_dir_after_batch}`（ADR-008 的 P4 未实现）与 `partition.file.opendes.storage_driver`（驱动冲突）→ 拒绝启动（+3）。**切片 4**：`server.http.transfer_max_body_bytes`（数据面 PUT 上限 = 全局键与 `partition.file.<p>.max_file_bytes` 取较小者）、`metadata.sqlite.{journal_mode,synchronous}`、`location.sqlite.synchronous` → 生效（+4）。**切片 5（本轮）**：`self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` → 生效（+3）：`key_id` 进被签名载荷并在解码侧 fail-closed（换 id → 旧 URL 401），两个 TTL 键是**自签分支的上界**（`expiry.*` 语义不变）。**切片 6b（C10.19）**：`events.publisher` 与 `events.webhook.{url,timeout_ms,topic}` → **生效**（+4；ADR-013 §9 的 webhook 发布器，**发布失败非致命** —— 连不上/超时/非 2xx 只告警，请求照常 201；`none` 显式关闭）。**ADR-008 的 P4（C9.23）**：`storage.posix.group_commit_max_batch` → **生效**（+1）；`storage.posix.durability=batch` 从 `FsyncPolicy::kBySize` 近似改为**真两阶段批提交**（此前小文件从不落盘 = 耐久性谎言）；`sync_dir_after_batch=false` 仍拒绝启动（R2 不变量）。**C10.20（本轮）**：`*.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}` **6 个键** → **生效**（+6；L2 共用协调器 `src/infra/sqlite/sqlite_group_commit.h`：并发写一批一次 COMMIT + 每操作 SAVEPOINT；**读可能多等 ≤ max_wait_ms**）。三态 **113/18/25** |
 | `observability.audit_fail_closed` | **已接通（C10.13）** | `UseCasePorts.audit_fail_closed`：`true` 时审计写入失败让请求以 **500** 结束；`false`（默认）保持非致命。真实进程用例：`FSS_AUDIT_FAULT_INJECT=1` 注入"必然失败"的审计后端（**故障注入开关，不是配置键**）→ `fail_closed=true` 时 `uploadURL` = 500、`false` 时 = 200（正例对照，R16）。★ 该注入开关只用于测试/演练：生产环境**不要**设置 `FSS_AUDIT_FAULT_INJECT` |
 | `storage.io_engine=uring` | **不可用（引擎未启用）** | 组合根会真实探测（`sys::ProbeIoUring`）并按 ADR-010 拒绝/回退；但 `UringIoEngine::enabled()=false`（U1~U4 未满足）→ 显式要求 `uring` 一律 **exit 78**，`auto` 回退 blocking（横幅 + `fss_io_engine` 可见） |
 | `metadata.repository`/`location.repository` 的 `postgres`/`remote` | **未实现（显式拒绝）** | 配成非 `sqlite` → **exit 78**，绝不静默降级为 SQLite |
 | PG 仓储 / PG 租约 / 数据库时钟 | **未实现** | `deployment.mode=multi` 运行形态不存在，组合根拒绝启动（ADR-009） |
 | 多实例运行形态 | **未验证** | 无 PG 版仓储与租约；`leases.*`（除 `enabled` 的拒绝守卫）、`leader_election.*` 仍未接线（§1.3.3） |
 | `metadata.sqlite.{journal_mode,synchronous}` / `location.sqlite.synchronous` | **已接通（切片 4）** | 两个 `Sqlite*RepositoryOptions` 新增 `wal` / `synchronous_level` 真实字段并真的执行 PRAGMA；`synchronous` **不落盘**，用同连接访问器 `AppliedPragma("synchronous")` 验证（另开 sqlite3 连接读回无效）。真实进程侧：`metadata.sqlite.journal_mode=DELETE` 用 `python3 sqlite3` 读回 `delete`，横幅打印 `synchronous=<实际取值>`；TRUNCATE / 非枚举值 → exit 78（§1.3.1） |
-| `metadata.sqlite.{max_write_concurrency,group_commit*}` / `location.sqlite.{max_write_concurrency,group_commit*}` | **未接通（如实登记）** | 两个仓储都是"单连接 + 互斥"，`max_write_concurrency` 不改变行为；`group_commit*` 没有组提交实现。按"不发明字段"保持"已读但无效果"（§1.3.3） |
+| `metadata.sqlite.max_write_concurrency` / `location.sqlite.max_write_concurrency` | **未接通（如实登记）** | 两个仓储都是「单连接 + 互斥」⇒ 实际写并发恒为 1 ≤ 上限，改它不改变行为。下一步：连接池交付后才接通（`group_commit*` 三键已由 **C10.20** 接通，见 §1.3.1） |
 | `storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read,group_commit_max_batch}` 与 `partition.file.opendes.{staging_container,persistent_container,storage_driver}` | **已定案（C10.16 续 + ADR-008 的 P4）** | `PosixBlobStoreOptions` 已加 6 个真实字段（atomic_write/dir_mode/file_mode/fadvise_*/batch_commit+group_commit_max_batch）并接通；`PartitionConfig` 已加容器名/分区驱动字段：容器名接通、分区驱动冲突 → 拒绝启动；`sync_dir_after_batch=false` → 拒绝启动（R2 不变量，§1.3.2） |
 | 远端 Storage Service 仓储（`metadata.repository=remote`） | **未实现** | ADR-004 列为可选 |
 | RS256 / JWKS（`auth.jwt.jwks_url`） | **未实现** | 配置非空 → schema 拒绝启动（ADR-012 §5.3）；只支持 HS256 |

@@ -43,6 +43,23 @@ TEST_CASE("★ C2.10/C6.5 SqliteMetadataRepository 通过与内存实现**同一
   fss::test::CheckMetadataRepositoryContract(*fixture.repo, fixture.clock);
 }
 
+// =============================================================================
+//  C10.20：`group_commit=false` 的**逐字回归**
+// =============================================================================
+//  ★ 上面那条契约用例跑的是 `group_commit` 的 schema 默认值（`true` = 批路径）。
+//    这条把同一套契约在**逐操作**档（接线前的 `BEGIN IMMEDIATE…COMMIT` 行为）上再跑
+//    一遍 —— 两个档位的返回值与副作用必须逐字相同（R15：写进文档的约定要有测试走过）。
+TEST_CASE("★ C10.20 group_commit=false 下 SQLite 元数据仓储仍通过与内存共用的契约",
+          "[phase6][integration][sqlite][c10.20]") {
+  fss::test::TempDir dir("sqlite_metadata_gc_off");
+  fss::ManualClock clock{1700000000};
+  fss::infra::SqliteMetadataRepositoryOptions options;
+  options.group_commit = false;
+  auto opened = SqliteMetadataRepository::Open(dir.child("metadata.db"), clock, options);
+  REQUIRE(opened.ok());
+  fss::test::CheckMetadataRepositoryContract(*opened.value(), clock);
+}
+
 TEST_CASE("★ C6.5 版本链在**数据库层面**的真实形态（列与唯一约束）",
           "[phase6][integration][sqlite][c6.5]") {
   Fixture fixture;

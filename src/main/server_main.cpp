@@ -1152,8 +1152,8 @@ static int RunServer(int argc, char** argv) {
   //  ★ 按 `SqliteMetadataRepositoryOptions` / `SqliteLocationRepositoryOptions` 的字段接线；
   //    切片 4 给两个结构体补齐了 `journal_mode`（`wal` 布尔）与 `synchronous`
   //    （`synchronous_level`），因此这四个键从「已读但无效果」移入「生效」。
-  //    仍未接的是 `group_commit*`（实现里没有组提交）与 `max_write_concurrency`
-  //    （单连接 + 互斥，实际并发恒为 1）—— 见 operations.md §1.3.3。
+  //    **本切片（C10.20）**把 `group_commit*`（6 个键）也接通（真组提交实现）——
+  //    仍未接的只剩 `max_write_concurrency`（单连接 + 互斥，实际并发恒为 1）—— 见 §1.3.3。
   const long metadata_sqlite_busy_timeout_ms =
       resolver.Int("metadata.sqlite.busy_timeout_ms", 5000);
   const long location_sqlite_busy_timeout_ms =
@@ -1173,6 +1173,27 @@ static int RunServer(int argc, char** argv) {
   //  取值不改变行为 → 仍如实登记为"已读但无效果"（见 §1.3.3），这里只把值传进 Options。
   const long location_sqlite_max_write_concurrency =
       resolver.Int("location.sqlite.max_write_concurrency", 8);
+  //  ---- C10.20（本切片）：数据库层组提交（6 个键）----
+  //  ★ 逐键来源（默认值 = `core_schema.cpp` / `config/fss.example.json`）：
+  //    `metadata.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
+  //      → `SqliteMetadataRepositoryOptions`（下游 = 共用协调器 `SqliteGroupCommitOptions`）
+  //    `location.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
+  //      → `SqliteLocationRepositoryOptions`（同一个共用协调器）
+  //  ★ 语义（详见 `src/infra/sqlite/sqlite_group_commit.h`）：`group_commit=true` 时并发
+  //    写操作凑成一批、一个事务一次提交（每操作 SAVEPOINT 保原子性）；`false` 时逐操作
+  //    提交（与接线前逐字一致）。
+  //  ⚠️ **代价**：批事务期间领队持有连接互斥 ⇒ **读可能多等 ≤ max_wait_ms**
+  //    （写进 `docs/operations.md` 与 `docs/02-design.md`，不让运维以为是免费收益）。
+  const bool metadata_sqlite_group_commit = resolver.Bool("metadata.sqlite.group_commit", true);
+  const long metadata_sqlite_group_commit_max_wait_ms =
+      resolver.Int("metadata.sqlite.group_commit_max_wait_ms", 5);
+  const long metadata_sqlite_group_commit_max_batch =
+      resolver.Int("metadata.sqlite.group_commit_max_batch", 64);
+  const bool location_sqlite_group_commit = resolver.Bool("location.sqlite.group_commit", true);
+  const long location_sqlite_group_commit_max_wait_ms =
+      resolver.Int("location.sqlite.group_commit_max_wait_ms", 5);
+  const long location_sqlite_group_commit_max_batch =
+      resolver.Int("location.sqlite.group_commit_max_batch", 64);
 
   //  ---- 自签数据面 ----
   const bool self_signed_enabled = resolver.Bool("self_signed.enabled", true);
@@ -1648,6 +1669,13 @@ static int RunServer(int argc, char** argv) {
                             "POSIX 批提交的批次数（每批 1 次 syncfs + 1 次 fsync(dir)）");
   metrics_registry.Register("fss_posix_batch_objects_total", metrics::Registry::Kind::kCounter,
                             "通过两阶段批提交提交的对象数（用于计算平均批大小）");
+  //  ★ C10.20：SQLite 组提交的可观测性（否则"组提交生效"在真实进程上无法验证）。
+  //    判据：`fss_sqlite_ops_total{repo} / fss_sqlite_group_commits_total{repo}` = 平均批大小；
+  //    `group_commit=false` 时两者恒等（每操作一批）。
+  metrics_registry.Register("fss_sqlite_group_commits_total", metrics::Registry::Kind::kCounter,
+                            "SQLite 组提交的批次数（每批 1 次事务 COMMIT；逐操作档下每操作一批）");
+  metrics_registry.Register("fss_sqlite_ops_total", metrics::Registry::Kind::kCounter,
+                            "交给 SQLite 组提交协调器的写操作数（用于计算平均批大小）");
   MeteredBlobStore metered_blob(*blob_store, metrics_registry,
                                storage_driver == "s3" ? "s3" : "posix");
   SingleStoreFactory blob_factory(metered_blob);
@@ -1662,6 +1690,13 @@ static int RunServer(int argc, char** argv) {
   location_sqlite_options.max_write_concurrency =
       static_cast<int>(location_sqlite_max_write_concurrency);
   location_sqlite_options.synchronous_level = location_sqlite_synchronous;
+  //  C10.20：`location.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
+  location_sqlite_options.group_commit = location_sqlite_group_commit;
+  location_sqlite_options.group_commit_max_wait_ms =
+      static_cast<int>(location_sqlite_group_commit_max_wait_ms);
+  location_sqlite_options.group_commit_max_batch =
+      static_cast<int>(location_sqlite_group_commit_max_batch);
+  location_sqlite_options.metrics = &metrics_registry;
   auto location_repository =
       SqliteLocationRepository::Open(sqlite_path, location_sqlite_options);
   if (!location_repository.ok()) {
@@ -1672,6 +1707,13 @@ static int RunServer(int argc, char** argv) {
   metadata_sqlite_options.busy_timeout_millis = static_cast<int>(metadata_sqlite_busy_timeout_ms);
   metadata_sqlite_options.wal = metadata_sqlite_journal_mode != "DELETE";
   metadata_sqlite_options.synchronous_level = metadata_sqlite_synchronous;
+  //  C10.20：`metadata.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
+  metadata_sqlite_options.group_commit = metadata_sqlite_group_commit;
+  metadata_sqlite_options.group_commit_max_wait_ms =
+      static_cast<int>(metadata_sqlite_group_commit_max_wait_ms);
+  metadata_sqlite_options.group_commit_max_batch =
+      static_cast<int>(metadata_sqlite_group_commit_max_batch);
+  metadata_sqlite_options.metrics = &metrics_registry;
   auto metadata_repository_handle =
       SqliteMetadataRepository::Open(metadata_db_path, clock, metadata_sqlite_options);
   if (!metadata_repository_handle.ok()) {
@@ -2143,6 +2185,16 @@ static int RunServer(int argc, char** argv) {
             << "ms journal_mode=" << metadata_sqlite_journal_mode << "（wal="
             << (metadata_sqlite_journal_mode != "DELETE" ? "true" : "false")
             << "，synchronous=" << metadata_sqlite_synchronous_text << "）\n"
+            //  ★ C10.20：6 个组提交键的实际取值必须与 journal_mode / synchronous 同处可见
+            //    （否则运维无法确认"默认的组提交"到底开没开、窗口多大）。
+            << "  sqlite commit  : location group_commit="
+            << (location_sqlite_group_commit ? "true" : "false")
+            << " max_wait_ms=" << location_sqlite_group_commit_max_wait_ms
+            << " max_batch=" << location_sqlite_group_commit_max_batch
+            << "（组提交：并发写一批一次 COMMIT；读可能多等 ≤ max_wait_ms）"
+            << " | metadata group_commit=" << (metadata_sqlite_group_commit ? "true" : "false")
+            << " max_wait_ms=" << metadata_sqlite_group_commit_max_wait_ms
+            << " max_batch=" << metadata_sqlite_group_commit_max_batch << "\n"
             << "  transfer limit : 数据面 PUT max_body_bytes=" << transfer_put_max_body_bytes
             << "（0=不限；全局 server.http.transfer_max_body_bytes=" << transfer_max_body_bytes
             << "，partition.file." << partition_file.partition

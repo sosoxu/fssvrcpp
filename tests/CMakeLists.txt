@@ -285,6 +285,24 @@ fss_add_test(test_sqlite_write_concurrency
   LIBS    fss_location_sqlite Threads::Threads
   LABELS  phase3 integration)
 
+# =============================================================================
+#  C10.20（本切片）：SQLite **数据库层组提交**（6 个键）
+#    · unit：共用协调器 `infra/sqlite/sqlite_group_commit.h` 的**每操作原子性**
+#      （真实主键冲突 + "半成品"回滚）与**整批 COMMIT 失败**语义（故障注入）；
+#    · integration：两个仓储的摊销 == ceil(N/B)、group_commit=false 逐字回归、
+#      max_wait_ms 的等待窗口、读不脏（批事务开着时读必须等待）。
+#    时序全部由注入的门控/观察者决定 —— 不靠 sleep 猜批大小。
+# =============================================================================
+fss_add_test(test_sqlite_group_commit_unit
+  SOURCES unit/test_sqlite_group_commit.cpp
+  LIBS    SQLite::SQLite3 fss_metrics Threads::Threads
+  LABELS  "phase10;unit")
+
+fss_add_test(test_sqlite_group_commit
+  SOURCES integration/test_sqlite_group_commit.cpp
+  LIBS    fss_location_sqlite fss_metadata_sqlite Threads::Threads
+  LABELS  "phase10;integration")
+
 # -----------------------------------------------------------------------------
 #  阶段 6：元数据语义完整化
 # -----------------------------------------------------------------------------

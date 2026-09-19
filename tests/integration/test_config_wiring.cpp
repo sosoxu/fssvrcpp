@@ -31,6 +31,7 @@
 // =============================================================================
 #include <catch2/catch.hpp>
 
+#include "app_fixture.h"  // AppFixture::MakeRecord
 #include "http_fixture.h"  // Authed / TargetOf
 #include "raw_http.h"
 #include "server_process.h"
@@ -2191,4 +2192,128 @@ TEST_CASE("★ C9.23 真实进程：默认 durability=batch 下上传 200 且 /m
   //  正控：批次数与对象数也在动（不是只注册了一个恒 0 的家族）
   REQUIRE(metrics.body.find("fss_posix_group_commits_total") != std::string::npos);
   REQUIRE(metrics.body.find("fss_posix_batch_objects_total") != std::string::npos);
+}
+
+// =============================================================================
+//  C10.20（本切片）：SQLite **数据库层组提交**在真实进程上的可观测性
+// =============================================================================
+//  判据（父代理定案）：**至少一个键的非默认值在真实进程里可观测**。
+//  本用例用两个键各做一次真实进程断言（其余可观测手段见 §未做项：真实进程侧无法直接
+//  数"事务次数"，因此用"等待窗口的时延"+"指标是否存在"两条实测证据）：
+//    · `metadata.sqlite.group_commit_max_wait_ms`：设成 400ms 时，一次 createMetadata
+//      的 HTTP 时延必然 ≥ 一个窗口（该请求至少有一次元数据写入）——窗口真的生效；
+//    · `metadata.sqlite.group_commit`：同一窗口下改成 `false`（逐操作事务）时，同一
+//      请求不再等窗口（时延显著下降）——开关真的改变了行为。
+//    · 横幅（真实进程启动输出）打印两个仓储的三个键的实际取值（不靠口头承诺）；
+//    · `/metrics` 暴露 `fss_sqlite_{ops,group_commits}_total{repo="metadata"}`，
+//      且真实写入让它动过（正控：不是"注册了一个恒 0 的家族"）。
+// =============================================================================
+TEST_CASE("★ C10.20 真实进程：sqlite 组提交的键被读取（横幅 + 指标 + 窗口时延可观测）",
+          "[phase10][config][c10.20]") {
+  TempDir data_dir("c1020_gc_proc");
+
+  const auto run_with_options = [&](const std::string& tag,
+                                    const std::vector<std::string>& extra_args,
+                                    long* latency_ms, std::string* log,
+                                    std::string* metrics) {
+    TempDir cfg_dir("c1020_cfg_" + tag);
+    const int port = FreePort();
+    REQUIRE(port > 0);
+    const std::string config = WriteFile(
+        cfg_dir, tag + ".json",
+        "{\n"
+        "  \"server\": {\"http\": {\"bind\": \"127.0.0.1\", \"port\": " + std::to_string(port) +
+            "}},\n"
+            "  \"storage\": {\"posix\": {\"root\": \"" + data_dir.child("store_" + tag) +
+            "\"}},\n"
+            "  \"location\": {\"sqlite\": {\"path\": \"" + data_dir.child("loc_" + tag + ".db") +
+            "\"}},\n"
+            "  \"metadata\": {\"sqlite\": {\"path\": \"" + data_dir.child("meta_" + tag + ".db") +
+            "\"}},\n"
+            "  \"self_signed\": {\"signing_key\": \"c1020-secret\", \"public_base_url\": "
+            "\"http://127.0.0.1:" + std::to_string(port) + "/api/file\"},\n"
+            "  \"auth\": {\"mode\": \"disabled\"}\n}\n");
+    std::vector<std::string> args{"--config", config};
+    for (const auto& arg : extra_args) args.push_back(arg);
+    ServerProcess server(SelfContainedOptions(args));
+    REQUIRE(WaitReady(server.http_port()));
+
+    //  一次真实 createMetadata：先 uploadURL + PUT（数据面），再 POST metadata。
+    //  只对 POST 计时 —— 它才是元数据仓储的写路径（组提交的作用域）。
+    const auto upload = HttpDo(server.http_port(), "GET", "/api/file/v2/files/uploadURL", Authed());
+    REQUIRE(upload.status == 200);
+    const auto upload_json = fss::json::ParseObject(upload.body);
+    REQUIRE(upload_json.ok());
+    const std::string file_source =
+        upload_json.value()["Location"]["FileSource"].get<std::string>();
+    const std::string signed_url =
+        upload_json.value()["Location"]["SignedURL"].get<std::string>();
+    const auto put = HttpDo(server.http_port(), "PUT", TargetOf(signed_url), Authed(),
+                            std::string(8, 'x'));
+    CAPTURE(put.body);
+    REQUIRE(put.status == 200);
+
+    const auto record = fss::test::AppFixture::MakeRecord(file_source, "c1020.txt");
+    const auto begin = std::chrono::steady_clock::now();
+    const auto created = HttpDo(server.http_port(), "POST", "/api/file/v2/files/metadata", Authed(),
+                                fss::json::Dump(fss::domain::ToJson(record)));
+    *latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - begin)
+                      .count();
+    CAPTURE(created.body, *latency_ms);
+    REQUIRE(created.status == 201);
+
+    *log = server.DumpLog();
+    const auto metrics_reply = HttpGet(server.http_port(), "/metrics");
+    REQUIRE(metrics_reply.transport_ok);
+    REQUIRE(metrics_reply.status == 200);
+    *metrics = metrics_reply.body;
+  };
+
+  const auto sample_value = [](const std::string& body, const std::string& sample) -> long {
+    //  ★ 只解析**样本行**（前面是换行）：只找 `name ` 会先命中 `# HELP name ...`
+    //    （phase9 §13.3 踩过：把帮助文本当数字，strtol 恒为 0）。
+    const std::size_t pos = body.find("\n" + sample + " ");
+    if (pos == std::string::npos) return -1;
+    return std::strtol(body.c_str() + pos + 1 + sample.size() + 1, nullptr, 10);
+  };
+
+  SECTION("group_commit_max_wait_ms=400（group_commit 默认 true）→ 写请求至少等一个窗口") {
+    long latency_ms = 0;
+    std::string log;
+    std::string metrics;
+    run_with_options("window", {"--set", "metadata.sqlite.group_commit_max_wait_ms=400"},
+                     &latency_ms, &log, &metrics);
+    //  横幅：三个键的实际取值必须可见（与 journal_mode / synchronous 同处声明）。
+    REQUIRE(log.find("sqlite commit  :") != std::string::npos);
+    REQUIRE(log.find("metadata group_commit=true max_wait_ms=400 max_batch=64") !=
+            std::string::npos);
+    INFO("createMetadata latency(ms) = " << latency_ms);
+    REQUIRE(latency_ms >= 350);  // 窗口真的生效（不是"读了配置但忽略"）
+    //  /metrics：真实写入让两族计数都动过（正控：不是恒 0 的家族）。
+    const long ops = sample_value(metrics, "fss_sqlite_ops_total{repo=\"metadata\"}");
+    const long commits = sample_value(metrics, "fss_sqlite_group_commits_total{repo=\"metadata\"}");
+    INFO("fss_sqlite_ops_total{metadata} = " << ops << "；commits = " << commits);
+    REQUIRE(ops >= 1);
+    REQUIRE(commits >= 1);
+  }
+
+  SECTION("group_commit=false（同一窗口）→ 不再等窗口（键真的改变了行为）") {
+    long latency_ms = 0;
+    std::string log;
+    std::string metrics;
+    run_with_options("off",
+                     {"--set", "metadata.sqlite.group_commit_max_wait_ms=400", "--set",
+                      "metadata.sqlite.group_commit=false"},
+                     &latency_ms, &log, &metrics);
+    REQUIRE(log.find("metadata group_commit=false max_wait_ms=400") != std::string::npos);
+    INFO("createMetadata latency(ms) = " << latency_ms);
+    REQUIRE(latency_ms < 350);  // 逐操作档：窗口被忽略 ⇒ 不可能等满 400ms
+    const long ops = sample_value(metrics, "fss_sqlite_ops_total{repo=\"metadata\"}");
+    const long commits = sample_value(metrics, "fss_sqlite_group_commits_total{repo=\"metadata\"}");
+    INFO("fss_sqlite_ops_total{metadata} = " << ops << "；commits = " << commits);
+    REQUIRE(ops >= 1);
+    //  逐操作档：每个操作一批 ⇒ 提交次数与操作次数**相等**。
+    REQUIRE(commits == ops);
+  }
 }

@@ -192,7 +192,8 @@ target_link_libraries(fss_location_memory PUBLIC fss_domain fss_time)
 add_library(fss_location_sqlite STATIC
   infra/location/sqlite/sqlite_location_repository.cpp)
 target_include_directories(fss_location_sqlite PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(fss_location_sqlite PUBLIC fss_domain SQLite::SQLite3)
+# fss_metrics（L1）：组提交批次数/操作数（`fss_sqlite_{group_commits,ops}_total`）
+target_link_libraries(fss_location_sqlite PUBLIC fss_domain fss_metrics SQLite::SQLite3)
 
 # L2：集中存储的自签传输 token 与 `/v1/transfer` 内核（ADR-003 §6.3）
 add_library(fss_transfer STATIC
@@ -204,7 +205,8 @@ target_link_libraries(fss_transfer PUBLIC fss_domain fss_crypto)
 add_library(fss_metadata_sqlite STATIC
   infra/metadata/sqlite/sqlite_metadata_repository.cpp)
 target_include_directories(fss_metadata_sqlite PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(fss_metadata_sqlite PUBLIC fss_domain fss_json SQLite::SQLite3)
+# fss_metrics（L1）：组提交批次数/操作数（`fss_sqlite_{group_commits,ops}_total`）
+target_link_libraries(fss_metadata_sqlite PUBLIC fss_domain fss_json fss_metrics SQLite::SQLite3)
 
 add_library(fss_metadata_memory STATIC
   infra/metadata/memory/memory_metadata_repository.cpp)

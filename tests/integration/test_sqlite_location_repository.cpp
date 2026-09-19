@@ -38,6 +38,22 @@ TEST_CASE("★ C2.10/C3.8 SqliteLocationRepository 通过与内存实现共用�
   fss::test::CheckLocationRepositoryContract(*repository);
 }
 
+// =============================================================================
+//  C10.20：`group_commit=false` 的**逐字回归**
+// =============================================================================
+//  ★ `group_commit` 的 schema 默认值是 `true`（组提交档），因此上面那条契约用例跑的
+//    是**批路径**。这条用例把同一个契约在 `group_commit=false`（逐操作事务，与接线前
+//    逐字一致）上再跑一遍 —— 否则"两种档位语义相同"只是口头承诺（R15）。
+TEST_CASE("★ C10.20 group_commit=false 下 SQLite 位置仓储仍通过与内存共用的契约",
+          "[phase3][sqlite][c10.20]") {
+  fss::test::TempDir dir("sqlite_location_gc_off");
+  fss::infra::SqliteLocationRepositoryOptions options;
+  options.group_commit = false;  // 逐操作：一次 BEGIN IMMEDIATE…COMMIT / 一条自动提交语句
+  auto opened = SqliteLocationRepository::Open(dir.child("locations.db"), options);
+  REQUIRE(opened.ok());
+  fss::test::CheckLocationRepositoryContract(*opened.value());
+}
+
 TEST_CASE("★ C3.8 双租户：同 file_id / 同 file_source 在两个 partition 各自独立",
           "[phase3][sqlite][c3.8]") {
   fss::test::TempDir dir("sqlite_tenants");

@@ -1163,6 +1163,33 @@ fssvrcpp/
 SQLite 写并发  = 8（实测峰值，超过反而下降）
 ```
 
+### 13.5 SQLite 组提交：单连接 + 计划内 SAVEPOINT + 读等待窗口（C10.20）
+
+本仓库的两个 SQLite 仓储（`SqliteLocationRepository` / `SqliteMetadataRepository`）都是
+**单连接 + 互斥**：一个 `sqlite3*` 由一把 `mutex_` 串行化，`max_write_concurrency` 只是
+"上限"（实际并发恒为 1）。因此"组提交"不能靠多连接并发批处理，只能沿着**同一个连接**
+把并发到达的写操作**凑批**：
+
+| 环节 | 做法 | 取舍 |
+| --- | --- | --- |
+| 批的形成 | 第一个到达的写操作成为**领队**：等「批满 `group_commit_max_batch`」或「从第一个待处理操作起超过 `group_commit_max_wait_ms`」，然后**一个** `BEGIN IMMEDIATE` + **一次** `COMMIT` | 顺序单文件写**每操作最多多等一个窗口**（拿不到摊销）；只有并发写才有摊销 —— **不是纯免费收益** |
+| 每操作原子性 | 批内每个操作前 `SAVEPOINT op_i`：成功 `RELEASE`，失败 `ROLLBACK TO op_i; RELEASE op_i` | 一个操作失败**不会**拖垮同批其它操作，也不留半成品（契约语义逐字不变） |
+| 整批提交失败 | `COMMIT` 遇到 `SQLITE_FULL`/磁盘错误 → 批内**所有**操作都返回该错误 | **有意的语义**：整批没落盘时谎报"某个操作成功"更糟 |
+| 读路径 | 领队在**批事务期间持有同一把连接互斥** ⇒ 同仓储的读在它后面排队 | **读可能多等 ≤ `group_commit_max_wait_ms`**（+ 批执行时间）。单连接下这是"读不脏"的**唯一**手段（见 AGENTS §4.3 的陷阱） |
+| 关掉 | `group_commit=false` → 逐操作提交（与接线前逐字一致） | 需要"每操作一次 fsync"或极低尾延迟时用它 |
+
+实现是一个 **L2 共用小工具** `src/infra/sqlite/sqlite_group_commit.h`（两个仓储各持有
+一个 `SqliteGroupCommitter`，共用同一套协议与接缝）：`ISqliteBatchObserver`（记录每个批次的
+`(ops, committed)` 与保存点回滚次数）、`ISqliteBatchGate`（`ShouldFlush` 决定领队何时
+flush、`BeforeCommit` 把"事务开着"变成确定性可观察点）、`ISqliteCommitFault`（注入整批
+`COMMIT` 失败）。★ **耐久性等级不变**：仍是"每个事务一次 `COMMIT`"，只是把多个操作的语句
+合并进一个事务（`synchronous` 语义不变）；**没有**新增崩溃风险，也**不**声称吞吐提升数字
+（未做 R2 合规测量）。
+
+> ⚠️ 不要把它读成"组提交总是更快"：**并发**写才摊销，**顺序**写会变慢（每操作等一个窗口）；
+> 读会多等一个窗口。真实进程实测：`group_commit_max_wait_ms=400` → 一次 `createMetadata`
+> 416ms；同窗口 + `group_commit=false` → 14ms（`docs/test-evidence/phase10.md` 的 C10.20）。
+
 ---
 
 ## 14. 可观测性
@@ -1256,9 +1283,9 @@ SQLite 写并发  = 8（实测峰值，超过反而下降）
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
 exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、`expiry.*` 接进组合根，
 并把 16 个未实现键改为"非默认值 → 拒绝启动"（后续切片与 C10.16 / C10.16 续 / 切片 4 / 切片 5 / **切片 6a（C10.18）** 继续收敛，当前三态为
-**生效 107 / 拒绝启动 18 / 已读但无效果 31**；逐键登记在 `docs/operations.md` §1.2/§1.3）；
+**生效 113 / 拒绝启动 18 / 已读但无效果 25**（C10.20 后）；逐键登记在 `docs/operations.md` §1.2/§1.3）；
 ② 多实例相关的 `shared_mount_required`/`one_filesystem_per_partition` 仍不可配（在 §1.3 的
-34 个"已读但无效果"键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
+**25** 个「已读但无效果」键里）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
 实现（ADR-006 §6 的门槛）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
 
 ---

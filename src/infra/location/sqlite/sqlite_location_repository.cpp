@@ -2,6 +2,7 @@
 #include "infra/location/sqlite/sqlite_location_repository.h"
 
 #include "common/json/json.h"
+#include "infra/sqlite/sqlite_group_commit.h"
 
 #include <sqlite3.h>
 
@@ -188,6 +189,22 @@ std::string ExtraString(const domain::FileLocation& location, std::string_view k
   return slot.is_string() ? slot.get<std::string>() : std::string{};
 }
 
+//  upsert 的**语句级**执行与错误映射（逐操作路径与批内路径共用一份）。
+//  ★ 开了 `sqlite3_extended_result_codes` 之后 `rc` 是**扩展码**
+//    （SQLITE_CONSTRAINT_UNIQUE = 2067），不是主码 SQLITE_CONSTRAINT(19)；
+//    只比主码会漏判，症状是"唯一约束冲突被当成 500"（P3-D03）。
+fss::Result<void> StepUpsert(sqlite3* db, sqlite3_stmt* stmt,
+                             const domain::FileLocation& location) {
+  const int rc = sqlite3_step(stmt);
+  if (rc == SQLITE_DONE) return Ok();
+  if ((rc & 0xFF) == SQLITE_CONSTRAINT) {
+    //  (partition, file_source) 唯一索引冲突（同 file_id 的 upsert 已被 ON CONFLICT 处理）
+    return Err(fss::ErrorKind::kLocationAlreadyExists,
+               "file_source 已被另一个 file_id 占用：" + location.file_source);
+  }
+  return SqliteError(db, "写入位置记录失败");
+}
+
 }  // namespace
 
 fss::Result<std::unique_ptr<SqliteLocationRepository>> SqliteLocationRepository::Open(
@@ -232,6 +249,18 @@ fss::Result<std::unique_ptr<SqliteLocationRepository>> SqliteLocationRepository:
   sqlite3_busy_timeout(repository->db_, options.busy_timeout_millis);
 
   FSS_TRY(repository->EnsureSchema());
+  //  ★ 本切片：组提交协调器（`group_commit=false` 时逐操作路径不碰它）。
+  SqliteGroupCommitOptions group_options;
+  group_options.group_commit = options.group_commit;
+  group_options.group_commit_max_wait_ms = options.group_commit_max_wait_ms;
+  group_options.group_commit_max_batch = options.group_commit_max_batch;
+  group_options.batch_observer = options.batch_observer;
+  group_options.batch_gate = options.batch_gate;
+  group_options.commit_fault = options.commit_fault;
+  group_options.metrics = options.metrics;
+  group_options.metrics_repo = "location";
+  repository->committer_ = std::make_unique<SqliteGroupCommitter>(
+      repository->db_, repository->mutex_, group_options);
   return repository;
 }
 
@@ -258,13 +287,34 @@ fss::Result<domain::FileLocation> SqliteLocationRepository::LoadRow(
   return ParseLocation(ColumnText(statement, 0));
 }
 
+void SqliteLocationRepository::NotifyBatch(std::size_t ops_in_batch, bool committed) {
+  if (options_.batch_observer != nullptr) {
+    options_.batch_observer->OnBatchCommitted(ops_in_batch, committed);
+  }
+  if (options_.metrics != nullptr) {
+    const fss::metrics::Labels labels{{"repo", "location"}};
+    options_.metrics->Increment("fss_sqlite_group_commits_total", labels);
+    options_.metrics->Increment("fss_sqlite_ops_total", labels,
+                                static_cast<std::int64_t>(ops_in_batch));
+  }
+}
+
 fss::Result<void> SqliteLocationRepository::Save(std::string_view partition,
                                                  const domain::FileLocation& location) {
-  std::lock_guard<std::mutex> guard(mutex_);
   if (partition.empty()) return Invalid("partition 不能为空");
   if (location.file_id.empty()) return Invalid("file_id 不能为空");
   if (location.file_source.empty()) return Invalid("file_source 不能为空");
+  if (options_.group_commit) {
+    const std::string part(partition);
+    return committer_->Submit<void>(
+        [this, part, location](sqlite3* db) { return SaveInTransaction(db, part, location); });
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  return SaveLocked(partition, location);
+}
 
+fss::Result<void> SqliteLocationRepository::SaveLocked(
+    std::string_view partition, const domain::FileLocation& location) {
   Statement statement(db_, kUpsert);
   if (!statement.ok()) return SqliteError(db_, "准备 upsert 失败");
   sqlite3_stmt* stmt = statement.get();
@@ -283,17 +333,37 @@ fss::Result<void> SqliteLocationRepository::Save(std::string_view partition,
   const std::string data = DumpLocation(location);
   BindText(stmt, 12, data);
 
-  const int rc = sqlite3_step(stmt);
-  if (rc == SQLITE_DONE) return Ok();
-  //  ★ 开了 `sqlite3_extended_result_codes` 之后，这里拿到的是**扩展码**
-  //    （SQLITE_CONSTRAINT_UNIQUE = 2067），不是主码 SQLITE_CONSTRAINT(19)。
-  //    只比主码会漏判，症状是"唯一约束冲突被当成 500"。
-  if ((rc & 0xFF) == SQLITE_CONSTRAINT) {
-    //  (partition, file_source) 唯一索引冲突（同 file_id 的 upsert 已被 ON CONFLICT 处理）
-    return Err(fss::ErrorKind::kLocationAlreadyExists,
-               "file_source 已被另一个 file_id 占用：" + location.file_source);
+  const auto outcome = StepUpsert(db_, stmt, location);
+  if (outcome.ok()) {
+    //  单条自动提交语句 = 一次提交（与接线前一致）。
+    NotifyBatch(1, true);
+    return Ok();
   }
-  return SqliteError(db_, "写入位置记录失败");
+  NotifyBatch(1, false);
+  return outcome.error();
+}
+
+fss::Result<void> SqliteLocationRepository::SaveInTransaction(
+    sqlite3* db, std::string_view partition, const domain::FileLocation& location) {
+  Statement statement(db, kUpsert);
+  if (!statement.ok()) return SqliteError(db, "准备 upsert 失败");
+  sqlite3_stmt* stmt = statement.get();
+
+  BindText(stmt, 1, partition);
+  BindText(stmt, 2, location.file_id);
+  BindText(stmt, 3, location.file_source);
+  BindText(stmt, 4, ExtraString(location, "container"));
+  BindText(stmt, 5, ExtraString(location, "object_key"));
+  BindText(stmt, 6, domain::StorageZoneName(location.zone));
+  BindText(stmt, 7, domain::StorageDriverName(location.driver));
+  BindText(stmt, 8, location.user_id);
+  sqlite3_bind_int64(stmt, 9, location.created_at_epoch_seconds);
+  sqlite3_bind_int64(stmt, 10, location.updated_at_epoch_seconds);
+  BindText(stmt, 11, location.signed_url);
+  const std::string data = DumpLocation(location);
+  BindText(stmt, 12, data);
+
+  return StepUpsert(db, stmt, location);
 }
 
 fss::Result<domain::FileLocation> SqliteLocationRepository::Find(std::string_view partition,
@@ -330,7 +400,22 @@ fss::Result<domain::FileLocation> SqliteLocationRepository::FindByFileSource(
 fss::Result<void> SqliteLocationRepository::UpdateSignedUrl(
     std::string_view partition, std::string_view file_id, std::string_view signed_url,
     std::int64_t updated_at_epoch_seconds) {
+  if (options_.group_commit) {
+    const std::string part(partition);
+    const std::string id(file_id);
+    const std::string url(signed_url);
+    return committer_->Submit<void>([this, part, id, url, updated_at_epoch_seconds](
+                                        sqlite3* db) {
+      return UpdateSignedUrlInTransaction(db, part, id, url, updated_at_epoch_seconds);
+    });
+  }
   std::lock_guard<std::mutex> guard(mutex_);
+  return UpdateSignedUrlLocked(partition, file_id, signed_url, updated_at_epoch_seconds);
+}
+
+fss::Result<void> SqliteLocationRepository::UpdateSignedUrlLocked(
+    std::string_view partition, std::string_view file_id, std::string_view signed_url,
+    std::int64_t updated_at_epoch_seconds) {
   //  读-改-写 `data`：保留未知字段（否则一次 signed URL 更新就会丢字段）
   //  ★ 必须用 FindInternal：本方法已持锁，调用加锁的 Find 会自锁（非递归 mutex）
   const auto existing = FindInternal(partition, file_id);
@@ -350,20 +435,82 @@ fss::Result<void> SqliteLocationRepository::UpdateSignedUrl(
   BindText(stmt, 4, partition);
   BindText(stmt, 5, file_id);
 
-  if (sqlite3_step(stmt) != SQLITE_DONE) return SqliteError(db_, "更新 signed_url 失败");
-  if (sqlite3_changes(db_) == 0) return NotFound("位置记录不存在：" + std::string(file_id));
+  if (sqlite3_step(stmt) != SQLITE_DONE) {
+    NotifyBatch(1, false);
+    return SqliteError(db_, "更新 signed_url 失败");
+  }
+  if (sqlite3_changes(db_) == 0) {
+    NotifyBatch(1, false);
+    return NotFound("位置记录不存在：" + std::string(file_id));
+  }
+  NotifyBatch(1, true);
+  return Ok();
+}
+
+fss::Result<void> SqliteLocationRepository::UpdateSignedUrlInTransaction(
+    sqlite3* db, std::string_view partition, std::string_view file_id,
+    std::string_view signed_url, std::int64_t updated_at_epoch_seconds) {
+  const auto existing = FindInternal(partition, file_id);
+  if (!existing.ok()) return existing.error();
+
+  domain::FileLocation location = existing.value();
+  location.signed_url = std::string(signed_url);
+  location.updated_at_epoch_seconds = updated_at_epoch_seconds;
+  const std::string data = DumpLocation(location);
+
+  Statement statement(db, kUpdateSignedUrl);
+  if (!statement.ok()) return SqliteError(db, "准备更新失败");
+  sqlite3_stmt* stmt = statement.get();
+  BindText(stmt, 1, location.signed_url);
+  sqlite3_bind_int64(stmt, 2, location.updated_at_epoch_seconds);
+  BindText(stmt, 3, data);
+  BindText(stmt, 4, partition);
+  BindText(stmt, 5, file_id);
+
+  if (sqlite3_step(stmt) != SQLITE_DONE) return SqliteError(db, "更新 signed_url 失败");
+  if (sqlite3_changes(db) == 0) return NotFound("位置记录不存在：" + std::string(file_id));
   return Ok();
 }
 
 fss::Result<void> SqliteLocationRepository::Delete(std::string_view partition,
                                                    std::string_view file_id) {
+  if (options_.group_commit) {
+    const std::string part(partition);
+    const std::string id(file_id);
+    return committer_->Submit<void>(
+        [this, part, id](sqlite3* db) { return DeleteInTransaction(db, part, id); });
+  }
   std::lock_guard<std::mutex> guard(mutex_);
+  return DeleteLocked(partition, file_id);
+}
+
+fss::Result<void> SqliteLocationRepository::DeleteLocked(std::string_view partition,
+                                                         std::string_view file_id) {
   Statement statement(db_, kDelete);
   if (!statement.ok()) return SqliteError(db_, "准备删除失败");
   BindText(statement.get(), 1, partition);
   BindText(statement.get(), 2, file_id);
-  if (sqlite3_step(statement.get()) != SQLITE_DONE) return SqliteError(db_, "删除失败");
-  if (sqlite3_changes(db_) == 0) return NotFound("位置记录不存在：" + std::string(file_id));
+  if (sqlite3_step(statement.get()) != SQLITE_DONE) {
+    NotifyBatch(1, false);
+    return SqliteError(db_, "删除失败");
+  }
+  if (sqlite3_changes(db_) == 0) {
+    NotifyBatch(1, false);
+    return NotFound("位置记录不存在：" + std::string(file_id));
+  }
+  NotifyBatch(1, true);
+  return Ok();
+}
+
+fss::Result<void> SqliteLocationRepository::DeleteInTransaction(sqlite3* db,
+                                                                 std::string_view partition,
+                                                                 std::string_view file_id) {
+  Statement statement(db, kDelete);
+  if (!statement.ok()) return SqliteError(db, "准备删除失败");
+  BindText(statement.get(), 1, partition);
+  BindText(statement.get(), 2, file_id);
+  if (sqlite3_step(statement.get()) != SQLITE_DONE) return SqliteError(db, "删除失败");
+  if (sqlite3_changes(db) == 0) return NotFound("位置记录不存在：" + std::string(file_id));
   return Ok();
 }
 

@@ -2,11 +2,13 @@
 #include "infra/metadata/sqlite/sqlite_metadata_repository.h"
 
 #include "common/json/json.h"
+#include "infra/sqlite/sqlite_group_commit.h"
 
 #include <sqlite3.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -144,6 +146,38 @@ fss::Result<void> ValidateRecord(std::string_view partition,
   return Ok();
 }
 
+//  语句级插入一行版本（**无事务控制**：调用方负责 BEGIN/COMMIT 或 SAVEPOINT）。
+//  返回的是 SQLite 的返回码而不是 `Result`，因为调用方要按**主码**做唯一约束恢复
+//  （P3-D03：开了 `sqlite3_extended_result_codes` 时 rc 是扩展码，必须 `rc & 0xFF`）。
+struct InsertOutcome {
+  int rc = SQLITE_ERROR;
+  bool ok() const { return rc == SQLITE_DONE; }
+};
+
+InsertOutcome InsertVersionRow(sqlite3* db, std::string_view partition,
+                               const domain::FileMetadataRecord& stored,
+                               std::string_view file_source, std::int64_t created_at,
+                               std::optional<std::int64_t> previous_version) {
+  Statement stmt(db, kInsertVersion);
+  if (!stmt.ok()) return InsertOutcome{SQLITE_ERROR};
+  BindText(stmt.get(), 1, partition);
+  BindText(stmt.get(), 2, stored.id);
+  sqlite3_bind_int64(stmt.get(), 3, static_cast<sqlite3_int64>(stored.version));
+  sqlite3_bind_int(stmt.get(), 4, 1);
+  if (previous_version.has_value()) {
+    sqlite3_bind_int64(stmt.get(), 5, static_cast<sqlite3_int64>(*previous_version));
+  } else {
+    sqlite3_bind_null(stmt.get(), 5);
+  }
+  BindText(stmt.get(), 6, file_source);
+  BindText(stmt.get(), 7, stored.kind);
+  BindText(stmt.get(), 8, stored.data.name.value_or(""));
+  sqlite3_bind_int64(stmt.get(), 9, static_cast<sqlite3_int64>(created_at));
+  BindText(stmt.get(), 10, "");
+  BindText(stmt.get(), 11, json::Dump(domain::ToJson(stored)));
+  return InsertOutcome{sqlite3_step(stmt.get())};
+}
+
 }  // namespace
 
 // =============================================================================
@@ -196,6 +230,19 @@ fss::Result<std::unique_ptr<SqliteMetadataRepository>> SqliteMetadataRepository:
       return fss::Err(fss::ErrorKind::kInternal, "初始化元数据 schema 失败：" + message);
     }
   }
+  //  ★ 本切片：组提交协调器（`group_commit=true` 时用；`false` 时逐操作路径根本不碰它，
+  //    因此仍然创建 —— 让"逐操作路径"与"批路径"共享同一份选项/接缝）。
+  SqliteGroupCommitOptions group_options;
+  group_options.group_commit = options.group_commit;
+  group_options.group_commit_max_wait_ms = options.group_commit_max_wait_ms;
+  group_options.group_commit_max_batch = options.group_commit_max_batch;
+  group_options.batch_observer = options.batch_observer;
+  group_options.batch_gate = options.batch_gate;
+  group_options.commit_fault = options.commit_fault;
+  group_options.metrics = options.metrics;
+  group_options.metrics_repo = "metadata";
+  repository->committer_ = std::make_unique<SqliteGroupCommitter>(
+      repository->db_, repository->mutex_, group_options);
   return repository;
 }
 
@@ -241,13 +288,45 @@ fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::FindLatestBySo
 // =============================================================================
 //  写路径
 // =============================================================================
+//  ★ 本切片的结构：每个写操作有两个**语句级**实现（`...InTransaction`），
+//    区别只在"谁负责事务/保存点"：
+//      · `group_commit=false` → `...Locked`：自己 `BEGIN IMMEDIATE … COMMIT`，
+//        与接线前逐字一致（每次调用一次事务）；
+//      · `group_commit=true`  → 批协调器在**一个**事务里调用 `...InTransaction`，
+//        每个操作外裹 `SAVEPOINT`（每操作原子性，见共用小工具的头注释）。
+//    `...Locked` 要求调用方已持 `mutex_`；`...InTransaction` 由协调器的领队线程在
+//    持锁的事务内调用。
+// =============================================================================
+void SqliteMetadataRepository::NotifyBatch(std::size_t ops_in_batch, bool committed) {
+  if (options_.batch_observer != nullptr) {
+    options_.batch_observer->OnBatchCommitted(ops_in_batch, committed);
+  }
+  if (options_.metrics != nullptr) {
+    const fss::metrics::Labels labels{{"repo", "metadata"}};
+    options_.metrics->Increment("fss_sqlite_group_commits_total", labels);
+    options_.metrics->Increment("fss_sqlite_ops_total", labels,
+                                static_cast<std::int64_t>(ops_in_batch));
+  }
+}
+
 fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::Create(
     std::string_view partition, const domain::FileMetadataRecord& record) {
   FSS_TRY(ValidateRecord(partition, record));
+  if (options_.group_commit) {
+    //  批内路径：整个操作（幂等前置读 + 插入）作为一个保存点单位。
+    const std::string part(partition);
+    return committer_->Submit<domain::FileMetadataRecord>(
+        [this, part, record](sqlite3* db) { return CreateInTransaction(db, part, record); });
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  return CreateLocked(partition, record);
+}
+
+fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::CreateLocked(
+    std::string_view partition, const domain::FileMetadataRecord& record) {
   const std::string file_source =
       record.data.dataset_properties.file_source_info.file_source;
 
-  std::lock_guard<std::mutex> guard(mutex_);
   //  ★ 幂等键先查：同 (partition, file_source) 已存在 → 返回**第一次那条**（R5）。
   //    这里用"先查后插 + 事务"而不是只靠唯一索引报错，是因为契约要求返回的是
   //    **已存在的那条记录**（客户端重试要拿到同样的 id/version）。
@@ -283,43 +362,78 @@ fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::Create(
   sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, &error);
   if (error != nullptr) {
     sqlite3_free(error);
+    NotifyBatch(1, false);
     return fss::Err(fss::ErrorKind::kInternal, "开启事务失败");
   }
-  {
-    Statement stmt(db_, kInsertVersion);
-    if (!stmt.ok()) {
-      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-      return fss::Err(fss::ErrorKind::kInternal, "prepare insert 失败");
-    }
-    BindText(stmt.get(), 1, partition);
-    BindText(stmt.get(), 2, stored.id);
-    sqlite3_bind_int64(stmt.get(), 3, 1);
-    sqlite3_bind_int(stmt.get(), 4, 1);
-    sqlite3_bind_null(stmt.get(), 5);
-    BindText(stmt.get(), 6, file_source);
-    BindText(stmt.get(), 7, stored.kind);
-    BindText(stmt.get(), 8, stored.data.name.value_or(""));
-    sqlite3_bind_int64(stmt.get(), 9, created_at);
-    BindText(stmt.get(), 10, "");
-    BindText(stmt.get(), 11, json::Dump(domain::ToJson(stored)));
-    const int rc = sqlite3_step(stmt.get());
-    if (rc != SQLITE_DONE) {
-      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-      //  ★ 唯一约束挡下并发插入（`ux_metadata_source` / 主键）时，幂等语义要求
-      //    返回**已存在的那条记录**，而不是把 UNIQUE 冲突当 500 抛给客户端。
-      //    ⚠️ `sqlite3_extended_result_codes` 打开时 `rc` 是**扩展码**，必须按主码比较（P3-D03）。
-      if ((rc & 0xFF) == SQLITE_CONSTRAINT) {
-        if (auto existing = FindLatestBySource(db_, partition, file_source); existing.ok()) {
-          return existing.value();
-        }
-        return Invalid("同 id 已存在且 file_source 不同：" + record.id);
+  const auto inserted =
+      InsertVersionRow(db_, partition, stored, file_source, created_at, std::nullopt);
+  if (!inserted.ok()) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    //  ★ 唯一约束挡下并发插入（`ux_metadata_source` / 主键）时，幂等语义要求
+    //    返回**已存在的那条记录**，而不是把 UNIQUE 冲突当 500 抛给客户端。
+    //    ⚠️ `sqlite3_extended_result_codes` 打开时 `rc` 是**扩展码**，必须按主码比较（P3-D03）。
+    if ((inserted.rc & 0xFF) == SQLITE_CONSTRAINT) {
+      if (auto existing = FindLatestBySource(db_, partition, file_source); existing.ok()) {
+        NotifyBatch(1, false);  //  该操作最终成功，但**没有**提交：事务已回滚
+        return existing.value();
       }
-      return fss::Err(fss::ErrorKind::kInternal, std::string("插入元数据失败：") + sqlite3_errstr(rc));
+      NotifyBatch(1, false);
+      return Invalid("同 id 已存在且 file_source 不同：" + record.id);
     }
+    NotifyBatch(1, false);
+    return fss::Err(fss::ErrorKind::kInternal,
+                    std::string("插入元数据失败：") + sqlite3_errstr(inserted.rc));
   }
   sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+  NotifyBatch(1, true);
   return stored;
 }
+
+//  批内路径：同一段语句，但**不**自己 BEGIN/COMMIT（事务与保存点由协调器负责）。
+fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::CreateInTransaction(
+    sqlite3* db, std::string_view partition, const domain::FileMetadataRecord& record) {
+  const std::string file_source =
+      record.data.dataset_properties.file_source_info.file_source;
+
+  if (auto existing = FindLatestBySource(db, partition, file_source); existing.ok()) {
+    return existing.value();  //  幂等命中 → 该操作成功，且没有任何写入
+  }
+  {
+    Statement stmt(db, kSelectIdExists);
+    if (!stmt.ok()) return fss::Err(fss::ErrorKind::kInternal, "prepare 失败");
+    BindText(stmt.get(), 1, partition);
+    BindText(stmt.get(), 2, record.id);
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW) {
+      if (auto existing = FindLatestBySource(db, partition, file_source); existing.ok()) {
+        return existing.value();
+      }
+      return Invalid("同 id 已存在且 file_source 不同：" + record.id);
+    }
+    if (rc != SQLITE_DONE) {
+      return fss::Err(fss::ErrorKind::kInternal, std::string("查询失败：") + sqlite3_errstr(rc));
+    }
+  }
+
+  domain::FileMetadataRecord stored = record;
+  stored.version = 1;
+  const std::int64_t created_at = clock_->NowEpochSeconds();
+  const auto inserted =
+      InsertVersionRow(db, partition, stored, file_source, created_at, std::nullopt);
+  if (!inserted.ok()) {
+    //  约束冲突的幂等恢复与逐操作路径同义（失败 INSERT 不留下任何行）。
+    if ((inserted.rc & 0xFF) == SQLITE_CONSTRAINT) {
+      if (auto existing = FindLatestBySource(db, partition, file_source); existing.ok()) {
+        return existing.value();
+      }
+      return Invalid("同 id 已存在且 file_source 不同：" + record.id);
+    }
+    return fss::Err(fss::ErrorKind::kInternal,
+                    std::string("插入元数据失败：") + sqlite3_errstr(inserted.rc));
+  }
+  return stored;
+}
+
 
 fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::GetById(
     std::string_view partition, std::string_view record_id) {
@@ -338,10 +452,20 @@ fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::GetLatestByFil
 fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::Update(
     std::string_view partition, const domain::FileMetadataRecord& record) {
   FSS_TRY(ValidateRecord(partition, record));
+  if (options_.group_commit) {
+    const std::string part(partition);
+    return committer_->Submit<domain::FileMetadataRecord>(
+        [this, part, record](sqlite3* db) { return UpdateInTransaction(db, part, record); });
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  return UpdateLocked(partition, record);
+}
+
+fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::UpdateLocked(
+    std::string_view partition, const domain::FileMetadataRecord& record) {
   const std::string file_source =
       record.data.dataset_properties.file_source_info.file_source;
 
-  std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(existing, FindLatestById(db_, partition, record.id));
 
   //  ★ 幂等键必须稳定：允许改内容，不允许改 (partition, file_source)
@@ -359,53 +483,90 @@ fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::Update(
   sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, &error);
   if (error != nullptr) {
     sqlite3_free(error);
+    NotifyBatch(1, false);
     return fss::Err(fss::ErrorKind::kInternal, "开启事务失败");
   }
   {
     Statement stmt(db_, kClearLatest);
     if (!stmt.ok()) {
       sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      NotifyBatch(1, false);
       return fss::Err(fss::ErrorKind::kInternal, "prepare update 失败");
     }
     BindText(stmt.get(), 1, partition);
     BindText(stmt.get(), 2, stored.id);
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
       sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      NotifyBatch(1, false);
       return fss::Err(fss::ErrorKind::kInternal, "清理旧 latest 标记失败");
     }
   }
-  {
-    Statement stmt(db_, kInsertVersion);
-    if (!stmt.ok()) {
-      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-      return fss::Err(fss::ErrorKind::kInternal, "prepare insert 失败");
-    }
-    BindText(stmt.get(), 1, partition);
-    BindText(stmt.get(), 2, stored.id);
-    sqlite3_bind_int64(stmt.get(), 3, stored.version);
-    sqlite3_bind_int(stmt.get(), 4, 1);
-    sqlite3_bind_int64(stmt.get(), 5, existing.version);
-    BindText(stmt.get(), 6, file_source);
-    BindText(stmt.get(), 7, stored.kind);
-    BindText(stmt.get(), 8, stored.data.name.value_or(""));
-    sqlite3_bind_int64(stmt.get(), 9, created_at);
-    BindText(stmt.get(), 10, "");
-    BindText(stmt.get(), 11, json::Dump(domain::ToJson(stored)));
-    const int rc = sqlite3_step(stmt.get());
-    if (rc != SQLITE_DONE) {
-      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-      return fss::Err(fss::ErrorKind::kInternal,
-                      std::string("写入新版本失败：") + sqlite3_errstr(rc));
-    }
+  const auto inserted = InsertVersionRow(db_, partition, stored, file_source, created_at,
+                                         existing.version);
+  if (!inserted.ok()) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    NotifyBatch(1, false);
+    return fss::Err(fss::ErrorKind::kInternal,
+                    std::string("写入新版本失败：") + sqlite3_errstr(inserted.rc));
   }
   sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+  NotifyBatch(1, true);
   return stored;
 }
+
+//  批内路径：`kClearLatest` + 插入新版本两条语句；失败时由协调器回滚保存点，
+//  因此"清旧 latest 标记"这个**半个操作**不会留下来（每操作原子性）。
+fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::UpdateInTransaction(
+    sqlite3* db, std::string_view partition, const domain::FileMetadataRecord& record) {
+  const std::string file_source =
+      record.data.dataset_properties.file_source_info.file_source;
+
+  FSS_TRY(existing, FindLatestById(db, partition, record.id));
+
+  const auto& existing_source =
+      existing.data.dataset_properties.file_source_info.file_source;
+  if (existing_source != file_source) {
+    return Invalid("Update 不得改写 (partition, file_source) 幂等键");
+  }
+
+  domain::FileMetadataRecord stored = record;
+  stored.version = existing.version + 1;
+  const std::int64_t created_at = clock_->NowEpochSeconds();
+
+  {
+    Statement stmt(db, kClearLatest);
+    if (!stmt.ok()) return fss::Err(fss::ErrorKind::kInternal, "prepare update 失败");
+    BindText(stmt.get(), 1, partition);
+    BindText(stmt.get(), 2, stored.id);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+      return fss::Err(fss::ErrorKind::kInternal, "清理旧 latest 标记失败");
+    }
+  }
+  const auto inserted = InsertVersionRow(db, partition, stored, file_source, created_at,
+                                         existing.version);
+  if (!inserted.ok()) {
+    return fss::Err(fss::ErrorKind::kInternal,
+                    std::string("写入新版本失败：") + sqlite3_errstr(inserted.rc));
+  }
+  return stored;
+}
+
 
 fss::Result<void> SqliteMetadataRepository::Delete(std::string_view partition,
                                                    std::string_view record_id) {
   if (partition.empty()) return Invalid("partition 不能为空");
+  if (options_.group_commit) {
+    const std::string part(partition);
+    const std::string id(record_id);
+    return committer_->Submit<void>(
+        [this, part, id](sqlite3* db) { return DeleteInTransaction(db, part, id); });
+  }
   std::lock_guard<std::mutex> guard(mutex_);
+  return DeleteLocked(partition, record_id);
+}
+
+fss::Result<void> SqliteMetadataRepository::DeleteLocked(std::string_view partition,
+                                                         std::string_view record_id) {
   //  契约：删除**全部版本**；缺失 → kNotFound（与幂等删除不同，元数据删除要报缺失）
   {
     Statement stmt(db_, kCountVersions);
@@ -418,6 +579,32 @@ fss::Result<void> SqliteMetadataRepository::Delete(std::string_view partition,
     if (sqlite3_column_int64(stmt.get(), 0) == 0) return NotFound("Record Not Found");
   }
   Statement stmt(db_, kDeleteAllVersions);
+  if (!stmt.ok()) return fss::Err(fss::ErrorKind::kInternal, "prepare delete 失败");
+  BindText(stmt.get(), 1, partition);
+  BindText(stmt.get(), 2, record_id);
+  if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+    NotifyBatch(1, false);
+    return fss::Err(fss::ErrorKind::kInternal, "删除元数据失败");
+  }
+  //  单语句自动提交：一次语句 = 一次提交（与接线前一致）。
+  NotifyBatch(1, true);
+  return Ok();
+}
+
+fss::Result<void> SqliteMetadataRepository::DeleteInTransaction(sqlite3* db,
+                                                                 std::string_view partition,
+                                                                 std::string_view record_id) {
+  {
+    Statement stmt(db, kCountVersions);
+    if (!stmt.ok()) return fss::Err(fss::ErrorKind::kInternal, "prepare count 失败");
+    BindText(stmt.get(), 1, partition);
+    BindText(stmt.get(), 2, record_id);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
+      return fss::Err(fss::ErrorKind::kInternal, "统计版本失败");
+    }
+    if (sqlite3_column_int64(stmt.get(), 0) == 0) return NotFound("Record Not Found");
+  }
+  Statement stmt(db, kDeleteAllVersions);
   if (!stmt.ok()) return fss::Err(fss::ErrorKind::kInternal, "prepare delete 失败");
   BindText(stmt.get(), 1, partition);
   BindText(stmt.get(), 2, record_id);

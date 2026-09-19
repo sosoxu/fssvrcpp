@@ -276,6 +276,15 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | 2 | 「越界 Range → 416」并把 `bytes=999999999-8388607` 当作用例（ADR-002 §4 / H-1 回归） | 该输入是 **`last < first`（RFC 7233 §2.1 判为语法非法）→ 应忽略该头返回 200 全量**；真正"语法合法但越界"的 `bytes=999999999-` 才 → 416 | H-1 的**不变量**（不得下溢 `Content-Length`）保持不变并在两条输入上都断言；状态码按 RFC 与契约 §1.8 更正 |
 | 3 | 「`Range` 语法非法时返回什么」未记录 | 库在**解析阶段**就把非法 Range 变成 416 并**跳过路由**（与 RFC 7233 §4.4 冲突） | 包装层在错误处理器里重新分发为 200 全量，并记 `malformed_range_ignored_by_wrapper` 警告 |
 
+### 5.u 本轮更正的既有结论（C10.20：SQLite 的 `group_commit*` 从「已读但无效果」到「真组提交」）
+
+| # | 旧结论（记录于） | 现状（依据） | 影响 |
+| --- | --- | --- | --- |
+| 1 | 「`*.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}` **没有组提交实现**（两个仓储是"单连接 + 互斥"），按「不发明字段」如实登记为「已读但无效果」」（`AGENTS.md` §0 阶段 10 行、`docs/04-implementation-plan.md` C10.14、`docs/operations.md` §1.3.3） | **推翻（本轮 / C10.20）**：缺的不是语义而是实现 —— 「单连接」不代表不能组提交，只是不能靠**多连接**并发批处理；正确做法是沿**同一个连接**把并发到达的写操作**凑批**：第一个到达者成为领队，等「批满 `max_batch`」或「窗口 `max_wait_ms` 到期」→ **一个** `BEGIN IMMEDIATE` → 批内每操作一个 `SAVEPOINT` → **一次** `COMMIT`（`src/infra/sqlite/sqlite_group_commit.h`，两个仓储共用） | 6 个键移入「生效」→ 三态 **107/18/31 → 113/18/25**（`docs/operations.md` §1.3）；摊销确定性判据 == `ceil(N/B)`（`tests/integration/test_sqlite_group_commit.cpp`）；**每操作原子性**不变（`SAVEPOINT`/`ROLLBACK TO`，失败操作不留半行）；**整批 COMMIT 失败 → 批内所有操作返回该错误**（有意的语义）；⚠️ **读可能多等 ≤ `max_wait_ms`**（批事务期间领队持有连接互斥）—— **组提交不是纯免费收益**（`docs/02-design.md` §13.5）；`*.sqlite.max_write_concurrency` **仍未生效**（单连接 ⇒ 实际并发恒为 1，不在本切片范围内） |
+| 2 | （同上的隐含前提）「`max_write_concurrency` 与 `group_commit*` 是同一类"单连接下没意义"的键」 | **部分推翻**：`group_commit*` 有真实语义（凑批摊销 + 窗口上界），因此接通；`max_write_concurrency` **确实**无可观测效果（它表达"写入并发的上限"，而实际并发恒为 1）⇒ **仍留「已读但无效果」** | 两个键的命运**分开登记**（不是"顺手都把状态改掉"）：`operations.md` §1.3.1 与 §1.3.3 各留一行，理由写清楚 |
+
+---
+
 ### 5.w 本轮更正的既有结论（C10.16 续：`storage.posix.*` 细节键与容器名）
 
 | # | 旧结论（记录于） | 现状（依据） | 影响 |
@@ -303,7 +312,8 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | `storage.driver_report_override` | `""`（上报真实驱动） | 上游把所有云硬编码成 `"GCS"`；需要时用开关复刻 |
 | `storage.posix.durability` | **`batch`** | 两阶段批提交；`per_file` 为精确模式 |
 | `storage.io_engine` | **`blocking`** | 默认容器 seccomp 阻断 io_uring（实测 EPERM）；可选 `uring`/`auto` |
-| `storage.posix.group_commit_max_batch` | 500 | 吞吐 vs 崩溃丢失窗口的折中（建议 500–2000）；⚠️ ADR-008 的 P4 两阶段批提交**实现未交付** → 该键（与 `sync_dir_after_batch`）的非默认值在组合根**拒绝启动**（C10.16 续，`operations.md` §1.3.2） |
+| `storage.posix.group_commit_max_batch` | 500 | 吞吐 vs 崩溃丢失窗口的折中（建议 500–2000）；★ ADR-008 的 P4 两阶段批提交**已交付**（C9.23）→ 该键**生效**（进程内 N=8/C=4 → `syncfs == 2`；`tests/integration/test_posix_batch_commit.cpp`）。`storage.posix.sync_dir_after_batch=false` 因 **R2 不变量**仍**拒绝启动**（`operations.md` §1.3.2） |
+| `{metadata,location}.sqlite.group_commit` / `_max_wait_ms` / `_max_batch` | `true` / `5` / `64` | **C10.20**：并发写操作凑批 → 一个事务一次 `COMMIT`（摊销 = 并发才发生）；批内每操作 `SAVEPOINT` 保原子性；**读可能多等 ≤ `max_wait_ms`**（单连接 + 连接互斥的必然代价）。`group_commit=false` → 逐操作提交（与接线前逐字一致，可在意逐操作 fsync / 低尾延迟的场景使用）。见 `docs/02-design.md` §13.5 |
 | `location.sqlite.synchronous` | **`NORMAL`** | `FULL` 差 **21x** |
 | `location.sqlite.max_write_concurrency` | **8** | 实测 8 线程为峰值，32 线程反而下降 |
 | `metadata.repository` | `sqlite`（single）/ **`postgres`（multi 强制）** | ADR-004 / ADR-009 |
@@ -328,7 +338,7 @@ P6 元数据记录语义完整化（12 步序列 + 回滚 + 版本链 + DMS + De
 P7 gRPC 适配层 + 双协议等价性            ✅ 已完成（C7.1~C7.10；17/17 RPC + 契约 §6 矩阵 + 流式 + 双协议并发；6 测试 / 5378 断言）← 此阶段"双协议"达成
 P8 认证授权与多租户                        ✅ 已完成（C8.1~C8.8；JWT + 路由预检 + 跨租户隔离 + 远端 Entitlements fail-closed + 审计覆盖 + multi 校验 + 时钟偏差；6 测试 / 1323 断言）
 P9 硬化与交付（容量基线 / 故障注入 / GC / 打包 / 定稿 ADR-006） ✅ 已完成（C9.1~C9.13/C9.15/C9.16/C9.25；6 测试 / 466 断言；`run_all_gates.sh` P0~P9 全绿 225 s / 10 阶段）
-P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3/4/5/6a + C10.16 + C10.16 续（156 键三态 **107/18/31**（ADR-008 的 P4 后）；切片 5 = `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 生效；切片 6a = 远端 legal/schema 校验器 6 键生效 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动；切片 6b = `events.publisher` 与 `events.webhook.*` 4 键生效（**发布失败非致命**）；见 `docs/04-implementation-plan.md` 末尾）
+P10 配置面接线（让 `config/fss.example.json` 真正生效：CLI > env > file > 默认） ✅ 切片 1/2/3/4/5/6a + C10.16 + C10.16 续（156 键三态 **113/18/25**（C10.20 后）；切片 5 = `self_signed.{key_id,default_ttl_seconds,max_ttl_seconds}` 生效；切片 6a = 远端 legal/schema 校验器 6 键生效 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动；切片 6b = `events.publisher` 与 `events.webhook.*` 4 键生效（**发布失败非致命**）；见 `docs/04-implementation-plan.md` 末尾）
 ```
 
 **铁律**：门槛未通过 → 不得开始下一阶段。每阶段证据归档到 `docs/test-evidence/phaseN.md`。

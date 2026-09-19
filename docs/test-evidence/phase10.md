@@ -10,7 +10,7 @@
 | 脚本 | `scripts/verify_config_wiring.sh`：**54 条断言**（切片 1 的 22 条 + 切片 2：GC 调度 4 + `--once` 3 + 样例配置启动/拒绝 6 + C10.11 拒绝 15 + expiry 3 + 就绪 1） |
 | 全阶段门槛 | `./scripts/run_all_gates.sh` → **P0~P10 全绿，总耗时 348 s（5 分 48 秒，11 个阶段）**（含 ASan+UBSan 全量）；`ctest` **77/77** 通过 |
 | sanitizer | `run_sanitizers.sh` 已自动纳入 `phase10`（`✓ phase10 在 sanitizer 下通过`） |
-| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 107 / 拒绝启动（触发条件）18 / 已读但无效果 31**（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键；**切片 5** 接通 3 键；**切片 6a（C10.18）** 接通 6 键 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动；**切片 6b（C10.19）** 接通 `events.publisher` 与 `events.webhook.{url,timeout_ms,topic}` 4 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
+| 配置键三态 | `config/fss.example.json` **156** 个叶子键：**生效 113 / 拒绝启动（触发条件）18 / 已读但无效果 25**（C10.20 后；切片 6b 时为 107/18/31）（切片 3 新接通 9 键；**C10.16** 接通 1 键 + 2 键改为拒绝启动；**C10.16 续**接通 7 键 + 3 键改为拒绝启动；**切片 4** 接通 4 键；**切片 5** 接通 3 键；**切片 6a（C10.18）** 接通 6 键 + `auth.remote_entitlements.fail_closed` 更正为拒绝启动；**切片 6b（C10.19）** 接通 `events.publisher` 与 `events.webhook.{url,timeout_ms,topic}` 4 键）（逐键见 `docs/operations.md` §1.2 的"接通状态"列与 §1.3 的三个清单；由 §1.2 的 156 行程序化核对得出，`test_operations_doc` 机械断言） |
 | 切片 2 新增/修改 | `src/infra/location/memory/memory_lease_repository.{h,cpp}`（单实例内存租约）、`src/app/services/expiry_policy.{h,cpp}`（`ExpiryOptions` 重载 + `ParseExact`）、`src/app/services/location_issuer.{h,cpp}`、`src/main/server_main.cpp`、`src/CMakeLists.txt` |
 
 ---
@@ -1267,5 +1267,251 @@ assertions: 302 | 301 passed | 1 failed
 **`docs/test-evidence/phase9.md` §12**（结论 / 实现点 / 命令输出 / R1 自证 / 未做项）。
 
 对 P10 的影响：**零**——本切片**不新增任何配置键**，`docs/operations.md` §1.3 的三态计数
-保持 **生效 106 / 拒绝启动 19 / 已读但无效果 31 = 156** 不变（`test_operations_doc` 继续通过）；
+当时保持 **生效 106 / 拒绝启动 19 / 已读但无效果 31 = 156** 不变（`test_operations_doc` 继续通过）；
 新增两个测试二进制（`test_gc_endpoint` / `test_gc_task_single_flight`，标签 `phase9`）。
+
+> ⚠️ **当前值已变**：ADR-008 的 P4 后为 **107/18/31**，C10.20（本文件 §14）后为 **113/18/25**。
+
+---
+
+## 14. C10.20（本轮）：SQLite **数据库层组提交** —— 让 6 个「已读但无效果」的键真的生效
+
+> 判据编号 **C10.20**（`docs/04-implementation-plan.md` 的 P10 段）；逐键说明在
+> `docs/operations.md` §1.2.7 / §1.2.8 与 §1.3.1；设计取舍在 `docs/02-design.md` §13.5；
+> 踩到的两个陷阱登记在 `AGENTS.md` §4.3。
+
+### 14.1 结论（先说答案）
+
+1. **6 个键真的生效**：`metadata.sqlite.{group_commit,group_commit_max_wait_ms,group_commit_max_batch}`
+   与 `location.sqlite.{同三键}` —— 之前登记为「已读但无效果」（理由："两个仓储是单连接 +
+   互斥、没有组提交实现"）。本切片新增 L2 共用小工具 `src/infra/sqlite/sqlite_group_commit.h`
+   并把它接到两个仓储的写路径。
+2. **摊销是确定性的**（不靠 sleep）：N=8 并发 `Save`、批上限 B=4 → 提交次数 **2 == ceil(8/4)**；
+   B=2 → 4；B=8 → 1；**B=1 → 8**；`group_commit=false` → **8 且每操作一个事务**（逐字回归）。
+   元数据仓储同一套判据：N=6、B=3 → 2。
+3. **每操作原子性可机器检查且有牙齿**：批里一个操作失败（**真实约束冲突**）→ 只有它回滚、
+   同批其它操作照常提交且可读、失败操作**不留半行**、观察者看到 **1 次**保存点回滚。
+   去掉 `SAVEPOINT` 的注入（整批回滚）让两条用例都红（§14.4 ③）。
+4. **`max_wait_ms` 真的生效**：批永远不满时窗口是唯一的 flush 依据（`0` → 立即提交；
+   `400` → 实测等满 ≥ 350ms 且有界）。忽略它的注入会**挂死**（`timeout` rc=124，§14.4 ④）。
+5. **读不脏**：批事务开着时 `GetById` 在连接互斥上排队（150ms 内必须**不能**返回），
+   提交后返回的才是提交后的值。
+6. **真实进程可观测**：启动横幅新增 `sqlite commit :` 行；`/metrics` 新增
+   `fss_sqlite_{group_commits,ops}_total{repo=...}`；一次 `createMetadata` 在
+   `group_commit_max_wait_ms=400` 下耗时 **416ms**、同窗口 `group_commit=false` 下 **14ms**。
+7. **诚实边界**：`*.sqlite.max_write_concurrency` **仍未生效**（单连接 ⇒ 实际并发 1）；
+   组提交**不改变耐久性等级**（仍每事务一次 `COMMIT`）；**没有**任何吞吐数字（未做 R2 合规测量）。
+
+### 14.2 实现点（可点击）
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/infra/sqlite/sqlite_group_commit.h` **（新增）** | 共用协调器 `SqliteGroupCommitter` + 三个窄接缝：`ISqliteBatchObserver`（每批 `(ops, committed)` + 保存点回滚次数）、`ISqliteBatchGate`（`ShouldFlush` 决定领队何时 flush；`BeforeCommit` 把"事务开着"变成确定性时点）、`ISqliteCommitFault`（注入整批 `COMMIT` 失败）。协议：领队等「批满」或「窗口到期」→ **一个** `BEGIN IMMEDIATE` → 每操作 `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` → 一次 `COMMIT`；整批失败 → 批内所有操作返回该错误；批事务期间持有**连接互斥** |
+| `src/infra/location/sqlite/sqlite_location_repository.{h,cpp}` | Options 新增 `group_commit`/`group_commit_max_wait_ms`/`group_commit_max_batch` + 三个接缝 + `metrics`；写路径拆成 `...Locked`（逐操作，与接线前逐字一致）与 `...InTransaction`（批内，无事务控制）；`StepUpsert` 抽出语句级 upsert（两条路径共用） |
+| `src/infra/metadata/sqlite/sqlite_metadata_repository.{h,cpp}` | 同上；`InsertVersionRow`（语句级插入 + 扩展码按主码比较）、`CreateLocked/InTransaction`、`UpdateLocked/InTransaction`、`DeleteLocked/InTransaction` |
+| `src/main/server_main.cpp` | 6 个键逐键读入（默认 = schema 默认 `true/5/64`）→ 两个 Options；注册 `fss_sqlite_{group_commits,ops}_total`；横幅新增 `sqlite commit :` 行（与 `journal_mode`/`synchronous` 同处） |
+| `tests/unit/test_sqlite_group_commit.cpp` **（新增）** | 协调器级：每操作原子性（真实主键冲突 + 半成品回滚）、整批 COMMIT 失败（故障注入）、门控是 flush 时机的确定性来源 |
+| `tests/integration/test_sqlite_group_commit.cpp` **（新增）** | 仓储级：摊销 == `ceil(N/B)`（位置 + 元数据）、`group_commit=false` 逐字回归、每操作原子性（真实 `(partition, file_source)` 唯一索引冲突）、`max_wait_ms` 两档、**读不脏** |
+| `tests/integration/test_sqlite_{location,metadata}_repository.cpp` | 各自新增一条 `group_commit=false` 的**契约回归**（同一套 `port_contract.h` 在逐操作档再跑一遍） |
+| `tests/integration/test_config_wiring.cpp` | C10.20 真实进程用例（横幅 + 指标 + 时延 416ms vs 14ms） |
+
+### 14.3 实测命令与输出摘要
+
+```
+$ cmake --build build -j4
+  → 0 error
+
+$ ./build/bin/test_sqlite_group_commit_unit
+  → All tests passed (34 assertions in 3 test cases)
+
+$ ./build/bin/test_sqlite_group_commit
+  → All tests passed (62 assertions in 6 test cases)
+
+$ ./build/bin/test_config_wiring "★ C10.20*" -s        # 关键数字
+  createMetadata latency(ms) = 416          # group_commit_max_wait_ms=400（默认 group_commit=true）
+  fss_sqlite_ops_total{metadata} = 1；commits = 1
+  createMetadata latency(ms) = 14           # 同窗口 + metadata.sqlite.group_commit=false
+  fss_sqlite_ops_total{metadata} = 1；commits = 1
+  → All tests passed (57 assertions in 1 test case)
+
+$ ctest --test-dir build -j4
+  → 100% tests passed, 0 tests failed out of 86        （84 → 86：+2 个测试二进制）
+
+$ ctest --test-dir build -L phase3 --output-on-failure
+  → 100% tests passed, 0 tests failed out of 10
+$ ctest --test-dir build -L phase6 --output-on-failure
+  → 100% tests passed, 0 tests failed out of 9
+$ ctest --test-dir build -L phase10 --output-on-failure
+  → 100% tests passed, 0 tests failed out of 6
+
+$ ./scripts/verify_config_wiring.sh
+  → 配置面接线：全部通过（54 条断言）
+$ ./scripts/check_docs.sh --selftest
+  → 自证：D1/D2/D4/D5 都能检出注入的错误（检查器有效）；D5 = 11 个阶段 / 148 条门槛
+```
+
+真实进程启动横幅（`--set` 默认值 + 非默认值两处都断言过）：
+
+```
+  sqlite tuning  : location busy_timeout=5000ms journal_mode=WAL（wal=true，max_write_concurrency=8，synchronous=NORMAL）| metadata busy_timeout=5000ms journal_mode=WAL（wal=true，synchronous=NORMAL）
+  sqlite commit  : location group_commit=true max_wait_ms=5 max_batch=64（组提交：并发写一批一次 COMMIT；读可能多等 ≤ max_wait_ms） | metadata group_commit=true max_wait_ms=5 max_batch=64
+```
+
+### 14.4 R1 自证（4 个注入 → 对应用例失败 → 完整还原）
+
+每个注入都**全量重建**（`cmake --build build -j4`）后再跑；还原后
+`grep -rn "R1-INJECT" src/ tests/` **无输出（rc=1）**。
+
+**① 让 `group_commit` 被忽略（恒 false）** —— 在两个仓储的 `Open()` 里强制
+`options.group_commit = false;` → 判据 1（摊销）必须失败：
+
+```
+$ ./build/bin/test_sqlite_group_commit "★ C10.20 摊销：并发 N=8*"
+tests/integration/test_sqlite_group_commit.cpp:206: FAILED:
+  REQUIRE( harness.observer.BatchCount() == 2 )
+with expansion:  8 == 2
+tests/integration/test_sqlite_group_commit.cpp:217: FAILED:
+  REQUIRE( harness2.observer.CommitCount() == 4 )
+with expansion:  8 == 4
+test cases:  1 | 1 failed   assertions: 10 | 8 passed | 2 failed
+```
+
+**② 忽略 `max_batch`（选「恒 1」）** —— 在协调器构造里强制
+`options_.group_commit_max_batch = 1;`（说明：恒 1 表示"每个操作自己一批"，等价于
+"上限被忽略、退化到无摊销"；恒 ∞ 会挂在门控上，见 ④，故选恒 1）→ 判据 1 必须失败：
+
+```
+$ ./build/bin/test_sqlite_group_commit "★ C10.20 摊销：并发 N=8*"
+REQUIRE( harness2.observer.CommitCount() == 4 )   with expansion:  8 == 4
+test cases:  1 | 1 failed   assertions: 10 | 8 passed | 2 failed
+```
+
+**③ 去掉每操作 `SAVEPOINT`（一个失败就整批回滚）** —— 这是**最重要**的一条：
+`ExecuteBatch` 里不再 `SAVEPOINT`/`ROLLBACK TO`，改为"任一操作失败 → `ROLLBACK` 整批 +
+poison 全部结果" → 判据 2 必须失败：
+
+```
+$ ./build/bin/test_sqlite_group_commit_unit
+tests/unit/test_sqlite_group_commit.cpp:180: FAILED:
+  REQUIRE( r1.ok() )        with expansion:  false
+test cases:  3 |  2 passed | 1 failed   assertions: 25 | 24 passed | 1 failed
+
+$ ./build/bin/test_sqlite_group_commit "★ C10.20 每操作原子性*"
+tests/integration/test_sqlite_group_commit.cpp:313: FAILED:
+  REQUIRE( ok_count.load() == 2 )   with expansion:  0 == 2
+test cases:  1 | 1 failed   assertions: 3 | 2 passed | 1 failed
+```
+
+**④ 忽略 `max_wait_ms`（一直等到批满）** —— 把领队的 `wait_until(deadline)` 换成
+无超时的 `wait(sealed)`。门控是 `NeverFlushGate`（批永远不满）⇒ **挂死**（如实记录）：
+
+```
+$ timeout 20 ./build/bin/test_sqlite_group_commit "★ C10.20 max_wait_ms*"
+  → SIGTERM - Termination request signal
+  test cases: 1 | 1 failed   assertions: 2 | 1 passed | 1 failed
+$ echo $?
+  → 124        # timeout 杀掉的证据（不是用例自己失败，是永远等不到窗口）
+```
+
+**还原后的实测**：
+
+```
+$ grep -rn "R1-INJECT" src/ tests/          # 无输出（rc=1）
+$ cmake --build build -j4                   # 0 error
+$ ./build/bin/test_sqlite_group_commit      # All tests passed (62 assertions in 6 test cases)
+$ ./build/bin/test_sqlite_group_commit_unit # All tests passed (34 assertions in 3 test cases)
+```
+
+### 14.5 本切片自己踩到并修掉的两个问题（如实记录）
+
+**① 实现缺陷：领队等窗口的循环没有 `break`（第一次跑直接挂死）。**
+第一版写成
+
+```cpp
+while (!batch->sealed) {
+  if (gate && gate->ShouldFlush(...)) break;
+  batch_cv_.wait_until(lock, batch->deadline);   // ← 返回值没看，到期也不 break
+}
+```
+
+`wait_until` 到期返回 `timeout` 后循环条件仍为真、deadline 已过 ⇒ **忙循环**。
+症状：第一次跑 `test_sqlite_location_repository` 时 **600s 超时被 SIGTERM 杀掉**（不是断言失败，
+是根本不返回）。修法：`if (batch_cv_.wait_until(...) == std::cv_status::timeout) break;`。
+★ 教训：`wait_until` 的**返回值**是这类循环的唯一出口，必须显式处理（`AGENTS.md` §4.3）。
+
+**② 测试缺陷：并发批里"操作之间的相互影响"让判据随调度翻转。**
+第一版单测让操作 ① 插 `(1,'a')`、操作 ② 先插 `(2,'b')` 再插 `(1,'x')`（想制造"半成品 + 主键
+冲突"）。但批内执行顺序 = **到达顺序**：② 先到时它的第二次插入**反而成功**、① 才失败。
+压测 **200 次里 27 次** `REQUIRE(r1.ok())` 假失败：
+
+```
+$ for i in $(seq 1 200); do ./build/bin/test_sqlite_group_commit_unit; done
+  → fails=27/200     # r1 意外失败：UNIQUE constraint failed: t.id
+```
+
+修法：让 ② **自己内部**必然失败（插 `(2,'b')` 后再插 `(2,'x')`，与谁先到无关）→ **200/200 通过**。
+教训写进 `AGENTS.md` §4.3（"并发测试的失败必须由被测对象自己决定，不能依赖线程到达顺序"）。
+
+### 14.6 未做 / 未验证（如实登记）
+
+1. **`*.sqlite.max_write_concurrency` 仍未生效**：两个仓储都是"单连接 + 互斥"，
+   实际写并发**恒为 1 ≤ 上限**，改它不改变行为。**本切片刻意不把它标成生效**（它仍留在
+   `operations.md` §1.3.3）。下一步：连接池交付后才接通。
+2. **无吞吐数字**：组提交只保证"多个操作的语句合进一个事务（一次 `COMMIT`）"，
+   本切片**没有**做 R2 合规的独立进程 + 绑核吞吐测量 ⇒ **不给任何倍数或 req/s**。
+3. **不改变耐久性等级**：仍是"每个事务一次 `COMMIT`"，`synchronous` 语义不变；
+   **没有**新增崩溃风险，也没有做"断电下批提交是否安全"的实验（本环境无 root/不能 mount，
+   与 ADR-008 §6 / P9 §13.5 的未验证项相同，维持登记）。
+4. **真实进程侧只做到"窗口时延 + 指标"**：真实进程**无法**直接数"事务次数"
+   （SQLite 不暴露），因此 amortization 的确定性判据在 **L2 用例**里（观察者/门控），
+   真实进程侧只断言①横幅打印实际取值、②`/metrics` 两族存在且动过、③窗口时延差异。
+   **不声称真实进程验证了 `== ceil(N/B)`**。
+5. **`max_wait_ms` 与批大小的调参未做**：默认 `5ms/64` 直接取 schema 默认值；
+   没有测"顺序单写"下窗口带来的额外时延是否可接受（只知其**上界** = 每操作一个窗口）。
+6. **读的等待窗口只做了定性 + 有界断言**（`REQUIRE_FALSE(reader_done)` + 提交后取到新值）；
+   没有测"读在窗口下的 p99 时延分布"（需 R2 合规测量）。
+
+### 14.7 三态计数（本切片收尾）
+
+6 个键从「已读但无效果」移入「生效」：**生效 107 → 113**、**已读但无效果 31 → 25**
+（**113 + 18 + 25 = 156**，`test_operations_doc` 机械断言）。
+**未新增/删除任何配置键**（`git status --porcelain config/` 为空）。
+
+### 14.8 父代理独立复核：两条**数据正确性**语义我自己做了消融
+
+本切片的摊销判据（提交次数 == ⌈N/B⌉）只是性能；**真正要紧的是两条语义**——「每操作原子性」与
+「读不到未提交数据」。我按 R1 各自做了一次注入（全量重建后运行，随后完整还原）：
+
+**① 去掉每操作的 `ROLLBACK TO SAVEPOINT`**（失败操作不再单独回滚）：
+
+```
+$ ./build/bin/test_sqlite_group_commit          # 集成
+tests/integration/test_sqlite_group_commit.cpp:334: FAILED
+test cases: 6 | 5 passed | 1 failed      assertions: 62 | 61 passed | 1 failed
+$ ./build/bin/test_sqlite_group_commit_unit     # 单测
+tests/unit/test_sqlite_group_commit.cpp:199: FAILED
+test cases: 3 | 2 passed | 1 failed      assertions: 26 | 25 passed | 1 failed
+# 还原后：62 断言 / 6 用例 与 31 断言 / 3 用例 全绿
+```
+⇒ **"失败操作只回滚自己、同批其它照常提交"是被真正检查的性质**，不是靠"整批一起提交"顺带成立。
+
+**② 批事务期间不持连接互斥**（`defer_lock`，读不再排队）：
+
+```
+tests/integration/test_sqlite_group_commit.cpp:415: FAILED:
+  REQUIRE_FALSE( reader_done.load() )
+（另在 192 行有 3 条同族失败）
+test cases: 6 | 4 passed | 2 failed      assertions: 47 | 42 passed | 5 failed
+# 还原后：All tests passed (62 assertions in 6 test cases)
+```
+⇒ **"读会等到批结束、因此读不到未提交数据"是被真正检查的**；一旦去掉那把锁，读者立刻拿到
+批内未提交（随后可能被回滚）的数据 —— 用例立刻报错。这正是我在规格里要求"读与批互斥 + 把代价
+写进文档"的原因。
+
+**③ 独立复跑**：`cmake --build build -j4` 0 error；`ctest` **86/86**（84 → 86）；
+`./build/bin/test_sqlite_group_commit`（62/6）与 `test_sqlite_group_commit_unit`（31/3）全绿；
+`config/` 零改动；`grep -rn R1-INJECT src/ tests/` 无输出。
+
+**④ 说明**：`== ceil(N/B)` 的确定性判据在 L2（观察者 + 门控），真实进程侧只断言横幅取值、
+两族指标存在且动过、以及窗口时延差异（416ms vs 14ms）—— 这一点实现者已如实登记，我认可：
+SQLite 不对外暴露"事务次数"，真实进程侧无法直接数。**没有**任何吞吐数字被声明。

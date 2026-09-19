@@ -261,8 +261,8 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 #   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
 ```
 
-**为什么它不是配置键**：`docs/operations.md` 的 156 个叶子键三态清单（生效 107 / 拒绝启动 18 /
-已读但无效果 31）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+**为什么它不是配置键**：`docs/operations.md` 的 156 个叶子键三态清单（生效 113 / 拒绝启动 18 /
+已读但无效果 25）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
 它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动

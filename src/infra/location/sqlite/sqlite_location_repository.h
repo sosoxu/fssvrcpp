@@ -24,6 +24,7 @@
 #include "common/result/result.h"
 #include "domain/ports/ports.h"
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,7 +37,17 @@
 struct sqlite3;
 struct sqlite3_stmt;
 
+namespace fss::metrics {
+class Registry;
+}  // namespace fss::metrics
+
 namespace fss::infra {
+
+//  ★ 组提交的接缝/协调器声明在 `infra/sqlite/sqlite_group_commit.h`（L2 共用小工具）。
+class ISqliteBatchObserver;
+class ISqliteBatchGate;
+class ISqliteCommitFault;
+class SqliteGroupCommitter;
 
 struct SqliteLocationRepositoryOptions {
   int busy_timeout_millis = 5000;
@@ -51,6 +62,20 @@ struct SqliteLocationRepositoryOptions {
   //    `AppliedPragma("synchronous")`（在**本连接**上读回）。放在结构体**最后**，避免
   //    既有的聚合初始化按位置取值时静默错位。
   int synchronous_level = 1;
+  //  ★ 本切片：数据库层组提交（`location.sqlite.{group_commit,group_commit_max_wait_ms,
+  //    group_commit_max_batch}`）。默认值 = `core_schema.cpp` / `config/fss.example.json`
+  //    的默认值（`true` / `5` / `64`）。协议见 `infra/sqlite/sqlite_group_commit.h`：
+  //    `false` → 逐操作提交（与接线前逐字一致的单条自动提交语句）；
+  //    `true`  → 并发写操作凑成一批，一个事务一次提交。
+  bool group_commit = true;
+  int group_commit_max_wait_ms = 5;
+  int group_commit_max_batch = 64;
+  //  可观测/确定性接缝（测试用；生产为 null）。
+  ISqliteBatchObserver* batch_observer = nullptr;
+  ISqliteBatchGate* batch_gate = nullptr;
+  ISqliteCommitFault* commit_fault = nullptr;
+  //  可观测性（可选）：`fss_sqlite_{group_commits,ops}_total{repo="location"}`。
+  fss::metrics::Registry* metrics = nullptr;
 };
 
 class SqliteLocationRepository final : public domain::IFileLocationRepository {
@@ -90,8 +115,28 @@ class SqliteLocationRepository final : public domain::IFileLocationRepository {
   fss::Result<domain::FileLocation> FindInternal(std::string_view partition,
                                                  std::string_view file_id);
 
+  //  ---- 本切片：逐操作路径（`group_commit=false`，与接线前逐字一致）与
+  //       批内路径（`group_commit=true`，由批协调器在事务/保存点内调用） ----
+  fss::Result<void> SaveLocked(std::string_view partition, const domain::FileLocation& location);
+  fss::Result<void> SaveInTransaction(::sqlite3* db, std::string_view partition,
+                                      const domain::FileLocation& location);
+  fss::Result<void> UpdateSignedUrlLocked(std::string_view partition, std::string_view file_id,
+                                          std::string_view signed_url,
+                                          std::int64_t updated_at_epoch_seconds);
+  fss::Result<void> UpdateSignedUrlInTransaction(::sqlite3* db, std::string_view partition,
+                                                 std::string_view file_id,
+                                                 std::string_view signed_url,
+                                                 std::int64_t updated_at_epoch_seconds);
+  fss::Result<void> DeleteLocked(std::string_view partition, std::string_view file_id);
+  fss::Result<void> DeleteInTransaction(::sqlite3* db, std::string_view partition,
+                                        std::string_view file_id);
+  //  逐操作路径的观察者/指标通知（`group_commit=false` 时每个操作一批）。
+  void NotifyBatch(std::size_t ops_in_batch, bool committed);
+
   sqlite3* db_ = nullptr;
   SqliteLocationRepositoryOptions options_{};
+  //  组提交协调器（`group_commit=true` 时使用）；持有一份 `mutex_` 的引用。
+  std::unique_ptr<SqliteGroupCommitter> committer_;
   //  `mutable`：允许 const 诊断访问器 `AppliedPragma` 也走同一把锁（DB 连接不可并发访问）。
   mutable std::mutex mutex_;  // 单连接串行化：让并发调用者排队（C3.12）
 };

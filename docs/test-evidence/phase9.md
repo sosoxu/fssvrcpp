@@ -617,7 +617,8 @@ $ ./build/bin/test_posix_batch_commit       # All tests passed (128 assertions i
 
 `storage.posix.group_commit_max_batch` 从「拒绝启动」移入「生效」（+1）；
 `storage.posix.sync_dir_after_batch` **保持拒绝启动**（`false` → exit 78，理由 = R2 **不变量**，
-不是"未实现"）。三态：**生效 107 / 拒绝启动 18 / 已读但无效果 31 = 156**。
+不是"未实现"）。三态：**生效 107 / 拒绝启动 18 / 已读但无效果 31 = 156**
+（★ **这是 P9 当时的值**；**当前值**见 `docs/test-evidence/phase10.md` §14.7 —— C10.20 后为 **113/18/25**）。
 **未新增/删除任何配置键**（`git status --porcelain config/` 为空）。
 
 ### 13.7 父代理独立复核（自己重做顺序不变量注入）
@@ -1149,7 +1150,8 @@ All tests passed (159 assertions in 7 test cases)      # 还原后全绿
 
 ### 15.6 三态计数（未改配置面）
 
-**不新增/不改任何配置键** ⇒ 仍为 **生效 107 / 拒绝启动 18 / 已读但无效果 31 = 156**。
+**不新增/不改任何配置键** ⇒ 仍为 **生效 107 / 拒绝启动 18 / 已读但无效果 31 = 156**
+（★ **P9 当时的值**；**当前值**见 `docs/test-evidence/phase10.md` §14.7 —— C10.20 后为 **113/18/25**）。
 两个新事实走**环境变量**接缝（`FSS_IO_PROBE_INJECT`）而非配置键；反向用例
 （`--set storage.io_probe_inject=available`）实测 **exit 78**（未知键）。
 `test_operations_doc`（156 键自动比对）与 `./scripts/check_docs.sh` 均通过。
