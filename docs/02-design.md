@@ -1276,16 +1276,17 @@ flush、`BeforeCommit` 把"事务开着"变成确定性可观察点）、`ISqlit
 | R-25 GC 误删在途 | ✅ | 租约到期 + 原子领取 + 领取后复查记录（`test_gc_lease` 6 用例）；**P9 又抓到一条会破坏它的缺陷**：POSIX 时间戳时基错（P9-D04）→ 已修复并把时间戳语义写进端口契约 | 多实例的数据库时钟（P6-D18）、调度与领导者选举（C9.26 未验证） |
 | R-26 误用 SQLite 做多实例 | ✅ | `deployment.mode=multi` 的 7 条启动校验（含正例，C8.9）+ 组合根**真的装配** PG 仓储/租约/leader election（B1；无 libpq/DSN → exit 78，仍不可能误用 SQLite） | 多实例**运行形态已交付（B1）**；**已交付**：崩溃注入 + 共享目录的真·多进程 E2E（C9.26）、共享挂载交叉探针 + 配置/版本一致性（B2b）；**仍未验证**：NFS 语义（C9.27）——见 `test-evidence/phase10.md` §17/§20/§22 |
 | R-27 NFS 语义未验证 | ⛔ | 上生产硬前提（C9.27）；实现**不依赖** NFS 文件锁、用 PG advisory lock（ADR-009） | 本环境无 NFS/多客户端共享挂载 ⇒ **未验证**，登记为**生产门禁**：未在目标存储上验证前不得上生产 |
-| R-28 多实例 `syncfs` 干扰 | 🟡 | 部署建议"按 partition 分盘"；配置键 `shared_mount_required` / `one_filesystem_per_partition` 已在 schema 与示例中 | 干扰量级**未测**（C9.24 未验证）；`shared_mount_required` 已在 **B2b** 接通（写探针 + 与 live peer 交叉验证可见性 ⇒ "不是共享挂载"会在启动期 exit 78 / 运行期 not ready），但那只证明**共享性**，`syncfs` 干扰仍只能靠部署纪律；`one_filesystem_per_partition` 仍未接线 |
+| R-28 多实例 `syncfs` 干扰 | 🟡 | 部署建议"按 partition 分盘"；配置键 `shared_mount_required` / `one_filesystem_per_partition` 已在 schema 与示例中，且**两者都已接通** | 干扰量级**未测**（C9.24 未验证）；`shared_mount_required` 已在 **B2b** 接通（写探针 + 与 live peer 交叉验证可见性 ⇒ "不是共享挂载"会在启动期 exit 78 / 运行期 not ready），但那只证明**共享性**；`one_filesystem_per_partition` 已在 **E1b** 接通（`true` 时启动期校验规则 A/B：partition 与 `storage.posix.root` 分盘、partition 之间不共盘；违规 → exit 78）⇒ "按 partition 分盘"从纯部署纪律变成**可被拒绝启动的断言**，但 C9.24 的干扰量级仍只能靠部署纪律与后续实测 |
 | R-29 io_uring 当必需依赖 | ✅ | 默认 `blocking`（ADR-010）+ `scripts/check_io_uring.sh`（0/1/**2=无结论**）+ 探测失败按配置回退；**探测结果可见已交付**（C9.30：`/v2/info` 的 `ioEngine`/`ioUringAvailable` + `fss_io_engine`/`fss_io_uring_available` 指标，见 ADR-010 §7.1） | 引擎实现仍未交付（U1~U4 未满足 ⇒ `ioEngine` 恒 `blocking`）；C9.29 的收益复核仍需目标存储 |
 
 **P9 遗留（如实登记，不阻塞 C9.1~C9.10）**：① 组合根当时仍**只读环境变量**、未接
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
 exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、`expiry.*` 接进组合根，
 并把 16 个未实现键改为"非默认值 → 拒绝启动"（后续切片与 C10.16 / C10.16 续 / 切片 4 / 切片 5 / **切片 6a（C10.18）** 继续收敛，当前三态为
-**生效 129 / 拒绝启动 15 / 已读但无效果 13**（B2b 后）；逐键登记在 `docs/operations.md` §1.2/§1.3）；
-② 多实例相关的 `one_filesystem_per_partition` 仍不可配（在 §1.3 的
-**13** 个「已读但无效果」键里；`shared_mount_required` 已在 **B2b** 接通）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
+**生效 130 / 拒绝启动 15 / 已读但无效果 12**（E1b 后）；逐键登记在 `docs/operations.md` §1.2/§1.3）；
+② 多实例相关的 `one_filesystem_per_partition` 已接通（**E1b**：`true` 时启动期校验规则 A/B，
+违规 → exit 78；§1.2/§1.3.1 的该键行；`shared_mount_required` 已在 **B2b** 接通；
+§1.3.3 的「已读但无效果」清单已在 E1b 后**清空**）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
 实现（ADR-006 §6 的门槛）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
 
 ---

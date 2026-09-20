@@ -454,7 +454,7 @@ gc:
 - [ ] 在目标环境验证 NFS 语义（C9.27）——这是**上生产前的硬前提**
 - [x] 更新 `docs/operations.md`：多实例部署、PG 高可用、分盘建议、滚动升级与配置版本 —— 落在
   [`docs/operations.md`](../operations.md) §10「多实例部署与运维（ADR-009）」：§10.1 拓扑与跨实例语义（LB 重试 vs 粘性）、
-  §10.2 PG 高可用与连接预算（C9.28）、§10.3 分盘建议（`syncfs` 隔离；`one_filesystem_per_partition` 仍未接通）、
+  §10.2 PG 高可用与连接预算（C9.28）、§10.3 分盘建议（`syncfs` 隔离；`one_filesystem_per_partition` 已在 **E1b** 接通为启动期强制校验，规则 A/B 违规 → exit 78）、
   §10.4 上线前存储语义硬前提（C9.27）、§10.5 滚动升级与配置版本（B2b 守卫 + 可操作流程）、§10.6 实例标识与临时文件名、
   §10.7 可观测性（leader 门控指标 / readiness 语义）、§10.8 未交付与未验证清单。事故级处置（症状 → 诊断 → 处置 → 禁令）
   在 [`docs/runbook.md`](../runbook.md) §8.1~§8.6。

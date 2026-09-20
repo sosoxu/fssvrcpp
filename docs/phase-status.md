@@ -62,6 +62,12 @@
 > `test-evidence/phase10.md` §23）。上文作为历史登记保留（不删原句）。
 > ⚠️ `AGENTS.md` §0.1 的「PG 多实例」行**已同步**（ADR-009 §10 收口时更新，E1a 亦在其未交付
 > 清单里做了对应删减）；三态计数以 `operations.md` §1.3 为准。
+> ⚠️ **更正（E1b）**：本文件里「`storage.posix.one_filesystem_per_partition` 未接通/未交付」的说法
+> **已被 E1b 交付**（`true` 时启动期校验规则 A/B，违规 → exit 78；`storage.driver=s3` + `true` →
+> 拒绝启动；见 `test-evidence/phase10.md` §24）。上文作为历史登记保留（不删原句）；
+> 三态随之从 **129/15/13** 变为 **130/15/12**（键数仍 157，`operations.md` §1.3/§1.3.1）。
+> ★ 本文件是**只追加**的历史日志，按设计保留被取代的中间值，因此**不在** E1b 新增的
+> 跨文档三态护栏的扫描清单里（`tests/unit/test_operations_doc.cpp` 的注释写明了理由）。
 >
 > **C9.26 之后的更新（最新，优先于上面全部）**：ADR-009 §4.2/§4.3 的**进程级崩溃 E2E 已交付**
 > （见 `test-evidence/phase10.md` §20）：`tests/integration/test_multi_crash_recovery.cpp` 拉起

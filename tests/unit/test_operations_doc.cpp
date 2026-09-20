@@ -21,8 +21,10 @@
 #include "common/json/json.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <fstream>
 #include <functional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -194,11 +196,11 @@ TEST_CASE("★ C9.9 operations.md 覆盖 example 的全部叶子键且不写不�
 //            `拒绝启动（列出触发条件）` / `已读但无效果（必须给出理由与下一步）`"。
 //  这条测试把"计数"变成机械断言（否则文档里的数字只是人写的字，会漂移）：
 //    ① 示例文件的每个叶子键都必须在 §1.2 的某一行里以状态标记开头；
-//    ② 三态计数 = 生效 129 / 拒绝启动 15 / 已读但无效果 13，且相加 = 157；
+//    ② 三态计数 = 生效 130 / 拒绝启动 15 / 已读但无效果 12，且相加 = 157；
 //    ③ 文档正文里声明的数字也必须一致（防止只改表格不改正文）。
 //  ★ 只认"最后一列以状态标记开头"的行：同一个键在别处（如 §5.1 的档位表）出现不算。
 // =============================================================================
-TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 129 / 拒绝启动 15 / 已读但无效果 13）",
+TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 130 / 拒绝启动 15 / 已读但无效果 12）",
           "[phase10][docs][c10.11]") {
   const std::string example_path = std::string(FSS_REPO_ROOT) + "/config/fss.example.json";
   const std::string doc_path = std::string(FSS_REPO_ROOT) + "/docs/operations.md";
@@ -256,11 +258,133 @@ TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 129 / 拒绝启�
   REQUIRE(unmarked.empty());
   INFO("生效=" << n_effective << " 拒绝启动=" << n_reject << " 已读但无效果=" << n_ineffective
                << " 合计=" << leaves.size());
-  REQUIRE(n_effective == 129);
+  REQUIRE(n_effective == 130);
   REQUIRE(n_reject == 15);
-  REQUIRE(n_ineffective == 13);
+  REQUIRE(n_ineffective == 12);
   REQUIRE(n_effective + n_reject + n_ineffective == leaves.size());
   //  正文声明的数字也必须一致（防止"只改表格、不改正文"）
-  REQUIRE(doc.find("生效 129 / 拒绝启动 15 / 已读但无效果 13") != std::string::npos);
-  REQUIRE(doc.find("**129 + 15 + 13 = 157**") != std::string::npos);
+  REQUIRE(doc.find("生效 130 / 拒绝启动 15 / 已读但无效果 12") != std::string::npos);
+  REQUIRE(doc.find("**130 + 15 + 12 = 157**") != std::string::npos);
+}
+
+// =============================================================================
+//  E1b：三态计数的**跨文档一致性**护栏（本切片新增；"陈旧数字复活"防线）
+// =============================================================================
+//  为什么新增：`C10.11` 只钉住 `docs/operations.md` **自己**；而"生效 N / 拒绝启动 M /
+//  已读但无效果 K"这组数字在 `04-implementation-plan.md` / `02-design.md` / `runbook.md`
+//  / `AGENTS.md` 里也各写了一份。本轮把 `storage.posix.one_filesystem_per_partition`
+//  从「已读但无效果」移入「生效」时，正好暴露了"只改 operations.md、别处留旧值"这个
+//  漂移类（`docs/04` 的"陈旧数字复活"）。护栏做法：
+//    ① 从 `docs/operations.md` 取**权威三元组**（`std::regex` 的第一次匹配，默认 flags
+//       —— ECMAScript 的 `\s` 覆盖换行，因此 `runbook.md` 里跨行书写的三元组也能匹配）；
+//       要求恰为 130/15/12、N+M+K == 157，并要求正文含字面 `**130 + 15 + 12 = 157**`；
+//    ② 扫描**每一个**受管文件的**每一处**该正则，任何一处三元组 != 权威值 → 失败，
+//       并报出 `文件:行`（含多处时的全部位置）。
+//
+//  ★ 为什么**刻意排除** `docs/phase-status.md` 与 `docs/test-evidence/*.md`：它们是
+//    **只追加**的历史日志，按设计保留被取代的中间值（例如 B1 时的 `122/16/18`、
+//    B2b 时的 `129/15/13`）。把它们纳入扫描会让"如实保留历史登记"变成永远无法通过的
+//    检查 —— 这不是漏检，而是刻意的口径（排除清单在本用例里是显式的，不会随目录枚举漂移）。
+//
+//  ★ **已知局限（如实登记）**：本护栏只覆盖"**写出来的**三元组是否一致"，**不**覆盖
+//    "某个受管文件不再提这些数字"。若某个文件把整句删掉，本用例**不会**失败
+//    （`C10.11` 也只检查 operations.md 自己）。要覆盖"缺失"必须维护一份"必须出现该
+//    三元组的文件清单"，那会把历史文档也钉死，本切片不做。
+//
+//  ★ R1 自证（见 `docs/test-evidence/phase10.md` §24 的注入表"护栏注入"）：把
+//    `docs/02-design.md` 的 `130` 改成 `129` → 本用例失败并指出 `docs/02-design.md:<行>`；
+//    改回后恢复绿色。本用例开头还有对正则抽取器本身的**小自证**（能匹配、能跨行匹配、
+//    且对不含三态词的旧式 `129/15/13` 不匹配）。
+// =============================================================================
+TEST_CASE("★ E1b 三态计数跨文档一致（权威值取自 operations.md；受管文件不得留旧值）",
+          "[e1b][docs]") {
+  const std::string root = std::string(FSS_REPO_ROOT);
+  const std::regex pattern(
+      "生效\\s+(\\d+)\\s*/\\s*拒绝启动\\s+(\\d+)\\s*/\\s*已读但无效果\\s+(\\d+)");
+
+  const auto extract = [&](const std::string& text, std::size_t offset,
+                           int* n, int* m, int* k) -> bool {
+    std::smatch match;
+    const std::string tail = text.substr(offset);
+    if (!std::regex_search(tail, match, pattern)) return false;
+    *n = std::stoi(match[1].str());
+    *m = std::stoi(match[2].str());
+    *k = std::stoi(match[3].str());
+    return true;
+  };
+
+  //  ---- 抽取器小自证（R1：判据本身要能失败）----
+  {
+    int n = 0, m = 0, k = 0;
+    REQUIRE(extract("……（生效 130 / 拒绝启动 15 / 已读但无效果 12）……", 0, &n, &m, &k));
+    REQUIRE((n == 130 && m == 15 && k == 12));
+    //  跨行（runbook.md 的真实形态）：`\s` 必须覆盖换行
+    n = m = k = 0;
+    REQUIRE(extract("清单（生效 130 / 拒绝启动 15 /\n已读但无效果 12；E1b 后）", 0, &n, &m, &k));
+    REQUIRE((n == 130 && m == 15 && k == 12));
+    //  反面对照：历史净变化条目里的 `129/15/13` **不带三态词**，不得被当成一处声明
+    //  （否则 operations.md 的历史日志会自己把自己判失败）。
+    n = m = k = 0;
+    REQUIRE_FALSE(extract("三态从 **129/15/13** 变为 **130/15/12**", 0, &n, &m, &k));
+  }
+
+  //  ---- ① 权威值：docs/operations.md 的第一次匹配 ----
+  const std::string operations_path = root + "/docs/operations.md";
+  std::string operations_text;
+  REQUIRE(ReadFile(operations_path, operations_text));
+  int auth_n = 0, auth_m = 0, auth_k = 0;
+  INFO("权威文件: " << operations_path);
+  REQUIRE(extract(operations_text, 0, &auth_n, &auth_m, &auth_k));
+  INFO("权威三元组 = " << auth_n << "/" << auth_m << "/" << auth_k);
+  REQUIRE(auth_n == 130);
+  REQUIRE(auth_m == 15);
+  REQUIRE(auth_k == 12);
+  REQUIRE(auth_n + auth_m + auth_k == 157);
+  REQUIRE(operations_text.find("**130 + 15 + 12 = 157**") != std::string::npos);
+
+  //  ---- ② 受管文件逐处比对 ----
+  //  ★ `AGENTS.md` 由父代理维护（本切片改它之外的文件）；这里只**读它**做一致性比对。
+  const std::vector<std::string> managed = {
+      operations_path,
+      root + "/docs/04-implementation-plan.md",
+      root + "/docs/02-design.md",
+      root + "/docs/runbook.md",
+      root + "/AGENTS.md",
+  };
+  const auto line_of = [](const std::string& text, std::size_t position) -> std::size_t {
+    return 1 + static_cast<std::size_t>(
+                   std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(position),
+                              '\n'));
+  };
+
+  std::vector<std::string> mismatches;
+  std::size_t seen = 0;
+  for (const auto& path : managed) {
+    std::string text;
+    INFO("受管文件: " << path);
+    REQUIRE(ReadFile(path, text));
+    for (std::sregex_iterator it(text.begin(), text.end(), pattern), end; it != end; ++it) {
+      const auto& match = *it;
+      const int n = std::stoi(match[1].str());
+      const int m = std::stoi(match[2].str());
+      const int k = std::stoi(match[3].str());
+      ++seen;
+      if (n == auth_n && m == auth_m && k == auth_k) continue;
+      const std::string rel = path.substr(root.size() + 1);
+      mismatches.push_back(rel + ":" + std::to_string(line_of(text, match.position())) + " → " +
+                           std::to_string(n) + "/" + std::to_string(m) + "/" +
+                           std::to_string(k) + "（权威 " + std::to_string(auth_n) + "/" +
+                           std::to_string(auth_m) + "/" + std::to_string(auth_k) + "）");
+    }
+  }
+  INFO("受管文件里共发现 " << seen << " 处三态三元组；不一致 " << mismatches.size() << " 处");
+  {
+    //  ★ 把不一致处拼成**一个** INFO（循环内的 INFO 到 REQUIRE 处已出作用域，打印不出来）。
+    std::string report;
+    for (const auto& mismatch : mismatches) report += "  旧值/错值: " + mismatch + "\n";
+    INFO("不一致明细（文件:行 → 实际值）：\n" << report);
+    //  ★ 非空洞（R16）：受管文件至少要有几处声明，否则"全部一致"可能在空集合上成立。
+    REQUIRE(seen >= 5);
+    REQUIRE(mismatches.empty());
+  }
 }

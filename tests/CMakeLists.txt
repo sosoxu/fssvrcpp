@@ -843,3 +843,19 @@ fss_add_test(test_io_engine_exposure
   LABELS  "phase9;integration")
 # 被测进程就是 build/bin/fss_server → 构建它必须先于本测试
 add_dependencies(test_io_engine_exposure fss_server)
+
+# =============================================================================
+#  E1b：`storage.posix.one_filesystem_per_partition` 的启动期强制校验（**无 PG**）
+#    · L2 直接调用（U1~U6）：规则 A（与 root 分盘）、规则 B（两 partition 不共盘，
+#      用**合成多 partition 输入**钉住 —— 组合根今天只构造一个 partition，该规则在生产
+#      形态下是空集）、"刻意不检查 staging==persistent"的边界、目录不存在、空输入；
+#    · 真实 `fss_server`（W1~W5）：未分盘 → exit 78；`<root>/blobs` 软链到 /dev/shm →
+#      启动成功 + 真实上传的字节落在该文件系统；s3+true → exit 78；横幅打印已校验设备号。
+#    · 依赖 `build/bin/fss_server`（真实组合根），因此 add_dependencies。
+# =============================================================================
+fss_add_test(test_partition_filesystem_check
+  SOURCES integration/test_partition_filesystem_check.cpp
+  LIBS    fss_blob_posix Threads::Threads
+  LABELS  "integration;e1b")
+add_dependencies(test_partition_filesystem_check fss_server)
+set_tests_properties(test_partition_filesystem_check PROPERTIES TIMEOUT 300)

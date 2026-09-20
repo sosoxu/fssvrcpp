@@ -246,7 +246,8 @@ scripts/bench_baseline.sh --check    # 退化 >20% 直接失败（退出码 1）
   （用 GC 的 TTL 判定）。
 - `syncfs` 是**文件系统级**操作：建议按 partition 分盘，避免实例间互相拖慢。
   为什么、以及推荐的挂载布局见 [`operations.md`](operations.md) §10.3
-  （★ `storage.posix.one_filesystem_per_partition` **未接通**，分盘只能靠部署手段）。
+  （★ `storage.posix.one_filesystem_per_partition` 已在 **E1b** 接通：`true` 时启动期按
+  partition 校验文件系统隔离（规则 A/B），违规 → exit 78；`false` 时行为不变）。
 
 > **下面 8.1~8.6 只看"故障怎么判读"**：部署拓扑、PG 高可用与连接预算、分盘、
 > 滚动升级与配置版本的**完整说明**在 [`operations.md`](operations.md) §10，本节不重复长表。
@@ -399,8 +400,8 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 #   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
 ```
 
-**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 129 / 拒绝启动 15 /
-已读但无效果 13；B2b 后）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 130 / 拒绝启动 15 /
+已读但无效果 12；E1b 后）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
 它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动
@@ -461,7 +462,7 @@ FSS_CLAIM_HOLD_MS=15000 ./build/bin/fss_server --config config/fss.json &
 > 所以生产路径（未设置该变量）的行为与引入本接缝之前逐字节一致。
 >
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 129 / 拒绝启动 15 / 已读但无效果 13）由 `test_operations_doc` **机械比对**；
+> （生效 130 / 拒绝启动 15 / 已读但无效果 12）由 `test_operations_doc` **机械比对**；
 > "让每个 `createMetadata` 故意卡住 N 毫秒"不是运维语义，生产上只会制造事故。
 > 若写成配置项会按**未知键 → exit 78** 被拒。
 >
@@ -495,7 +496,7 @@ FSS_CLOCK_SKEW_INJECT_MS=1000 ./build/bin/fss_server --config config/fss.json &
 > 避免演练结论被误读成"这台机器钟真的偏了"。**默认不注入**，生产路径逐字节不变。
 >
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 129 / 拒绝启动 15 / 已读但无效果 13）由 `test_operations_doc` **机械比对**；
+> （生效 130 / 拒绝启动 15 / 已读但无效果 12）由 `test_operations_doc` **机械比对**；
 > "让实例钟走偏"不是运维语义，生产上只会制造事故。若写成配置项会按**未知键 → exit 78** 被拒。
 >
 > **禁令**：**不要**在生产/预发设置 `FSS_CLOCK_SKEW_INJECT_MS`。它只用于 B2a 的
@@ -519,7 +520,7 @@ FSS_SERVICE_VERSION_OVERRIDE=9.9.9 ./build/bin/fss_server --config config/fss.js
 ```
 
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 129 / 拒绝启动 15 / 已读但无效果 13）由 `test_operations_doc` **机械比对**；
+> （生效 130 / 拒绝启动 15 / 已读但无效果 12）由 `test_operations_doc` **机械比对**；
 > "让实例谎报版本"不是运维语义（真实滚动升级应通过部署流程控制），
 > 若写成配置项会按**未知键 → exit 78** 被拒。
 >

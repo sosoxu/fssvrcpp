@@ -160,6 +160,7 @@ target_link_libraries(fss_io PUBLIC fss_domain fss_sys)
 # 与 fss_io（fsync 分级 + 可注入落盘接缝）。
 add_library(fss_blob_posix STATIC
   infra/blob/posix/posix_blob_store.cpp
+  infra/blob/posix/partition_filesystem_check.cpp
   infra/blob/posix/shared_mount_probe.cpp)
 target_include_directories(fss_blob_posix PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fss_blob_posix PUBLIC fss_domain fss_crypto fss_fs fss_io fss_metrics)

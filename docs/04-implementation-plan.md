@@ -20,7 +20,7 @@
 | **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | ✅ **已完成（C7.1~C7.10 全部满足；17/17 RPC；6 测试 / 5378 断言）** |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ✅ **已完成（C8.1~C8.8 全部满足；C8.9 配置级 + C8.10 机制级完成；6 测试 / 1323 断言）** |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ✅ **已完成（C9.1~C9.13、C9.15、C9.16、C9.25、C9.31、C9.32 满足；C9.8/C9.12 有独立证据文件；环境不具备的判据登记为未验证）**。**C9.31 为 P9 补交（P10 期间完成）**：GC 的 HTTP 按需端点 `POST /v2/gc:run` + `GcTask` 单飞护栏（证据 `docs/test-evidence/phase9.md` §12）。**C9.32 也为 P9 补交（P10 期间完成）**：`main()` 顶层兜底 → 未预期异常以 **exit 70（EX_SOFTWARE）+ 可读原因** 结束；容器 `--pids-limit=64` 真实回归 **ExitCode 70**（证据 `phase9.md` §14、`phase9-image.md` §10.12） |
-| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | ✅ **切片 1/2/3/4/5/6a/6b 全部完成（C10.1~C10.20）**：三态 156 键 **生效 122 / 拒绝启动 16 / 已读但无效果 18**（`docs/operations.md` §1.3；ADR-008 的 P4 +1 与 **C10.20** 的 6 键）；真实二进制证据见 `docs/test-evidence/phase10.md`。**期间补交 P9 的 C9.31**（GC 按需端点；不改任何配置键，三态计数不变） |
+| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | ✅ **切片 1/2/3/4/5/6a/6b 全部完成（C10.1~C10.20）**：三态 157 键 **生效 130 / 拒绝启动 15 / 已读但无效果 12**（`docs/operations.md` §1.3；B2a/B2b/E1b 后；ADR-008 的 P4 +1、**C10.20** 的 6 键、**E1b** 的 1 键）；真实二进制证据见 `docs/test-evidence/phase10.md`。**期间补交 P9 的 C9.31**（GC 按需端点；不改任何配置键，三态计数不变） |
 
 **全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P10 并全绿。
 任何阶段的门槛脚本一旦被加入，后续阶段不得使其退化。
@@ -998,7 +998,7 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
 切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）、切片 4（数据面 PUT 上限 + SQLite PRAGMA）
 与切片 5（`self_signed` 三键：`key_id` + 自签 TTL 上界）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态（B2b 后的当前值）：**生效 129 / 拒绝启动 15 / 已读但无效果 13 = 157**（`docs/operations.md` §1.3；B2a 与 B2b 的净变化见该节末尾）。
+三态（E1b 后的当前值）：**生效 130 / 拒绝启动 15 / 已读但无效果 12 = 157**（`docs/operations.md` §1.3；B2a/B2b/E1b 的净变化见该节末尾）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
@@ -1072,7 +1072,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（**当前为 生效 122 / 拒绝启动 16 / 已读但无效果 18 = 156**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
+  `docs/operations.md` 逐键三态化（**当前为 生效 130 / 拒绝启动 15 / 已读但无效果 12 = 157**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1163,7 +1163,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   组合根三分支：`log`（默认，既有 `LogEventPublisher` 逐字不变）/ `webhook` / `none`（内联 `NoopEventPublisher`，  **显式关闭**）；横幅打印 publisher/端点/timeout/topic（**不打印密钥**）。
   `src/app/usecases/usecases.cpp` 的 `PublishStatus` 补上 `record_id`（第 10 步/幂等命中路径带真实 id；  第 1 步 IN_PROGRESS 发生在建记录前 → 空），使 `statusChanged.body.recordId` 与上游形状一致。
   用例：`tests/integration/test_webhook_publisher.cpp`（真实进程 + `mock_validators.py --mode webhook`；  `--observe-file` 新增 `bodies` 列表断言两个 kind 都发了）+ `tests/unit/test_composition_root_guard.cpp` 清单加   `WebhookEventPublisher`。**未交付**：异步有界发布队列、重试退避、投递保证、与真实消息总线/中间件联调。
-* 三态计数（B2b 后的当前值）：**生效 129 / 拒绝启动 15 / 已读但无效果 13 = 157**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* 三态计数（E1b 后的当前值）：**生效 130 / 拒绝启动 15 / 已读但无效果 12 = 157**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
   其中「拒绝启动」+1 来自 C10.18 的**伴随更正**（`auth.remote_entitlements.fail_closed`），
   与"6 个键接通"是两件事（落点不同：一个进「生效」、一个进「拒绝启动」）。
 

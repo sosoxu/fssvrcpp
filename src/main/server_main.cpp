@@ -42,6 +42,7 @@
 #include "infra/auth/local/local_jwt_authorizer.h"
 #include "infra/auth/remote/remote_entitlements_authorizer.h"
 #include "infra/blob/metered/metered_blob_store.h"
+#include "infra/blob/posix/partition_filesystem_check.h"
 #include "infra/blob/posix/posix_blob_store.h"
 #include "infra/blob/posix/shared_mount_probe.h"
 #include "infra/blob/s3/s3_blob_store.h"
@@ -1452,6 +1453,12 @@ static int RunServer(int argc, char** argv) {
   //    `<storage.posix.root>/.fss_probe.<instance_id>` 并与 `instance_registry` 的
   //    live peer 交叉比对可见性（`multi` 由 schema 强制为 true）。
   const bool shared_mount_required = resolver.Bool("storage.posix.shared_mount_required", false);
+  //  ★ E1b（ADR-009 §6.3/§8.3）：`storage.posix.one_filesystem_per_partition=true` 是
+  //    **部署方的断言**（"每个 partition 独占文件系统"）。组合根在启动期**验证**它
+  //    （规则 A/B 见 `src/infra/blob/posix/partition_filesystem_check.h`），不成立 → exit 78。
+  //    读它同时让来源出现在 `--print-config` 的逐键 provenance 里。
+  const bool one_filesystem_per_partition =
+      resolver.Bool("storage.posix.one_filesystem_per_partition", false);
   const std::string durability = resolver.Str("storage.posix.durability", "per_file");
   const long fsync_threshold_bytes =
       resolver.Int("storage.posix.fsync_threshold_bytes", 1024 * 1024);
@@ -1762,6 +1769,16 @@ static int RunServer(int argc, char** argv) {
     return reject_startup(
         "storage.io_uring.register_files=true —— io_uring 引擎本身未启用（ADR-010 U1~U4），"
         "注册文件表更不可能生效。下一步：保持 false，并先跑 scripts/check_io_uring.sh。");
+  }
+  //  ★ E1b：`storage.driver=s3` 下实例不落在字节通路上（ADR-009 §4.1），没有"partition
+  //    文件系统"可供 `syncfs` 隔离 —— 该键只对 posix 有意义。此前它被静默忽略（读了但
+  //    无效果），把一个非默认值接受下来就是让运维**以为**断言被验证了；这里显式拒绝。
+  if (storage_driver == "s3" && one_filesystem_per_partition) {
+    return reject_startup(
+        "storage.posix.one_filesystem_per_partition=true 与 storage.driver=s3 矛盾 —— 该键"
+        "只在 storage.driver=posix 下有意义（s3 下实例不在字节通路上，没有可供 syncfs "
+        "隔离的 partition 文件系统，ADR-009 §4.1）。下一步：删除该键或设为 false；"
+        "若确实使用集中存储，把 storage.driver 改回 posix。");
   }
   //  ★ B1：`leases.enabled` / `leader_election.enabled` **不再是**这里的"未实现 → 拒绝启动"
   //    守卫 —— 它们已经是**生效**键：分别决定"用 PG 租约还是内存租约"与"是否做 leader
@@ -2325,6 +2342,14 @@ static int RunServer(int argc, char** argv) {
   std::string instance_registry_banner = "未启用（本进程未使用 PG 仓储）";
   std::string consistency_banner = "未启用（本进程未使用 PG 仓储）";
   std::string mount_probe_banner = "未启用（本进程未使用 PG 仓储）";
+  //  ★ E1b：`storage.posix.one_filesystem_per_partition` 的启动期校验结论。
+  //    R11（"探测结果必须可见"）：断言被验证过还是没启用，必须在横幅上一眼可辨
+  //    —— 静默通过 = 运维无法区分"验证过了"与"根本没读这个键"。
+  //    ★ 冲突说明：交付说明 2.4 写"false 时不加横幅行"，2.5 又要求 false 时打印
+  //    `未启用（...=false）`；这里按更具体的 2.5 执行（与既有的
+  //    `shared mount : 未启用（...）` 行同构），判定与拒绝行为在 false 下逐字不变。
+  std::string part_fs_banner =
+      "未启用（storage.posix.one_filesystem_per_partition=false）";
 #ifdef FSS_HAVE_LIBPQ
   //  ★ B2b：生命周期 = RunServer 的局部对象（RAII）。声明顺序保证析构顺序为
   //    monitor（stop+join）→ probe（删自己的探针）→ registry（删自己的行）。
@@ -2692,6 +2717,69 @@ static int RunServer(int argc, char** argv) {
   partition_cfg.max_object_bytes = partition_file.max_file_bytes > 0 ? partition_file.max_file_bytes
                                                                      : -1;
   StaticPartitionRegistry partitions(partition_cfg);
+
+  // ===========================================================================
+  //  E1b：`storage.posix.one_filesystem_per_partition=true` 的启动期强制校验
+  // ===========================================================================
+  //  为什么在这里：`partition_cfg`（以及它决定的分区名）到这里才存在；容器名必须走
+  //  **同一个** `ObjectKeyPolicy::ContainerFor`（用例 / GC / 启动建目录同源），
+  //  绝不手写 `<partition>-staging`。
+  //  为什么先建目录：`CheckOneFilesystemPerPartition` 是**只读**的，目录不存在就报错
+  //  （不替运维创建，否则挂载点会被空目录顶掉）。而 POSIX 驱动本身要求容器目录存在，
+  //  组合根在下文 GC 段也做同一件事 —— 这里提前用**同一个** `ensure_container`（幂等），
+  //  于是"检查失败"与"目录缺失"不会混为一谈（后者由 L2 用例 U4 钉住）。
+  //  ★ `false`（默认）时本块不执行：没有 stat、没有拒绝，判定行为逐字不变。
+  if (one_filesystem_per_partition && storage_driver == "posix") {
+    const auto staging_container = app::ObjectKeyPolicy::ContainerFor(
+        partitions, partition_cfg.partition, domain::StorageZone::kStaging);
+    const auto persistent_container = app::ObjectKeyPolicy::ContainerFor(
+        partitions, partition_cfg.partition, domain::StorageZone::kPersistent);
+    if (!staging_container.ok() || !persistent_container.ok()) {
+      return reject_startup(
+          "storage.posix.one_filesystem_per_partition 校验失败：无法解析 partition \"" +
+          partition_cfg.partition + "\" 的容器名：" +
+          (staging_container.ok() ? persistent_container.error().ToString()
+                                  : staging_container.error().ToString()) +
+          "\n  下一步：检查 partition.file.<p>.{staging,persistent}_container 的取值。");
+    }
+    //  目录 = `<storage.posix.root>/blobs/<container>`，与 `PosixBlobStore(storage_root + "/blobs")`
+    //  的构造**逐字同源**（见上文 blob store 构造处）。
+    infra::PartitionDirSpec part_spec;
+    part_spec.partition = partition_cfg.partition;
+    part_spec.staging_dir = storage_root + "/blobs/" + staging_container.value();
+    part_spec.persistent_dir = storage_root + "/blobs/" + persistent_container.value();
+    (void)metered_blob.ensure_container(staging_container.value());
+    (void)metered_blob.ensure_container(persistent_container.value());
+
+    const auto part_fs_report =
+        infra::CheckOneFilesystemPerPartition(storage_root, {part_spec});
+    if (!part_fs_report.ok()) {
+      return reject_startup(part_fs_report.error().ToString() +
+                            "\n  下一步：按上面的修法处理（把该 partition 的目录挂到独立"
+                            "文件系统，或把 storage.posix.one_filesystem_per_partition 设回"
+                            " false）后重启。");
+    }
+    //  R11：断言"验证过"必须可见 —— 横幅带上 root 与每个 partition 的实际 st_dev。
+    std::ostringstream part_fs;
+    part_fs << "已启用（storage.posix.one_filesystem_per_partition=true）；root st_dev="
+            << part_fs_report.value().root_device;
+    for (const auto& entry : part_fs_report.value().entries) {
+      part_fs << "；partition \"" << entry.partition << "\" staging st_dev=" << entry.device
+              << "（" << entry.sample_path << "）persistent st_dev="
+              << entry.persistent_device << "（" << entry.persistent_sample_path << "）";
+    }
+    //  ★ 如实说明边界：当前组合根只构造**一个** partition ⇒ 规则 B（两个 partition 不得
+    //    共盘）在本形态下是空集；且"该 fs 上有没有非本服务的负载"进程内不可观测。
+    part_fs << "；规则 B 在当前单 partition 形态下为空集（合成多 partition 输入由用例钉住）";
+    part_fs_banner = part_fs.str();
+    logging::Info(logger,
+                  "storage.posix.one_filesystem_per_partition=true：已按 partition 校验文件系统"
+                  "隔离（规则 A：与 root 分盘；规则 B：partition 之间不共盘；"
+                  "刻意不检查 staging 与 persistent 是否同盘）",
+                  {{"component", "server_main"},
+                   {"storage.posix.root", storage_root},
+                   {"root_device", std::to_string(part_fs_report.value().root_device)}});
+  }
 
   //  ---- 可选校验器（legal / schema；P10 切片 6a / ADR-013）----
   //  ★ R12：具体实现只能在**组合根**创建 —— 用例层只见 `ILegalValidator` /
@@ -3204,7 +3292,9 @@ static int RunServer(int argc, char** argv) {
             //  ★ B2b：注册表 / 一致性 / 共享挂载探针的实际结论（同样不许"检查过没过靠猜"）。
             << "  instance reg   : " << instance_registry_banner << "\n"
             << "  consistency    : " << consistency_banner << "\n"
-            << "  shared mount   : " << mount_probe_banner << "\n";
+            << "  shared mount   : " << mount_probe_banner << "\n"
+            //  ★ E1b：`one_filesystem_per_partition` 的校验结论（false = 未启用）。
+            << "  part fs check : " << part_fs_banner << "\n";
   //  ★ C9.26：测试接缝生效时**必须可见**（可运维：横幅回答"它会不会故意卡住"）。
   //    未设置时不打印该行 → 既有横幅逐字不变（既有测试只做子串断言，不受影响）。
   if (claim_hold_millis > 0) {

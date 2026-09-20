@@ -3425,7 +3425,7 @@ FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg
   默认值字段（proto3 既有行为）；本片只断言非空值 `"ws-77"` 的键名。
 * **`/v2/info` 的 REST 字段顺序 / `Content-Type`** 未在本片新增断言（既有 `test_ops_endpoints` 覆盖）。
 
-## 父代理独立复核
+## 父代理独立复核（E1a）
 
 **复核人：父代理（不采信子代理自报数字；以下每条都是我自己跑出来的）。**
 
@@ -3536,3 +3536,223 @@ fss_instance_registry_stale_rows_removed_total 1
 - 交付的两个功能在**真实进程**上成立（single 的字段暴露与指标族缺席、multi 的自动 id + 运行期清理）；
 - 子代理的**文档**有 3 处不准确，已由我修正；
 - 未验证项以子代理 §23.6 与 `AGENTS.md` §0.1 的登记为准（尤其：清理**失败**分支未用只读账号实测）。
+
+## 24. E1b（本切片）：`storage.posix.one_filesystem_per_partition` 从「已读但无效果」变成真的启动期强制校验
+
+> 本切片收掉最后一个「已读但无效果」键（`docs/operations.md` §1.3.3 的清空项；`AGENTS.md` §0.1）。
+> 语义（钉住，不多不少）：`true` = 部署方**断言**"每个 partition 独占文件系统"，组合根在启动期
+> **验证**它，不成立 → `exit 78`（fail-closed）；`false`（默认）不 stat、不拒绝，行为与接线前逐字一致。
+
+### 24.1 交付内容（单一来源）
+
+* `src/infra/blob/posix/partition_filesystem_check.{h,cpp}`（新增 L2，与 `shared_mount_probe.*`
+  同层同风格）：**只读** `::stat(2)`（跟随符号链接；`std::filesystem` 没有 `st_dev` API，
+  先例 `posix_blob_store.cpp:9,64-69`）。规则 **A**：每个 partition 的 staging/persistent
+  必须与 `root` 分盘；规则 **B**：两个不同 partition 不得解析到同一文件系统。
+  空输入 / 非绝对路径 / 目录缺失 / root 不可 stat → `Err(kInvalidArgument, 可读原因)`，
+  消息含键名、分区名、完整路径、两组 `st_dev`、`syncfs` 理由、修法与"下一步"。
+  ★ **刻意不检查**同一 partition 的 staging 与 persistent 是否同盘；★ **不声称**能观测
+  "该 fs 上有没有非本服务负载"（进程内不可观测）。
+* `src/CMakeLists.txt`：`partition_filesystem_check.cpp` 加入 `fss_blob_posix`。
+* `src/main/server_main.cpp`：读键（→ `--print-config` provenance 可见 `[file]/[default]`）；
+  `storage.driver=s3` + `true` → 早于任何 S3 I/O 的 `reject_startup`；`posix` + `true` 时在
+  `StaticPartitionRegistry` 之后按 `ObjectKeyPolicy::ContainerFor` 解析容器名（**不手写**
+  `<partition>-staging`），目录 = `<storage.posix.root>/blobs/<container>`（与 `PosixBlobStore`
+  构造同源），先用驱动的 `ensure_container`（幂等，与 GC 段同一调用）保证目录存在再校验；
+  失败 → `reject_startup`；成功 → 横幅 `part fs check :` 打印实际设备号 + `logging::Info`（R11）。
+* `tests/integration/test_partition_filesystem_check.cpp`（新增）+ `tests/CMakeLists.txt`
+  （标签 `integration;e1b`，**无 pg**，`add_dependencies(... fss_server)`）。
+* 文档：`docs/operations.md`（§1.2 该键行、§1.2 前言计数、§1.3 三个计数 + 清单、
+  §1.3.1/§1.3.3、§10.3、§10.8 的 C9.24 两处）、`tests/unit/test_operations_doc.cpp`
+  （计数 + 新增跨文档护栏）、`docs/04-implementation-plan.md`、`docs/02-design.md`（R-28 + P9 遗留）、
+  `docs/runbook.md`、`docs/00-final-design.md`（新增 §5.aa）、ADR-008/ADR-009 的两处"未接通"表述。
+  `AGENTS.md` **未改**（父代理维护；护栏把它纳入**只读**扫描）。
+
+### 24.2 命令与输出摘要
+
+```bash
+cmake --build build -j4                              # rc=0（默认构建，FSS_WITH_PG=OFF）
+./build/bin/test_partition_filesystem_check          # All tests passed (144 assertions in 12 test cases)
+ctest --test-dir build -L e1b --output-on-failure    # 100% tests passed, 0 failed out of 1；0.47 s
+ctest --test-dir build -R test_partition_filesystem_check  # 100% passed（0.44 s）
+./build/bin/test_operations_doc                      # All tests passed (43 assertions in 3 test cases)
+./scripts/check_docs.sh                              # 全部检查通过（D1~D5）；D5 = 11 阶段 / 148 条门槛（未变）
+```
+
+★ 本切片**全程在默认（无 PG）构建**验证：新模块与用例都不需要 PostgreSQL，也没有 `pg` 标签。
+
+```bash
+# 额外回归（默认构建，排除 pg 标签；确认启动横幅多一行没有打断既有用例）
+ctest --test-dir build -LE pg --output-on-failure   # 100% tests passed, 0 tests failed out of 89；99.22 s
+
+# PG 构建（本切片不需要 PG，只做编译 + 跑同一份 E1b 用例）
+cmake --build build-pg -j4                          # rc=0
+./build-pg/bin/test_partition_filesystem_check      # All tests passed (144 assertions in 12 test cases)
+ctest --test-dir build-pg -L e1b                    # 100% passed（0.44 s）
+```
+
+### 24.3 设备与横幅（实测，非推算）
+
+| 路径 | `st_dev`（本机实测） | 用途 |
+| --- | --- | --- |
+| `/dev/shm` | **65**（tmpfs） | U1/U3/U4/U5、W2/W5 的"另一个文件系统" |
+| `/run/lock` | **64**（tmpfs） | U5 的**第三个**设备（"staging==persistent 不是规则"需要三个互不相同的设备） |
+| 仓库 / `/tmp` | **2096**（ext4，`/dev/sdd`） | `root`、普通布局、`TempDir` |
+
+W5 断言的横幅行（`--config` 指向 `<root>/blobs -> /dev/shm/<unique>`，key=true；**逐字**取自真实进程 stdout）：
+
+```text
+  part fs check : 已启用（storage.posix.one_filesystem_per_partition=true）；root st_dev=2096；partition "opendes" staging st_dev=65（<root>/blobs/opendes-staging）persistent st_dev=65（<root>/blobs/opendes-persistent）；规则 B 在当前单 partition 形态下为空集（合成多 partition 输入由用例钉住）
+```
+
+### 24.4 用例与判据
+
+| 用例（全部带 `[e1b]`） | 判据 |
+| --- | --- |
+| U1 正控 | root 在仓库 fs、两个目录软链到 /dev/shm ⇒ `ok()`；`entries[0].device != root_device`（设备相等时**明确失败**，不跳过） |
+| U2 反例（规则 A） | 目录与 root 同盘 ⇒ 错误消息含键名/`opendes`/两条路径/`syncfs`/`false` |
+| U3 反例（规则 B） | **合成两个 partition** 同在 /dev/shm ⇒ 错误点名 `"alpha"`、`"beta"`、设备号与两条路径 |
+| U4 反例（目录不存在） | 报错要求先创建/挂载；事后 `REQUIRE_FALSE(exists(path))`（**只读**自证；配正控证明路径写对） |
+| U5 边界 | root 在 /dev/shm、staging 在仓库 fs、persistent 在 /run/lock（**三设备互异**）⇒ **必须通过**（钉住"没有加 staging==persistent 规则"） |
+| U6 边界 | 空输入 ⇒ 报错（"检查恒真"保护） |
+| U7 边界 | 相对路径 ⇒ 报错（检查不得依赖 CWD；反面对照用绝对路径进入规则判定） |
+| W1 反例 | 真实进程 posix+true+普通布局 ⇒ **exit 78**，输出含键名/`opendes`/`下一步` |
+| W2 正例 | `<root>/blobs` 软链到 /dev/shm ⇒ 启动 + readiness 200 + 真实 `uploadURL→PUT→POST metadata` 往返；**PUT 后**对象文件真的在 /dev/shm 目标目录、`st_dev` 相符、内容逐字节相等（同时钉住 `fs::SafeJoin` 的 canonical 包含性在软链 root 下仍成立） |
+| W3 正控 | key=false + 普通布局 ⇒ 照常启动 + ready；横幅 `part fs check : 未启用` |
+| W4 反例 | `storage.driver=s3` + true ⇒ **exit 78** + s3 专属消息（不需要 S3 服务：拒绝发生在任何 S3 I/O 之前） |
+| W5 正控 | key=true 时横幅真的打印 `已启用` + root/staging/persistent 的实际 `st_dev`（R11） |
+
+### 24.5 R1 注入自证（每个都是：注入 → 重编 → 看到指定用例失败 → 还原 → 重编 → 绿）
+
+| 注入 | 改动 | 观察到的失败（逐字） | 还原后 |
+| --- | --- | --- | --- |
+| **I1** | `CheckOneFilesystemPerPartition` 开头 `return PartitionFilesystemReport{};`（恒 ok） | U2 `REQUIRE_FALSE( report.ok() )`；U3 同；**W1 `REQUIRE( outcome.exit_code == 78 )` → `outcome.exit_code := 124`（服务器真的起来了，被 `timeout` 收尸）**；另有 U1/U4/U5/U6（空报告/不报错）与 W5 横幅失败；W2/W3/W4 仍绿 | 144/12 全绿 |
+| **I2** | 组合根条件改成 `if (false && one_filesystem_per_partition && …)`（**L2 保持正确**） | **W1 `outcome.exit_code := 124`**；W5 `REQUIRE( banner.find("part fs check : 已启用") != npos )` 失败；而 **U2 绿（10 断言）/ U3 绿（22 断言）** ⇒ "规则"与"接线"分离 | 144/12 全绿 |
+| **I3** | 缺失目录分支改为**回溯到最深的已存在祖先**取设备号（"合理地错"） | U4 `REQUIRE( message.find("创建") != std::string::npos )` 失败（10 断言里 9 过）—— 错误退化成规则 A，没有"先创建/挂载"指令 | 144/12 全绿 |
+| **I4** | 新增"staging 设备必须等于 persistent 设备"规则 | U5 `REQUIRE( report.ok() )` 失败（12 断言里 11 过） | 144/12 全绿 |
+| **I5** | 空输入分支 `return PartitionFilesystemReport{};`（恒真通过） | U6 `REQUIRE_FALSE( report.ok() )` 失败（2 断言里 1 过） | 144/12 全绿 |
+| **护栏注入** | `docs/02-design.md` 的 `130` 改成 `129` | `REQUIRE( mismatches.empty() )` 失败，明细 `旧值/错值: docs/02-design.md:1286 → 129/15/12（权威 130/15/12）` | `test_operations_doc` 43/3 全绿 |
+
+**没有任何注入出现"注入了但用例仍绿"的情况。** 其中 I1 与 I2 的分工是刻意的：I1 同时打掉
+L2 规则与组合根接线（U2/U3 + W1），I2 只打掉接线而保留 L2（W1 失败、U2/U3 仍绿）——
+后者证明 W1 测的是**组合根真的调用了检查**，而不是"检查在别处被顺带执行"。
+
+### 24.6 未覆盖 / 未验证（如实登记）
+
+* **规则 B 在当前生产形态下是空集**：组合根只由 `partition.file.opendes.*` 构造**一个**
+  `PartitionConfig`（`StaticPartitionRegistry` 单例），所以"两个 partition 不共盘"永远无法在
+  真实进程上触发。它由**合成多 partition 输入**的 U3 钉住；生产多 partition 形态**未实测**
+  （需要按 partition 分盘的工厂，ADR-009 §7 仍未交付）。
+* **"该文件系统上有没有非本服务负载"不可观测**：进程内看不到挂载表 / 其他写入者，
+  本模块**不声称**能校验它 —— 这是部署纪律，不是已验证能力。
+* **C9.24（`syncfs` 跨实例干扰量级）仍未被测量**：本切片只把"按 partition 分盘"从纯部署纪律
+  变成**可被拒绝启动的断言**（`docs/operations.md` §10.8 两处已把"键状态"与"干扰量级"分开登记）。
+* **真实独立卷 / 真实挂载点未测**：U1/W2 用的是 `/dev/shm` 这个 tmpfs（无 root、不能 `mount`），
+  它只证明"`st_dev` 不同 + 字节落在软链目标"，**不等于**"真实独立块设备/独立 export"。
+  U5 用 `/run/lock`（64）作第三个设备；若目标环境没有第三个**可写且 `st_dev` 互异**的
+  文件系统，U5 会**明确失败**告诉读者本环境无法表达该正例，而不是静默跳过。
+* **s3 + 软链/多卷布局未测**（也不需要）：`s3` + `true` 在**任何 S3 I/O 之前**就 exit 78，因此
+  没有"给 s3 配 posix 目录布局"的合法形态可测。
+* **相对路径分支（U7）只验证了"被拒"**：没有验证真实运维把 `storage.posix.root` 写成相对路径
+  时的完整启动行为（组合根会先创建 `<cwd>/…/blobs`，再被本检查拒绝）。
+* **`one_filesystem_per_partition=true` + `shared_mount_required=true` + multi 的组合未测**：
+  multi 需要 PG；本切片（无 PG）只覆盖 single。
+* **横幅口径的一处刻意选择**：交付说明 2.4 写"`false` 时不加横幅行"，2.5 又要求 `false` 时打印
+  `未启用（…=false）`；本实现按更具体的 2.5 执行（与既有 `shared mount : 未启用（…）` 同构）。
+  判定与拒绝行为在 `false` 下**逐字不变**，横幅多一行是**可见性**（R11）而非行为变化。
+* **跨文档三态护栏不覆盖"缺失"**：它只检查"**写出来的**三元组是否一致"；某个受管文件
+  若把整句删掉（不再提这些数字），本用例**不会**失败（已在 `tests/unit/test_operations_doc.cpp`
+  的注释里登记为已知局限）。要覆盖"缺失"必须维护"必须出现该三元组的文件清单"。
+* **护栏的扫描清单是硬编码的 5 个文件**（`operations.md` / `04-implementation-plan.md` /
+  `02-design.md` / `runbook.md` / `AGENTS.md`）：新增一份写三态计数的文档不会被自动纳入
+  （这是刻意的显式清单，避免把 `phase-status.md` 这类**只追加历史日志**误纳）。
+
+
+## 父代理独立复核
+
+**复核人：父代理（不采信子代理自报数字；以下每条都是我自己跑出来的）。**
+
+### 复核方式
+
+- 消融同样用**运行期环境开关**（临时加在 `CheckOneFilesystemPerPartition` 开头与组合根的
+  E1b 块上，复核后**已删除**：`grep -rn "PARENT-ABLATION\|FSS_PARENT_" src/ tests/` 无输出；
+  我顺手加进 `.cpp` 的 `#include <cstdlib>` 也已移除），同一二进制两种跑法。
+- 基线：`HEAD=bde0b4c`（E1a 已推送；本切片改动全在工作树），`AGENTS.md` 仅含父代理自己的
+  三态计数改动。
+
+### 1. 数字复核（我自己跑）
+
+| 命令 | 我的实测 |
+| --- | --- |
+| `./build/bin/test_partition_filesystem_check` | **All tests passed (144 assertions in 12 test cases)** |
+| `./build-pg/bin/test_partition_filesystem_check` | **144 assertions / 12 test cases**（与默认构建逐字相同） |
+| `./build/bin/test_operations_doc` | **43 assertions / 3 test cases**（E1a 时是 24/2 ⇒ 新增的跨文档护栏真的被执行到） |
+
+### 2. 独立消融：规则与接线**分别**是承重的
+
+| 消融 | 我的实测 |
+| --- | --- |
+| 基线，只跑 `*E1b-U2*,*E1b-U3*` | All tests passed (32 assertions in 2 test cases) |
+| **I1**：L2 桩化为恒 `ok()` | U2/U3：`REQUIRE_FALSE( report.ok() )` ×2 → `test cases: 2 | 0 passed | 2 failed`（18 断言 16 过） |
+| **I2**：只跳过组合根那块（L2 保持正确） | U2/U3 **仍全绿**（32 断言 / 2 用例）⇒ 规则正确与"接线存在"是两件事 |
+
+### 3. 独立消融：真实进程侧（我自己起 `fss_server`，不经过测试夹具）
+
+| 场景（我的端口/配置） | 期望 | 实测 |
+| --- | --- | --- |
+| key=`true` + 容器目录与 root **同盘** | 78 | **rc=78**，消息含规则 A、两条路径与两组 `st_dev`（`root=2096`） |
+| key=`true` + `<root>/blobs` **真为**软链到 `/dev/shm`（`stat -L` 验证 `blobs=65`） | 启动 | **rc=124**（跑满 timeout），横幅 `root st_dev=2096 … staging st_dev=65 … persistent st_dev=65` |
+| key=`false` + 普通布局 | 启动 | **rc=124**，横幅 `part fs check : 未启用（…=false）` |
+| key=`false` + **相对** root | 启动（证明 false 下不做该检查） | **rc=124** |
+| key=`true` + **相对** root | 78 | **rc=78**，消息 `storage.posix.root 必须是绝对路径（实际："build/parent-e1b/root"）` |
+| `storage.driver=s3` + key=`true` | 78 | **rc=78**，消息说明该键只在 posix 下有意义 |
+| **I1**（L2 桩化）+ 同盘配置 | 启动（即 W1 会失败） | **rc=124** |
+| **I2**（跳过接线）+ 同盘配置 | 启动（即 W1 会失败） | **rc=124** |
+
+⇒ "同盘 → exit 78"这条判据确实由**这条**检查产生（两种消融都能让它消失），
+且"软链到另一个文件系统 → 放行"不是靠放过一切换来的（同盘仍被拒）。
+
+### 4. 跨文档数字护栏（我自己换一个文件、换一种形态注入）
+
+子代理注入的是 `docs/02-design.md`（单行形态）。我改用 **`docs/runbook.md` 第 403 行**——
+那里的三元组是**跨行**写的（`生效 130 / 拒绝启动 15 /\n已读但无效果 12`），是正则最可能漏掉的形态：
+
+```text
+REQUIRE( mismatches.empty() )
+  旧值/错值: docs/runbook.md:403 → 129/15/12（权威 130/15/12）
+test cases:  3 |  2 passed | 1 failed
+```
+
+还原后 43/3 全绿。⇒ 护栏对跨行形态与"逐处点名"都成立。我用 Python 复现了护栏正则，
+12 处匹配（operations ×2、04-plan ×4、02-design ×1、runbook ×4、AGENTS ×1）**全部**是
+`130/15/12`。
+
+### 5. 复核中发现并修正的问题
+
+| 位置 | 问题 | 处置 |
+| --- | --- | --- |
+| `docs/operations.md` §1.3.3 的 ★ 句 | 写成「**本清单已清空**」，但该清单**仍有 12 个键**（`large_file_plane.*` 6 + `metadata.remote.*` 4 + 两个 `max_write_concurrency`）；真正清空的是**前缀表里的 `storage` 行** | 改为「本清单里 `storage` 前缀已清空」+ 明确列出剩余 12 键的类别，并点明"不是漏网之鱼" |
+| `docs/00-final-design.md` §5.aa 影响 ② | 同上（"清单**清空**"与随后的"12 个键"自相矛盾） | 改为"`storage` 前缀已清空（该清单仍有 12 个键…）" |
+| `src/infra/blob/posix/partition_filesystem_check.h` 的"只读保证" | 只写了"不替运维建目录，否则挂载点会被空目录顶掉"，读者会以为**产品路径**也不建目录；实际组合根在调用前用既有的幂等 `ensure_container`（GC 段本来就在做）建好了目录 | 补一段"谁在什么时候建目录"：产品路径的失败原因是同盘/共盘，而"目录缺失"分支是**模块契约**（U4 + 无副作用断言钉住） |
+| 本文件的结构 | E1a 的父代理复核标题与新追加的 E1b 标题同名（两个 `## 父代理独立复核`） | E1a 的标题改为 `## 父代理独立复核（E1a）`，本段为 E1b |
+| 子代理报告的首句 | 自报"已读但无效果清单清空" | 与 §1.3.3 实际（仍有 12 键）不符，以本节上表的更正为准 |
+
+### 6. 我自己的复核事故（如实记录）
+
+第一次搭"软链到 tmpfs"的正例时，我写了 `mkdir -p root2/blobs && ln -s $SHM root2/blobs` ——
+**先建了目录再建同名软链**，于是软链落到了 `blobs/` **里面**（`root2/blobs/<shm-basename>`），
+`blobs` 本身仍是仓库文件系统上的真目录，key=`true` 因此正确地报了 78。我一开始把
+`stat -c %d blobs` 当成"软链的设备号"（没加 `-L`），差点把"实现拒绝合法布局"写进结论。
+改用 `mkdir -p root2` + 直接 `ln -s`，并用 `stat -L` 复核后，同一条配置 **rc=124**、
+横幅显示 `staging st_dev=65`。与 AGENTS §4.3「探针没真的执行过就别把它当成环境结论」同族。
+
+### 7. 复核结论
+
+- 子代理的 144/12、两构建一致、I1~I5 与护栏注入**成立**；我用不同机制（运行期开关 +
+  自己起进程 + 换成跨行形态的文件）独立复现了最关键的三条（规则承重、接线承重、护栏有效）；
+- `false`（默认）路径**确实没有新增 stat/拒绝**（相对 root 也能启动），`true` 路径**真的**
+  会因同盘 exit 78、因跨盘放行；
+- 文档里 1 处实质错误（"清单已清空"）+ 1 处措辞会误导读者（L2 头部的建目录归属）+ 1 处
+  结构问题（重名标题）由我修正；
+- 未验证项以 §24.6 与 `AGENTS.md` §0.1 的登记为准（尤其：规则 B 在生产形态是空集、
+  C9.24 干扰量级仍未测、`/dev/shm` 不等价于真实独立卷或挂载点）。
