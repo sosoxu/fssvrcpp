@@ -161,12 +161,57 @@ struct MetadataPage {
   std::int64_t total = 0;
 };
 
+//  ★ C1（ADR-009 §4.2）：元数据记录的**写入状态机** `claiming → ready`。
+//    它是**仓储列**，**不是** OSDU 记录的一部分 —— 绝不进 `ToJson` / `ParseFileMetadataRecord`，
+//    否则 REST/gRPC 的线上契约就会多出一个字段（本切片的硬要求）。
+//    `kDeleted` 对应 PG schema 里由外部写入的墓碑行（本仓储的 `Delete` 仍是硬删除）。
+enum class MetadataState { kClaiming, kReady, kDeleted };
+
+//  `ClaimForWrite` 的结果（ADR-009 §4.2 的"原子领取"）：
+//    · `claimed == true`  → 本调用赢得领取权，刚插入/占用了 (partition, file_source) 上的
+//      一条 `claiming` 行；调用方**必须**负责把它推到 `kReady`（成功后 `MarkReady`，
+//      失败后 `ReleaseClaim` 释放，否则该 file_source 永远无法被重试）。
+//    · `claimed == false` → 已存在活动记录：`record` 是既有那条，`state` 是它的状态。
+//      调用方**不得复制**（这正是 ADR-009 M2 要消除的"两个实例各复制一遍"）。
+struct MetadataClaim {
+  bool claimed = false;
+  FileMetadataRecord record;  // claimed=true 时是刚插入的 claiming 行；false 时是既有的活动记录
+  MetadataState state = MetadataState::kReady;  // claimed=false 时既有记录的状态
+};
+
 class IMetadataRepository {
  public:
   virtual ~IMetadataRepository() = default;
-  //  创建：**幂等**（同 partition + 同 FileSource 重复创建必须返回同一条记录，R5）
+  //  创建：**幂等**（同 partition + 同 FileSource 重复创建必须返回同一条记录，R5）。
+  //  ★ C1：本方法按新的原语实现（claim → mark ready），可观测语义与接线前逐字一致。
   virtual Result<FileMetadataRecord> Create(std::string_view partition,
                                             const FileMetadataRecord& record) = 0;
+
+  //  ★ C1：ADR-009 §4.2 的**原子领取**（单条 INSERT … ON CONFLICT DO NOTHING）：
+  //    不存在活动记录 → 插入 `state='claiming'` 的 v1 并返回 {claimed=true}；
+  //    已存在活动记录 → 返回 {claimed=false, record=既有, state=它的状态}，**不复制、不报错**。
+  //    ★ 领取发生在 staging→persistent **复制之前**：并发实例里只有一个能领到，
+  //      因此只有一个会去复制（这正是本切片要交付的）。
+  virtual Result<MetadataClaim> ClaimForWrite(std::string_view partition,
+                                             const FileMetadataRecord& record) = 0;
+
+  //  ★ C1：`claiming → ready`，并把**最终**记录（含复制后才算出的 checksum）落库。
+  //    只对 (partition, id, version) 且 `state='claiming'` 的行生效；0 行 → kNotFound。
+  //    ⚠️ 记录里的 `file_source`（幂等键）必须与领取时的行**完全一致**：不一致 → kInvalidArgument
+  //       且**保持 claiming**（调用方仍可 `ReleaseClaim`）—— 允许在 mark-ready 时改写幂等键
+  //       会让 `ux_mr_source` 与所有按 file_source 的查找静默失配（见测试证据 §18 的判断记录）。
+  //    ★ 4 参形态是父代理批准的偏离（原定 3 参）：checksum 只能在复制/回算之后才知道，
+  //       必须随本调用一次性落库（单条 UPDATE），否则 claiming 行里的 data 是过期快照。
+  virtual Result<FileMetadataRecord> MarkReady(std::string_view partition,
+                                              std::string_view record_id,
+                                              std::int64_t version,
+                                              const FileMetadataRecord& record) = 0;
+
+  //  ★ C1：放弃领取（复制/校验和/mark-ready 失败时调用）：只删**本版本**且
+  //    `state='claiming'` 的行；0 行 → kNotFound。删掉后同一 file_source 可被重新领取。
+  virtual Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
+                                    std::int64_t version) = 0;
+
   virtual Result<FileMetadataRecord> GetById(std::string_view partition,
                                              std::string_view record_id) = 0;
   //  拿最新版本（`is_latest` 语义，R6：部分唯一索引的谓词要含业务语义）

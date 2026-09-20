@@ -153,3 +153,83 @@ TEST_CASE("★ 切片 4：SqliteMetadataRepository 的 synchronous 真的下发�
     REQUIRE(opened.value()->AppliedPragma("synchronous").ok());
   }
 }
+
+// =============================================================================
+//  ★ C1：旧库文件（本切片之前的 schema，**没有** state 列）必须被幂等迁移
+// =============================================================================
+//  为什么必须有这条：单实例部署升级时打开的是**已存在的**库文件；`CREATE TABLE IF NOT EXISTS`
+//  不会给旧表补列，读取路径引用 `state` 会直接报 "no such column: state"。
+//  这里手工造一个旧 schema 的库（含一行旧记录）→ 打开仓储 → 断言：
+//    ① 旧行仍可见（迁移默认值 'ready'）；② 新列真的存在（PRAGMA）；③ 再次打开不报错（幂等）。
+TEST_CASE("★ C1 SQLite：旧库文件（无 state 列）被幂等迁移，旧行按 ready 可见",
+          "[phase6][integration][sqlite][c1]") {
+  fss::test::TempDir dir("sqlite_metadata_migrate");
+  const std::string path = dir.child("legacy.db");
+  const std::string partition = "legacy-part";
+  auto record = fss::test::MakeRecord(partition, "old", "/legacy/1", "legacy-name");
+  const std::string data = fss::json::Dump(fss::domain::ToJson(record));
+
+  {
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                            nullptr) == SQLITE_OK);
+    //  ★ 旧 schema：**故意**没有 state 列（本切片之前的形态）
+    const std::string schema =
+        "CREATE TABLE metadata ("
+        " partition_id TEXT NOT NULL, id TEXT NOT NULL, version INTEGER NOT NULL,"
+        " is_latest INTEGER NOT NULL, previous_version INTEGER, file_source TEXT NOT NULL,"
+        " kind TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,"
+        " created_by TEXT NOT NULL DEFAULT '', data TEXT NOT NULL,"
+        " PRIMARY KEY (partition_id, id, version));"
+        "CREATE UNIQUE INDEX ux_metadata_source ON metadata (partition_id, file_source)"
+        " WHERE is_latest = 1;"
+        "CREATE UNIQUE INDEX ux_metadata_latest ON metadata (partition_id, id) WHERE is_latest = 1;";
+    char* error = nullptr;
+    const int schema_rc = sqlite3_exec(db, schema.c_str(), nullptr, nullptr, &error);
+    if (error != nullptr) sqlite3_free(error);
+    REQUIRE(schema_rc == SQLITE_OK);
+    const std::string insert =
+        "INSERT INTO metadata (partition_id, id, version, is_latest, previous_version,"
+        " file_source, kind, name, created_at, created_by, data) VALUES ('" +
+        partition + "', '" + record.id + "', 1, 1, NULL, '/legacy/1', 'k', 'legacy-name',"
+        " 1700000000, '', '" + data + "')";
+    char* insert_error = nullptr;
+    const int rc = sqlite3_exec(db, insert.c_str(), nullptr, nullptr, &insert_error);
+    INFO("旧行插入 rc=" << rc << " err=" << (insert_error != nullptr ? insert_error : ""));
+    if (insert_error != nullptr) sqlite3_free(insert_error);
+    REQUIRE(rc == SQLITE_OK);
+    sqlite3_close(db);
+  }
+
+  fss::ManualClock clock{1700000000};
+  auto opened = SqliteMetadataRepository::Open(path, clock);
+  REQUIRE(opened.ok());
+  //  ① 旧行按迁移默认值 'ready' 可见
+  const auto got = opened.value()->GetById(partition, record.id);
+  REQUIRE(got.ok());
+  REQUIRE(got.value().version == 1);
+  REQUIRE(got.value().data.name.has_value());
+  REQUIRE(*got.value().data.name == "legacy-name");
+  //  ② 新列真的存在（不是"碰巧读到了内存里的东西"）
+  {
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK);
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(db, "PRAGMA table_info(metadata)", -1, &stmt, nullptr) ==
+            SQLITE_OK);
+    bool has_state = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      const unsigned char* name = sqlite3_column_text(stmt, 1);
+      if (name != nullptr && std::string(reinterpret_cast<const char*>(name)) == "state") {
+        has_state = true;
+      }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    REQUIRE(has_state);
+  }
+  //  ③ 迁移幂等：再次打开同一个库文件不报错
+  auto again = SqliteMetadataRepository::Open(path, clock);
+  REQUIRE(again.ok());
+  REQUIRE(again.value()->GetById(partition, record.id).ok());
+}

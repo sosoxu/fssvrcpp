@@ -39,6 +39,13 @@ class InMemoryMetadataRepository final : public domain::IMetadataRepository {
 
   fss::Result<domain::FileMetadataRecord> Create(std::string_view partition,
                                                  const domain::FileMetadataRecord& record) override;
+  fss::Result<domain::MetadataClaim> ClaimForWrite(
+      std::string_view partition, const domain::FileMetadataRecord& record) override;
+  fss::Result<domain::FileMetadataRecord> MarkReady(
+      std::string_view partition, std::string_view record_id, std::int64_t version,
+      const domain::FileMetadataRecord& record) override;
+  fss::Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
+                                 std::int64_t version) override;
   fss::Result<domain::FileMetadataRecord> GetById(std::string_view partition,
                                                   std::string_view record_id) override;
   fss::Result<domain::FileMetadataRecord> GetLatestByFileSource(
@@ -59,6 +66,9 @@ class InMemoryMetadataRepository final : public domain::IMetadataRepository {
     domain::FileMetadataRecord record;
     std::int64_t created_at_epoch_seconds = 0;
     bool is_latest = false;
+    //  ★ C1（ADR-009 §4.2）：写入状态机。它**不是**记录模型的一部分（不进 JSON），
+    //    只决定该版本对"读取路径"是否可见（只有 ready 可见）。
+    domain::MetadataState state = domain::MetadataState::kReady;
   };
   using Chain = std::vector<Version>;
   using RecordId = std::string;

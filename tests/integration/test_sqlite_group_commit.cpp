@@ -255,13 +255,33 @@ TEST_CASE("★ C10.20 摊销：元数据仓储也走同一套组提交（N=6、B
     threads.emplace_back([&repo, &failures, i] {
       const std::string suffix = "m" + std::to_string(i);
       const auto record = fss::test::MakeRecord("opendes", suffix, "/u/" + suffix, suffix);
-      if (!repo.Create("opendes", record).ok()) ++failures;
+      //  ★ C1：`ClaimForWrite`（原子领取）是**一个**批操作 —— 用它钉住"摊销 == ceil(N/B)"。
+      if (!repo.ClaimForWrite("opendes", record).ok()) ++failures;
     });
   }
   for (auto& thread : threads) thread.join();
   REQUIRE(failures.load() == 0);
   REQUIRE(observer.CommitCount() == 2);  // ceil(6/3) == 2
   REQUIRE(observer.Ops() == std::vector<std::size_t>{3, 3});
+  REQUIRE(observer.Rollbacks() == 0);
+
+  //  ★ C1：`Create` 现在是 claim → mark-ready 的**复合**路径（每次登记 2 个批操作）。
+  //    单独钉住它：6 次登记 = 12 个批操作、B=3 → 4 次提交（摊销比仍由 B 决定）。
+  //    这条替代的只是"用哪个写原语计数"——`ceil(N/B)` 这条判据本身没有被放宽。
+  observer.Reset();
+  std::atomic<int> create_failures{0};
+  std::vector<std::thread> create_threads;
+  for (int i = 0; i < 6; ++i) {
+    create_threads.emplace_back([&repo, &create_failures, i] {
+      const std::string suffix = "c" + std::to_string(i);
+      const auto record = fss::test::MakeRecord("opendes", suffix, "/u/" + suffix, suffix);
+      if (!repo.Create("opendes", record).ok()) ++create_failures;
+    });
+  }
+  for (auto& thread : create_threads) thread.join();
+  REQUIRE(create_failures.load() == 0);
+  REQUIRE(observer.CommitCount() == 4);  // ceil(12/3) == 4（ClaimForWrite + MarkReady 各一个操作）
+  REQUIRE(observer.Ops() == std::vector<std::size_t>{3, 3, 3, 3});
   REQUIRE(observer.Rollbacks() == 0);
 }
 
@@ -389,8 +409,25 @@ TEST_CASE("★ C10.20 读不脏：批事务开着时 GetById 必须等待，返�
   const std::string partition = "opendes";
   const auto record = fss::test::MakeRecord(partition, "dirty1", "/u/dirty1", "after-commit");
 
+  //  ★ C1：`Create` 现在是 claim → mark-ready 两次写（两个批操作）。要让"读必须等到批结束、
+  //    且返回**提交后的值**"这条判据仍然成立，这里把**可见性翻转**（`MarkReady`）作为被
+  //    门控卡住的那**一个**批操作：只有它提交之后，`GetById` 才应该看到 ready 记录。
+  //    （若仍用 `Create` 当写者，被卡住的是 claiming 批；那批提交后读到的正确结果就是
+  //     kNotFound —— "返回提交后的值"在那条路径上无从断言，这是新顺序的真实语义。）
+  //  领取是**准备步骤**：用一个不带门控的第二个连接完成，避免它先撞上 `BeforeCommit` 的门。
+  {
+    SqliteMetadataRepositoryOptions plain_options;
+    plain_options.group_commit = false;  // 逐操作路径，不经过门控
+    auto plain_opened = SqliteMetadataRepository::Open(dir.child("meta.db"), clock, plain_options);
+    REQUIRE(plain_opened.ok());
+    const auto claimed = plain_opened.value()->ClaimForWrite(partition, record);
+    REQUIRE(claimed.ok());
+    REQUIRE(claimed.value().claimed);
+  }
+  observer.Reset();  // 领取不属于被测的那一批
+
   std::atomic<bool> writer_ok{false};
-  std::thread writer([&] { writer_ok = repo.Create(partition, record).ok(); });
+  std::thread writer([&] { writer_ok = repo.MarkReady(partition, record.id, 1, record).ok(); });
 
   //  领队在批事务内、COMMIT 之前被门控卡住（确定性时点，不用 sleep 猜）。
   REQUIRE(gate.WaitUntilOpen());

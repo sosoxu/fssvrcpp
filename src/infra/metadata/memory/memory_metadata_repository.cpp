@@ -44,26 +44,51 @@ const InMemoryMetadataRepository::Chain* InMemoryMetadataRepository::FindChain(
 
 fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::Create(
     std::string_view partition, const domain::FileMetadataRecord& record) {
+  FSS_TRY(ValidatePartitionAndId(partition, record));
+  //  ★ C1：`Create` 用新原语实现（claim → mark ready）。可观测语义与接线前逐字一致：
+  //    幂等键相同 → 返回**第一次那条**；否则写入 v1 ready 记录。
+  FSS_TRY(claim, ClaimForWrite(partition, record));
+  if (!claim.claimed) {
+    //  claimed=false：既有记录（ready 或**另一个实例正在 claiming**）。两者都返回既有 id
+    //  —— 旧 `Create` 的判据是"同幂等键返回同一条"，这一点没有改变。
+    return claim.record;
+  }
+  //  ★ `MarkReady` 落库**最终** record（内容 = 调用方传入的 v1 记录），并翻到 ready。
+  return MarkReady(partition, claim.record.id, claim.record.version, claim.record);
+}
+
+fss::Result<domain::MetadataClaim> InMemoryMetadataRepository::ClaimForWrite(
+    std::string_view partition, const domain::FileMetadataRecord& record) {
   std::lock_guard<std::mutex> guard(mutex_);
   FSS_TRY(ValidatePartitionAndId(partition, record));
-
   const std::string part(partition);
   const std::string file_source = FileSourceOf(record);
   if (file_source.empty()) {
     return Invalid("file_source 不能为空（它是创建幂等键）");
   }
 
-  // ★ R5：先查幂等键 —— 已存在就直接返回**同一条记录**（第一次写入的内容获胜）
+  // ★ R5/ADR-009 §4.2：已有**活动记录**（ready 或 claiming）→ 不插入、不复制、不报错。
   const SourceKey source_key{part, file_source};
   const auto existing = source_index_.find(source_key);
   if (existing != source_index_.end()) {
-    return by_id_[part][existing->second].back().record;
+    const Chain* chain = FindChain(partition, existing->second);
+    if (chain != nullptr && !chain->empty()) {
+      domain::MetadataClaim out;
+      out.claimed = false;
+      out.record = chain->back().record;
+      out.state = chain->back().state;
+      return out;
+    }
   }
 
-  // 同 id 但 file_source 不同 → 冲突（一个 record id 只能属于一个幂等键）
+  //  同 id 但 file_source 不同 → 冲突（一个 record id 只能属于一个幂等键）。
+  //  ★ 这个守卫刻意**不过滤 state**：它是"一个 id 一条链"的**不变量检查**，不是客户端读取
+  //    路径（不会把记录交给客户端）。若按 ready 过滤，内存实现会把第二条链追加到同一个 id
+  //    下（内存没有主键约束兜底）。SQLite/PG 的等义效果由主键/唯一约束给出，报同一种
+  //    kInvalidArgument（见各实现与契约用例）。
   auto& bucket = by_id_[part];
   if (bucket.find(record.id) != bucket.end()) {
-    return Invalid("record.id 已存在但 file_source 不同");
+    return Invalid("同 id 已存在且 file_source 不同：" + record.id);
   }
 
   Version version;
@@ -71,9 +96,76 @@ fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::Create(
   version.record.version = 1;
   version.created_at_epoch_seconds = clock_.NowEpochSeconds();
   version.is_latest = true;
+  version.state = domain::MetadataState::kClaiming;  // ★ 领取：对读取路径不可见
   bucket[record.id].push_back(std::move(version));
   source_index_[source_key] = record.id;
-  return by_id_[part][record.id].back().record;
+
+  domain::MetadataClaim out;
+  out.claimed = true;
+  out.record = by_id_[part][record.id].back().record;
+  out.state = domain::MetadataState::kClaiming;
+  return out;
+}
+
+fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::MarkReady(
+    std::string_view partition, std::string_view record_id, std::int64_t version,
+    const domain::FileMetadataRecord& record) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  FSS_TRY(ValidatePartitionAndId(partition, record));
+  //  ★ `record_id` / `version`（列语义）是权威的：记录里的 id/version 只是同一份数据的拷贝，
+  //    读路径也是用列覆盖 JSON。因此这里不做"record.version 必须等于 version"的拒绝
+  //    （那会把"版本不存在 → kNotFound"的契约判据变成 kInvalidArgument）。
+  const std::string part(partition);
+  const auto bucket = by_id_.find(part);
+  if (bucket == by_id_.end()) return NotFound("Record Not Found");
+  const auto found = bucket->second.find(std::string(record_id));
+  if (found == bucket->second.end()) return NotFound("Record Not Found");
+  Chain& chain = found->second;
+  for (auto it = chain.begin(); it != chain.end(); ++it) {
+    if (it->record.version != version) continue;
+    if (it->state != domain::MetadataState::kClaiming) {
+      return NotFound("Record Not Found（该版本不是 claiming 状态）");
+    }
+    //  ★ 幂等键必须稳定：允许补 final 数据（checksum 等），不允许改写 file_source。
+    if (FileSourceOf(it->record) != FileSourceOf(record)) {
+      return Invalid("MarkReady 不得改写 (partition, file_source) 幂等键");
+    }
+    it->record = record;
+    it->record.id = std::string(record_id);
+    it->record.version = version;
+    it->state = domain::MetadataState::kReady;  // ★ 对读取路径可见
+    return it->record;
+  }
+  return NotFound("Record Not Found");
+}
+
+fss::Result<void> InMemoryMetadataRepository::ReleaseClaim(std::string_view partition,
+                                                           std::string_view record_id,
+                                                           std::int64_t version) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (partition.empty()) return Invalid("partition 不能为空");
+  const std::string part(partition);
+  const auto bucket = by_id_.find(part);
+  if (bucket == by_id_.end()) return NotFound("Record Not Found");
+  const auto found = bucket->second.find(std::string(record_id));
+  if (found == bucket->second.end()) return NotFound("Record Not Found");
+  Chain& chain = found->second;
+  for (auto it = chain.begin(); it != chain.end(); ++it) {
+    if (it->record.version != version) continue;
+    if (it->state != domain::MetadataState::kClaiming) {
+      //  只删 claiming 行：ready/deleted 的行绝不能被"放弃领取"顺手删掉。
+      return NotFound("Record Not Found（该版本不是 claiming 状态）");
+    }
+    const std::string file_source = FileSourceOf(it->record);
+    chain.erase(it);
+    //  R10：清理顺序 —— 只剩空链时同步删掉幂等键索引，file_source 才能被重新领取。
+    if (chain.empty()) {
+      source_index_.erase(SourceKey{part, file_source});
+      bucket->second.erase(found);
+    }
+    return Ok();
+  }
+  return NotFound("Record Not Found");
 }
 
 fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::GetById(
@@ -81,6 +173,11 @@ fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::GetById(
   std::lock_guard<std::mutex> guard(mutex_);
   const Chain* chain = FindChain(partition, record_id);
   if (chain == nullptr || chain->empty()) {
+    return NotFound("Record Not Found");
+  }
+  //  ★ C1：只把 `ready` 交给客户端 —— 另一个实例正在 claiming 的行**必须不可见**，
+  //    否则客户端会把"还没登记完（对象可能还没复制）"的记录当成已完成。
+  if (chain->back().state != domain::MetadataState::kReady) {
     return NotFound("Record Not Found");
   }
   return chain->back().record;  // back() 即 latest（按版本号追加）
@@ -100,6 +197,10 @@ fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::GetLatestByF
   if (chain == nullptr || chain->empty()) {
     return NotFound("Record Not Found");
   }
+  //  ★ C1：claiming 行不可见（与 GetById 同一纪律）
+  if (chain->back().state != domain::MetadataState::kReady) {
+    return NotFound("Record Not Found");
+  }
   return chain->back().record;
 }
 
@@ -111,6 +212,11 @@ fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::Update(
   const std::string part(partition);
   const Chain* existing_chain = FindChain(partition, record.id);
   if (existing_chain == nullptr || existing_chain->empty()) {
+    return NotFound("Record Not Found");
+  }
+  //  ★ C1：`Update` 的"既有记录"查找同样只认 ready —— 否则 Update 会去改一条
+  //    另一个实例正在 claiming（还没有最终数据）的行。
+  if (existing_chain->back().state != domain::MetadataState::kReady) {
     return NotFound("Record Not Found");
   }
   const std::string file_source = FileSourceOf(record);
@@ -174,6 +280,8 @@ fss::Result<domain::MetadataPage> InMemoryMetadataRepository::List(
     if (chain.empty()) continue;
     const Version& latest = chain.back();
     if (!latest.is_latest) continue;  // 只列 latest（版本链对外是一条记录）
+    //  ★ C1：List 只列 ready —— claiming 行对客户端不可见
+    if (latest.state != domain::MetadataState::kReady) continue;
 
     if (query.kind.has_value() && latest.record.kind != *query.kind) continue;
     if (query.name_prefix.has_value()) {

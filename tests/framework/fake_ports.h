@@ -456,6 +456,19 @@ class FaultyMetadataRepository final : public domain::IMetadataRepository {
   fss::ErrorKind create_error = fss::ErrorKind::kInternal;
   int create_calls = 0;
 
+  //  ★ C1：用例的写路径现在走 claim → mark-ready（`Create` 只被契约套件与旧路径使用）。
+  //    因此故障注入接缝必须**跟着迁移**，否则 `fail_create` 会静默变成"永远不被触发"的空断言
+  //    （AGENTS §4.3：否定式判据/护栏静默失明）。
+  bool fail_claim = false;
+  fss::ErrorKind claim_error = fss::ErrorKind::kInternal;
+  int claim_calls = 0;
+  bool fail_mark_ready = false;
+  fss::ErrorKind mark_ready_error = fss::ErrorKind::kInternal;
+  int mark_ready_calls = 0;
+  bool fail_release = false;
+  fss::ErrorKind release_error = fss::ErrorKind::kInternal;
+  int release_calls = 0;
+
   fss::Result<domain::FileMetadataRecord> Create(std::string_view partition,
                                                 const domain::FileMetadataRecord& record) override {
     ++create_calls;
@@ -463,6 +476,31 @@ class FaultyMetadataRepository final : public domain::IMetadataRepository {
       return Err(create_error, "测试替身：写入元数据记录失败");
     }
     return inner_.Create(partition, record);
+  }
+  fss::Result<domain::MetadataClaim> ClaimForWrite(
+      std::string_view partition, const domain::FileMetadataRecord& record) override {
+    ++claim_calls;
+    if (fail_claim) {
+      return Err(claim_error, "测试替身：领取元数据写入权失败");
+    }
+    return inner_.ClaimForWrite(partition, record);
+  }
+  fss::Result<domain::FileMetadataRecord> MarkReady(
+      std::string_view partition, std::string_view record_id, std::int64_t version,
+      const domain::FileMetadataRecord& record) override {
+    ++mark_ready_calls;
+    if (fail_mark_ready) {
+      return Err(mark_ready_error, "测试替身：标记元数据 ready 失败");
+    }
+    return inner_.MarkReady(partition, record_id, version, record);
+  }
+  fss::Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
+                                 std::int64_t version) override {
+    ++release_calls;
+    if (fail_release) {
+      return Err(release_error, "测试替身：放弃领取失败");
+    }
+    return inner_.ReleaseClaim(partition, record_id, version);
   }
   fss::Result<domain::FileMetadataRecord> GetById(std::string_view partition,
                                                  std::string_view record_id) override {

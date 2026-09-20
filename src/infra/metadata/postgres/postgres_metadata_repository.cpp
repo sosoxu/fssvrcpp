@@ -19,17 +19,24 @@ namespace {
 //    无 `NULLS NOT DISTINCT`、无 PG-14 专属 GUC。`to_timestamp(bigint)` 自 8.1 起可用。
 constexpr const char* kSelectLatestById = R"sql(
 SELECT version, data FROM file_metadata_records
- WHERE partition_id = $1 AND id = $2 AND is_latest AND state <> 'deleted')sql";
+ WHERE partition_id = $1 AND id = $2 AND is_latest AND state = 'ready')sql";
 
 constexpr const char* kSelectLatestBySource = R"sql(
 SELECT version, data FROM file_metadata_records
+ WHERE partition_id = $1 AND file_source = $2 AND is_latest AND state = 'ready')sql";
+
+//  ★ C1：领取路径按幂等键取**活动**行（claiming 或 ready），连带回传状态。
+constexpr const char* kSelectClaimBySource = R"sql(
+SELECT version, data, state FROM file_metadata_records
  WHERE partition_id = $1 AND file_source = $2 AND is_latest AND state <> 'deleted')sql";
 
-constexpr const char* kSelectIdExists = R"sql(
-SELECT 1 FROM file_metadata_records
- WHERE partition_id = $1 AND id = $2 AND state <> 'deleted' LIMIT 1)sql";
+//  ★ C1：MarkReady 0 行更新时的**歧义消解**（区分"版本不存在"与"幂等键不符"）。
+constexpr const char* kSelectVersionState = R"sql(
+SELECT state, file_source FROM file_metadata_records
+ WHERE partition_id = $1 AND id = $2 AND version = $3::int)sql";
 
-//  ★ ADR-009 §4.2 的**原子领取**（M2 修复）：一条语句完成"插入本版本 + 冲突则放弃"。
+//  ★ ADR-009 §4.2 的**原子领取**（M2 修复），本切片把插入状态改成 `'claiming'`
+//    （复制成功后再由 `kMarkReady` 翻到 `'ready'`）。一条语句完成"插入本版本 + 冲突则放弃"。
 //    `ON CONFLICT (partition_id, file_source) WHERE state <> 'deleted' AND is_latest`
 //    的谓词必须与 `db/migrations/001_init.sql` 的 `ux_mr_source` **逐字一致**，否则
 //    PostgreSQL 无法推断出该部分唯一索引（实测两引擎报 42P10）；
@@ -38,17 +45,33 @@ constexpr const char* kClaimInsert = R"sql(
 INSERT INTO file_metadata_records
   (partition_id, id, version, kind, state, is_latest, created_at, created_by,
    acl_viewers, acl_owners, legal_tags, file_source, data)
-VALUES ($1, $2, 1, $3, 'ready', TRUE, to_timestamp($4::bigint), '',
+VALUES ($1, $2, 1, $3, 'claiming', TRUE, to_timestamp($4::bigint), '',
         $5::jsonb, $6::jsonb, $7::jsonb, $8, $9::jsonb)
 ON CONFLICT (partition_id, file_source) WHERE state <> 'deleted' AND is_latest DO NOTHING
 RETURNING id, version)sql";
+
+//  ★ C1：claiming → ready，并一次性把**最终**记录（含复制后才算出的 checksum）与镜像列同步。
+//    `file_source = $4` 是幂等键守卫：不一致 → 0 行 → 由 `kSelectVersionState` 判为
+//    kInvalidArgument，且行**保持 claiming**（调用方仍可 ReleaseClaim）。
+constexpr const char* kMarkReady = R"sql(
+UPDATE file_metadata_records
+   SET state = 'ready', data = $5::jsonb, kind = $6,
+       acl_viewers = $7::jsonb, acl_owners = $8::jsonb, legal_tags = $9::jsonb
+ WHERE partition_id = $1 AND id = $2 AND version = $3::int
+   AND state = 'claiming' AND file_source = $4
+RETURNING version, data)sql";
+
+//  ★ C1：放弃领取 —— 只删 claiming 行（ready 行删不到 → 0 行 → kNotFound）。
+constexpr const char* kReleaseClaim = R"sql(
+DELETE FROM file_metadata_records
+ WHERE partition_id = $1 AND id = $2 AND version = $3::int AND state = 'claiming')sql";
 
 //  ★ 版本链（R6）：先把旧的 is_latest 清零，再插入新版本 —— 两条语句必须在**同一事务**里
 //    （`Update` 用 BEGIN/COMMIT/ROLLBACK 控制），否则中间态会短暂出现"没有 latest"或
 //    "两个 latest"（后者会被 ux_mr_latest 拒绝）。
 constexpr const char* kClearLatest = R"sql(
 UPDATE file_metadata_records SET is_latest = FALSE
- WHERE partition_id = $1 AND id = $2 AND is_latest AND state <> 'deleted')sql";
+ WHERE partition_id = $1 AND id = $2 AND is_latest AND state = 'ready')sql";
 
 constexpr const char* kInsertVersion = R"sql(
 INSERT INTO file_metadata_records
@@ -65,14 +88,14 @@ DELETE FROM file_metadata_records WHERE partition_id = $1 AND id = $2)sql";
 constexpr const char* kCountVersions = R"sql(
 SELECT COUNT(*) FROM file_metadata_records WHERE partition_id = $1 AND id = $2)sql";
 
-//  `List` 的基句：只取 latest 且未删除的行；过滤/排序/分页在下面按需拼接（占位符编号连续）。
+//  `List` 的基句：只取 latest 且**已 ready** 的行；过滤/排序/分页在下面按需拼接（占位符编号连续）。
 constexpr const char* kSelectListBase = R"sql(
 SELECT version, data FROM file_metadata_records
- WHERE partition_id = $1 AND is_latest AND state <> 'deleted')sql";
+ WHERE partition_id = $1 AND is_latest AND state = 'ready')sql";
 
 constexpr const char* kCountListBase = R"sql(
 SELECT COUNT(*) FROM file_metadata_records
- WHERE partition_id = $1 AND is_latest AND state <> 'deleted')sql";
+ WHERE partition_id = $1 AND is_latest AND state = 'ready')sql";
 
 //  ---- 通用小工具（消息与 SqliteMetadataRepository 保持一致）----
 fss::Error Invalid(const std::string& message) {
@@ -89,6 +112,13 @@ bool HasPrefix(std::string_view text, std::string_view prefix) {
 std::int64_t ParseInt64(const std::string& text) {
   if (text.empty()) return 0;
   return static_cast<std::int64_t>(std::strtoll(text.c_str(), nullptr, 10));
+}
+
+//  ★ C1：`state` 列 → 领域枚举（与 SqliteMetadataRepository 的映射逐字一致）。
+domain::MetadataState ParseMetadataState(std::string_view text) {
+  if (text == "claiming") return domain::MetadataState::kClaiming;
+  if (text == "deleted") return domain::MetadataState::kDeleted;
+  return domain::MetadataState::kReady;
 }
 
 std::string DumpStringArray(const std::vector<std::string>& items) {
@@ -158,33 +188,54 @@ fss::Result<domain::FileMetadataRecord> PostgresMetadataRepository::FindLatestBy
   return RowToRecord(result.value(), 0);
 }
 
+fss::Result<domain::FileMetadataRecord> PostgresMetadataRepository::FindClaimBySource(
+    PgConnection& connection, std::string_view partition, std::string_view file_source,
+    domain::MetadataState* state) {
+  const auto result = connection.ExecParams(kSelectClaimBySource,
+                                            {std::string(partition), std::string(file_source)});
+  if (!result.ok()) return Annotate(result.error(), "查询元数据记录失败");
+  if (result.value().RowCount() == 0) return NotFound("Record Not Found");
+  //  列顺序：version, data, state（与 RowToRecord 的 2 列布局不同，故单独解析）
+  FSS_TRY(value, json::ParseObject(result.value().Value(0, 1)));
+  FSS_TRY(record, domain::ParseFileMetadataRecord(value));
+  record.version = ParseInt64(result.value().Value(0, 0));
+  if (state != nullptr) *state = ParseMetadataState(result.value().Value(0, 2));
+  return record;
+}
+
 // =============================================================================
-//  Create（原子领取）
+//  Create / ClaimForWrite / MarkReady / ReleaseClaim（ADR-009 §4.2）
 // =============================================================================
 fss::Result<domain::FileMetadataRecord> PostgresMetadataRepository::Create(
+    std::string_view partition, const domain::FileMetadataRecord& record) {
+  FSS_TRY(ValidateRecord(partition, record));
+  //  ★ C1：用新原语实现（claim → mark ready）。可观测语义与接线前逐字一致。
+  FSS_TRY(claim, ClaimForWrite(partition, record));
+  if (!claim.claimed) {
+    //  既有记录（ready，或另一个实例正在 claiming）→ 返回既有 id（旧 Create 的幂等语义）。
+    return claim.record;
+  }
+  return MarkReady(partition, claim.record.id, claim.record.version, claim.record);
+}
+
+fss::Result<domain::MetadataClaim> PostgresMetadataRepository::ClaimForWrite(
     std::string_view partition, const domain::FileMetadataRecord& record) {
   FSS_TRY(ValidateRecord(partition, record));
   const std::string file_source =
       record.data.dataset_properties.file_source_info.file_source;
   FSS_TRY(handle, pool_->Borrow());
 
-  //  ★ 幂等键先查：同 (partition, file_source) 已存在 → 返回**第一次那条**（R5）。
-  if (auto existing = FindLatestBySource(*handle, partition, file_source); existing.ok()) {
-    return existing.value();
-  }
-
-  //  同 id 已被别的 file_source 占用 → 拒绝（否则会破坏"一个 id 一条链"的不变量）
+  //  ★ 幂等键先查：同 (partition, file_source) 已有活动记录（ready/claiming）→ 返回它。
+  //    claiming 也返回 claimed=false：**不复制**正是本切片的目的。
   {
-    const auto probe =
-        handle->ExecParams(kSelectIdExists, {std::string(partition), record.id});
-    if (!probe.ok()) return Annotate(probe.error(), "查询元数据 id 失败");
-    if (probe.value().RowCount() > 0) {
-      //  ★ 并发实例可能刚刚插入**同一个 file_source** 的那条：先按幂等键回读，
-      //    只有确实"同 id 但 file_source 不同"才拒绝（ADR-009 M2 / R5）
-      if (auto existing = FindLatestBySource(*handle, partition, file_source); existing.ok()) {
-        return existing.value();
-      }
-      return Invalid("同 id 已存在且 file_source 不同：" + record.id);
+    domain::MetadataState state = domain::MetadataState::kReady;
+    if (auto existing = FindClaimBySource(*handle, partition, file_source, &state);
+        existing.ok()) {
+      domain::MetadataClaim out;
+      out.claimed = false;
+      out.record = existing.value();
+      out.state = state;
+      return out;
     }
   }
 
@@ -192,6 +243,7 @@ fss::Result<domain::FileMetadataRecord> PostgresMetadataRepository::Create(
   stored.version = 1;
   const std::int64_t created_at = clock_->NowEpochSeconds();
 
+  //  ★★ 单语句原子领取（R1 注入点①：拆成"先查后插"两条语句 → 并发下会出现多个 winner）。
   const auto inserted = handle->ExecParams(
       kClaimInsert,
       {std::string(partition), stored.id, stored.kind, std::to_string(created_at),
@@ -199,11 +251,17 @@ fss::Result<domain::FileMetadataRecord> PostgresMetadataRepository::Create(
        DumpStringArray(stored.legal.legaltags), file_source,
        json::Dump(domain::ToJson(stored))});
   if (!inserted.ok()) {
-    //  主键冲突（同 id 但不同 file_source 且 version 相同）被 MapPgError 映射成
-    //  kLocationAlreadyExists（23505）—— 这里按幂等语义恢复，不把 UNIQUE 冲突当 500。
+    //  主键/ux_mr_latest 冲突（同 id 但不同 file_source）被 MapPgError 映射成
+    //  kLocationAlreadyExists（23505）—— 按幂等语义恢复，不把 UNIQUE 冲突当 500。
     if (inserted.error().kind() == fss::ErrorKind::kLocationAlreadyExists) {
-      if (auto existing = FindLatestBySource(*handle, partition, file_source); existing.ok()) {
-        return existing.value();
+      domain::MetadataState state = domain::MetadataState::kReady;
+      if (auto existing = FindClaimBySource(*handle, partition, file_source, &state);
+          existing.ok()) {
+        domain::MetadataClaim out;
+        out.claimed = false;
+        out.record = existing.value();
+        out.state = state;
+        return out;
       }
       return Invalid("同 id 已存在且 file_source 不同：" + record.id);
     }
@@ -211,13 +269,73 @@ fss::Result<domain::FileMetadataRecord> PostgresMetadataRepository::Create(
   }
   //  ★ 原子领取失败（另一个实例赢了竞态）：0 行返回 → 按幂等键回读并返回那条。
   if (inserted.value().RowCount() == 0) {
-    if (auto existing = FindLatestBySource(*handle, partition, file_source); existing.ok()) {
-      return existing.value();
+    domain::MetadataState state = domain::MetadataState::kReady;
+    if (auto existing = FindClaimBySource(*handle, partition, file_source, &state);
+        existing.ok()) {
+      domain::MetadataClaim out;
+      out.claimed = false;
+      out.record = existing.value();
+      out.state = state;
+      return out;
     }
     return fss::Err(fss::ErrorKind::kInternal,
                     "插入元数据失败：claim 未插入且按 file_source 回读为空");
   }
-  return stored;
+  domain::MetadataClaim out;
+  out.claimed = true;
+  out.record = stored;
+  out.state = domain::MetadataState::kClaiming;
+  return out;
+}
+
+fss::Result<domain::FileMetadataRecord> PostgresMetadataRepository::MarkReady(
+    std::string_view partition, std::string_view record_id, std::int64_t version,
+    const domain::FileMetadataRecord& record) {
+  FSS_TRY(ValidateRecord(partition, record));
+  //  ★ `record_id` / `version`（列语义）是权威的：不做"record.version 必须等于 version"的
+  //    拒绝（否则"版本不存在 → kNotFound"的契约判据会变成 kInvalidArgument）。
+  const std::string file_source =
+      record.data.dataset_properties.file_source_info.file_source;
+  domain::FileMetadataRecord stored = record;
+  stored.id = std::string(record_id);
+  stored.version = version;
+  FSS_TRY(handle, pool_->Borrow());
+
+  const auto updated = handle->ExecParams(
+      kMarkReady,
+      {std::string(partition), std::string(record_id), std::to_string(version), file_source,
+       json::Dump(domain::ToJson(stored)), stored.kind, DumpStringArray(stored.acl.viewers),
+       DumpStringArray(stored.acl.owners), DumpStringArray(stored.legal.legaltags)});
+  if (!updated.ok()) return Annotate(updated.error(), "mark-ready 失败");
+  if (updated.value().RowCount() > 0) return RowToRecord(updated.value(), 0);
+
+  //  0 行更新：区分"版本不存在/不是 claiming"（kNotFound）与"幂等键不符"（kInvalidArgument，
+  //  且行**保持 claiming**，调用方仍可 ReleaseClaim）。
+  const auto probe = handle->ExecParams(
+      kSelectVersionState,
+      {std::string(partition), std::string(record_id), std::to_string(version)});
+  if (!probe.ok()) return Annotate(probe.error(), "查询元数据版本失败");
+  if (probe.value().RowCount() == 0) return NotFound("Record Not Found");
+  if (probe.value().Value(0, 0) != "claiming") return NotFound("Record Not Found");
+  if (probe.value().Value(0, 1) != file_source) {
+    return Invalid("MarkReady 不得改写 (partition, file_source) 幂等键");
+  }
+  return NotFound("Record Not Found");
+}
+
+fss::Result<void> PostgresMetadataRepository::ReleaseClaim(std::string_view partition,
+                                                           std::string_view record_id,
+                                                           std::int64_t version) {
+  if (partition.empty()) return Invalid("partition 不能为空");
+  FSS_TRY(handle, pool_->Borrow());
+  const auto result = handle->ExecParams(
+      kReleaseClaim, {std::string(partition), std::string(record_id), std::to_string(version)});
+  if (!result.ok()) return Annotate(result.error(), "放弃领取失败");
+  if (result.value().AffectedRows() == 0) {
+    //  只删 claiming 行 → 版本不存在 / 已是 ready 都归为 kNotFound。
+    return NotFound("Record Not Found（该版本不是 claiming 状态）");
+  }
+  return Ok();
 }
 
 // =============================================================================

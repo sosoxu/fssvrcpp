@@ -208,7 +208,10 @@ TEST_CASE("★ C9.2 ② 元数据写入失败（DB 只读/锁的等价物）→ 
   const std::string file_source = json.value()["Location"]["FileSource"].get<std::string>();
 
   fss::test::FaultyMetadataRepository& faulty = fx.faulty;
-  faulty.fail_create = true;  // ★ 注入：写入元数据失败（DB 只读/锁的等价物）
+  //  ★ C1：用例的写路径已经是 `ClaimForWrite`（复制之前原子领取），不再调用 `Create`。
+  //    因此"DB 只读/锁"等价故障必须注入到**领取**这一步 —— 注入 `fail_create` 会静默失效
+  //    （用例根本不走那条路径，测试会在 201 上通过却什么都证明不了）。
+  faulty.fail_claim = true;  // ★ 注入：领取元数据写入权失败（DB 只读/锁的等价物）
 
   auto record = fss::test::AppFixture::MakeRecord(file_source, "fault.bin");
   const std::string body = fss::json::Dump(fss::domain::ToJson(record));
@@ -216,9 +219,11 @@ TEST_CASE("★ C9.2 ② 元数据写入失败（DB 只读/锁的等价物）→ 
   INFO("元数据写入失败 → " << failed.status << " " << failed.body);
   REQUIRE(failed.status == 500);  // kInternal → 500
   REQUIRE(failed.body.find("\"code\":500") != std::string::npos);
+  //  接缝真的被走到（正控：证明失败发生在领取步骤，而不是别处顺手失败）
+  REQUIRE(faulty.claim_calls == 1);
 
   const double recovery_ms = MeasureRecoveryMillis(
-      [&] { faulty.fail_create = false; },
+      [&] { faulty.fail_claim = false; },
       [&] {
         const auto retry = HttpDo(port, "POST", "/api/file/v2/files/metadata", Authed(), body);
         return retry.status == 201;

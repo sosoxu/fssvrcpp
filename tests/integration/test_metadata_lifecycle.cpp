@@ -592,14 +592,17 @@ TEST_CASE("★ C6.3 故障③：第 7 步校验和回算失败 → **回滚删�
   REQUIRE(fx.metadata.List(fx.caller.partition, query).value().total == 0);
 }
 
-TEST_CASE("★ C6.3 故障④：第 9 步写记录失败 → 回滚删除 persistent + 500",
+TEST_CASE("★ C6.3/C1 故障④：第 9 步写记录失败（MarkReady）→ 回滚删除 persistent + 释放领取 + 500",
           "[phase6][integration][c6.3]") {
   AppFixture fx;
   const auto uploaded = UploadWithContent(fx, "fault-step9");
   const ObjectRef persistent = PersistentRef(fx, uploaded.staging_ref);
 
   fss::test::FaultyMetadataRepository failing{fx.metadata};
-  failing.fail_create = true;
+  //  ★ C1：第 9 步现在是 `MarkReady`（claiming→ready），且它在**复制之后**。
+  //    注入点必须跟着迁移：`fail_create` 已经不在这条路径上，用它会让用例静默通过 201
+  //    （旧测试在新实现下"仍然绿"却什么都没证明 —— 这正是要避免的静默失明）。
+  failing.fail_mark_ready = true;
   fx.UseMetadata(failing);
 
   auto record = AppFixture::MakeRecord(uploaded.file_source, "step9.bin");
@@ -608,7 +611,7 @@ TEST_CASE("★ C6.3 故障④：第 9 步写记录失败 → 回滚删除 persis
   REQUIRE_FALSE(result.ok());
   REQUIRE(result.error().kind() == fss::ErrorKind::kInternal);  // → 500
   REQUIRE(result.error().message().find("写入元数据记录失败") != std::string::npos);
-  REQUIRE(failing.create_calls == 1);
+  REQUIRE(failing.mark_ready_calls == 1);
 
   REQUIRE(fx.events.statuses() == std::vector<std::string>{"IN_PROGRESS", "FAILED"});
   REQUIRE(HasAudit(fx.audit, "createMetadataFailure", "failure"));
@@ -617,6 +620,62 @@ TEST_CASE("★ C6.3 故障④：第 9 步写记录失败 → 回滚删除 persis
   REQUIRE_FALSE(fx.blob.stat(persistent).value().exists);
   // ★ staging 仍在 → 证明第 11 步的清理确实发生在第 9 步**之后**
   REQUIRE(fx.blob.stat(uploaded.staging_ref).value().exists);
+
+  // ★ C1：领取必须被释放（ReleaseClaim 被调用），且**没有客户端可见记录**
+  REQUIRE(failing.release_calls == 1);
+  const auto by_source = fx.metadata.GetLatestByFileSource(fx.caller.partition,
+                                                           uploaded.file_source);
+  REQUIRE_FALSE(by_source.ok());
+  REQUIRE(by_source.error().kind() == fss::ErrorKind::kNotFound);
+  fss::domain::MetadataQuery query;
+  REQUIRE(fx.metadata.List(fx.caller.partition, query).value().total == 0);
+
+  // ★ 正控：清掉故障后用**同一条查找路径**重试必须成功（证明上面的 kNotFound 不是
+  //    "路径写错所以恒真"），并且这次真的能看到记录 —— 即 file_source 可被重新领取。
+  failing.fail_mark_ready = false;
+  const auto retry =
+      create.Execute(fx.caller, AppFixture::MakeRecord(uploaded.file_source, "retry.bin"));
+  INFO("重试：" << (retry.ok() ? std::string("ok") : retry.error().ToString()));
+  REQUIRE(retry.ok());
+  const auto visible = fx.metadata.GetLatestByFileSource(fx.caller.partition,
+                                                        uploaded.file_source);
+  REQUIRE(visible.ok());
+  REQUIRE(visible.value().id == retry.value());
+  REQUIRE(fx.metadata.List(fx.caller.partition, query).value().total == 1);
+}
+
+TEST_CASE("★ C1 故障：放弃领取本身失败 → 原错误返回 + 审计告警 +（如实断言）claiming 行残留",
+          "[phase6][integration][c6.3]") {
+  AppFixture fx;
+  const auto uploaded = UploadWithContent(fx, "fault-release");
+
+  fss::test::FaultyMetadataRepository failing{fx.metadata};
+  failing.fail_mark_ready = true;   // 触发"复制成功后 mark-ready 失败"
+  failing.fail_release = true;      // 再让放弃领取也失败（双重故障）
+  fx.UseMetadata(failing);
+
+  CreateFileMetadata create(*fx.ports);
+  const auto result =
+      create.Execute(fx.caller, AppFixture::MakeRecord(uploaded.file_source, "rel.bin"));
+  REQUIRE_FALSE(result.ok());
+  //  原错误（mark-ready 失败）仍然返回，不被"释放失败"改写
+  REQUIRE(result.error().kind() == fss::ErrorKind::kInternal);
+  REQUIRE(result.error().message().find("写入元数据记录失败") != std::string::npos);
+  REQUIRE(failing.release_calls == 1);  // 释放**被尝试过**
+  //  ★ 释放失败必须**可见**：一条审计告警（否则 claiming 行残留会无人察觉）
+  REQUIRE(HasAudit(fx.audit, "createMetadataClaimReleaseFailure", "failure"));
+
+  //  ★ 如实断言这条故障的后果：claiming 行残留 ⇒ 该 file_source 在 GC 回收之前
+  //    **无法**被重新领取（claim 返回 claimed=false/claiming）。这是"崩溃/释放失败"
+  //    的已知未交付面（租约回收是下一个切片），不是被测试掩盖的东西。
+  auto probe = AppFixture::MakeRecord(uploaded.file_source, "probe.bin");
+  probe.id = fx.caller.partition + ":dataset--File.Generic:probe";
+  const auto reclaim = fx.metadata.ClaimForWrite(fx.caller.partition, probe);
+  REQUIRE(reclaim.ok());
+  REQUIRE_FALSE(reclaim.value().claimed);
+  REQUIRE(reclaim.value().state == fss::domain::MetadataState::kClaiming);
+  //  但客户端仍然看不到任何记录
+  REQUIRE_FALSE(fx.metadata.GetLatestByFileSource(fx.caller.partition, uploaded.file_source).ok());
 }
 
 TEST_CASE("★ C6.3 故障⑤：第 10 步 SUCCESS 事件失败 → 非致命，仍 201",
@@ -768,4 +827,59 @@ TEST_CASE("★ C6.9 ≥1 GiB 搬迁 + 流式回算：RSS 增长 < 64 MiB",
   REQUIRE(stored.ok());
   REQUIRE(*stored.value().data.checksum == expected);
   REQUIRE(*stored.value().data.checksum_algorithm == "SHA256");
+}
+
+// =============================================================================
+//  ★ C1：另一实例正在 claiming → **真实 HTTP 端点**返回 503 + 可读原因
+// =============================================================================
+//  判据（ADR-009 §4.2）：`claiming` 期间的第二个提交**不复制**、有界等待后返回
+//  `kUnavailable` → 契约 §5 映射为 **503**。这里走完整 HTTP 路径（uploadURL → PUT →
+//  POST metadata），而不是只断言用例层的 ErrorKind —— R15：写进契约的"503"要有测试
+//  真的执行过那条路径。
+TEST_CASE("★ C1 端到端：另一实例 claiming → POST /v2/files/metadata 返回 503（可读原因）",
+          "[phase6][integration][c6.3][c1]") {
+  fss::test::HttpFixture fx;
+  const int port = fx.port();
+
+  const auto upload =
+      fss::test::HttpDo(port, "GET", "/api/file/v2/files/uploadURL", fss::test::Authed());
+  REQUIRE(upload.status == 200);
+  const auto upload_json = fss::json::ParseObject(upload.body);
+  REQUIRE(upload_json.ok());
+  const std::string file_source =
+      upload_json.value()["Location"]["FileSource"].get<std::string>();
+  const auto put = fss::test::HttpDo(
+      port, "PUT",
+      fss::test::TargetOf(upload_json.value()["Location"]["SignedURL"].get<std::string>()),
+      fss::test::Authed(), "claiming-body");
+  REQUIRE(put.status == 200);
+
+  //  ★ 用**仓储层直接领取**把"另一个实例（正在复制）"变成确定性的既有状态
+  //    （不靠 sleep 猜时序，AGENTS §4.3）。
+  auto held = AppFixture::MakeRecord(file_source, "held-e2e.bin");
+  held.id = "opendes:dataset--File.Generic:held-e2e";
+  const auto claim = fx.metadata.ClaimForWrite("opendes", held);
+  REQUIRE(claim.ok());
+  REQUIRE(claim.value().claimed);
+  REQUIRE_FALSE(fx.metadata.GetLatestByFileSource("opendes", file_source).ok());  // claiming 不可见
+
+  auto record = AppFixture::MakeRecord(file_source, "loser-e2e.bin");
+  const std::string body = fss::json::Dump(fss::domain::ToJson(record));
+  const auto blocked =
+      fss::test::HttpDo(port, "POST", "/api/file/v2/files/metadata", fss::test::Authed(), body);
+  INFO("blocked → " << blocked.status << " " << blocked.body);
+  REQUIRE(blocked.status == 503);
+  REQUIRE(blocked.body.find("\"code\":503") != std::string::npos);
+  //  可读原因必须真的出现（客户端据此判断"重试"而不是"请求错了"）
+  REQUIRE(blocked.body.find("claiming") != std::string::npos);
+
+  //  ★ 正控：winner 标 ready 之后，同一个请求返回 201 且 id 就是既有那条
+  REQUIRE(fx.metadata.MarkReady("opendes", held.id, 1, held).ok());
+  const auto retry =
+      fss::test::HttpDo(port, "POST", "/api/file/v2/files/metadata", fss::test::Authed(), body);
+  INFO("retry → " << retry.status << " " << retry.body);
+  REQUIRE(retry.status == 201);
+  const auto retry_json = fss::json::ParseObject(retry.body);
+  REQUIRE(retry_json.ok());
+  REQUIRE(retry_json.value()["id"].get<std::string>() == held.id);
 }

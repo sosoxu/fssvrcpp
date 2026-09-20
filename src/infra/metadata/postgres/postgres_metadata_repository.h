@@ -39,7 +39,7 @@
 //    | `created_at INTEGER` | `created_at TIMESTAMPTZ` | **写**注入时钟的 epoch 秒（`to_timestamp($n::bigint)`）；**读/过滤**用 `floor(extract(epoch from created_at))::bigint`（`floor` 而非裸 `::bigint`：截断语义与 SQLite 的整数 epoch 一致，四舍五入会带来 ±1 s 漂移，破坏**含端点**的时间区间过滤） |
 //    | `created_by`         | `created_by`    | SQLite 写 `""`；PG 的列 NOT NULL 且无默认值 → 同样写 `""`（逐字节一致） |
 //    | `data TEXT`          | `data JSONB`    | 存 `json::Dump(domain::ToJson(record))` —— 与 SQLite 绑定的**是同一份完整信封**，未知/额外字段无损往返 |
-//    | （无）               | `state`         | **所有读取都过滤 `state <> 'deleted'`**；`Create`/`Update` 写 `'ready'`。`Delete` 是**硬删除全部版本**（见下） |
+//    | （无）               | `state`         | ★ C1：**所有客户端读取路径都只取 `state = 'ready'`**（claiming 对客户端不可见）；`ClaimForWrite` 写 `'claiming'`、`MarkReady` 翻 `'ready'`、`Update` 写 `'ready'`。`Delete` 是**硬删除全部版本**（见下）。字面量只出现在仓储内部，**绝不进记录 JSON** |
 //    | （无）               | `acl_viewers` / `acl_owners` / `legal_tags` | 写入时从记录填（`record.acl.viewers` / `record.acl.owners` / `record.legal.legaltags`），使这三列成为**忠实的反规范化镜像**而非永久为空；**读取只用 `data` JSON**（单一事实来源） |
 //
 //  ★ 时间基准：`created_at` 来自**注入的 `IClock`**（与 SQLite 逐字一致）。
@@ -47,11 +47,14 @@
 //    见 `PostgresLeaseRepository`）的 —— 元数据记录的 `created_at` 是应用时钟产生的时间戳，
 //    端口契约用 `ManualClock` 钉住它（时间区间过滤因此可确定性测试），组合根将来注入真实时钟。
 //
-//  ★ 本切片**未实现**的部分（如实登记，ADR-009 §10 第 2 项，留给后续切片）：
-//    · schema 里 `state = 'deleted'` 的**软删除**语义与 `claiming` → `ready` 状态机；
-//    · `CreateFileMetadata` 的**跨步骤**原子领取（本仓储只提供"单条 INSERT 的原子领取"）。
-//    读取路径已经过滤 `state <> 'deleted'`，因此**外部写入的 tombstone 行不会重新冒出来**；
-//    `Delete` 仍然是硬删除（与 SQLite 一致）。
+//  ★ C1（本切片）**已交付**：`claiming → ready` 状态机（`ClaimForWrite` / `MarkReady` /
+//    `ReleaseClaim`）与 `CreateFileMetadata` 的**跨步骤**原子领取 —— 领取发生在
+//    staging→persistent 复制**之前**，读取路径只返回 `state = 'ready'`。
+//  ★ 仍未交付（如实登记，留给后续切片）：
+//    · `state = 'deleted'` 的**软删除**语义（`Delete` 仍是硬删除，与 SQLite 一致）；
+//    · 崩溃遗留 `claiming` 行的**租约/GC 回收**（目前只能由 `ReleaseClaim` 或在途者的
+//      失败路径清掉；在该切片之前，残留行会让同一 fileSource 暂时无法被重新领取）。
+//    外部写入的 tombstone 行不会重新冒出来（读取路径已过滤）。
 //
 //  ★ 分区隔离是**每条语句**级的：所有 DML 都带 `partition_id` 条件
 //    （机械护栏 tests/unit/test_sql_guardrail.cpp；组合根未接线前，跨租户串数据
@@ -89,6 +92,13 @@ class PostgresMetadataRepository final : public domain::IMetadataRepository {
 
   fss::Result<domain::FileMetadataRecord> Create(std::string_view partition,
                                                  const domain::FileMetadataRecord& record) override;
+  fss::Result<domain::MetadataClaim> ClaimForWrite(
+      std::string_view partition, const domain::FileMetadataRecord& record) override;
+  fss::Result<domain::FileMetadataRecord> MarkReady(
+      std::string_view partition, std::string_view record_id, std::int64_t version,
+      const domain::FileMetadataRecord& record) override;
+  fss::Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
+                                 std::int64_t version) override;
   fss::Result<domain::FileMetadataRecord> GetById(std::string_view partition,
                                                   std::string_view record_id) override;
   fss::Result<domain::FileMetadataRecord> GetLatestByFileSource(
@@ -115,6 +125,11 @@ class PostgresMetadataRepository final : public domain::IMetadataRepository {
   fss::Result<domain::FileMetadataRecord> FindLatestBySource(PgConnection& connection,
                                                              std::string_view partition,
                                                              std::string_view file_source);
+  //  ★ C1：按幂等键取**活动**行（claiming 或 ready），并通过 `state` 回传它的状态。
+  fss::Result<domain::FileMetadataRecord> FindClaimBySource(PgConnection& connection,
+                                                            std::string_view partition,
+                                                            std::string_view file_source,
+                                                            domain::MetadataState* state);
 
   const fss::IClock* clock_ = nullptr;
   std::unique_ptr<PgPool> pool_;

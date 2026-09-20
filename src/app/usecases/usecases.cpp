@@ -10,7 +10,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <optional>
 #include <set>
+#include <thread>
 #include <utility>
 
 namespace fss::app {
@@ -290,6 +293,60 @@ fss::Result<std::string> ReturnExistingRecord(UseCasePorts& ports, const CallerC
   return existing.id;
 }
 
+//  ★ C1（ADR-009 §4.2）：领取成功后的**放弃**路径（复制 / 校验和 / mark-ready 失败时）。
+//
+//  顺序是**先删对象、再释放领取**，理由：
+//    · 删除对象时我们**仍持有 claim** ⇒ 没有别的实例能领到同一个 (partition, file_source)，
+//      因此也没有别的实例会写同一个 `to_ref` —— 我们删掉的一定是自己复制的对象，
+//      不会删掉"别人刚写好的对象"。
+//    · 反过来（先 ReleaseClaim 再删对象）会打开一个真实的窗口：另一个实例领到后开始复制，
+//      而我们随后按同样的 to_ref 把它删掉 ⇒ 对方返回 201 但对象已经没了（P6-D13 的反方向）。
+//    · `RollbackCreatedObject` 的守卫（按 file_source 查到**记录**就不删）保持不变。注意
+//      读取路径只认 `ready`，因此它**看不到**我们自己的 claiming 行 —— 这正是我们要的：
+//      在我们持有 claim 期间，to_ref 只可能由我们创建，删它是安全的。若存在既有 ready
+//      记录（理论上不可能：ClaimForWrite 会返回 claimed=false），守卫会保留对象。
+//    · 释放失败 = claiming 行残留（该 file_source 在 GC 回收前无法被重新领取）。这是
+//      **非致命但必须可见**的异常：记一条审计告警，原来的错误照常返回。
+void AbortClaimedCreate(UseCasePorts& ports, const CallerContext& caller,
+                        const std::optional<domain::ObjectRef>& to_ref,
+                        std::string_view file_source, std::string_view record_id,
+                        std::int64_t version) {
+  if (to_ref.has_value()) {
+    RollbackCreatedObject(ports, caller, *to_ref, file_source, record_id);
+  }
+  const auto released = ports.metadata.ReleaseClaim(caller.partition, record_id, version);
+  if (!released.ok()) {
+    (void)RecordAudit(ports, "createMetadataClaimReleaseFailure", caller, record_id, false);
+  }
+}
+
+//  ★ C1：另一个实例正在 `claiming` 同一个 fileSource 时的**有界等待**。
+//  为什么是"等待而不是直接 503"：最常见的形态是并发重试——赢家通常几十毫秒内就 mark
+//  ready；直接失败会把一个本可成功的请求变成 503（客户端还得自己重试）。
+//  为什么是**有界**且**不复制**：claiming 期间对象可能还没复制完，复制是赢家的职责；
+//  预算（≈2 s、50 ms 间隔）是固定的，不引入新的配置键（leases.* 仍是"已读但无效果"）。
+fss::Result<std::string> WaitForExistingClaim(UseCasePorts& ports, const CallerContext& caller,
+                                              const std::string& file_source) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+  for (;;) {
+    //  ★ 轮询走 `GetLatestByFileSource`（它的读取路径只返回 ready）：一旦赢家 mark ready
+    //    就会命中，返回同一条 id；仍 claiming 时它返回 kNotFound。
+    if (auto existing = ports.metadata.GetLatestByFileSource(caller.partition, file_source);
+        existing.ok()) {
+      return ReturnExistingRecord(ports, caller, existing.value());
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) break;
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    std::this_thread::sleep_for(remaining < std::chrono::milliseconds(50)
+                                    ? remaining
+                                    : std::chrono::milliseconds(50));
+  }
+  return Err(fss::ErrorKind::kUnavailable,
+             "另一实例正在登记同一 fileSource（claiming 中），请重试");
+}
+
 //  读取对象内容（用于计算校验和；仅在存储没有给出校验和时调用）
 
 bool LooksLikeFileSource(std::string_view value) {
@@ -492,7 +549,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   out.id = caller.partition + ":dataset--File.Generic:" + ports_.ids.NewUuidNoDash();
   out.version = 1;
 
-  // 4b. **幂等快路径**：同 (partition, FileSource) 已有记录 → 直接返回它。
+  // 4b. **幂等快路径**：同 (partition, FileSource) 已有**ready** 记录 → 直接返回它。
   //     ★ 顺序很重要：必须在"复制 + 清理 staging"**之前**判断。否则重试（或并发实例）
   //       会去复制一个已经被上一个成功请求清理掉的 staging 对象 → 502（P6-D13）；
   //       更糟的是它的回滚会把对方刚写好的 persistent 对象删掉。
@@ -501,10 +558,32 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     return ReturnExistingRecord(ports_, caller, existing.value());
   }
 
+  // 4c. ★★ C1（ADR-009 §4.2）：**复制之前先原子领取**。
+  //     在此之前只做了纯校验与一次廉价读取（没有外部副作用）；从这里往后才动存储。
+  //     领取成功 = 本调用是唯一会复制 staging→persistent 的实例（并发下另一个会
+  //     claimed=false，**不复制**）。失败路径必须 `ReleaseClaim`，否则该 fileSource
+  //     在本进程的后续重试里永远领不到（崩溃回收是下一个切片）。
+  FSS_TRY(claim, ports_.metadata.ClaimForWrite(caller.partition, out));
+  if (!claim.claimed) {
+    if (claim.state == domain::MetadataState::kReady) {
+      //  另一个实例已经登记完成 → 幂等返回同一条（与 4b 同义，只是竞态发生在中间）。
+      return ReturnExistingRecord(ports_, caller, claim.record);
+    }
+    if (claim.state == domain::MetadataState::kClaiming) {
+      //  ★ 另一个实例正在登记：**有界等待**（≈2 s）后 503，**绝不复制**（这就是本切片的目的）。
+      return WaitForExistingClaim(ports_, caller, file_source);
+    }
+    //  kDeleted / 其它不一致状态：fail closed —— 宁可控地失败，也不复制一个语义不明的对象。
+    return Err(fss::ErrorKind::kInternal,
+               "元数据状态不一致：fileSource 已有非 ready/claiming 的活动记录，拒绝复制");
+  }
+  //  领取成功：`claim.record` 就是刚插入的 v1 claiming 行，它的 version 是 MarkReady 的锚点。
+  const std::int64_t claimed_version = claim.record.version;
+
   // 5. 位置记录（FileSource → 物理位置）
   const auto location_result = ports_.locations.FindByFileSource(caller.partition, file_source);
   if (!location_result.ok()) {
-    (void)RecordAudit(ports_, "createMetadataFailure", caller, out.id, false);
+    AbortClaimedCreate(ports_, caller, std::nullopt, file_source, out.id, claimed_version);
     //  ★ 消息逐字对齐上游：源路径在存储侧不存在时，上游（Azure/GCP provider 的 copyFile
     //    失败分支）抛 `INVALID_SOURCE_EXCEPTION + "/" + <path>`，期望报文见
     //    `output_payloads/File_invalid_fileSource_msg.json`。此前这里给的是中文消息，
@@ -533,13 +612,14 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     const auto copied = CopyBetweenZones(ports_, caller.partition, from_ref, to_ref, location.zone,
                                          domain::StorageZone::kPersistent);
     if (!copied.ok()) {
-      //  ★ 并发实例可能在我们复制期间已经登记成功并清理了 staging（源"消失"正是这么来的）：
-      //    此时幂等地返回既有记录，**不要**报错，更不要回滚（见 RollbackCreatedObject 的守卫）。
+      //  ★ 防御性幂等分支：拿到 claim 之后理论上不可达（别的实例无法在同一 fileSource 上
+      //    完成登记），但保留接线前的行为：既有 ready 记录存在 → 幂等返回，并释放我们自己的领取。
       if (auto existing = ports_.metadata.GetLatestByFileSource(caller.partition, file_source);
           existing.ok()) {
+        (void)ports_.metadata.ReleaseClaim(caller.partition, out.id, claimed_version);
         return ReturnExistingRecord(ports_, caller, existing.value());
       }
-      RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
+      AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
       //  依赖服务（存储）异常 → 502（契约 §2.6：失败 → 502/500）
       return Err(fss::ErrorKind::kBadGateway,
                  "复制到 persistent 失败：" + copied.error().message());
@@ -550,7 +630,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     const auto persistent_store = ports_.blobs.ForPartition(caller.partition,
                                                             domain::StorageZone::kPersistent);
     if (!persistent_store.ok()) {
-      RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
+      AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
       return Err(fss::ErrorKind::kBadGateway,
                  "无法解析 persistent 存储：" + persistent_store.error().message());
     }
@@ -558,7 +638,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     if (!existing.ok() || !existing.value().exists) {
       //  位置记录说"已经迁过"，但对象不在 → 依赖故障（或被人删过）。
       //  绝不能静默写一条指向空对象的记录。
-      RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
+      AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
       return Err(fss::ErrorKind::kBadGateway,
                  "persistent 对象缺失（位置记录已迁移但对象不存在）");
     }
@@ -594,9 +674,10 @@ fss::Result<std::string> CreateFileMetadata::Execute(
                                                    domain::StorageZone::kPersistent,
                                                    crypto::ChecksumAlgorithm::kSha256);
     if (!computed.ok()) {
-      //  ★ 第 7 步失败也属于第 12 步的"任一步 6/7/9 失败"：必须**回滚删除**已搬迁的对象。
+      //  ★ 第 7 步失败也属于第 12 步的"任一步 6/7/9 失败"：必须**回滚删除**已搬迁的对象，
+      //    并释放领取（否则 claiming 行残留、该 fileSource 无法重试）。
       //    此前这里是 `FSS_TRY`，直接 return 就漏掉了回滚（C6.3 的故障注入点③抓到）。
-      RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
+      AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
       return Err(fss::ErrorKind::kBadGateway,
                  "计算校验和失败：" + computed.error().message());
     }
@@ -611,10 +692,13 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     out.data.checksum_algorithm = source_info.checksum_algorithm;
   }
 
-  // 8/9. 写元数据记录（幂等键 = partition + FileSource）
-  const auto created = ports_.metadata.Create(caller.partition, out);
+  // 8/9. ★ C1：把 claiming 行推到 ready，并一次性落库**最终**记录（含上面刚算出的 checksum）。
+  //      ADR-009 §4.2 的顺序：领取（复制之前）→ 复制 → 算校验和 → claiming→ready。
+  //      `MarkReady` 必须发生在成功事件/审计**之前**：客户端绝不能看到"SUCCESS 但记录仍 claiming"。
+  const auto created =
+      ports_.metadata.MarkReady(caller.partition, out.id, claimed_version, out);
   if (!created.ok()) {
-    RollbackCreatedObject(ports_, caller, to_ref, file_source, out.id);
+    AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
     return Err(fss::ErrorKind::kInternal, "写入元数据记录失败：" + created.error().message());
   }
 

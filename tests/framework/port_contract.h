@@ -922,6 +922,170 @@ inline void CheckMetadataRepositoryContract(domain::IMetadataRepository& repo,
     ContractOk(repo.Delete(pa, pa + ":dataset--File.Generic:g1"), "Delete A");
     ContractOk(repo.GetLatestByFileSource(pb, "/shared/fs"), "删除 A 不影响 B");
   }
+
+  // ===========================================================================
+  //  ★ C1（ADR-009 §4.2）：claiming → ready 状态机（memory / SQLite / PG 共用同一套断言）
+  // ===========================================================================
+  //  语义登记：
+  //    · `ClaimForWrite` 原子领取：无活动记录 → 插入 `claiming` v1 并 claimed=true；
+  //      已有活动记录（claiming/ready）→ claimed=false + 既有记录 + 它的状态，**不报错、不复制**。
+  //    · `claiming` 行对**所有**客户端读取路径不可见（GetById / GetLatestByFileSource / List）。
+  //    · `MarkReady(partition, id, version, record)`：claiming→ready，并把**最终** record
+  //      （含 copy 后才算出的 checksum）一次落库；版本/行不存在 → kNotFound；
+  //      改 `file_source`（幂等键）→ kInvalidArgument 且**保持 claiming**。
+  //    · `ReleaseClaim(partition, id, version)`：只删 claiming 行，删不到 → kNotFound；
+  //      释放后同一 file_source 可被重新领取。
+  SECTION("★ C1 claim：ClaimForWrite 赢得领取权；claiming 行对三条读取路径不可见（含正控）") {
+    const std::string src = "/u/claim/visible";
+    const auto rec = MakeRecord(pa, "clm1", src, "claim-name");
+    const auto claim = ContractOk(repo.ClaimForWrite(pa, rec), "ClaimForWrite");
+    REQUIRE(claim.claimed);
+    REQUIRE(claim.state == domain::MetadataState::kClaiming);
+    REQUIRE(claim.record.id == rec.id);
+    REQUIRE(claim.record.version == 1);
+
+    //  负断言：claiming 行绝不能被当成 ready 交给客户端
+    ContractError(repo.GetById(pa, rec.id), fss::ErrorKind::kNotFound, "claiming → GetById 不可见");
+    ContractError(repo.GetLatestByFileSource(pa, src), fss::ErrorKind::kNotFound,
+                  "claiming → GetLatestByFileSource 不可见");
+    {
+      const auto page = ContractOk(repo.List(pa, domain::MetadataQuery{}), "claiming → List");
+      REQUIRE(page.total == 0);
+      REQUIRE(page.records.empty());
+    }
+
+    //  ★ 正控：同一条查询路径在 MarkReady 之后**必须**能看到
+    //    （否则上面的 kNotFound 可能只是"路径写错所以恒真"）
+    auto final_rec = rec;
+    final_rec.data.checksum = "feedface";
+    const auto ready = ContractOk(repo.MarkReady(pa, rec.id, 1, final_rec), "MarkReady");
+    REQUIRE(ready.id == rec.id);
+    REQUIRE(ready.version == 1);
+    const auto by_id = ContractOk(repo.GetById(pa, rec.id), "ready → GetById");
+    REQUIRE(by_id.data.name.has_value());
+    REQUIRE(*by_id.data.name == "claim-name");
+    const auto by_source = ContractOk(repo.GetLatestByFileSource(pa, src), "ready → GetLatest");
+    REQUIRE(by_source.id == rec.id);
+    const auto page = ContractOk(repo.List(pa, domain::MetadataQuery{}), "ready → List");
+    REQUIRE(page.total == 1);
+    REQUIRE(page.records.front().id == rec.id);
+  }
+
+  SECTION("★ C1 claim：第二次 ClaimForWrite 返回 claimed=false + 既有状态（claiming → ready）") {
+    const std::string src = "/u/claim/second";
+    const auto first = MakeRecord(pa, "clm2a", src, "first");
+    const auto claim1 = ContractOk(repo.ClaimForWrite(pa, first), "claim1");
+    REQUIRE(claim1.claimed);
+
+    const auto second = MakeRecord(pa, "clm2b", src, "second");
+    const auto claim2 = ContractOk(repo.ClaimForWrite(pa, second), "claim2（同 file_source）");
+    REQUIRE_FALSE(claim2.claimed);
+    REQUIRE(claim2.state == domain::MetadataState::kClaiming);
+    REQUIRE(claim2.record.id == first.id);
+    //  第二个 id 从未被创建
+    ContractError(repo.GetById(pa, second.id), fss::ErrorKind::kNotFound, "第二个 id 不得存在");
+
+    ContractOk(repo.MarkReady(pa, first.id, 1, first), "MarkReady");
+    const auto claim3 = ContractOk(repo.ClaimForWrite(pa, second), "claim3（ready 后）");
+    REQUIRE_FALSE(claim3.claimed);
+    REQUIRE(claim3.state == domain::MetadataState::kReady);
+    REQUIRE(claim3.record.id == first.id);
+  }
+
+  SECTION("★ C1 claim：MarkReady 落库**最终** record（含 copy 后才算出的 checksum）") {
+    const std::string src = "/u/claim/final";
+    const auto rec = MakeRecord(pa, "clm3", src, "final-name");
+    ContractOk(repo.ClaimForWrite(pa, rec), "ClaimForWrite");
+    auto final_rec = rec;
+    final_rec.data.checksum = "feedface";
+    final_rec.data.checksum_algorithm = "MD5";
+    final_rec.data.dataset_properties.file_source_info.checksum = "feedface";
+    final_rec.data.dataset_properties.file_source_info.checksum_algorithm = "MD5";
+
+    const auto ready = ContractOk(repo.MarkReady(pa, rec.id, 1, final_rec), "MarkReady");
+    REQUIRE(ready.data.checksum.has_value());
+    REQUIRE(*ready.data.checksum == "feedface");
+    //  ★ 关键：不是只在返回值里，而是真的落库了（读回来仍是最终数据）
+    const auto got = ContractOk(repo.GetById(pa, rec.id), "GetById");
+    REQUIRE(got.data.checksum.has_value());
+    REQUIRE(*got.data.checksum == "feedface");
+    REQUIRE(got.data.dataset_properties.file_source_info.checksum_algorithm == "MD5");
+  }
+
+  SECTION("★ C1 claim：ReleaseClaim 后可重新领取；wrong version / missing row → kNotFound") {
+    const std::string src = "/u/claim/release";
+    const auto rec = MakeRecord(pa, "clm4", src, "release");
+    const auto claim = ContractOk(repo.ClaimForWrite(pa, rec), "ClaimForWrite");
+    REQUIRE(claim.claimed);
+
+    //  两侧都断言：错误版本 / 缺失行 → kNotFound
+    ContractError(repo.MarkReady(pa, rec.id, 99, rec), fss::ErrorKind::kNotFound,
+                  "MarkReady 版本错 → kNotFound");
+    ContractError(repo.ReleaseClaim(pa, rec.id, 99), fss::ErrorKind::kNotFound,
+                  "ReleaseClaim 版本错 → kNotFound");
+    const auto ghost = MakeRecord(pa, "clm4ghost", "/u/claim/ghost", "ghost");
+    ContractError(repo.MarkReady(pa, ghost.id, 1, ghost), fss::ErrorKind::kNotFound,
+                  "MarkReady 缺失行 → kNotFound");
+    ContractError(repo.ReleaseClaim(pa, ghost.id, 1), fss::ErrorKind::kNotFound,
+                  "ReleaseClaim 缺失行 → kNotFound");
+
+    //  正控：正确版本 ReleaseClaim 成功 → 释放后同一 file_source 可被重新领取
+    ContractOk(repo.ReleaseClaim(pa, rec.id, 1), "ReleaseClaim");
+    const auto reclaim = ContractOk(repo.ClaimForWrite(pa, rec), "ReleaseClaim 后重新领取");
+    REQUIRE(reclaim.claimed);
+    ContractOk(repo.MarkReady(pa, rec.id, 1, rec), "重新领取后 MarkReady");
+    REQUIRE(repo.GetById(pa, rec.id).ok());
+    //  反向正控：ReleaseClaim 绝不能删 ready 行
+    ContractError(repo.ReleaseClaim(pa, rec.id, 1), fss::ErrorKind::kNotFound,
+                  "ReleaseClaim 不得删 ready 行");
+    REQUIRE(repo.GetById(pa, rec.id).ok());
+  }
+
+  SECTION("★ C1 claim：MarkReady 不得改写 (partition, file_source) 幂等键（拒绝且行仍 claiming）") {
+    const std::string src = "/u/claim/guard";
+    const auto rec = MakeRecord(pa, "clm5", src, "guard");
+    ContractOk(repo.ClaimForWrite(pa, rec), "ClaimForWrite");
+    auto hostile = rec;
+    hostile.data.dataset_properties.file_source_info.file_source = "/u/claim/hijack";
+    ContractError(repo.MarkReady(pa, rec.id, 1, hostile), fss::ErrorKind::kInvalidArgument,
+                  "MarkReady 改写幂等键必须被拒");
+
+    //  ★ 被拒后行**仍是 claiming**：不可见、hostile source 不存在、可用正确记录 mark ready（正控）
+    ContractError(repo.GetById(pa, rec.id), fss::ErrorKind::kNotFound, "被拒后仍 claiming（不可见）");
+    ContractError(repo.GetLatestByFileSource(pa, "/u/claim/hijack"), fss::ErrorKind::kNotFound,
+                  "hostile file_source 不得出现");
+    const auto ready =
+        ContractOk(repo.MarkReady(pa, rec.id, 1, rec), "正控：正确 file_source 必须成功");
+    REQUIRE(ready.id == rec.id);
+    REQUIRE(repo.GetById(pa, rec.id).ok());
+    //  正控②：拒绝时行仍在（因此可以 ReleaseClaim 掉它）
+    auto rec2 = MakeRecord(pa, "clm5b", "/u/claim/guard2", "guard2");
+    ContractOk(repo.ClaimForWrite(pa, rec2), "ClaimForWrite 2");
+    auto hostile2 = rec2;
+    hostile2.data.dataset_properties.file_source_info.file_source = "/u/claim/hijack2";
+    ContractError(repo.MarkReady(pa, rec2.id, 1, hostile2), fss::ErrorKind::kInvalidArgument,
+                  "改写幂等键必须被拒");
+    ContractOk(repo.ReleaseClaim(pa, rec2.id, 1), "被拒的行仍可 ReleaseClaim");
+  }
+
+  SECTION("★ C1 claim：claiming 行本身是完整可解析的记录（无损往返 + 状态翻转不丢数据）") {
+    const std::string src = "/u/claim/wellformed";
+    auto rec = MakeRecord(pa, "clm6", src, "well-formed");
+    rec.extra["CustomClaimField"] = "keep";
+    const auto claim = ContractOk(repo.ClaimForWrite(pa, rec), "ClaimForWrite");
+    REQUIRE(claim.claimed);
+    REQUIRE(claim.record.data.name.has_value());
+    REQUIRE(*claim.record.data.name == "well-formed");
+    REQUIRE(claim.record.kind == rec.kind);
+    REQUIRE(claim.record.version == 1);
+    REQUIRE(json::Dump(claim.record.extra) == json::Dump(rec.extra));
+
+    //  正控：状态翻转之后同一份内容仍然在（data 没有在 claiming→ready 时丢失）
+    ContractOk(repo.MarkReady(pa, rec.id, 1, claim.record), "MarkReady");
+    const auto got = ContractOk(repo.GetById(pa, rec.id), "GetById");
+    REQUIRE(*got.data.name == "well-formed");
+    REQUIRE(json::Dump(got.extra) == json::Dump(rec.extra));
+  }
 }
 
 // =============================================================================

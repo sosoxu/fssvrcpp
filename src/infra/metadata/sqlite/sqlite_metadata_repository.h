@@ -86,6 +86,13 @@ class SqliteMetadataRepository final : public domain::IMetadataRepository {
 
   fss::Result<domain::FileMetadataRecord> Create(std::string_view partition,
                                                  const domain::FileMetadataRecord& record) override;
+  fss::Result<domain::MetadataClaim> ClaimForWrite(
+      std::string_view partition, const domain::FileMetadataRecord& record) override;
+  fss::Result<domain::FileMetadataRecord> MarkReady(
+      std::string_view partition, std::string_view record_id, std::int64_t version,
+      const domain::FileMetadataRecord& record) override;
+  fss::Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
+                                 std::int64_t version) override;
   fss::Result<domain::FileMetadataRecord> GetById(std::string_view partition,
                                                   std::string_view record_id) override;
   fss::Result<domain::FileMetadataRecord> GetLatestByFileSource(
@@ -115,18 +122,32 @@ class SqliteMetadataRepository final : public domain::IMetadataRepository {
   fss::Result<domain::FileMetadataRecord> FindLatestBySource(sqlite3* db,
                                                              std::string_view partition,
                                                              std::string_view file_source);
+  //  ★ C1：按幂等键取**活动**行（claiming 或 ready），并通过 `state` 回传它的状态。
+  fss::Result<domain::FileMetadataRecord> FindClaimBySource(sqlite3* db, std::string_view partition,
+                                                            std::string_view file_source,
+                                                            domain::MetadataState* state);
   fss::Result<domain::FileMetadataRecord> ReadRow(sqlite3_stmt* stmt);
 
-  //  ---- 本切片：逐操作路径（`group_commit=false`，与接线前逐字一致）与
-  //       批内路径（`group_commit=true`，由批协调器在事务内调用） ----
-  //  ★ 两条路径共用同一批"语句级"实现，唯一区别是**谁负责事务/保存点**：
-  //    逐操作路径自己 `BEGIN IMMEDIATE … COMMIT`；批内路径由协调器负责。
-  //  `...Locked` 方法要求调用方**已持有 `mutex_`**；`...InTransaction` 由协调器的
-  //  领队线程在**持有 `mutex_` 的事务内**调用（同一把锁，不会自锁）。
-  fss::Result<domain::FileMetadataRecord> CreateLocked(std::string_view partition,
-                                                       const domain::FileMetadataRecord& record);
-  fss::Result<domain::FileMetadataRecord> CreateInTransaction(
+  //  ---- C1（ADR-009 §4.2）：原子领取 / claiming→ready / 放弃领取 ----
+  //  ★ 与 Update/Delete 同构：`...Locked` 自己 `BEGIN IMMEDIATE…COMMIT`；`...InTransaction`
+  //    由批协调器在**同一连接**的事务内调用（组提交开启时）。两种路径的 SQL 与语义完全一致。
+  //    ★ SQLite 的写原子性来自 `BEGIN IMMEDIATE`（写锁串行化并发连接）：事务内**重新检查**
+  //      幂等键后再插入，因此不需要 PG 那条单语句 `ON CONFLICT`（守卫语义等价）。
+  fss::Result<domain::MetadataClaim> ClaimForWriteLocked(
+      std::string_view partition, const domain::FileMetadataRecord& record);
+  fss::Result<domain::MetadataClaim> ClaimForWriteInTransaction(
       sqlite3* db, std::string_view partition, const domain::FileMetadataRecord& record);
+  fss::Result<domain::FileMetadataRecord> MarkReadyLocked(
+      std::string_view partition, std::string_view record_id, std::int64_t version,
+      const domain::FileMetadataRecord& record);
+  fss::Result<domain::FileMetadataRecord> MarkReadyInTransaction(
+      sqlite3* db, std::string_view partition, std::string_view record_id, std::int64_t version,
+      const domain::FileMetadataRecord& record);
+  fss::Result<void> ReleaseClaimLocked(std::string_view partition, std::string_view record_id,
+                                       std::int64_t version);
+  fss::Result<void> ReleaseClaimInTransaction(sqlite3* db, std::string_view partition,
+                                              std::string_view record_id, std::int64_t version);
+
   fss::Result<domain::FileMetadataRecord> UpdateLocked(std::string_view partition,
                                                        const domain::FileMetadataRecord& record);
   fss::Result<domain::FileMetadataRecord> UpdateInTransaction(

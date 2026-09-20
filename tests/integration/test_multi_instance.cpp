@@ -79,6 +79,68 @@ struct Instance {
   fss::app::CallerContext caller{"opendes", "osdu-user", "Bearer test-token"};
 };
 
+// =============================================================================
+//  ★ C1：只统计"复制"次数的存储装饰器
+// =============================================================================
+//  判据"并发登记同一 fileSource 只发生一次 staging→persistent 复制"必须**可观测**，
+//  否则只能靠"两边返回同一个 id"间接推断（那证明不了没重复复制）。装饰器只转发数据面，
+//  不改任何语义（与 `CapabilityOverrideBlobStore` 同一纪律）。
+class CountingBlobStore final : public fss::domain::IBlobStore {
+ public:
+  explicit CountingBlobStore(fss::domain::IBlobStore& inner) : inner_(inner) {}
+
+  fss::domain::BlobCapabilities capabilities() const override { return inner_.capabilities(); }
+  fss::Result<void> ensure_container(const std::string& container) override {
+    return inner_.ensure_container(container);
+  }
+  fss::Result<fss::domain::SignedLocation> presign_put(
+      const fss::domain::ObjectRef& ref, const fss::domain::PresignOptions& o) override {
+    return inner_.presign_put(ref, o);
+  }
+  fss::Result<fss::domain::SignedLocation> presign_get(
+      const fss::domain::ObjectRef& ref, const fss::domain::PresignOptions& o) override {
+    return inner_.presign_get(ref, o);
+  }
+  fss::Result<void> put(const fss::domain::ObjectRef& ref, fss::bytes::ByteSource& source,
+                        const fss::domain::PutOptions& options) override {
+    puts_.fetch_add(1);
+    return inner_.put(ref, source, options);
+  }
+  fss::Result<void> get(const fss::domain::ObjectRef& ref, fss::bytes::ByteSink& sink,
+                        const fss::domain::ByteRange& range) override {
+    return inner_.get(ref, sink, range);
+  }
+  fss::Result<fss::domain::ObjectStat> stat(const fss::domain::ObjectRef& ref) override {
+    return inner_.stat(ref);
+  }
+  fss::Result<void> remove(const fss::domain::ObjectRef& ref) override {
+    return inner_.remove(ref);
+  }
+  fss::Result<fss::domain::ObjectStat> copy(const fss::domain::ObjectRef& from,
+                                            const fss::domain::ObjectRef& to) override {
+    copies_.fetch_add(1);
+    return inner_.copy(from, to);
+  }
+  fss::Result<fss::domain::ListPage> list(const std::string& container, const std::string& prefix,
+                                          const std::string& continuation_token,
+                                          int limit) override {
+    return inner_.list(container, prefix, continuation_token, limit);
+  }
+  fss::Result<fss::domain::TempSweepResult> remove_temp_files(
+      const std::string& container, std::int64_t older_than_epoch_seconds,
+      bool dry_run) override {
+    return inner_.remove_temp_files(container, older_than_epoch_seconds, dry_run);
+  }
+
+  int copies() const { return copies_.load(); }
+  int puts() const { return puts_.load(); }
+
+ private:
+  fss::domain::IBlobStore& inner_;
+  std::atomic<int> copies_{0};
+  std::atomic<int> puts_{0};
+};
+
 struct MultiInstanceFixture {
   fss::test::TempDir dir{"multi_instance"};
   fss::ManualClock clock{1700000000};
@@ -168,8 +230,10 @@ RaceOutcome RaceCreate(const std::unique_ptr<Instance>& a, const std::unique_ptr
 //  对照用的"错误实现"：按 **record id** 建键 + check-then-insert，没有幂等键约束
 // =============================================================================
 //  这正是 ADR-009 M2 记录的形态（也是 R5 的教训：约束建在随机主键上 → 幂等失效）。
-//  `before_insert` 是给测试用的同步点，把"两个实例都查完、都还没插"这个窗口固定下来；
-//  没有它，并发用例会时灵时不灵（R4：不稳的实验不能当证据）。
+//  ★ C1：用例的写路径已改成 `ClaimForWrite`（复制之前原子领取），所以对照实现也必须
+//    把**领取**做成 check-then-insert —— 否则"两条记录"的对照会因为"根本没并发领取"
+//    而变成另一种东西。`before_insert` 是给测试用的同步点，把"两个实例都查完、都还没插"
+//    这个窗口固定下来；没有它，并发用例会时灵时不灵（R4：不稳的实验不能当证据）。
 class NaiveIdKeyedMetadataRepository final : public IMetadataRepository {
  public:
   std::function<void()> before_insert;
@@ -180,29 +244,89 @@ class NaiveIdKeyedMetadataRepository final : public IMetadataRepository {
     {
       std::lock_guard<std::mutex> guard(mutex_);
       const auto it = Find(partition, record.data.dataset_properties.file_source_info.file_source);
-      if (it != records_.end()) return it->second;  // 已存在 → 幂等返回
+      if (it != records_.end()) return it->second.record;  // 已存在 → 幂等返回
     }
     if (before_insert) before_insert();
     //  ② 后插（随机主键，没有任何唯一约束兜底）
     std::lock_guard<std::mutex> guard(mutex_);
-    records_[Key(partition, record.id)] = record;
-    return record;
+    FileMetadataRecord stored = record;
+    stored.version = 1;
+    records_[Key(partition, record.id)] = Row{stored, fss::domain::MetadataState::kReady};
+    return stored;
+  }
+
+  //  ★ C1 对照：领取也是 check-then-insert，两个语句之间可以被另一个实例插进来。
+  fss::Result<fss::domain::MetadataClaim> ClaimForWrite(
+      std::string_view partition, const FileMetadataRecord& record) override {
+    const std::string file_source =
+        record.data.dataset_properties.file_source_info.file_source;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      const auto it = Find(partition, file_source);
+      if (it != records_.end()) {
+        fss::domain::MetadataClaim out;
+        out.claimed = false;
+        out.record = it->second.record;
+        out.state = it->second.state;
+        return out;
+      }
+    }
+    if (before_insert) before_insert();  // 把"两个实例都查完"的窗口固定下来
+    std::lock_guard<std::mutex> guard(mutex_);
+    FileMetadataRecord stored = record;
+    stored.version = 1;
+    records_[Key(partition, record.id)] = Row{stored, fss::domain::MetadataState::kClaiming};
+    fss::domain::MetadataClaim out;
+    out.claimed = true;
+    out.record = stored;
+    out.state = fss::domain::MetadataState::kClaiming;
+    return out;
+  }
+
+  fss::Result<FileMetadataRecord> MarkReady(std::string_view partition,
+                                           std::string_view record_id, std::int64_t version,
+                                           const FileMetadataRecord& record) override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto it = records_.find(Key(partition, record_id));
+    if (it == records_.end() || it->second.record.version != version) {
+      return Err(fss::ErrorKind::kNotFound, "记录不存在");
+    }
+    it->second.record = record;
+    it->second.record.version = version;
+    it->second.state = fss::domain::MetadataState::kReady;
+    return it->second.record;
+  }
+
+  fss::Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
+                                 std::int64_t version) override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto it = records_.find(Key(partition, record_id));
+    if (it == records_.end() || it->second.record.version != version ||
+        it->second.state != fss::domain::MetadataState::kClaiming) {
+      return Err(fss::ErrorKind::kNotFound, "记录不存在或不是 claiming");
+    }
+    records_.erase(it);
+    return fss::Ok();
   }
 
   fss::Result<FileMetadataRecord> GetById(std::string_view partition,
                                          std::string_view record_id) override {
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = records_.find(Key(partition, record_id));
-    if (it == records_.end()) return Err(fss::ErrorKind::kNotFound, "记录不存在");
-    return it->second;
+    if (it == records_.end() || it->second.state != fss::domain::MetadataState::kReady) {
+      return Err(fss::ErrorKind::kNotFound, "记录不存在");
+    }
+    return it->second.record;
   }
 
   fss::Result<FileMetadataRecord> GetLatestByFileSource(std::string_view partition,
                                                        std::string_view file_source) override {
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = Find(partition, file_source);
-    if (it == records_.end()) return Err(fss::ErrorKind::kNotFound, "记录不存在");
-    return it->second;
+    if (it == records_.end() || it->second.state != fss::domain::MetadataState::kReady) {
+      return Err(fss::ErrorKind::kNotFound, "记录不存在");
+    }
+    return it->second.record;
   }
 
   fss::Result<FileMetadataRecord> Update(std::string_view partition,
@@ -220,9 +344,9 @@ class NaiveIdKeyedMetadataRepository final : public IMetadataRepository {
                                  const MetadataQuery& query) override {
     std::lock_guard<std::mutex> guard(mutex_);
     MetadataPage page;
-    for (const auto& [key, record] : records_) {
+    for (const auto& [key, row] : records_) {
       if (key.rfind(std::string(partition) + "\x1f", 0) != 0) continue;
-      page.records.push_back(record);
+      page.records.push_back(row.record);
     }
     page.total = static_cast<std::int64_t>(page.records.size());
     (void)query;  // 对照只需要"总数"，过滤逻辑不是本用例的对象
@@ -230,15 +354,20 @@ class NaiveIdKeyedMetadataRepository final : public IMetadataRepository {
   }
 
  private:
+  struct Row {
+    FileMetadataRecord record;
+    fss::domain::MetadataState state = fss::domain::MetadataState::kReady;
+  };
+
   static std::string Key(std::string_view partition, std::string_view id) {
     return std::string(partition) + "\x1f" + std::string(id);
   }
 
-  std::map<std::string, FileMetadataRecord>::iterator Find(std::string_view partition,
-                                                           std::string_view file_source) {
+  std::map<std::string, Row>::iterator Find(std::string_view partition,
+                                            std::string_view file_source) {
     for (auto it = records_.begin(); it != records_.end(); ++it) {
       if (it->first.rfind(std::string(partition) + "\x1f", 0) != 0) continue;
-      if (it->second.data.dataset_properties.file_source_info.file_source == file_source) {
+      if (it->second.record.data.dataset_properties.file_source_info.file_source == file_source) {
         return it;
       }
     }
@@ -246,7 +375,7 @@ class NaiveIdKeyedMetadataRepository final : public IMetadataRepository {
   }
 
   std::mutex mutex_;
-  std::map<std::string, FileMetadataRecord> records_;
+  std::map<std::string, Row> records_;
 };
 
 }  // namespace
@@ -378,4 +507,88 @@ TEST_CASE("★ C6.11 对照：约束建在随机主键上（check-then-insert）
   //  ★ 两条记录、两个不同的 id —— 这正是 M2 的现场
   REQUIRE(page.value().total == 2);
   REQUIRE(outcome.A().value() != outcome.B().value());
+}
+
+// =============================================================================
+//  ★ C1（ADR-009 §4.2）：端到端"只复制一次"与"停滞 winner"
+// =============================================================================
+TEST_CASE("★ C1 并发登记同一 fileSource → 恰 1 次 staging→persistent 复制，两个调用者同一 id",
+          "[phase6][integration][c6.11][c1]") {
+  MultiInstanceFixture fx;
+  CountingBlobStore counting(fx.blob);
+
+  fx.clock.AdvanceSeconds(1);
+  const auto seeded = fx.SeedUpload("only-one-copy");
+  //  ★ 同一 id 种子 = 最坏情况（两个实例本来会生成同一个记录 id）
+  auto a = fx.Make(1);
+  auto b = fx.Make(1);
+  //  ★ 每个实例有自己的 `FakeBlobStoreFactory`（`MakeWith` 里新建）→ 必须逐个指向计数装饰器，
+  //    否则复制发生在未计数的内存 store 上，"恰 1 次复制"的判据会恒为 0==1 的假失败。
+  for (auto* instance : {a.get(), b.get()}) {
+    instance->factory->SetZoneStore(fss::domain::StorageZone::kStaging, counting);
+    instance->factory->SetZoneStore(fss::domain::StorageZone::kPersistent, counting);
+  }
+  auto record = AppFixture::MakeRecord(seeded.file_source, "one-copy.bin");
+
+  const auto outcome = RaceCreate(a, b, record);
+  INFO("A: " << (outcome.A().ok() ? outcome.A().value() : outcome.A().error().ToString()));
+  INFO("B: " << (outcome.B().ok() ? outcome.B().value() : outcome.B().error().ToString()));
+  REQUIRE(outcome.A().ok());
+  REQUIRE(outcome.B().ok());
+  REQUIRE(outcome.A().value() == outcome.B().value());
+
+  //  ★★ 本切片的核心判据：**恰好一次**复制（另一个实例领不到 claim，因此不复制）。
+  CAPTURE(counting.copies(), counting.puts());
+  REQUIRE(counting.copies() == 1);
+
+  //  正控：记录真的登记成功且可见（否则"只复制一次"可能只是"两边都失败了"）
+  const auto latest = fx.metadata.GetLatestByFileSource(fx.caller.partition, seeded.file_source);
+  REQUIRE(latest.ok());
+  REQUIRE(latest.value().id == outcome.A().value());
+  const auto location = fx.locations.FindByFileSource(fx.caller.partition, seeded.file_source);
+  REQUIRE(location.ok());
+  REQUIRE(location.value().zone == fss::domain::StorageZone::kPersistent);
+}
+
+TEST_CASE("★ C1 停滞 winner：loser 见 claiming → 503 且**不复制**；winner ready 后重试返回既有 id 且仍不复制",
+          "[phase6][integration][c6.11][c1]") {
+  MultiInstanceFixture fx;
+  CountingBlobStore counting(fx.blob);
+
+  fx.clock.AdvanceSeconds(1);
+  const auto seeded = fx.SeedUpload("stalled-winner");
+
+  //  ★ 用**仓储层直接领取**把 winner 停在 `claiming`（等价于"winner 的复制/校验和很慢"）。
+  //    这样 loser 观察 claiming 是**确定性**的，不靠 sleep 猜时序（AGENTS §4.3）。
+  auto held = AppFixture::MakeRecord(seeded.file_source, "held.bin");
+  held.id = fx.caller.partition + ":dataset--File.Generic:held";
+  const auto claim = fx.metadata.ClaimForWrite(fx.caller.partition, held);
+  REQUIRE(claim.ok());
+  REQUIRE(claim.value().claimed);
+
+  const int copies_before = counting.copies();
+  auto loser = fx.Make(7);
+  //  实例自己的工厂（`MakeWith` 新建）→ 指向计数装饰器，才能断言"loser 没复制"
+  loser->factory->SetZoneStore(fss::domain::StorageZone::kStaging, counting);
+  loser->factory->SetZoneStore(fss::domain::StorageZone::kPersistent, counting);
+  CreateFileMetadata create(*loser->ports);
+  const auto blocked =
+      create.Execute(loser->caller, AppFixture::MakeRecord(seeded.file_source, "loser.bin"));
+  INFO("loser: " << (blocked.ok() ? std::string("ok") : blocked.error().ToString()));
+  REQUIRE_FALSE(blocked.ok());
+  REQUIRE(blocked.error().kind() == fss::ErrorKind::kUnavailable);  // → 503
+  //  ★ 可读的原因（客户端据此判断"重试"而不是"请求错了"）
+  REQUIRE(blocked.error().message().find("claiming 中") != std::string::npos);
+  //  ★★ loser 一次复制都没做 —— 这就是 claim-before-copy 的目的
+  REQUIRE(counting.copies() == copies_before);
+
+  //  ★ 正控：winner ready 之后，loser 的**新一次**调用返回既有 id，且仍然零复制
+  const auto marked = fx.metadata.MarkReady(fx.caller.partition, held.id, 1, held);
+  REQUIRE(marked.ok());
+  const auto retry =
+      create.Execute(loser->caller, AppFixture::MakeRecord(seeded.file_source, "loser2.bin"));
+  INFO("retry: " << (retry.ok() ? retry.value() : retry.error().ToString()));
+  REQUIRE(retry.ok());
+  REQUIRE(retry.value() == held.id);
+  REQUIRE(counting.copies() == copies_before);
 }

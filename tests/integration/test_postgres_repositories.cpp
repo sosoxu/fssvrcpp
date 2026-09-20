@@ -103,6 +103,17 @@ std::int64_t ScalarQuery(const std::string& partition) {
   return static_cast<std::int64_t>(std::strtoll(result.value().Value(0, 0).c_str(), nullptr, 10));
 }
 
+//  ★ 预热连接池：`PgPool::Borrow` 在**持池锁**的状态下调用 `PgConnection::Connect`
+//    （一次网络往返），所以冷池上的"N 个并发"实际上是**串行建连** —— 先拿到连接的线程会在
+//    后面的线程拿到连接之前跑完整段逻辑，竞态被消掉、并发判据变成空证据（实测：非原子的
+//    ClaimForWrite 注入下用例仍"通过"）。判据"并发下恰 1 个 winner"必须先让 N 条连接就绪。
+void PrewarmPool(PostgresMetadataRepository& repo, int n) {
+  for (int i = 0; i < n; ++i) {
+    auto handle = repo.pool().Borrow();
+    REQUIRE(handle.ok());
+  }
+}
+
 //  直接往 `file_metadata_records` 插一行（用于制造"外部写入的墓碑行"与受控的 created_at）。
 void RawInsertMetadata(const std::string& partition, const std::string& id,
                        const std::string& file_source, const std::string& state,
@@ -665,6 +676,9 @@ TEST_CASE("★ C6.11/ADR-009 M2：并发 Create 同一 file_source 只产生 1 �
   REQUIRE(opened.ok());
   auto& repo = *opened.value();
 
+  //  ★ 先让 N 条连接就绪，否则"并发"会被惰性建连串行化（见 PrewarmPool 的说明）
+  PrewarmPool(repo, kConcurrency);
+
   //  并发起跑栅栏：所有线程先就位，再一起调 Create（最大化真实竞态）。
   //  ★ 结果不放进 `std::vector<Result<T>>`：`Result<T>` 没有默认构造函数（它只有
   //    "有值" 与 "有错" 两个状态），无法 `resize`。这里按"成功记录 / 错误消息"分开存。
@@ -739,5 +753,132 @@ TEST_CASE("★ C6.11/ADR-009 M2：并发 Create 同一 file_source 只产生 1 �
     REQUIRE(distinct_results.records[i].version == 1);
     REQUIRE(distinct_results.records[i].id == distinct_records[i].id);
   }
+  REQUIRE(ScalarQuery(distinct_partition) == kConcurrency);
+}
+
+// =============================================================================
+//  ★★ C1（ADR-009 §4.2 的 M2 证据）：并发 `ClaimForWrite` 同一 (partition, file_source)
+// =============================================================================
+//  判据与线程到达顺序**无关**（AGENTS §4.3）：
+//    · N≥8 个并发 `ClaimForWrite`，**不同的 id**、**相同的 file_source**；
+//    · 正确实现（单语句 `INSERT ... ON CONFLICT (...) DO NOTHING`）**恰好 1 个** winner；
+//    · 库里**恰好 1 行**（claiming 行也是行，所以 `ScalarQuery` 数得出来）；
+//    · 所有失败者 `claimed=false`，且能看到既有行的 id 与状态（claiming/ready）。
+//  正控：N 个**不同 file_source** → 恰好 N 个 winner、N 行（否则"恰 1 个"可能只是
+//        "并发调用全被丢弃"）。
+TEST_CASE("★ C1/ADR-009 §4.2：并发 ClaimForWrite 同一 file_source → 恰 1 个 winner、恰 1 行",
+          "[pg][infra][c6.11][c1]") {
+  static const std::string prefix = UniquePrefix("meta-claim-write");
+  PrefixGuard guard(prefix);
+
+  constexpr int kConcurrency = 8;
+  fss::ManualClock clock{1700000000};
+
+  //  ★ 每个并发线程用**自己的仓储对象**（各自一个 1 连接的池）。为什么不是共用一个池：
+  //    `PgPool::Borrow` 即使池已预热也只在池锁内做 `PQstatus`，但它**仍把 8 次借出串行化**；
+  //    实测共用池时"8 个并发 ClaimForWrite"从不发生唯一约束冲突（R1 注入"非原子领取"后用例
+  //    照样通过 ⇒ 判据是空证据）。独立池之后，唯一的同步点是数据库上的 `ux_mr_source`
+  //    部分唯一索引 —— 这正是本判据要考察的东西。
+  std::vector<std::unique_ptr<PostgresMetadataRepository>> repos;
+  for (int i = 0; i < kConcurrency; ++i) {
+    PostgresMetadataRepositoryOptions options;
+    options.pg = TestPgOptions(1);
+    auto opened = PostgresMetadataRepository::Open(options, clock);
+    REQUIRE(opened.ok());
+    repos.push_back(std::move(opened.value()));
+  }
+  auto& repo = *repos.front();
+
+  struct ClaimOutcome {
+    std::vector<domain::MetadataClaim> claims;
+    std::vector<std::string> errors;
+  };
+  const auto run_concurrent = [&](const std::string& partition,
+                                  const std::vector<domain::FileMetadataRecord>& records) {
+    ClaimOutcome outcome;
+    outcome.claims.resize(records.size());
+    outcome.errors.resize(records.size());
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    threads.reserve(records.size());
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      threads.emplace_back([&, i] {
+        ready.fetch_add(1);
+        while (!go.load()) std::this_thread::yield();
+        auto claimed = repos[i]->ClaimForWrite(partition, records[i]);
+        if (claimed.ok()) {
+          outcome.claims[i] = std::move(claimed).value();
+        } else {
+          outcome.errors[i] = claimed.error().message();
+        }
+      });
+    }
+    while (ready.load() < static_cast<int>(records.size())) std::this_thread::yield();
+    go.store(true);
+    for (auto& thread : threads) thread.join();
+    return outcome;
+  };
+
+  //  ---- 竞态：N 个不同 id、同一 file_source ----
+  const std::string race_partition = prefix + "-race";
+  const std::string race_source = "/claim-race/source";
+  std::vector<domain::FileMetadataRecord> race_records;
+  for (int i = 0; i < kConcurrency; ++i) {
+    race_records.push_back(fss::test::MakeRecord(race_partition, "claim-" + std::to_string(i),
+                                                 race_source, "name-" + std::to_string(i)));
+  }
+  const auto results = run_concurrent(race_partition, race_records);
+  int winners = 0;
+  int winner_index = -1;
+  for (int i = 0; i < kConcurrency; ++i) {
+    INFO("caller " << i << " : " << results.errors[i]);
+    REQUIRE(results.errors[i].empty());
+    REQUIRE(results.claims[i].record.version == 1);
+    if (results.claims[i].claimed) {
+      ++winners;
+      winner_index = i;
+    }
+  }
+  REQUIRE(winners == 1);  // ★ 只有一个 winner（R1 注入：拆成两条语句 → 这里会 >1）
+  REQUIRE(winner_index >= 0);
+  const std::string winner_id = results.claims[winner_index].record.id;
+  for (int i = 0; i < kConcurrency; ++i) {
+    //  所有调用者（赢家与输家）都指向同一条记录
+    REQUIRE(results.claims[i].record.id == winner_id);
+    if (!results.claims[i].claimed) {
+      REQUIRE((results.claims[i].state == domain::MetadataState::kClaiming ||
+               results.claims[i].state == domain::MetadataState::kReady));
+    }
+  }
+  //  ★ 库里**恰好 1 行**（不是 8 行、也不是 0 行）—— 判据由实现决定，与线程顺序无关
+  REQUIRE(ScalarQuery(race_partition) == 1);
+
+  //  winner 推到 ready 后按 file_source 可见；行数仍是 1（claiming → ready 不新增行）
+  const auto marked =
+      repo.MarkReady(race_partition, winner_id, 1, race_records[winner_index]);
+  REQUIRE(marked.ok());
+  const auto latest = repo.GetLatestByFileSource(race_partition, race_source);
+  REQUIRE(latest.ok());
+  REQUIRE(latest.value().id == winner_id);
+  REQUIRE(latest.value().version == 1);
+  REQUIRE(ScalarQuery(race_partition) == 1);
+
+  //  ---- 正控：N 个**不同 file_source** → 恰好 N 个 winner、N 行 ----
+  const std::string distinct_partition = prefix + "-distinct";
+  std::vector<domain::FileMetadataRecord> distinct_records;
+  for (int i = 0; i < kConcurrency; ++i) {
+    distinct_records.push_back(fss::test::MakeRecord(
+        distinct_partition, "d-" + std::to_string(i), "/claim-distinct/" + std::to_string(i),
+        "distinct-name-" + std::to_string(i)));
+  }
+  const auto distinct = run_concurrent(distinct_partition, distinct_records);
+  int distinct_winners = 0;
+  for (int i = 0; i < kConcurrency; ++i) {
+    INFO("distinct caller " << i << " : " << distinct.errors[i]);
+    REQUIRE(distinct.errors[i].empty());
+    if (distinct.claims[i].claimed) ++distinct_winners;
+  }
+  REQUIRE(distinct_winners == kConcurrency);
   REQUIRE(ScalarQuery(distinct_partition) == kConcurrency);
 }

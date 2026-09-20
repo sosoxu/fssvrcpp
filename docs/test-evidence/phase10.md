@@ -2265,6 +2265,13 @@ ctest --test-dir build --output-on-failure
 > `config/fss.example.json`、`db/migrations/001_init.sql`、`github.txt` 均未被本切片触碰
 > （`AGENTS.md` 的 B1 状态由父代理在本轮另行更新）。
 
+> ★ **后续更正（C1 / §18.7，父代理记录在此以保证指向正确）**：§16.1 第 3 行"8 并发
+> `Create` → 恰好 1 行"当时用的是**同一个 `PgPool`**，而该池的连接是惰性建立的 ⇒ 8 个
+> 线程实际被错开；把 `ON CONFLICT` 换成"非原子两步"后该用例**仍然通过**（C1 注入时实测）
+> ⇒ 它只能证明**幂等语义**，**不能**作为"真并发下原子领取"的证据。C1 已把新用例改为
+> **每线程一个仓储/连接池并预热**，改后同样的注入才会失败（`winners == 1` → `4 == 1`）。
+> 结论按证据范围收窄，上面的历史记录不改写。
+
 #### 17.8.4 复核中由父代理修掉的第二个问题：门禁脚本在**目标引擎**上失败
 
 `db/tests/002_advisory_lock.sh` 的 `spawn_holder()` 注释写着"循环短查询（leader 持锁的会话
@@ -2285,6 +2292,178 @@ pg_sleep(0.2) $$`**。在 PG 14.24 上 `client_connection_check_interval`（该�
 
 该脚本属于 `FSS_GATES_WITH_PG=1`，因此**目标引擎现在也有判定力**（此前"通过"只发生在
 PG 14 上）。同时把 `pg_leader_election.h` 里"必须改成"的措辞改为"**已改成**"（R13）。
+
+## 18. C1（本轮）：ADR-009 §4.2 的原子领取变成真的 —— claim **先于复制**，`claiming → ready`
+
+> 依据：ADR-009 §4.2（`POST /v2/files/metadata` 的原子领取）；`state` 是**仓储列**，
+> 不是 OSDU 记录的一部分。前置：A2（§16）的单语句 `ON CONFLICT` 领取。
+
+### 18.1 结论（先说答案）
+
+1. **领取先于复制**：`CreateFileMetadata` 现在的顺序是 `幂等预检 → ClaimForWrite →
+   位置记录读取 → staging→persistent 复制 → 校验和 → MarkReady → 成功事件/审计`。
+   并发实例里只有一个拿到 claim，因此**只有一个会复制**（此前两个都复制）。
+2. **`claiming` 对客户端不可见**：memory / SQLite / PG 的 `GetById`、
+   `GetLatestByFileSource`、`List`、`Update` 的既有查找，以及 SQL 的 id-exists 探测，
+   全部只认 `state = 'ready'`（`is_latest` 仍必须成立）。PG schema 的 `state` 列**未改**
+   （`db/migrations/001_init.sql` 逐字未动）；SQLite 自己建表 + **幂等迁移**补列。
+3. **`claiming` 的第二次提交 → 有界等待后 503，且**不复制**：轮询 `GetLatestByFileSource`
+   （≈50 ms 间隔，总预算 ≈2 s，**不新增配置键**）；赢家在预算内 ready 就返回同一 id，
+   否则 `Err(kUnavailable, "另一实例正在登记同一 fileSource（claiming 中），请重试")`
+   （契约 §5 → **503**）。
+4. **失败路径**：复制/校验和/MarkReady 任一步失败 → 先 `RollbackCreatedObject`（删对象）
+   再 `ReleaseClaim`（释放幂等键），客户端看不到记录、且**同一 fileSource 可立即重新领取**。
+5. **`Create` 语义不变**：按新原语实现（`ClaimForWrite` → `MarkReady`），可观测语义与接线前
+   逐字一致（幂等返回、version=1、错误分类）；契约套件（memory/SQLite/PG 共用）全绿。
+6. **两端引擎都实测**：本地 PG **14.24** 与目标 PG **12.6** 上 `test_postgres_repositories`
+   均为 **666 断言 / 15 用例**；`pgtest-%` 残留两库均为 **0**。
+7. **不新增/不激活任何配置键**：`leases.*` 逐字未动；`docs/operations.md` 三态计数保持
+   **122/16/18**（`test_operations_doc` 在 86/86 里通过）。
+
+### 18.2 实现点（可点击）
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/domain/ports/ports.h` | 新增 `enum class MetadataState{kClaiming,kReady,kDeleted}`、`struct MetadataClaim`，以及 `ClaimForWrite` / `MarkReady` / `ReleaseClaim` 三个纯虚。★ `MarkReady` 是 **4 参**（见 §18.5 的偏离记录） |
+| `src/infra/metadata/memory/memory_metadata_repository.{h,cpp}` | `Version` 增加 `state`；读取路径只返回 ready；三个新原语；`Create` = claim + mark-ready |
+| `src/infra/metadata/sqlite/sqlite_metadata_repository.{h,cpp}` | 建表加 `state TEXT NOT NULL DEFAULT 'ready'` + **幂等 `ALTER TABLE` 迁移**（`PRAGMA table_info` 探测）；读取 SQL 加 `state='ready'`；三个新原语（逐操作 + 组提交两条路径，原子性来自 `BEGIN IMMEDIATE` 事务内重查） |
+| `src/infra/metadata/postgres/postgres_metadata_repository.{h,cpp}` | 单语句 `INSERT … ON CONFLICT(partition_id,file_source) WHERE state<>'deleted' AND is_latest DO NOTHING` 写 `'claiming'`；`kMarkReady` 一条 `UPDATE … SET state='ready', data=$5, kind/acl/legal 同步 … RETURNING/`；`kReleaseClaim` 只删 claiming；读取全部 `state='ready'` |
+| `src/app/usecases/usecases.cpp` | 领取先于复制；`WaitForExistingClaim`（有界等待 → 503）；`AbortClaimedCreate`（先删对象、再释放领取）；成功路径 `MarkReady(…, out)` |
+| `tests/framework/port_contract.h` | 契约套件新增 6 个 claim 生命周期 SECTION（可见性含正控、第二次领取、最终数据落库、ReleaseClaim/重领、幂等键守卫、claiming 行完整可解析） |
+| `tests/framework/fake_ports.h` | `FaultyMetadataRepository` 新增 `fail_claim` / `fail_mark_ready` / `fail_release` 接缝 + 三个转发实现（接缝**迁移**而非废弃，见 §18.6） |
+| `tests/integration/test_postgres_repositories.cpp` | 新增"N=8 并发 `ClaimForWrite` 同 fileSource → 恰 1 winner / 恰 1 行"+ 正控；★ 用**每线程独立仓储/连接池**制造真并发（见 §18.7 的发现） |
+| `tests/integration/test_multi_instance.cpp` | 新增 `CountingBlobStore`；"恰 1 次复制"用例 + "停滞 winner → loser 503 且零复制 / ready 后重试同 id 且零复制"用例；对照仓储同步迁移到新原语 |
+| `tests/integration/test_sqlite_metadata_repository.cpp` | 新增"旧库文件无 state 列 → 幂等迁移 + 旧行按 ready 可见"用例 |
+| `tests/{hardening,integration}/test_{fault_injection,metadata_lifecycle}.cpp` | 故障注入点迁移（`fail_create` → `fail_claim` / `fail_mark_ready`）+ 新故障用例（MarkReady 失败可重领、ReleaseClaim 失败如实断言残留）+ **真实 HTTP 端点**的 claiming→503 用例（含正控：winner ready 后同请求 201 且同 id） |
+| `tests/integration/test_sqlite_group_commit.cpp` | 摊销判据改用单操作原语计数 + 单独钉住 `Create` 的复合路径（理由见 §18.4） |
+
+### 18.3 实测命令与输出摘要
+
+```bash
+# 默认树（FSS_WITH_PG=OFF）
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
+#  → 100% tests passed, 0 tests failed out of 86（改动文件 0 warning）
+
+# PG 树（本地 PG 14.24）
+cmake --build build-pg -j4
+ctest --test-dir build-pg -L pg --output-on-failure
+#  → 100% tests passed, 0 tests failed out of 7
+./build-pg/bin/test_postgres_repositories
+#  → All tests passed (666 assertions in 15 test cases)
+
+# 目标引擎 PG 12.6（远端 DSN）
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg --output-on-failure
+#  → 100% tests passed, 0 tests failed out of 7
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ./build-pg/bin/test_postgres_repositories
+#  → All tests passed (666 assertions in 15 test cases)
+```
+
+并发/一次复制/停滞 winner 三条判据的实测结果：
+
+| 判据 | 位置 | 结果 |
+| --- | --- | --- |
+| N=8 并发 `ClaimForWrite` 同 `(partition,file_source)` | `test_postgres_repositories.cpp` | **恰 1 个 winner、恰 1 行**（`ScalarQuery==1`）；所有输家 `claimed=false` 且指向同一 id；正控：8 个不同 file_source → 8 winner / 8 行 |
+| 两个实例并发登记同一 fileSource | `test_multi_instance.cpp` | 两者同 id；`CountingBlobStore.copy` 调用数 **== 1**；记录可见 + 位置记录迁到 persistent（正控） |
+| 停滞 winner（直接持 claiming） | `test_multi_instance.cpp` | loser 返回 `kUnavailable`（→503）且消息含"claiming 中"，`copy` 调用数**不变**；winner `MarkReady` 后 loser 重试返回既有 id，`copy` 仍**不变** |
+| claiming loser 走**真实 HTTP 端点** | `test_metadata_lifecycle.cpp` | `POST /v2/files/metadata` → **503**（body 含 `"code":503` 与 `claiming`）；正控：winner ready 后同一请求 → **201** 且 `id` == 既有 id（28 断言） |
+
+`pgtest-%` 残留（两库）：`0`（`SELECT count(*) … WHERE partition_id LIKE 'pgtest-%'`）。
+
+### 18.4 被合法更新的既有测试期望（逐条给理由）
+
+| 测试 | 旧期望 | 新期望 | 理由 |
+| --- | --- | --- | --- |
+| `test_fault_injection.cpp` C9.2② | 注入 `fail_create` → 500 | 注入 `fail_claim` → 500（并断言 `claim_calls==1`） | 用例的写路径已改为 `ClaimForWrite`；继续注入 `fail_create` 会让用例**静默变成空断言**（在 201 上通过） |
+| `test_metadata_lifecycle.cpp` C6.3 故障④ | 注入 `fail_create`、断言 `create_calls==1` | 注入 `fail_mark_ready`、断言 `mark_ready_calls==1` | 同上；第 9 步现在是 `MarkReady`（复制**之后**） |
+| `test_sqlite_group_commit.cpp` 摊销 | 6 次 `Create` = 6 个批操作 → 2 次提交 | 6 次 `ClaimForWrite` → 2 次提交；**另加**一条 6 次 `Create` = 12 个批操作 → 4 次提交 | `Create` 现在是 claim+mark-ready 的复合路径（2 个批操作/次）。`ceil(N/B)` 这条判据本身没有被放宽：单操作原语仍钉住 `{3,3}`，复合路径单独钉住 `{3,3,3,3}` |
+| `test_sqlite_group_commit.cpp` 读不脏 | writer 用 `Create`，读回 ready 值 | 领取是**准备步骤**（另一条无门控连接），被门控卡住的是**可见性翻转** `MarkReady`；读回 ready 值 | 若仍卡 `Create`，被卡住的是 claiming 批，那批提交后读到的正确结果就是 `kNotFound` —— 新顺序下"返回提交后的值"只能在 `MarkReady` 上断言。`REQUIRE_FALSE(reader_done)` 这条**脏读护栏未动** |
+
+### 18.5 偏离记录：`MarkReady` 是 4 参（父代理批准）
+
+原定签名 `MarkReady(partition, record_id, version)` **无法落库服务器算出的 checksum**：
+claim 行在**复制之前**插入，而 checksum 在**复制之后**才知道；POSIX 的流式 SHA-256、
+"算法跟随驱动"（C6.4 的 MD5 用例）与 `hide_checksum` 逼出的流式回算（64 MiB / 1 GiB RSS 用例）
+都要求 checksum 来自**复制结果**，不能从 staging 预算。因此经父代理批准，签名改为：
+
+```cpp
+virtual Result<FileMetadataRecord> MarkReady(std::string_view partition,
+                                            std::string_view record_id,
+                                            std::int64_t version,
+                                            const FileMetadataRecord& record) = 0;
+```
+
+实现是**一条** `UPDATE … SET state='ready', data=…, kind=…, acl_viewers=…, acl_owners=…,
+legal_tags=… WHERE partition_id=… AND id=… AND version=… AND state='claiming' AND file_source=…`，
+因此没有"ready 行但 data 过期"的窗口。**两条守卫**（父代理要求）：
+① 若 `record` 的 `file_source` 与 claim 行不一致 → `kInvalidArgument`，且行**保持 claiming**
+（仍可 `ReleaseClaim`）—— 幂等键不允许在 mark-ready 时改写；② `ClaimForWrite` 仍写入**完整**
+记录 JSON（复制前快照），claiming 行本身可解析、可往返。
+**OSDU 线上契约未变**：`state` 绝不进 `ToJson` / `ParseFileMetadataRecord`，REST/gRPC 报文逐字节不变。
+
+### 18.6 故障注入接缝的迁移与"非空洞"自证
+
+`FaultyMetadataRepository` 的旧接缝只有 `fail_create`。用例改走 claim→mark-ready 后，若不动它，
+`fail_create` 就永远不被触发——测试会**继续通过但什么都证明不了**（AGENTS §4.3 的"护栏静默失明"）。
+本轮新增 `fail_claim` / `fail_mark_ready` / `fail_release` 三个接缝 + 三个转发实现，并新增用例：
+
+* **MarkReady 失败**：回滚删对象 + `ReleaseClaim` + 500 + 无可见记录 + **可重新领取**
+  （正控：清故障后同一条查找路径重试成功且可见）；
+* **ReleaseClaim 失败**（双重故障）：原错误照常返回 + 审计告警
+  `createMetadataClaimReleaseFailure`；**如实断言**其后果 = claiming 行残留 ⇒ 该 fileSource
+  暂时无法重领（这是"崩溃/释放失败"的已知未交付面，不是被测试掩盖的东西）。
+
+**自证（R1 注入④）**：临时让替身**忽略** `fail_mark_ready` → 故障④用例**失败**（原始输出：
+`REQUIRE_FALSE( result.ok() )`，`with expansion:` 空 = 真的拿到了一个成功的 `Result`），
+恢复后通过。证明这条接缝**真的在起作用**，不是摆设。
+
+### 18.7 R1 自证（每条都在**完整重编**后跑；末尾已全部还原，`md5sum` 逐字一致）
+
+| # | 注入 | 结果 |
+| --- | --- | --- |
+| ① | PG `kClaimInsert` 去掉 `ON CONFLICT … DO NOTHING`，并把"唯一约束挡下"误判成"我赢了" | 新并发用例**失败**：`REQUIRE( winners == 1 )` → `4 == 1`；`assertions: 25 \| 24 passed \| 1 failed` |
+| ② | memory `GetById` 去掉 `state=='ready'` 过滤 | 契约**失败**：`claiming → GetById 不可见` 与 `被拒后仍 claiming（不可见）` 两条 `kNotFound` 判据各失败；`assertions: 532 \| 530 passed \| 2 failed` |
+| ③ | memory `MarkReady` 忘记翻 `ready`（行停在 claiming） | 端到端**失败**：`REQUIRE( outcome.A().ok() )`（loser 有界等待超时 → 503）；`assertions: 5 \| 4 passed \| 1 failed` |
+| ④ | 替身忽略 `fail_mark_ready` 接缝 | 故障④**失败**：`REQUIRE_FALSE( result.ok() )`（见 §18.6） |
+
+四条注入逐一还原后 `md5sum -c` 全部 `OK`；`grep -rn "R1-INJECT" src/ tests/` **为空**。
+
+**★ 本轮抓到的一个真问题（否则 R1① 无法失败）**：最初新并发用例与既有 M2 用例共用一个
+`PostgresMetadataRepository`（一个连接池）。`PgPool::Borrow` 在**池锁内**做 `PQstatus` 健康检查，
+把 8 次借出**串行化**；即使先预热连接池，8 个线程在 `ClaimForWrite` 里仍被这一步排成队 ——
+实测**非原子的领取注入下用例照样通过**（`R1INJECT_CONFLICT_HIT` 计数为 0）。改成
+**每线程一个仓储对象/连接池**后，唯一的同步点回到数据库上的 `ux_mr_source` 部分唯一索引，
+注入①才如预期失败。结论：**"共享一个池的 N 线程并发"在这个池实现下不是真并发**
+（既有 M2 用例同样受影响；本轮给它加了池预热，但它的并发度仍受 `Borrow` 串行化限制——
+如实标注，不宣称它是真并发判据）。
+
+### 18.8 仍未交付 / 未验证（如实登记）
+
+* **上传路径的租约 `Acquire`/`Renew`/`Release`** —— 因此 `leases.{ttl_seconds,
+  renew_interval_seconds,time_source}` 仍「已读但无效果」；`staging_leases` 表仍只由 GC 侧使用。
+* **崩溃遗留 `claiming` 行的回收（GC 侧）** —— 本轮只交付 `ReleaseClaim`（在途失败时）与
+  正常 `MarkReady`；领取者**进程崩溃**会留下一个 `claiming` 行，同一 `fileSource` 在它被
+  `ReleaseClaim`/`Delete` 清除前**无法重新领取**，客户端会拿到有界等待后的 503。按切片约定，
+  按租约到期的回收是**下一个切片**。
+* **真·多实例 E2E + 崩溃注入（C9.26）** —— 本轮的并发判据在**单进程多连接**上完成，
+  没有两个真实进程 + 共享目录 + `kill -9` 注入。
+* **`state = 'deleted'` 的软删除语义** —— `Delete` 仍是硬删除（与 SQLite 一致）；
+  PG 里外部写入的 tombstone 行对读取不可见，且同 fileSource 的新领取会插入一新行
+  （`ux_mr_source` 的谓词排除 deleted），但"用软删除表达删除"本身未交付。
+* **NFS 语义（C9.27）**、**B2 的就绪/连接预算/时钟偏移**、**PG 连接预算（C9.28）**。
+* **`AGENTS.md` §0.1 的过时叙述**：仍把"`CreateFileMetadata` 跨步骤原子领取与
+  `claiming→ready`"列在"仍未交付"里。按会话约定 `AGENTS.md` 由父代理维护，本轮**未改**，
+  在此如实登记（PG 仓储头注释已按 R13 更新）。
+* 目标 PG 12.6 的 6 次完整 `-L pg` 运行中有 **1 次**单个用例失败的瞬时现象，失败用例名未被
+  捕获；其后 5 次完整运行 + 新用例在 12.6 上 **15/15** 重复运行均通过。该瞬时现象**未定位**，
+  如实登记为"未复现"。
+
+### 18.9 三态与契约面（收尾）
+
+* 配置键：**未新增、未激活**任何键；`leases.*` 逐字未动；`config/fss.example.json` /
+  `docs/operations.md` 未改，三态保持 **122 / 16 / 18**（`test_operations_doc` 通过）。
+* OSDU 线上契约：**未变**（`state` 不进 JSON；REST/gRPC 字段与报文不变）。
+* `./scripts/check_docs.sh`：D1~D5 全通过（63 链接 / 13 ADR / 148 条门槛）。
 
 
 
