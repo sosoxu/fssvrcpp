@@ -15,12 +15,16 @@
 > ⚠️ **下面是搬迁时的快照（逐字保留，不改写）**。快照之后发生的变更以 `AGENTS.md` §0.1、
 > `04-implementation-plan.md` 与对应的 `test-evidence/phaseN.md` 为准。
 > **已知的后继变更（截至本次搬迁）**：ADR-009 的**数据层三件已交付** —— PG 位置仓储、
-> 在途租约（见 `test-evidence/phase10.md` §15）与**元数据仓储**（§16），因此下面 P6/P8/P9 行里
-> "PG 版 `ILeaseRepository` / PG 仓储**未交付**"的说法**已过时**；
-> **仍未交付**：`CreateFileMetadata` 的**跨步骤**原子领取与 `claiming→ready` 状态机、
-> leader election、组合根的 `deployment.mode=multi` 接线（`multi` 仍拒绝启动），
-> 即 `location.postgres.*`/`metadata.postgres.*`/`leases.*`/`leader_election.*` 仍是
-> 「已读但无效果」（三态计数 **113/18/25** 未变）。
+> 在途租约（见 `test-evidence/phase10.md` §15）与**元数据仓储**（§16）；**`deployment.mode=multi`
+> 运行形态与 leader election 已交付**（§17，`multi` 不再拒绝启动）；**ADR-009 §4.2 的跨步骤
+> 原子领取 + `claiming→ready` 状态机已交付**（§18，`ClaimForWrite`/`MarkReady`/`ReleaseClaim`）。
+> 因此下面 P6/P8/P9 行里"PG 版 `ILeaseRepository` / PG 仓储 / leader election / multi 运行形态
+> **未交付**"的说法**已过时**。
+> **仍未交付**：**崩溃者留下的 `claiming` 行按租约到期回收**、上传路径的租约
+> `Acquire`/`Renew`（故 `leases.{ttl_seconds,renew_interval_seconds,time_source}` 仍
+> 「已读但无效果」）、共享挂载探针、readiness 的 PG 探活与 `metadata.postgres.schema_version_check`、
+> PG 连接预算（C9.28）、PG↔本地时钟偏移比对、真·多实例 E2E + 崩溃注入（C9.26）、NFS（C9.27）。
+> 三态现为 **生效 122 / 拒绝启动 16 / 已读但无效果 18**（`operations.md` §1.3）。
 >
 > ⚠️ **B1 之后的更新（最新，优先于上面的搬迁快照）**：组合根的 `deployment.mode=multi`
 > 接线**已交付**（见 `test-evidence/phase10.md` §17）——新增 L2 `src/infra/postgres/pg_leader_election.*`
