@@ -71,6 +71,13 @@ inline std::string ReadWholeFile(const std::string& path) {
   return buffer.str();
 }
 
+//  执行一条 shell 命令并**显式消费**退出码：`-Wunused-result` 对 `system(3)` 生效，
+//  而 `(void)system(...)` 并不能让它闭嘴。只用于进程生命周期管理（kill / 存活探测）。
+inline void RunShell(const std::string& command) {
+  const int rc = std::system(command.c_str());
+  (void)rc;
+}
+
 struct ServerProcessOptions {
   //  是否注入默认的 `FSS_HTTP_PORT=0` / `FSS_GRPC_PORT=-1`。配置面测试要自己控制端口时
   //  必须关掉 HTTP 那个（env 的优先级高于配置文件，否则"文件里的端口"永远测不到）。
@@ -92,9 +99,18 @@ class ServerProcess {
   explicit ServerProcess(ServerProcessOptions options) { Start(std::move(options)); }
 
   ~ServerProcess() {
-    if (!pid_.empty()) {
-      (void)std::system(("kill " + pid_ + " 2>/dev/null || true").c_str());
+    if (pid_.empty()) return;
+    RunShell("kill " + pid_ + " 2>/dev/null || true");
+    //  ★ B2b：等进程**真的消失**再返回。组合根在优雅退出路径上会注销
+    //    `instance_registry` 行并删除共享挂载探针；同一测试进程里下一个用例可能
+    //    立刻拉起新实例 —— 若上个实例还没退完，新实例会把它当成 live peer，
+    //    在存储根不同时被新的"共享挂载"判定 fail-closed（exit 78），造成跨用例误报。
+    //    轮询**真实条件**（`kill -0`），最多 5s；超时再 SIGKILL，绝不挂住用例。
+    for (int attempt = 0; attempt < 200; ++attempt) {
+      if (std::system(("kill -0 " + pid_ + " 2>/dev/null").c_str()) != 0) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
+    RunShell("kill -9 " + pid_ + " 2>/dev/null || true");
   }
   ServerProcess(const ServerProcess&) = delete;
   ServerProcess& operator=(const ServerProcess&) = delete;

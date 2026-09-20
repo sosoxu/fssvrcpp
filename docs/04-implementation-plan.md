@@ -998,7 +998,7 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
 切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）、切片 4（数据面 PUT 上限 + SQLite PRAGMA）
 与切片 5（`self_signed` 三键：`key_id` + 自签 TTL 上界）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态：**生效 122 / 拒绝启动 16 / 已读但无效果 18**（`docs/operations.md` §1.3；ADR-008 的 P4 +1、C10.20 的 6 键）。
+三态（B2b 后的当前值）：**生效 129 / 拒绝启动 15 / 已读但无效果 13 = 157**（`docs/operations.md` §1.3；B2a 与 B2b 的净变化见该节末尾）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
@@ -1163,7 +1163,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   组合根三分支：`log`（默认，既有 `LogEventPublisher` 逐字不变）/ `webhook` / `none`（内联 `NoopEventPublisher`，  **显式关闭**）；横幅打印 publisher/端点/timeout/topic（**不打印密钥**）。
   `src/app/usecases/usecases.cpp` 的 `PublishStatus` 补上 `record_id`（第 10 步/幂等命中路径带真实 id；  第 1 步 IN_PROGRESS 发生在建记录前 → 空），使 `statusChanged.body.recordId` 与上游形状一致。
   用例：`tests/integration/test_webhook_publisher.cpp`（真实进程 + `mock_validators.py --mode webhook`；  `--observe-file` 新增 `bodies` 列表断言两个 kind 都发了）+ `tests/unit/test_composition_root_guard.cpp` 清单加   `WebhookEventPublisher`。**未交付**：异步有界发布队列、重试退避、投递保证、与真实消息总线/中间件联调。
-* 三态计数：**生效 122 / 拒绝启动 16 / 已读但无效果 18 = 156**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* 三态计数（B2b 后的当前值）：**生效 129 / 拒绝启动 15 / 已读但无效果 13 = 157**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
   其中「拒绝启动」+1 来自 C10.18 的**伴随更正**（`auth.remote_entitlements.fail_closed`），
   与"6 个键接通"是两件事（落点不同：一个进「生效」、一个进「拒绝启动」）。
 

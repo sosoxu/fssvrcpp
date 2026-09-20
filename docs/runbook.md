@@ -227,12 +227,17 @@ scripts/bench_baseline.sh --check    # 退化 >20% 直接失败（退出码 1）
   （`staging_leases`）与 `PgLeaderElection`（会话级 advisory lock），并让 GC 的周期调度
   与 `POST /v2/gc:run` 都以 leader 门控。启动前提与故障排查见
   [`docs/operations.md`](operations.md) §7.3 与 §2.1。
-- ★ **仍未交付**（不要把"能启动"读成"多实例已完整验证"）：共享挂载探针
-  （`storage.posix.shared_mount_required` 只参与强制校验）、readiness 的 PG `SELECT 1` +
-  迁移版本校验、`instance_registry`/配置版本一致性、PG 连接预算（C9.28）、
-  PG-vs-本地时钟比较、上传路径的租约 `Acquire`/`Renew`、`CreateFileMetadata` 跨步骤原子领取、
-  **完整多实例 E2E 与崩溃注入（C9.26）**、**NFS 语义验证（C9.27）**、`syncfs` 干扰评估（C9.24）、
-  `/v2/info` 暴露 `instanceId`。多实例前的硬前提仍是 **C9.27**。
+- ★ **B2b 起已交付**：共享挂载探针（`storage.posix.shared_mount_required`：写
+  `<root>/.fss_probe.<instance_id>` + 与 `instance_registry` 的 live peer 交叉验证可见性；
+  启动期不可见 → exit 78，运行期不可见 → readiness not ready）、readiness 的
+  PG `SELECT 1` + 迁移版本校验（B2a）、`instance_registry` 心跳 + `config_hash`/服务版本
+  一致性（滚动升级护栏，B2b）、PG 连接预算（C9.28，B2a）、PG-vs-本地时钟比较（B2a）、
+  上传路径的租约 `Acquire`/`Renew`、`CreateFileMetadata` 跨步骤原子领取、
+  **多实例 E2E 与崩溃注入（C9.26）**。
+- ★ **仍未交付/未验证**（不要把"能启动"读成"多实例已完整验证"）：**NFS 语义验证（C9.27）** ——
+  B2b 只证明"交叉探针可见 = 共享性"，**不**证明 NFS 的 `rename`/close-to-open/`syncfs` 语义；
+  `syncfs` 干扰评估（C9.24）、`/v2/info` 暴露 `instanceId`、ADR-009 §10 的多实例部署 /
+  PG HA / 按盘分区 / 滚动升级运维手册。多实例前的硬前提仍是 **C9.27**。
 - 共享 POSIX 挂载上的临时文件命名包含实例标识与**每进程随机 token**
   （`.tmp.<instance_id>.<pid>.<counter>.<random>`；ADR-009 §4.5 的随机后缀已在 B1 补齐）。
   `deployment.instance_id` 在 multi 下未配置/为空时由组合根**自动生成**（默认 `local` 会让
@@ -274,8 +279,8 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 #   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
 ```
 
-**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 128 / 拒绝启动 15 /
-已读但无效果 14）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 129 / 拒绝启动 15 /
+已读但无效果 13；B2b 后）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
 它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动
@@ -336,7 +341,7 @@ FSS_CLAIM_HOLD_MS=15000 ./build/bin/fss_server --config config/fss.json &
 > 所以生产路径（未设置该变量）的行为与引入本接缝之前逐字节一致。
 >
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 128 / 拒绝启动 15 / 已读但无效果 14）由 `test_operations_doc` **机械比对**；
+> （生效 129 / 拒绝启动 15 / 已读但无效果 13）由 `test_operations_doc` **机械比对**；
 > "让每个 `createMetadata` 故意卡住 N 毫秒"不是运维语义，生产上只会制造事故。
 > 若写成配置项会按**未知键 → exit 78** 被拒。
 >
@@ -370,8 +375,33 @@ FSS_CLOCK_SKEW_INJECT_MS=1000 ./build/bin/fss_server --config config/fss.json &
 > 避免演练结论被误读成"这台机器钟真的偏了"。**默认不注入**，生产路径逐字节不变。
 >
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 128 / 拒绝启动 15 / 已读但无效果 14）由 `test_operations_doc` **机械比对**；
+> （生效 129 / 拒绝启动 15 / 已读但无效果 13）由 `test_operations_doc` **机械比对**；
 > "让实例钟走偏"不是运维语义，生产上只会制造事故。若写成配置项会按**未知键 → exit 78** 被拒。
 >
 > **禁令**：**不要**在生产/预发设置 `FSS_CLOCK_SKEW_INJECT_MS`。它只用于 B2a 的
 > PG↔本地钟偏移判据的回归与故障演练；演练结束请确认该变量已从环境 / systemd unit 中移除。
+
+### 10.4 服务版本**覆盖**接缝（B2b；⚠️ 同样**不要在生产设置**）
+
+ADR-009 §5.3 的滚动升级护栏要求"两个 live peer 的 `service_version` 不兼容 → readiness
+not ready"。真实机器上两个实例跑的是同一个二进制 ⇒ 版本必然相同，这条判据无法用配置制造。
+本接缝把上报给 `instance_registry` 的**服务版本串**换成一个可控值（默认取
+`FSS_BUILD_VERSION`，由 CMake 注入），用于验证"版本不一致"这条分支：
+
+| 环境变量 | 取值 | 行为 |
+| --- | --- | --- |
+| `FSS_SERVICE_VERSION_OVERRIDE` | 非空字符串 | 用该串替代 `FSS_BUILD_VERSION` 上报（横幅标注"测试接缝已生效"） |
+| 同上 | 未设置 / 空 | **不覆盖**：上报真实构建版本，生产路径逐字节不变 |
+
+```bash
+# 演练：把本实例上报成 9.9.9（与对端 0.1.0 的 major.minor 不同）→ readiness not ready
+FSS_SERVICE_VERSION_OVERRIDE=9.9.9 ./build/bin/fss_server --config config/fss.json &
+```
+
+> **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
+> （生效 129 / 拒绝启动 15 / 已读但无效果 13）由 `test_operations_doc` **机械比对**；
+> "让实例谎报版本"不是运维语义（真实滚动升级应通过部署流程控制），
+> 若写成配置项会按**未知键 → exit 78** 被拒。
+>
+> **禁令**：**不要**在生产/预发设置 `FSS_SERVICE_VERSION_OVERRIDE`。它只用于 B2b 的
+> 版本兼容判据回归；演练结束请确认该变量已从环境 / systemd unit 中移除。

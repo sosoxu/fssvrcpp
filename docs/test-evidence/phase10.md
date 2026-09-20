@@ -3059,3 +3059,242 @@ $ JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh
 * ⚠️ `AGENTS.md` 未改动（父代理所有，受 64 KiB 预算约束）：其 §0.1 的"readiness 的 PG 探活 +
   `schema_version_check`、PG 连接预算（C9.28）、PG↔本地时钟偏移比对"三处"仍未交付"叙述**已过时**，
   以本 §21 与 `docs/phase-status.md` 的 B2a 更新段为准。
+
+---
+
+## 22. B2b（本切片）：把 `storage.posix.shared_mount_required` 做成真的 + 滚动升级一致性做成真的
+
+### 22.1 结论（先说答案）
+
+ADR-009 剩下的两条判据已交付，且**逐条有真实进程证据**（本机 PG 14.24 与目标 PG 12.6）：
+
+| 判据 | 落地 | 真实进程判据 |
+| --- | --- | --- |
+| `storage.posix.shared_mount_required` **真的生效**（§8.1 item 4） | 新 L2 `src/infra/blob/posix/shared_mount_probe.{h,cpp}`：写 `<root>/.fss_probe.<instance_id>`（id + 时间戳）+ 读回自证 + 交叉可见性 + 过老清理 | `tests/integration/test_shared_mount_and_registry.cpp` **B2b-1**（同 root → 两个探针都真实存在、都 ready）/**B2b-2**（★ 同 PG + **不同** root → 第二个实例 **exit 78**，原因给出对端 id/探针路径/两个 root）/**B2b-4**（运行期探针消失 → not ready；过 live 窗口 → 忽略 stale 行 → ready） |
+| `instance_registry` **心跳 + 配置/版本一致性**（§5.3 滚动升级护栏） | 新 L2 `src/infra/postgres/pg_instance_registry.{h,cpp}`（upsert/心跳/列 live peer/注销/过老清理）+ 组合根后台线程（**10s**）+ 把结论并进**既有** `ports.shared_state_probe` | 同文件 **B2b-3**（`config_hash` 不同 → 503 且原因指出对端；正控：配置逐字相同 → 200）、**B2b-3**（`FSS_SERVICE_VERSION_OVERRIDE=9.9.9` → 503，原因含版本） |
+
+**三态净变化（先给数字）**：`157` 键；**生效 128 → 129**、**拒绝启动 15 → 15**、
+**已读但无效果 14 → 13**。唯一变化：`storage.posix.shared_mount_required` 从「已读但无效果」
+移入「生效」。**`deployment.instance_id`（B1 起生效）与其它键的三态不变** —— 本条不新增配置键、
+不改默认值。逐键见 `docs/operations.md` §1.3；`tests/unit/test_operations_doc.cpp` 的计数断言
+与正文数字串已同步为 `生效 129 / 拒绝启动 15 / 已读但无效果 13` / `**129 + 15 + 13 = 157**`。
+
+**新增测试**：`tests/integration/test_shared_mount_and_registry.cpp`（`pg;infra;b2b`，
+`FIXTURES_REQUIRED pg`，`TIMEOUT 900`）—— **4 用例 / 194 断言**。
+
+### 22.2 实现点（可点击）
+
+* `src/infra/blob/posix/shared_mount_probe.h` / `.cpp`（**新增**）：`FileNameFor()` 是
+  `.fss_probe.<id>` 的**单一来源**；`WriteOwn()` 用 `fs::AtomicWriteFile`（临时名含实例标识，
+  ADR-009 M1）写 `instance_id=<id>\nwritten_at_epoch_millis=<ms>` 并**读回自证**（读不回 =
+  fail-closed）；`PeerProbeVisible()` 要求文件内容里的 `instance_id=` **整行**等于该 peer
+  （防止把陈旧/半截文件当可见）；`RemoveOwn()` 幂等删除；`CleanupStale()` 按 mtime 清
+  `.fss_probe.*`（**不含自己的、不含 `.tmp.` 中间态**）。
+* `src/infra/postgres/pg_instance_registry.h` / `.cpp`（**新增**）：`UpsertSelf()`
+  （`INSERT ... ON CONFLICT (instance_id) DO UPDATE`；`started_at` 只在首插时写）、
+  `TouchHeartbeat()`（行不存在时自动重新 upsert）、`ListLivePeers(liveness)`
+  （`heartbeat_at > now() - ($2::int * INTERVAL '1 second')`，PG **12.6** 兼容）、
+  `RemoveSelf()`（**析构函数也调用**，保证 exit 78 / SIGTERM / 未捕获异常每条退出路径都注销）、
+  `CleanupStale()`（阈值 300s，只删别的实例且**过老**的行）、纯函数 `ServiceVersionCompatible()`
+  与 `PeerConsistencyReason()`（可读原因，指出 peer id + 差在哪）。**不建新连接池**：复用组合根
+  已有的"共享状态池"（元数据池优先）⇒ C9.28 的连接预算公式不变。
+* `src/main/server_main.cpp`：`shared_mount_required` 配置读取；`ComputeInstanceConfigHash()`
+  （**脱敏**有效配置 `RedactedDump()` → 去实例本地键 → `Dump` → SHA-256，注释说明为什么安全）；
+  `InstanceConsistencyMonitor`（内联类：10s 心跳线程 + 互斥量缓存的 not-ready 原因，
+  `Stop()+join()` 覆盖析构）；启动块（**先写探针 → 再注册 → 再查对端可见性**）；启动期
+  交叉可见性 → `reject_startup`（exit 78）；把监视器结论并进既有 `ports.shared_state_probe`
+  （REST/gRPC 同源）；横幅新增 `instance reg` / `consistency` / `shared mount`；
+  测试接缝 `FSS_SERVICE_VERSION_OVERRIDE`（**环境变量，不是配置键**）。
+* `src/CMakeLists.txt`：`fss_blob_posix` 加 `shared_mount_probe.cpp`；`fss_pg` 加
+  `pg_instance_registry.cpp`。
+* `tests/framework/server_process.h`：析构里 `kill` 后**轮询 `kill -0` 等进程真的消失**
+  （≤5s，超时再 SIGKILL）—— 否则同一测试进程里下一个用例可能把上个实例当 live peer，
+  在存储根不同时被新判据 fail-closed。新增 `RunShell()` 显式消费 `system(3)` 退出码
+  （`(void)system(...)` 并不能压掉 `-Wunused-result`）。
+* `tests/integration/test_multi_mode.cpp`（B1-4/B1-5）与
+  `tests/integration/test_multi_crash_recovery.cpp`（C9.26）：**因新判据而必须让同一部署的
+  两个实例配置一致** —— B1-4/B1-5 改为共享同一 storage root；B1-5 两个实例共用同一
+  `leader_election.lock_key`；C9.26 两个实例都 `gc.enabled=true`（**谁跑 GC 由 leader 门控**，
+  与生产形态一致），并新增 `InstanceRegistryGuard` 清掉被 `kill -9` 的实例留下的注册表行。
+  **上述改动的断言只增强了"配置一致性"这一前提，没有放宽任何原有判据**（断言数由 185/6 用例
+  （B1 系列）与 268（C9.26）可见：只改了场景配置与本用例的前置说明）。
+* `docs/operations.md` §1.2/§1.3、`docs/runbook.md` §8/§10.4、`docs/phase-status.md`、
+  `docs/02-design.md`（R-26/R-28）、`docs/03-api-contract.md` §multi 表：逐键行 + 三态计数 +
+  接缝文档 + "只证明共享性、不等于 NFS 语义"。
+
+### 22.3 实测命令与输出摘要
+
+**默认构建（`build`，`FSS_WITH_PG=OFF`）**
+```
+$ cmake --build build -j4                       # 0 error；改动文件 0 warning
+$ ctest --test-dir build --output-on-failure
+100% tests passed, 0 tests failed out of 88      # Total Test time 90.16 s
+```
+（唯一告警来自**未改动**的 `src/common/http/server.cpp:1052`（既有的 `-Wsign-compare`）；
+`tests/framework/{raw_http,app_fixture,mock_validators}.h` 的既有告警亦与本次改动无关。）
+
+**PG 套件（`build-pg`，`FSS_WITH_PG=ON`）**
+```
+# 本机 PG 14.24
+$ ctest --test-dir build-pg -L pg --output-on-failure
+100% tests passed, 0 tests failed out of 11      # Total Test time 79.92 s（新用例 31.3 s）
+
+# 目标 PG 12.6（FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss）
+$ FSS_PG_DSN=... ctest --test-dir build-pg -L pg --output-on-failure
+100% tests passed, 0 tests failed out of 11      # Total Test time 100.18 s（新用例 35.0 s）
+
+# 新用例本体（两引擎一致）
+$ ./build-pg/bin/test_shared_mount_and_registry
+All tests passed (194 assertions in 4 test cases)
+```
+
+**★ 判别性用例（不同 storage root = 不是共享挂载）的原始失败/通过形态**
+
+该用例（B2b-2）的判据是"第二个实例**退出码必须是 78**，且原因里同时出现 live peer 的
+`instance_id`、探针文件名与两个 root"。**正确实现下它通过**（11/11 中的一部分）；
+把 `PeerProbeVisible` 注成恒真时它以 `outcome.exit_code := 124`（**没有拒绝启动**）失败 —— 见 §22.5。
+
+**残留（两引擎都为 0）**
+```
+$ <psql DSN> -tAc "SELECT count(*) FROM instance_registry;"                       -> 0
+$ <psql DSN> -tAc "SELECT count(*) FROM pg_locks WHERE locktype='advisory';"      -> 0
+$ <psql DSN> -tAc "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'pgtest%';" -> 0
+$ <psql DSN> -tAc "SELECT count(*) FROM file_metadata_records WHERE partition_id LIKE 'pgtest%';" -> 0
+$ <psql DSN> -tAc "SELECT count(*) FROM file_locations WHERE partition_id LIKE 'pgtest%';"        -> 0
+$ <psql DSN> -tAc "SELECT count(*) FROM staging_leases WHERE partition_id LIKE 'pgtest%';"        -> 0
+$ find /tmp /home/ll/fssvrcpp -name '.fss_probe.*' | wc -l                        -> 0
+```
+B2b 的 4 个用例各自使用**独立 scratch schema**（`pgtest_b2b_<tag>_<pid>_<n>`，
+`CREATE SCHEMA` 后 `SET search_path`，应用只读的 `db/migrations/001_init.sql`，结束
+`DROP SCHEMA ... CASCADE`）⇒ `instance_registry` 的行随 schema 一起消失；
+被 `kill -9` 的实例（C9.26 的 `c926-a`）留下的行由 `InstanceRegistryGuard` 按**自己的
+instance_id**删除（绝不 TRUNCATE、绝不删别的实例）。探针文件随 `TempDir`/`BuildDirGuard` 一起清理。
+
+**门槛**
+```
+$ ./scripts/check_docs.sh
+全部检查通过（D1~D5）
+
+$ JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh
+  [preflight] ✅ 无注入残留
+  [docs]      ✅ 通过（--selftest 检查器有效）
+  [infra]     ✅ 11/11（ctest -L pg，本机 14.24；含新增 test_shared_mount_and_registry）
+  [phase1]    ✅ ASan + UBSan 全绿（phase0~phase10）
+  [phaseN]    ✅ 各阶段通过
+  汇总
+    失败: 无
+  ⏱  总耗时: 8 分 35 秒（515 s，阶段数 11）
+  ✅ 全部已启用阶段门槛通过
+```
+
+### 22.4 三态 / 键数净变化
+
+| 键 | 之前 | 之后 | 理由 |
+| --- | --- | --- | --- |
+| `storage.posix.shared_mount_required` | 已读但无效果 | **生效** | 启动期写探针 + 与 `instance_registry` 的 live peer 交叉验证可见性（启动期不可见 exit 78 / 运行期不可见 not ready） |
+
+计数：**生效 128 → 129**、**拒绝启动 15 → 15**、**已读但无效果 14 → 13**、键数 **157 → 157**
+（无新增键）。§1.3.1 的生效清单加入该键；§1.3.3 的清单移除它，并**顺带修正**了该清单里此前
+残留的 6 个 `*.sqlite.group_commit*`（C10.20 起已生效）与 4 个 `metadata.remote.*` 之外的
+陈旧条目 —— 现在清单精确等于机械统计出来的 13 个键。
+
+### 22.5 R1 自证（3 条注入；每条都在**完整重编**后跑，末尾已全部还原，`md5sum` 逐字一致）
+
+基线：`src/infra/blob/posix/shared_mount_probe.cpp 09bc9a00…`、
+`src/infra/postgres/pg_instance_registry.cpp ea8909ed…`。
+
+**注入 1 —— 跳过探针写入**（`WriteOwn()` 开头 `return Ok();`）→ **B2b-1 的"互相可见"正控失败**
+```
+$ cmake --build build-pg -j4 && ./build-pg/bin/test_shared_mount_and_registry
+-------------------------------------------------------------------------------
+★ B2b-1：同一 PG + 同一 storage root 的两个 multi 实例都
+-------------------------------------------------------------------------------
+/home/ll/fssvrcpp/tests/framework/server_process.h:194: FAILED:
+  REQUIRE( http_port_ != 0 )                       # 第二个实例因"看不到对端探针"exit 78
+test cases:   4 |   1 passed | 3 failed
+assertions: 146 | 141 passed | 5 failed
+```
+（B2b-2 仍"通过"是因为它本来就期望 exit 78；判别力由 B2b-1/3/4 承担。）
+
+**注入 2 —— 把"不可见的 live peer"当成 OK**（`PeerProbeVisible()` 恒 `true`）→ **B2b-2 失败**
+```
+$ cmake --build build-pg -j4 && ./build-pg/bin/test_shared_mount_and_registry "*B2b-2*"
+★ B2b-2：同一 PG + **不同** storage root → 第二个实例 exit
+/home/ll/fssvrcpp/tests/integration/test_shared_mount_and_registry.cpp:436: FAILED:
+  REQUIRE( outcome.exit_code == 78 )
+with expansion:
+  outcome.exit_code := 124                          # 没有 fail-closed，跑满 20s 超时
+test cases:  1 |  0 passed | 1 failed
+assertions: 20 | 19 passed | 1 failed
+```
+
+**注入 3 —— 忽略 `config_hash` 不一致**（`if (false && peer.config_hash != self_config_hash)`）→ **B2b-3 失败**
+```
+$ cmake --build build-pg -j4 && ./build-pg/bin/test_shared_mount_and_registry "*B2b-3*"
+★ B2b-3：config_hash / 服务版本不一致 → 后启动者 not
+/home/ll/fssvrcpp/tests/integration/test_shared_mount_and_registry.cpp:502: FAILED:
+  REQUIRE( not_ready )                              # 配置不同的实例被放行成 ready
+test cases:  1 | 0 passed | 1 failed
+assertions: 85 | 84 passed | 1 failed
+```
+（版本那一段在注入 3 下**仍然通过** —— 说明注入只打掉了 config_hash 这一条，判据不是"一锅端"。）
+
+**还原证明**
+```
+$ md5sum -c /tmp/r1_baseline.md5
+src/infra/blob/posix/shared_mount_probe.cpp: OK
+src/infra/postgres/pg_instance_registry.cpp: OK
+$ grep -rn "R1-INJECT" src/ tests/     # 无输出（0 处）
+```
+还原后**完整重编** `build-pg` 并重跑：`ctest -L pg` **11/11**、
+`./build-pg/bin/test_shared_mount_and_registry` **All tests passed (194 assertions in 4 test cases)**。
+
+### 22.6 判断记录（本切片的取舍，逐条给理由）
+
+* **`config_hash` 哈希什么**：`Config::RedactedDump()`（所有 `FieldSpec::Secret()` 字段 → `***`；
+  含 HMAC 密钥、S3 secret、自签 `signing_key`、两个 PG DSN、remote `static_token`）→ 解析回
+  JSON（nlohmann 对象键有序 ⇒ 确定串）→ **删除实例本地键**（`deployment.instance_id`、
+  `server.{http,grpc}.{bind,port}`、`self_signed.public_base_url`）→ `Dump` → SHA-256。
+  **为什么安全**：① 明文密钥根本不进入哈希函数（脱敏在前）；② 只存不可逆摘要，无法反推配置；
+  ③ 删除的键是"每实例本就不同"的身份/监听地址/对外 URL，否则同一部署的两个实例永远互相判为不一致
+  （B2b-1 的正控就是这条：两个实例端口/实例 id 不同但 `config_hash` 必须相等）。
+* **live 窗口 = 3 × 10s = 30s**（心跳周期 10s 固定，不新增配置键）；过老清理阈值 **300s**
+  （=10 × 窗口）—— 只清"崩溃很久"的行，不会误删"晚了几拍"的实例。判定一律用 **PG `now()`**，
+  不用实例本地钟（ADR-009 的既定纪律）。
+* **版本兼容 = `major.minor` 相等**（去掉 `-rcN`/`+build` 后缀），patch 允许不同（滚动升级语义）；
+  版本串不是纯数字点分时退化为**逐字相等**（fail-closed，宁严勿松）。
+* **readiness 复用既有机制**：只把监视器的缓存原因并进 B2a 已装配的 `ports.shared_state_probe`
+  （REST `503` 文本 / gRPC `UNAVAILABLE` 文本同源），**没有**第二条 readiness 路径。
+* **启动期 vs 运行期**：启动期只对"**已有 live peer**"判"探针可见性"（不可见 → exit 78）；
+  **配置/版本**不一致**不** exit（滚动升级时新实例"不 ready 而非崩溃"才正确），交给运行期
+  readiness。没有 live peer 时不声称已验证，横幅打印"**跨实例可见性尚未验证**"+ 一条 Warn。
+* **连接预算不变**：注册表/心跳复用组合根已有的共享状态池，不新建池 ⇒ C9.28 的
+  "每实例最坏连接数"公式与 B2a 完全一致（B2a-1 的算术无需改动）。
+* **注册表注销用 RAII**（析构函数调 `RemoveSelf()`）：否则 exit 78 的实例会留下"半截注册"，
+  被别的实例当成 live peer（注入前的 B2b-2 实测暴露了这一点：退出后行还在）。
+* **为什么改既有测试的场景配置**：`config_hash` 一致性把"同一部署的两实例配置必须逐字一致"
+  变成了硬约束；B1-4/B1-5（两个不同 storage root）与 C9.26（A/B 的 `gc.enabled` 不同）此前是
+  "为了测别的东西"而刻意制造的配置差异，现在按生产形态改成一致（C9.26 里"谁跑 GC"仍由
+  leader 门控决定）。**没有**放宽/删除任何断言或护栏；改的是前置条件。
+
+### 22.7 仍未交付 / 未验证（如实登记）
+
+* **NFS 语义（C9.27）仍未验证**：本切片证明的是"**交叉探针可见 = 共享性**"，**没有**测
+  NFS 的 `rename` 原子性/close-to-open 一致性/`syncfs` 语义；`AGENTS.md` 的既定硬前提
+  （多实例上生产必须先验 C9.27）不变。
+* **`/v2/info` 的 `instanceId`**：本切片**未**加（REST/gRPC 的 `/v2/info` 字段未变，
+  OSDU 线契约未改）。
+* **ADR-009 §10 的运维手册**（多实例部署拓扑 / PG HA / 按 partition 分盘 / 滚动升级流程）**未写**。
+* **跨实例 `createMetadata` 的 LB 粘性**：未提供建议/配置（登记为未交付）。
+* **时钟**：`config_hash`/探针判定不依赖本地钟；心跳/liveness 用 PG `now()`。但
+  `deployment.clock_skew_tolerance_seconds` 只夹住"本地钟 vs PG now()"，**跨主机 NTP 漂移**
+  仍未在真实多主机上验证（沿用 B2a 的登记）。
+* **`instance_registry` 的运行期过老清理**：只在**启动期**清理；一个长期运行的实例不会在运行期
+  删除别的过老行（避免与"只是慢"混淆）。行数在极端情况（大量崩溃实例且无重启）下可能累积 ——
+  这是本切片刻意选的保守策略。
+* **测试覆盖的边界**：只用 **2 个实例**、只有**同一台机器**上的"共享目录"（不是 NFS）；
+  未测 >2 实例、跨主机、真实滚动升级（新旧二进制同时在线）—— 一致性判据是用
+  `FSS_SERVICE_VERSION_OVERRIDE` 接缝驱动的，**不是**两个真实不同版本的二进制。
+* **`service_version` 的来源**：`FSS_BUILD_VERSION`（CMake `PROJECT_VERSION`，当前 `0.1.0`），
+  非 git 描述；不同构建若 `PROJECT_VERSION` 相同则版本判据无区分力（构建流水线需要保证
+  patch 单调，本切片不改 CMake 版本注入）。

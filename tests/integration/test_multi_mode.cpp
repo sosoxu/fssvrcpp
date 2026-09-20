@@ -450,8 +450,11 @@ TEST_CASE("★ B1-4：两个进程共享 lock_key → 恰好一个 leader，非 
           "[pg][infra][b1]") {
   TempDir cfg_a_dir("b1_two_a_cfg");
   TempDir cfg_b_dir("b1_two_b_cfg");
-  TempDir data_a_dir("b1_two_a_data");
-  TempDir data_b_dir("b1_two_b_data");
+  //  ★ B2b：multi 下 `shared_mount_required=true` 现在**真的**要求两个实例看到同一个挂载
+  //    （启动期交叉探针可见性；不同 root → exit 78）。本用例只考察 leader 门控，
+  //    因此让两个进程共享**同一个**存储根 —— 与 `test_multi_crash_recovery.cpp` 同形。
+  TempDir data_dir("b1_two_data");
+  const std::string root = data_dir.child("store");
   const int port_a = FreePort();
   const int port_b = FreePort();
   REQUIRE(port_a > 0);
@@ -463,11 +466,11 @@ TEST_CASE("★ B1-4：两个进程共享 lock_key → 恰好一个 leader，非 
   //    且窗口内**反复轮询** B 的计数恒为 0。
   const std::string config_a = WriteFile(
       cfg_a_dir, "a.json",
-      ScenarioConfig("multi", data_a_dir.child("store"), port_a, "b1-two-a",
+      ScenarioConfig("multi", root, port_a, "b1-two-a",
                      /*leader_enabled=*/true, key, /*gc_enabled=*/true));
   const std::string config_b = WriteFile(
       cfg_b_dir, "b.json",
-      ScenarioConfig("multi", data_b_dir.child("store"), port_b, "b1-two-b",
+      ScenarioConfig("multi", root, port_b, "b1-two-b",
                      /*leader_enabled=*/true, key, /*gc_enabled=*/true));
 
   ServerProcess server_a(ProcessOptions(PgArgs(config_a, TestDsn(), TestDsn())));
@@ -528,41 +531,54 @@ TEST_CASE("★ B1-4：两个进程共享 lock_key → 恰好一个 leader，非 
 TEST_CASE("★ B1-5：multi 下空/未配置 deployment.instance_id 自动生成唯一 id（两个进程不同）",
           "[pg][infra][b1]") {
   TempDir cfg_a_dir("b1_id_a_cfg");
-  TempDir data_a_dir("b1_id_a_data");
   TempDir cfg_b_dir("b1_id_b_cfg");
-  TempDir data_b_dir("b1_id_b_data");
+  //  ★ B2b：两个 multi 实例的 `shared_mount_required=true` 现在要求它们看到同一个挂载
+  //    （不同 root → 第二个实例启动期 exit 78）。本用例只考察 instance_id 生成，
+  //    因此共享同一个存储根。
+  TempDir data_dir("b1_id_data");
+  const std::string root = data_dir.child("store");
   const int port_a = FreePort();
   const int port_b = FreePort();
   REQUIRE(port_a > 0);
   REQUIRE(port_b > 0);
 
-  //  A：显式置空（`--set deployment.instance_id=`）；B：**完全未配置**（有效默认 local）。
-  const std::string config_a = WriteFile(
-      cfg_a_dir, "a.json",
-      ScenarioConfig("multi", data_a_dir.child("store"), port_a, "", /*leader_enabled=*/true,
-                     /*lock_key=*/1800000005, /*gc_enabled=*/false));
-  const std::string config_b = WriteFile(
-      cfg_b_dir, "b.json",
-      ScenarioConfig("multi", data_b_dir.child("store"), port_b, "local",
-                     /*leader_enabled=*/true, /*lock_key=*/1800000006, /*gc_enabled=*/false));
+  std::string id_a;
+  std::string id_b;
+  {
+    //  A：显式置空（`--set deployment.instance_id=`）；B：**完全未配置**（有效默认 local）。
+    //  ★ B2b：两个实例必须是**同一个部署配置**（`instance_registry` 的 config_hash 一致性
+    //    护栏）⇒ 除 instance_id/端口外逐字相同：所以它们共用**同一个** lock_key
+    //    （leader 选举本来就该部署级一致；本用例只考察 id 生成，不考察 leadership）。
+    const std::string config_a = WriteFile(
+        cfg_a_dir, "a.json",
+        ScenarioConfig("multi", root, port_a, "", /*leader_enabled=*/true,
+                       /*lock_key=*/1800000005, /*gc_enabled=*/false));
+    const std::string config_b = WriteFile(
+        cfg_b_dir, "b.json",
+        ScenarioConfig("multi", root, port_b, "local",
+                       /*leader_enabled=*/true, /*lock_key=*/1800000005, /*gc_enabled=*/false));
 
-  ServerProcess server_a(ProcessOptions(PgArgs(config_a, TestDsn(), TestDsn())));
-  ServerProcess server_b(ProcessOptions(PgArgs(config_b, TestDsn(), TestDsn())));
-  REQUIRE(WaitReady(port_a));
-  REQUIRE(WaitReady(port_b));
+    ServerProcess server_a(ProcessOptions(PgArgs(config_a, TestDsn(), TestDsn())));
+    ServerProcess server_b(ProcessOptions(PgArgs(config_b, TestDsn(), TestDsn())));
+    REQUIRE(WaitReady(port_a));
+    REQUIRE(WaitReady(port_b));
 
-  const std::string id_a = InstanceIdOf(server_a.DumpLog());
-  const std::string id_b = InstanceIdOf(server_b.DumpLog());
-  CAPTURE(id_a, id_b, server_a.DumpLog(), server_b.DumpLog());
-  REQUIRE_FALSE(id_a.empty());
-  REQUIRE_FALSE(id_b.empty());
-  REQUIRE(id_a != "local");
-  REQUIRE(id_b != "local");
-  REQUIRE(id_a != id_b);  // ★ M1：两个实例绝不能共享同一标识
-  REQUIRE(server_a.DumpLog().find("自动生成唯一 id") != std::string::npos);
-  REQUIRE(server_b.DumpLog().find("自动生成唯一 id") != std::string::npos);
+    id_a = InstanceIdOf(server_a.DumpLog());
+    id_b = InstanceIdOf(server_b.DumpLog());
+    CAPTURE(id_a, id_b, server_a.DumpLog(), server_b.DumpLog());
+    REQUIRE_FALSE(id_a.empty());
+    REQUIRE_FALSE(id_b.empty());
+    REQUIRE(id_a != "local");
+    REQUIRE(id_b != "local");
+    REQUIRE(id_a != id_b);  // ★ M1：两个实例绝不能共享同一标识
+    REQUIRE(server_a.DumpLog().find("自动生成唯一 id") != std::string::npos);
+    REQUIRE(server_b.DumpLog().find("自动生成唯一 id") != std::string::npos);
+  }  // ← A/B 在此优雅退出并注销 registry 行（B2b），不干扰下面的 single 正控
 
   //  ★ 正例对照（R16）：single 模式**不生成** id（逐字保持不变）。
+  //    ★ B2b：single 进程的 config_hash 与刚退出的 multi 实例不同 —— 若 A/B 还 live，
+  //      本实例会因"配置不一致"变 not ready。因此 A/B 必须先退出（上面的作用域 +
+  //      ServerProcess 析构会等到进程真的消失）。
   TempDir cfg_s_dir("b1_id_s_cfg");
   TempDir data_s_dir("b1_id_s_data");
   const int port_s = FreePort();

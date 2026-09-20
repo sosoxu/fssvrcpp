@@ -219,6 +219,26 @@ if(FSS_WITH_PG)
     FIXTURES_REQUIRED pg
     TIMEOUT 900)
 
+  # ===========================================================================
+  #  B2b（本切片，ADR-009 §5.3 / §8.1 item 4）：`instance_registry` 心跳 +
+  #  配置/版本一致性 + `storage.posix.shared_mount_required` 的**真实共享挂载探针**
+  #    · 两个真实 `fss_server` 进程 + **同一 PG**（每个用例一个 scratch schema，
+  #      结束即 DROP ⇒ 注册表行零残留）；
+  #    · 同一 storage root → 都 ready 且互相看得见探针（正控）；
+  #    · ★ 同一 PG + **不同** storage root → 后启动者 **exit 78**（"不是共享挂载"）；
+  #    · config_hash / 服务版本不一致 → 后启动者 **not ready**（滚动升级护栏）；
+  #    · `kill -9` 对端后：live 窗口内仍被检查（not ready），过窗后 stale 行被忽略（ready）。
+  #  ★ 参数（钉住的设计，非配置键）：心跳 10s / live 窗口 30s ⇒ 最慢的用例要等窗口过期。
+  # ===========================================================================
+  fss_add_test(test_shared_mount_and_registry
+    SOURCES integration/test_shared_mount_and_registry.cpp
+    LIBS    fss_pg Threads::Threads
+    LABELS  "pg;infra;b2b")
+  add_dependencies(test_shared_mount_and_registry fss_server)
+  set_tests_properties(test_shared_mount_and_registry PROPERTIES
+    FIXTURES_REQUIRED pg
+    TIMEOUT 900)
+
   if(FSS_PG_TEARDOWN)
     add_test(NAME pg_fixture_teardown COMMAND "${_pg_script}" stop)
     set_tests_properties(pg_fixture_teardown PROPERTIES

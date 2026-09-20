@@ -38,10 +38,12 @@
 #include "common/sys/capability.h"
 #include "common/time/clock.h"
 #include "domain/ports/ports.h"
+#include "app/version.h"
 #include "infra/auth/local/local_jwt_authorizer.h"
 #include "infra/auth/remote/remote_entitlements_authorizer.h"
 #include "infra/blob/metered/metered_blob_store.h"
 #include "infra/blob/posix/posix_blob_store.h"
+#include "infra/blob/posix/shared_mount_probe.h"
 #include "infra/blob/s3/s3_blob_store.h"
 #include "infra/event/webhook_event_publisher.h"
 #include "infra/io/uring_io_engine.h"
@@ -54,6 +56,7 @@
 #include "infra/metadata/postgres/postgres_metadata_repository.h"
 #include "infra/metadata/sqlite/sqlite_metadata_repository.h"
 #include "infra/postgres/pg_leader_election.h"
+#include "infra/postgres/pg_instance_registry.h"
 #include "infra/postgres/pg_schema.h"
 #include "infra/schema/remote_schema_validator.h"
 #include "infra/transfer/blob_byte_source.h"
@@ -1098,6 +1101,192 @@ class GcScheduler {
   std::atomic<std::int64_t> runs_{0};
 };
 
+// =============================================================================
+//  ★ B2b（ADR-009 §5.3 / §8.1 item 4）：实例心跳 + 配置/版本一致性 + 共享挂载探针
+// =============================================================================
+//  三条**固定参数**（钉住的设计：不新增配置键）：
+//    · 心跳周期 10s；
+//    · live 窗口 = 3 × 心跳周期 = 30s（`instance_registry.heartbeat_at` 在窗口内才算 live）；
+//    · 过老行清理阈值 300s（= 10 × 窗口；远大于窗口，不会误删"只是晚了几拍"的实例）。
+constexpr int kInstanceHeartbeatSeconds = 10;
+constexpr int kInstanceLivenessSeconds = 3 * kInstanceHeartbeatSeconds;
+constexpr int kInstanceStaleCleanupSeconds = 10 * kInstanceLivenessSeconds;
+//  探针文件的过老清理阈值：只用于清掉崩溃实例留下的文件（不参与 liveness 判定）。
+constexpr int kProbeStaleCleanupSeconds = 3600;
+
+//  `config_hash` 的材料 = **脱敏后的有效配置**去掉"每实例本来就不同"的键，再 SHA-256。
+//  为什么安全（不许出现明文密钥，也不许让哈希可反推密钥）：
+//    ① 先走 `Config::RedactedDump()` —— 所有 `FieldSpec::Secret()` 字段（HMAC 密钥、
+//       S3 secret、自签 signing_key、两个 PG DSN、remote static_token）都被替换成 `***`，
+//       明文根本不会进入哈希函数；
+//    ② 存的只是 SHA-256 摘要（64 位十六进制），不可逆，无法从中恢复任何配置值；
+//    ③ 移除的键是**实例身份/监听地址/对外 URL**（同机多实例必须不同），它们不代表
+//       "配置一致性"，否则同一部署的两个实例永远互相判为不一致。
+//  产出的串会写进 `instance_registry.config_hash` 并打印在启动横幅（只截断展示）。
+fss::Result<std::string> ComputeInstanceConfigHash(const fss::config::Config& cfg) {
+  auto parsed = fss::json::Parse(cfg.RedactedDump());
+  if (!parsed.ok()) {
+    return fss::Err(fss::ErrorKind::kInternal,
+                    "config_hash 计算失败：脱敏配置不是合法 JSON：" +
+                        parsed.error().message());
+  }
+  fss::json::Value material = parsed.value();
+  //  nlohmann 的对象键是有序的（std::map）⇒ `Dump` 对同一份配置产出确定串。
+  static const char* const kInstanceLocalKeys[] = {
+      "deployment.instance_id",       // 实例身份（multi 下还可能被自动生成）
+      "server.http.bind",             // 监听地址（每实例可不同）
+      "server.http.port",             // 监听端口（同机多实例必须不同）
+      "server.grpc.bind",             // 同上
+      "server.grpc.port",             // 同上
+      "self_signed.public_base_url",  // 对外可达地址（内嵌每实例端口）
+  };
+  for (const char* key : kInstanceLocalKeys) {
+    const std::string path(key);
+    fss::json::Value* cursor = &material;
+    std::size_t start = 0;
+    while (true) {
+      if (!cursor->is_object()) break;
+      const auto dot = path.find('.', start);
+      const std::string segment =
+          path.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+      if (dot == std::string::npos) {
+        cursor->erase(segment);
+        break;
+      }
+      auto it = cursor->find(segment);
+      if (it == cursor->end()) break;
+      cursor = &(*it);
+      start = dot + 1;
+    }
+  }
+  return fss::crypto::Sha256Hex(fss::json::Dump(material));
+}
+
+//  共享挂载失败的**可读原因**（启动期检查与运行时心跳共用同一份措辞）。
+std::string MountVisibilityFailureReason(const fss::infra::SharedMountProbe& probe,
+                                         const std::string& peer_id, int liveness_seconds) {
+  return "共享挂载校验失败：实例 " + peer_id + " 是 live peer（心跳在 " +
+         std::to_string(liveness_seconds) + "s 内），但其探针文件 " + probe.PathFor(peer_id) +
+         " 在本实例的 storage.posix.root（" + probe.root() +
+         "）下不可见 —— storage.posix.root 不是所有实例共享的挂载"
+         "（能写自己的探针、却看不到别的实例的探针 = 各实例看到的是各自的本地目录）";
+}
+
+//  启动期交叉可见性检查：对**当前 live peer** 逐个验证探针可见性。
+//  返回 live peer 数（0 = 尚无 live peer，无法证明共享性；由运行时心跳复查兜住）。
+fss::Result<int> StartupMountVisibilityCheck(fss::infra::PgInstanceRegistry& registry,
+                                             fss::infra::SharedMountProbe& probe) {
+  FSS_TRY(peers, registry.ListLivePeers(kInstanceLivenessSeconds));
+  for (const auto& peer : peers) {
+    if (!probe.PeerProbeVisible(peer.instance_id)) {
+      return fss::Err(fss::ErrorKind::kUnavailable,
+                      MountVisibilityFailureReason(probe, peer.instance_id,
+                                                   kInstanceLivenessSeconds));
+    }
+  }
+  return static_cast<int>(peers.size());
+}
+
+//  B2b 的**运行时**判定：每 10s 刷新心跳、复查与每个 live peer 的一致性
+//  （共享挂载可见性 / 服务版本兼容性 / config_hash），把"不 ready 的可读原因"
+//  缓存在内存里。readiness 探针（`ports.shared_state_probe`）只读缓存 ——
+//  与 B2a 的 PG 探针合成**同一个**判据（REST 与 gRPC 按构造一致）。
+class InstanceConsistencyMonitor {
+ public:
+  InstanceConsistencyMonitor(fss::infra::PgInstanceRegistry& registry,
+                             fss::infra::SharedMountProbe* probe,
+                             std::string self_service_version, std::string self_config_hash)
+      : registry_(registry),
+        probe_(probe),
+        self_service_version_(std::move(self_service_version)),
+        self_config_hash_(std::move(self_config_hash)) {}
+  ~InstanceConsistencyMonitor() { Stop(); }
+  InstanceConsistencyMonitor(const InstanceConsistencyMonitor&) = delete;
+  InstanceConsistencyMonitor& operator=(const InstanceConsistencyMonitor&) = delete;
+
+  void Start() {
+    if (thread_.joinable()) return;
+    stop_.store(false);
+    thread_ = std::thread([this] { Run(); });
+  }
+  //  幂等；**必须**在每条退出路径上跑到（析构也调用）—— 绝不留 joinable 线程。
+  void Stop() {
+    if (!thread_.joinable()) return;
+    stop_.store(true);
+    wait_cv_.notify_all();
+    thread_.join();
+  }
+  std::string NotReadyReason() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return reason_;
+  }
+
+ private:
+  void Run() {
+    Tick();  // 立即做一次：readiness 从**第一次**请求起就反映真实一致性
+    std::unique_lock<std::mutex> lock(wait_mutex_);
+    while (!stop_.load()) {
+      if (wait_cv_.wait_for(lock, std::chrono::seconds(kInstanceHeartbeatSeconds),
+                            [this] { return stop_.load(); })) {
+        return;
+      }
+      lock.unlock();
+      Tick();
+      lock.lock();
+    }
+  }
+
+  void Tick() {
+    std::string reason = Evaluate();
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    reason_ = std::move(reason);
+  }
+
+  std::string Evaluate() {
+    //  ① 每次心跳刷新自己的探针文件：内容里的时间戳是**信息性**的（用系统墙钟即可，
+    //     它不参与任何判定；mtime 才是清理依据），但刷新保证"活实例的探针不会因过老被清"。
+    if (probe_ != nullptr) {
+      const auto now_millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+      if (const auto written = probe_->WriteOwn(now_millis); !written.ok()) {
+        return "共享挂载探针写入失败（readiness fail-closed）：" + written.error().message();
+      }
+    }
+    //  ② 心跳：失败即 not ready（心跳写不进去 ⇒ 别的实例会误判本实例已死）。
+    if (const auto touched = registry_.TouchHeartbeat(); !touched.ok()) {
+      return "instance_registry 心跳失败（readiness fail-closed）：" +
+             touched.error().message();
+    }
+    //  ③ live peer 一致性（顺序固定：可见性 → 版本 → config_hash）。
+    const auto peers = registry_.ListLivePeers(kInstanceLivenessSeconds);
+    if (!peers.ok()) {
+      return "无法读取共享的 instance_registry（readiness fail-closed）：" +
+             peers.error().message();
+    }
+    for (const auto& peer : peers.value()) {
+      if (probe_ != nullptr && !probe_->PeerProbeVisible(peer.instance_id)) {
+        return MountVisibilityFailureReason(*probe_, peer.instance_id, kInstanceLivenessSeconds);
+      }
+      std::string mismatch =
+          fss::infra::PeerConsistencyReason(peer, self_service_version_, self_config_hash_);
+      if (!mismatch.empty()) return mismatch;
+    }
+    return {};
+  }
+
+  fss::infra::PgInstanceRegistry& registry_;
+  fss::infra::SharedMountProbe* probe_;  // 可空（shared_mount_required=false）
+  std::string self_service_version_;
+  std::string self_config_hash_;
+  mutable std::mutex state_mutex_;
+  std::string reason_;
+  std::mutex wait_mutex_;
+  std::condition_variable wait_cv_;
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
+
 //  SIGINT / SIGTERM → 置位（**信号处理器里只做这一件事**：async-signal-safe）。
 //  ★ 主循环轮询它（AGENTS §4.3："不要用固定 sleep 等状态"），随后走统一退出路径：
 //    Stop GC 调度 → Stop HTTP → Shutdown gRPC。绝不留下 joinable 线程。
@@ -1208,6 +1397,10 @@ static int RunServer(int argc, char** argv) {
   //  ---- 存储（storage.*，C10.4）----
   const std::string storage_driver = resolver.Str("storage.driver", "posix");
   const std::string storage_root = resolver.Str("storage.posix.root", "/tmp/fss-data");
+  //  ★ B2b（ADR-009 §8.1 item 4）：共享挂载探针开关。`true` 时组合根会写
+  //    `<storage.posix.root>/.fss_probe.<instance_id>` 并与 `instance_registry` 的
+  //    live peer 交叉比对可见性（`multi` 由 schema 强制为 true）。
+  const bool shared_mount_required = resolver.Bool("storage.posix.shared_mount_required", false);
   const std::string durability = resolver.Str("storage.posix.durability", "per_file");
   const long fsync_threshold_bytes =
       resolver.Int("storage.posix.fsync_threshold_bytes", 1024 * 1024);
@@ -2077,7 +2270,16 @@ static int RunServer(int argc, char** argv) {
   // ===========================================================================
   std::string pg_budget_banner = "未校验（本进程未使用 PG 仓储）";
   std::string clock_skew_banner = "未校验（本进程未使用 PG 仓储）";
+  //  ★ B2b：注册表/探针/监视器的启动横幅（三条判据的实际结论必须可见）。
+  std::string instance_registry_banner = "未启用（本进程未使用 PG 仓储）";
+  std::string consistency_banner = "未启用（本进程未使用 PG 仓储）";
+  std::string mount_probe_banner = "未启用（本进程未使用 PG 仓储）";
 #ifdef FSS_HAVE_LIBPQ
+  //  ★ B2b：生命周期 = RunServer 的局部对象（RAII）。声明顺序保证析构顺序为
+  //    monitor（stop+join）→ probe（删自己的探针）→ registry（删自己的行）。
+  std::unique_ptr<infra::PgInstanceRegistry> instance_registry;
+  std::unique_ptr<infra::SharedMountProbe> shared_mount_probe;
+  std::unique_ptr<InstanceConsistencyMonitor> consistency_monitor;
   //  共享状态连接池：优先元数据池（`metadata.postgres.*` 是版本检查键的命名空间），
   //  否则用位置池（single + `location.repository=postgres` 的合法形态，DSN 同库）。
   infra::PgPool* shared_state_pool = nullptr;
@@ -2171,6 +2373,123 @@ static int RunServer(int argc, char** argv) {
         "OK（本地 " + std::to_string(local_now_millis) + " ms vs 数据库 " +
         std::to_string(pg_now.value()) + " ms，偏差 " + std::to_string(skew_millis) +
         " ms，容忍 " + std::to_string(tolerance_millis) + " ms）";
+
+    // =========================================================================
+    //  ③ B2b：instance_registry 心跳 + 配置/版本一致性 + 共享挂载探针
+    // =========================================================================
+    //  ADR-009 §5.3（滚动升级：版本/配置不一致 → 不 ready）与 §8.1 item 4
+    //  （`storage.posix.root` 是否真的共享 → 交叉探针可见性）。
+    //  ★ 顺序（不可交换）：**先写自己的探针文件 → 再注册注册表行 → 再查对端可见性**。
+    //    这样"对端注册后立刻查我"时我的探针一定已在共享目录里（见 shared_mount_probe.h）。
+    //  ★ 连接预算：本模块复用 `shared_state_pool`，不新建池 ⇒ C9.28 的公式不变。
+    {
+      //  service_version = 二进制已有的版本串（`FSS_BUILD_VERSION`，由 CMake 注入）。
+      //  测试接缝 `FSS_SERVICE_VERSION_OVERRIDE`（**环境变量，不是配置键**）用于验证
+      //  "滚动升级时版本不一致"这条判据；横幅会显式标注接缝生效（避免误读）。
+      const char* version_override = std::getenv("FSS_SERVICE_VERSION_OVERRIDE");
+      const bool version_overridden = version_override != nullptr && *version_override != '\0';
+      const std::string self_service_version = version_overridden
+                                                   ? std::string(version_override)
+                                                   : std::string(fss::app::BuildVersion());
+
+      //  ① 探针文件（仅 `shared_mount_required=true`）：**先于**注册表注册。
+      int stale_probes_removed = 0;
+      if (shared_mount_required) {
+        shared_mount_probe =
+            std::make_unique<infra::SharedMountProbe>(storage_root, effective_instance_id);
+        if (const auto written = shared_mount_probe->WriteOwn(clock.NowEpochMillis());
+            !written.ok()) {
+          return reject_startup(
+              "storage.posix.shared_mount_required=true 但探针文件写入失败（fail-closed）：" +
+              written.error().ToString() + "\n  下一步：确认 storage.posix.root（" + storage_root +
+              "）存在、可写，且在所有实例上指向**同一个共享挂载**。");
+        }
+        //  清理崩溃实例留下的过老探针（不碰自己的、不碰 `.tmp.` 中间态）。
+        if (const auto cleaned =
+                shared_mount_probe->CleanupStale(std::chrono::seconds(kProbeStaleCleanupSeconds));
+            cleaned.ok()) {
+          stale_probes_removed = cleaned.value();
+        }
+      }
+
+      //  ② 注册表注册（含 config_hash 计算）。
+      const auto config_hash_result = ComputeInstanceConfigHash(cfg);
+      if (!config_hash_result.ok()) {
+        return reject_startup("config_hash 计算失败（fail-closed）：" +
+                              config_hash_result.error().ToString());
+      }
+      const std::string self_config_hash = config_hash_result.value();
+      instance_registry = std::make_unique<infra::PgInstanceRegistry>(
+          *shared_state_pool, effective_instance_id, self_service_version, self_config_hash);
+      if (const auto registered = instance_registry->UpsertSelf(); !registered.ok()) {
+        return reject_startup(
+            "instance_registry 注册失败（fail-closed）：" + registered.error().ToString() +
+            "\n  下一步：确认已执行 db/migrations/001_init.sql（instance_registry 表），"
+            "且运行账号对该表有 INSERT/UPDATE/DELETE 权限。");
+      }
+      int stale_rows_removed = 0;
+      if (const auto cleaned = instance_registry->CleanupStale(kInstanceStaleCleanupSeconds);
+          cleaned.ok()) {
+        stale_rows_removed = cleaned.value();
+      }
+      instance_registry_banner =
+          "已注册（instance_id=" + effective_instance_id +
+          " service_version=" + self_service_version +
+          (version_overridden
+               ? "（★测试接缝 FSS_SERVICE_VERSION_OVERRIDE 已生效；生产禁止设置）"
+               : "") +
+          " config_hash=" + self_config_hash.substr(0, 12) +
+          "；心跳 " + std::to_string(kInstanceHeartbeatSeconds) + "s，live 窗口 " +
+          std::to_string(kInstanceLivenessSeconds) + "s，过老清理阈值 " +
+          std::to_string(kInstanceStaleCleanupSeconds) + "s，启动清理 " +
+          std::to_string(stale_rows_removed) + " 行）";
+
+      //  ③ 启动期交叉可见性检查（仅 `shared_mount_required=true`）。
+      int live_peers_at_startup = 0;
+      if (shared_mount_required) {
+        const auto visibility =
+            StartupMountVisibilityCheck(*instance_registry, *shared_mount_probe);
+        if (!visibility.ok()) {
+          return reject_startup(
+              visibility.error().message() +
+              "\n  下一步：让所有实例的 storage.posix.root 指向**同一个共享挂载**"
+              "（NFS / 共享卷），或把 deployment.mode 改回 single"
+              "（multi 强制要求 shared_mount_required=true，见 core_schema.cpp 跨字段校验）。");
+        }
+        live_peers_at_startup = visibility.value();
+        if (live_peers_at_startup == 0) {
+          mount_probe_banner =
+              "已写入 " + shared_mount_probe->OwnPath() + "（写回自证通过）；" +
+              "★ 启动时没有 live peer ⇒ **跨实例可见性尚未验证**" +
+              "（无法证明共享、也无法证伪；由运行时每 " +
+              std::to_string(kInstanceHeartbeatSeconds) + "s 的心跳复查兜住）";
+          logging::Warn(logger,
+                        "shared mount cross-instance visibility NOT yet verified at startup",
+                        {{"component", "server_main"},
+                         {"probe_path", shared_mount_probe->OwnPath()},
+                         {"reason", "启动时 instance_registry 里没有 live peer；"
+                                    "已写入自己的探针，运行时心跳会复查对端可见性"}});
+        } else {
+          mount_probe_banner =
+              "已验证（" + std::to_string(live_peers_at_startup) +
+              " 个 live peer 的探针在本实例 root 下均可见；自己的探针 " +
+              shared_mount_probe->OwnPath() + "）";
+        }
+        mount_probe_banner += "；清理过老探针 " + std::to_string(stale_probes_removed) + " 个";
+      } else {
+        mount_probe_banner = "未启用（storage.posix.shared_mount_required=false）";
+      }
+      consistency_banner =
+          "已启用（每 " + std::to_string(kInstanceHeartbeatSeconds) +
+          "s 心跳；对每个 live peer 检查探针可见性" +
+          std::string(shared_mount_required ? "" : "（探针未启用）") +
+          " + 服务版本兼容性 + config_hash；不一致 → readiness not ready）";
+
+      //  ④ 启动运行时监视器（readiness 从第一次请求起就读它的结论）。
+      consistency_monitor = std::make_unique<InstanceConsistencyMonitor>(
+          *instance_registry, shared_mount_probe.get(), self_service_version, self_config_hash);
+      consistency_monitor->Start();
+    }
   }
 #endif
 
@@ -2400,8 +2719,19 @@ static int RunServer(int argc, char** argv) {
 #ifdef FSS_HAVE_LIBPQ
   if (shared_state_pool != nullptr) {
     const bool check_schema_version = metadata_postgres_schema_version_check;
-    ports.shared_state_probe = [shared_state_pool, check_schema_version]() -> fss::Result<void> {
-      return infra::ProbePgSharedState(*shared_state_pool, check_schema_version);
+    infra::PgPool* probe_pool = shared_state_pool;
+    //  ★ B2b：把"实例一致性"（心跳/共享挂载/版本/config_hash）与 B2a 的 PG 探针
+    //    合成**同一个** readiness 判据。监视器可能为空（理论上不会：注册失败会 exit 78），
+    //    因此这里判空。
+    InstanceConsistencyMonitor* monitor = consistency_monitor.get();
+    ports.shared_state_probe = [probe_pool, check_schema_version,
+                                monitor]() -> fss::Result<void> {
+      FSS_TRY(infra::ProbePgSharedState(*probe_pool, check_schema_version));
+      if (monitor != nullptr) {
+        const std::string reason = monitor->NotReadyReason();
+        if (!reason.empty()) return Err(fss::ErrorKind::kUnavailable, reason);
+      }
+      return Ok();
     };
   }
 #endif
@@ -2805,7 +3135,11 @@ static int RunServer(int argc, char** argv) {
                     ? "true（readiness 比对 schema_migrations.max(version) 与期望 " +
                           std::to_string(infra::kExpectedSchemaVersion) + "）"
                     : std::string("false（readiness 只做 SELECT 1 探活，不比对迁移版本）"))
-            << "\n";
+            << "\n"
+            //  ★ B2b：注册表 / 一致性 / 共享挂载探针的实际结论（同样不许"检查过没过靠猜"）。
+            << "  instance reg   : " << instance_registry_banner << "\n"
+            << "  consistency    : " << consistency_banner << "\n"
+            << "  shared mount   : " << mount_probe_banner << "\n";
   //  ★ C9.26：测试接缝生效时**必须可见**（可运维：横幅回答"它会不会故意卡住"）。
   //    未设置时不打印该行 → 既有横幅逐字不变（既有测试只做子串断言，不受影响）。
   if (claim_hold_millis > 0) {

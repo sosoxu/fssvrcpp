@@ -159,7 +159,8 @@ target_link_libraries(fss_io PUBLIC fss_domain fss_sys)
 # L2：集中存储驱动（POSIX）。依赖 fss_fs（安全路径 + 原子写）、fss_crypto（流式校验和）
 # 与 fss_io（fsync 分级 + 可注入落盘接缝）。
 add_library(fss_blob_posix STATIC
-  infra/blob/posix/posix_blob_store.cpp)
+  infra/blob/posix/posix_blob_store.cpp
+  infra/blob/posix/shared_mount_probe.cpp)
 target_include_directories(fss_blob_posix PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fss_blob_posix PUBLIC fss_domain fss_crypto fss_fs fss_io fss_metrics)
 
@@ -230,6 +231,7 @@ if(PostgreSQL_FOUND)
   # + 领导者选举（会话级 advisory lock，专用锁连接；ADR-009 §4.4）
   add_library(fss_pg STATIC
     infra/postgres/pg_connection.cpp
+    infra/postgres/pg_instance_registry.cpp
     infra/postgres/pg_leader_election.cpp
     infra/postgres/pg_schema.cpp)
   target_include_directories(fss_pg PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -347,6 +347,33 @@ class FileSourceGuard {
   std::vector<std::string> sources_;
 };
 
+//  ★ B2b：`instance_registry` 的行也要按**自己的 instance_id** 清干净（残留 0）。
+//    为什么必须有它：用例里 A 被 `kill -9`，永远不会自己注销；只靠"过老清理"
+//    会把行留到阈值（300s）之后。守卫在**两个 ServerProcess 析构之后**运行
+//    （声明顺序更早 ⇒ 析构更晚），因此不会与 B 的优雅注销/心跳重新注册打架。
+//    绝不 TRUNCATE、绝不删别的实例的行。
+void CleanupInstanceRegistryRows(const std::vector<std::string>& instance_ids) {
+  auto connection = PgConnection::Connect(TestPgOptions(1));
+  if (!connection.ok()) return;
+  for (const auto& id : instance_ids) {
+    if (id.empty()) continue;
+    (void)connection.value()->ExecParams(
+        "DELETE FROM instance_registry WHERE instance_id = $1", {id});
+  }
+}
+
+class InstanceRegistryGuard {
+ public:
+  explicit InstanceRegistryGuard(std::vector<std::string> instance_ids)
+      : instance_ids_(std::move(instance_ids)) {}
+  ~InstanceRegistryGuard() { CleanupInstanceRegistryRows(instance_ids_); }
+  InstanceRegistryGuard(const InstanceRegistryGuard&) = delete;
+  InstanceRegistryGuard& operator=(const InstanceRegistryGuard&) = delete;
+
+ private:
+  std::vector<std::string> instance_ids_;
+};
+
 //  build/ 下的临时目录（RAII）：共享存储根刻意放在 build 目录里（本用例的"共享"
 //  是**本地目录被两个进程共用**，不是 NFS —— 见文件头）。
 class BuildDirGuard {
@@ -398,14 +425,17 @@ ServerProcessOptions ProcessOptions(const std::vector<std::string>& args,
 
 //  `deployment.mode=multi` 的**完整**配置：schema 跨字段要求全部满足
 //  （postgres 仓储 + 租约 + 选举 + shared_mount_required + require_lease_expiry）。
-//  两个进程只差 `instance_id`、HTTP 端口与 `gc.enabled`（见下面 `gc_enabled` 的说明）：
-//  **同一个** storage root、**同一个** lock_key。
+//  两个进程只差 `instance_id` 与 HTTP 端口：**同一个** storage root、**同一个** lock_key、
+//  **逐字相同**的 `gc.*`。
 //
-//  ★ `gc_enabled`：A（将被 kill 的 leader）上**关闭周期 GC**。理由：C9.26 的判据是
-//    "**幸存者**的 GC 接管后回收崩溃者的 claiming 行"。若 A 上也跑周期 GC，判据会被
-//    A 自己的 GC 穿插（正常情况下它无害 —— 租约活着；但在 R1 注入"无视租约门"时，
-//    A 会在 kill **之前**就回收掉自己的 claiming 行，让失败点落在步骤③而不是步骤⑤）。
-//    关掉 A 的周期 GC 只去掉这个混淆项，不改变"谁最终回收"这件事（B 接管后才跑）。
+//  ★ `gc_enabled`：两个实例都**开启**周期 GC —— 这是 B2b 之后的**唯一合法**配置：
+//    `instance_registry` 的 config_hash 一致性护栏要求同一部署的 live peer 配置逐字一致
+//    （`gc.enabled` 出现在脱敏有效配置里）。**谁跑 GC 由 leader election 决定**（本来就该
+//    如此）：A 先启动、持锁 ⇒ 只有 A 跑周期 GC；A 被 `kill -9` 后 B 接管锁 ⇒ B 开始跑。
+//    这与"多实例部署里所有实例配置相同、只有 leader 跑 GC"的生产形态**完全一致**。
+//    为什么不再像旧版那样给 A 关掉 GC：C9.26 的判据是"**幸存者**的 GC 接管后回收崩溃者的
+//    claiming 行"；A 活着时它的 GC 因租约活着而**不会**回收自己的 claiming 行（正常路径
+//    判据不受影响），而"谁最终回收"仍由 leader 门控（B 接管后才跑）。
 std::string ScenarioConfig(const std::string& root, int port, const std::string& instance_id,
                            std::int64_t lock_key, bool gc_enabled) {
   std::ostringstream json;
@@ -579,7 +609,7 @@ TEST_CASE("★ C9.26：两个真实进程共享 PG+本地存储；kill -9 持 cl
 
   const std::string config_a = WriteFile(work_dir.str() + "/a.json",
                                          ScenarioConfig(root, port_a, "c926-a", lock_key,
-                                                        /*gc_enabled=*/false));
+                                                        /*gc_enabled=*/true));
 
   const std::string crashed_payload =
       std::string("C9.26-crashed-upload-payload:") + std::string(512, 'A');
@@ -590,6 +620,9 @@ TEST_CASE("★ C9.26：两个真实进程共享 PG+本地存储；kill -9 持 cl
 
   FileSourceGuard guard;
   auto* const sources = guard.sources();
+  //  ★ B2b：本用例两个实例的注册表行（`instance_id` 固定为 c926-a / c926-b）。
+  //    守卫声明在 ServerProcess 之前 ⇒ 析构在它们之后 ⇒ A 的残留行一定被清掉。
+  InstanceRegistryGuard registry_guard({"c926-a", "c926-b"});
 
   // ---------------------------------------------------------------------------
   //  ① 两个进程就绪；恰好一个 leader（pg_locks 恰好一行 + 横幅自认）
@@ -628,9 +661,10 @@ TEST_CASE("★ C9.26：两个真实进程共享 PG+本地存储；kill -9 持 cl
   REQUIRE(server_b.DumpLog().find("启动时本实例=非 leader") != std::string::npos);
   REQUIRE(server_b.DumpLog().find("claim hold ms") == std::string::npos);
   REQUIRE_FALSE(AdvisoryLockPid(lock_key) == 0);
-  //  ★ 场景的正控（见 `ScenarioConfig` 的 `gc_enabled` 说明）：A 不跑周期 GC、B 跑。
-  REQUIRE(server_a.DumpLog().find("gc             : 未启动（gc.enabled=false") !=
-          std::string::npos);
+  //  ★ 场景的正控（见 `ScenarioConfig` 的 `gc_enabled` 说明）：两个实例配置**逐字相同**
+  //    （B2b 的 config_hash 护栏要求），因此**都**开了周期 GC；实际跑 GC 的只有 leader
+  //    —— A 先启动持锁 ⇒ A 跑；A 被 kill 后 B 接管 ⇒ B 跑。
+  REQUIRE(server_a.DumpLog().find("gc             : 已启动（间隔 1s") != std::string::npos);
   REQUIRE(server_b.DumpLog().find("gc             : 已启动（间隔 1s") != std::string::npos);
   //  实测值（成功路径也打印：判据的"观测值"必须可归档，而不是只在失败时可见）。
   std::cout << "[C9.26] ① leader = A pid(process)=" << server_a.pid()

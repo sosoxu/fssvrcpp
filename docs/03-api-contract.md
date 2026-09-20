@@ -169,7 +169,7 @@
 | 1 | `metadata.repository` / `location.repository` | `postgres` | 各实例共享 SQLite 会让状态发散 |
 | 2 | `leases.enabled` / `leader_election.enabled` | `true` | 租约与领导者选举是多实例一致性的前提（ADR-009） |
 | 3 | `gc.require_lease_expiry` | `true` | 否则 GC 会把**在途上传**当孤儿删（实测 20/20 误删） |
-| 4 | `storage.posix.shared_mount_required` | `true` | 存储根必须在共享挂载上（★ 该键只做强制校验，**共享挂载探针未实现**） |
+| 4 | `storage.posix.shared_mount_required` | `true` | 存储根必须在共享挂载上（★ B2b 起**真的探测**：写 `<root>/.fss_probe.<instance_id>` 并与 `instance_registry` 的 live peer 交叉验证可见性；启动期不可见 → exit 78，运行期不可见 → readiness not ready。只证明"共享性"，NFS 语义见 C9.27） |
 | 5 | `deployment.max_clock_skew_seconds` | `0 < 值 ≤ 60` | 时钟偏差过大会让租约/过期误判（C8.10） |
 
 **运行形态（B1 起）**：组合根对 `FSS_DEPLOYMENT_MODE=multi` 会**真的创建** PG 元数据仓储、

@@ -84,6 +84,24 @@
 > （含新增 `tests/integration/test_production_readiness.cpp`，4 用例 / 133 断言）。
 > **仍未交付（B2b）**：共享挂载探针、`instance_registry` 心跳 / config-version 一致性；NFS 语义
 > （C9.27）仍未验证。
+>
+> **B2b 之后的更新（最新，优先于上面全部）**：ADR-009 §5.3（滚动升级一致性）与 §8.1 item 4
+> （`storage.posix.root` 是否真的共享）**已交付**（见 `test-evidence/phase10.md` §22）：
+> ① 真的用 PG 时 upsert `instance_registry`（`instance_id`/`service_version`（= `FSS_BUILD_VERSION`）/
+> `config_hash`（**脱敏**有效配置去掉每实例键后的 SHA-256）/`started_at`/`heartbeat_at`），
+> 后台线程每 **10s** 刷新心跳；② 一个 peer 是 **live** 当且仅当心跳在 **3×10s = 30s** 内；
+> live peer 的 `config_hash` 或 `service_version`（major.minor）不一致 → readiness **not ready**
+> （可读原因指出对端 id 与差在哪）；stale 行被忽略（启动期按 300s 阈值清理）；③
+> `storage.posix.shared_mount_required=true` → 写 `<root>/.fss_probe.<instance_id>` 并与每个
+> live peer **交叉验证探针可见性**：启动期不可见 → **exit 78**，运行期不可见 → not ready；
+> 启动时若无 live peer，横幅如实打印"**跨实例可见性尚未验证**"。readiness **复用 B2a 的**
+> `ports.shared_state_probe`（REST/gRPC 同源）。因此 `storage.posix.shared_mount_required`
+> **生效**：三态 **生效 128 / 拒绝启动 15 / 已读但无效果 14 → 生效 129 / 拒绝启动 15 /
+> 已读但无效果 13**（键数仍 157）。新增 `tests/integration/test_shared_mount_and_registry.cpp`
+> （4 用例 / **194** 断言）；测试接缝 `FSS_SERVICE_VERSION_OVERRIDE`（**环境变量，不是配置键**，
+> runbook §10.4）。**仍未交付/未验证**：NFS 语义（C9.27 —— B2b 只证明"共享性"）、`/v2/info` 的
+> `instanceId`、ADR-009 §10 的多实例部署/PG HA/按盘分区/滚动升级运维手册。见
+> `docs/test-evidence/phase10.md` §22。
 
 ---
 
