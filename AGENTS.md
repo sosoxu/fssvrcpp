@@ -264,6 +264,7 @@ P10 配置面接线                          ✅ C10.1~C10.20 + ADR-008 的 P4�
 | 跨会话 advisory lock 行为 | `db/tests/002_advisory_lock.sh` |
 | 并发领取幂等（含自证对照） | `db/tests/003_concurrent_claim.sh` |
 | io_uring 可用性 | `./scripts/check_io_uring.sh`（退出码：0=可用 / 1=不可用 / **2=环境不具备探测条件 → 无结论**） |
+| **共享存储（NFS）语义 C9.27** | `./scripts/check_nfs_semantics.sh <共享挂载上的目录>` —— `rename` 原子性 / close-to-open / `syncfs` 范围；退出码 **0=全通过 / 1=有 FAIL / 2=无结论**。★ 本机无 NFS 挂载（无 root 不能 `mount`）⇒ **必须在目标环境的真实挂载上执行**，把原始输出登记到 `docs/test-evidence/phase9.md`；**不要**用本地盘的结果代替（本地 ext4 通过 ≠ NFS 通过） |
 
 **原则**：能机械化的规则就机械化。写进 AGENTS.md 但无法检查的规则，视为"建议"而非"约束"。
 
