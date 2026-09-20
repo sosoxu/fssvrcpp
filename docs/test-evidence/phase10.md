@@ -2467,3 +2467,170 @@ legal_tags=… WHERE partition_id=… AND id=… AND version=… AND state='clai
 
 
 
+## 19. C2（本轮）：在途租约真的生效 + GC 按租约回收崩溃者的 `claiming` 行
+
+### 19.1 结论（先说答案）
+
+* ADR-009 §4.2/§4.3 的**在途租约侧**已交付：上传路径 `Acquire`、复制/校验和期间 `Renew`
+  （新增 L4 `LeaseRenewer`）、`MarkReady`/回滚后 `Release`；**崩溃者留下的 `claiming` 行**
+  由 GC 用「`ClaimExpired` 已原子领取的过期租约」驱动新增端口方法
+  `IMetadataRepository::ReclaimStaleClaiming` 回收（内存 / SQLite / PG 三实现）。
+* `leases.{ttl_seconds,renew_interval_seconds,time_source}` 从「已读但无效果」变为**生效**：
+  三态 **122 / 16 / 18 → 125 / 16 / 15**（合计仍 156）。
+* PG 侧新增 `leases.time_source`（`database` 默认 / `local` 用注入 `IClock`），三种原语
+  （`Acquire`/`Renew`/`ClaimExpired`）在**同一时间基准**下自洽；`local` 跑与 `database`
+  相同的共享契约测试。
+* 实测：默认构建 `ctest` **87/87**（原 86/86，新增 `test_lease_lifecycle`）；PG 14.24 与
+  目标 PG 12.6 上 `ctest -L pg` 均 **8/8**，`pgtest-%` 残留 **0**，advisory lock **0**。
+
+### 19.2 实现点（可点击）
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/domain/ports/ports.h` | `IMetadataRepository` 新增 `ReclaimStaleClaiming(partition, older_than, limit, live_expired_sources)`（保留全部既有方法） |
+| `src/infra/metadata/memory/memory_metadata_repository.{h,cpp}` | 内存实现：集合 + 年龄双判据；空集合短路为 0；逐条回收并清理幂等键索引（R10） |
+| `src/infra/metadata/sqlite/sqlite_metadata_repository.{h,cpp}` | 单事务（`BEGIN IMMEDIATE`）+ 事务内先选后删（行级 `state='claiming'` 守卫）；`...Locked` / `...InTransaction` 双路径（组提交） |
+| `src/infra/metadata/postgres/postgres_metadata_repository.{h,cpp}` | 单语句 CTE + `FOR UPDATE SKIP LOCKED` + `DELETE … RETURNING`；`text[]` 用带转义的数组字面量参数 |
+| `src/infra/location/postgres/postgres_lease_repository.{h,cpp}` | 新增 `LeaseTimeSource{database,local}`；`local` 变体把 3 处 `now()` 换成 `to_timestamp($N::bigint)`；`Open` 校验 `local` 必须带时钟 |
+| `src/app/services/lease_renewer.{h,cpp}`（新增） | RAII 续租器：启用才起线程；线程创建失败记 `last_error` 不抛出；`Stop()` 幂等 `stop+notify+join`；最近一次续租失败可查 |
+| `src/app/usecases/usecases.h` | `UseCasePorts` 追加（带默认值，既有聚合初始化不受影响）：`leases` 指针、`leases_enabled`、`lease_ttl_seconds`、`lease_renew_interval_seconds`、`instance_id` |
+| `src/app/usecases/usecases.cpp` | `GetUploadLocation` 发地址后 `Acquire`（冲突 → 503 且撤销位置/空对象）；`CreateFileMetadata` `EnsureLeaseOwnership`（`Renew`→`Acquire` 回退）+ `LeaseRenewer` + 步骤边界 fail-closed + `MarkReady` 后/回滚后 `Release`（RAII `UploadLeaseGuard`） |
+| `src/app/tasks/gc_task.{h,cpp}` | `GcOptions::lease_ttl_seconds`、`GcReport::reclaimed_claiming`；`CollectExpiredLeases` 里租约驱动回收；租约→位置解析同时容错 PG（`file_id` 反解）与内存（键 = `file_source`）两种回填；新增 `fss_gc_reclaimed_claiming_total` |
+| `src/CMakeLists.txt` | `fss_app` 加入 `app/services/lease_renewer.cpp` |
+| `src/main/server_main.cpp` | 组合根装配 `ports.leases*`/`leases_enabled`/`ttl`/`renew`/`instance_id`；GC 的 `lease_ttl_seconds`；PG 租约 `time_source` + 时钟；横幅打印实际时间源 |
+| `tests/framework/port_contract.h` | 新增 `ReclaimStaleClaiming` 契约 section（正例 + 三条负例 + 正控），内存/SQLite/PG 共用 |
+| `tests/framework/fake_ports.h` | 租约替身新增 `ExpiresAtMillis` / `now_millis` 诊断访问器；`FaultyMetadataRepository` 转发新方法 |
+| `tests/integration/test_lease_lifecycle.cpp`（新增） | 默认不接租约 / 跨实例 503 / 慢复制续租保活 / 崩溃→回收→重试 / 只回收集合内 file_source |
+| `tests/integration/test_postgres_lease_lifecycle.cpp`（新增） | PG TTL 直接查表 / `time_source` local 契约 + 与墙钟对照 / PG 端到端崩溃回收 |
+| `tests/integration/test_multi_instance.cpp` | 对照替身补 `ReclaimStaleClaiming`（显式返回 0 + 理由） |
+| `tests/CMakeLists.txt` | 注册 `test_lease_lifecycle`（`phase6;integration`）与 `test_postgres_lease_lifecycle`（`pg;infra`） |
+| `docs/operations.md` | §1.2/§1.3 三态计数与三个 `leases.*` 行改「生效」并把 `leases` 前缀行清零；§4 新增 `fss_gc_reclaimed_claiming_total` |
+| `docs/phase-status.md` | 追加 C2 更新段（原「上传路径租约未交付」的说法标记为过时） |
+| `tests/unit/test_operations_doc.cpp` | 三态机械断言 125/16/15 |
+
+### 19.3 实测命令与输出摘要
+
+```text
+$ cmake --build build -j4                      # FSS_WITH_PG=OFF（收尾保持 OFF）
+# 触碰文件 0 warning（src/ 全部干净；测试里既有 -Wmissing-field-initializers 与本切片无关）
+
+$ ctest --test-dir build                       # 100% tests passed, 0 tests failed out of 87
+
+$ ./build/bin/test_lease_lifecycle
+All tests passed (185 assertions in 5 test cases)
+
+$ cmake --build build-pg -j4
+$ ctest --test-dir build-pg -L pg              # 本地 PG 14.24：8/8 passed
+    test_postgres_repositories ....... Passed
+    test_postgres_lease_lifecycle .... Passed
+$ ./build-pg/bin/test_postgres_repositories
+All tests passed (689 assertions in 15 test cases)
+$ ./build-pg/bin/test_postgres_lease_lifecycle
+All tests passed (164 assertions in 4 test cases)
+
+# 本地 PG 14.24 残留（全部 0）：meta / loc / lease / advisory lock
+$ FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg   # 目标 PG 12.6：8/8 passed
+All tests passed (689 assertions in 15 test cases)      # test_postgres_repositories
+All tests passed (164 assertions in 4 test cases)       # test_postgres_lease_lifecycle
+# 目标 PG 12.6 残留（全部 0）：meta / loc / lease / advisory lock
+
+$ ./scripts/check_docs.sh                      # D1~D5 全部通过（63 链接 / 13 ADR / 148 条门槛）
+$ JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh
+（见 §19.8；日志 /tmp/r1/run_all_gates.log）
+```
+
+崩溃→回收→重试（`test_lease_lifecycle` 与 `test_postgres_lease_lifecycle` 各一遍）：
+
+* 活租约阶段（推进时间超过年龄阈值 + `Renew` 保活）：`expired_leases_claimed=0`、
+  `reclaimed_claiming=0`、对象与位置记录仍在；正控 = `ClaimForWrite` 仍返回
+  `claimed=false + kClaiming`（行确实存在）。
+* 过期阶段（越过 TTL）：`expired_leases_claimed=1`、`reclaimed_claiming=1`、
+  `deleted_objects=1`；`claiming` 行与 staging 对象、位置记录都消失。
+* 重试：推进越过 GC 领取后推后的 60 s，重新播种 staging 对象 + 位置记录，
+  同一个 `fileSource` 的 `CreateFileMetadata` **成功**，租约在 `MarkReady` 后被释放。
+
+### 19.4 租约生命周期的时间决定（判断记录）
+
+* **`Renew` 先于 `Acquire`**：`CreateFileMetadata` 大概率就是发地址的同一实例 → `Renew`
+  成功即确认所有权；只有 `kNotFound`（租约被清）或 `kPermissionDenied`（换了实例）才
+  `Acquire` 回退。回退仍报 live owner → **fail-closed**（`kUnavailable`，不复制）。
+* **续租器只"记录最近一次失败"，成功即清除**：瞬时 PG 抖动会在下一轮自愈；持续失败
+  （租约被抢）保持错误。用例在**每个步骤边界**（复制后、校验和后、mark-ready 前）检查 →
+  失败即回滚已复制对象（此时仍持 claim）→ `ReleaseClaim` → 释放租约 → `kUnavailable`。
+  这样"记录错误"与"中止操作"不会互相矛盾。
+* **释放顺序：`MarkReady` 之后 / 回滚之后**。`MarkReady` 之前记录对 GC 不可见（读只认
+  `ready`），租约是保护对象的唯一凭据；提前释放会打开"GC 删掉在途对象"的数据丢失窗口。
+  释放失败非致命（记审计 `createMetadataLeaseReleaseFailure`），原结果照常返回。
+* **`local` 时间基准的取舍**：三种原语必须同基准，否则"写进去的 `expires_at`"与"领取时
+  的比较"互相矛盾。`database` 是跨实例推荐值；`local` 只为单实例/受控测试提供可注入时钟。
+  **内存租约仓储按构造就是本地钟**，不假装兑现 `database`（它只在 `leases.enabled=false`
+  下装配）—— 已写进 `operations.md` §1.3 与仓储头注释。
+* **memory-vs-PG 租约键不对称的处理**：PG `ClaimExpired` 用 `LEFT JOIN file_locations`
+  反解真正的 `file_id`，内存实现只回填租约键（= `file_source`）。GC 解析位置记录时
+  **先按 `file_id` 查、失败再按租约键 = `file_source` 查**，因此两种回填都正确；`DeleteCandidate`
+  与报告统一使用**解析出的 location.file_id**（不再用 `lease.file_id`）。既有
+  `test_gc_lease`（用 `file_id` 当租约键）与本切片（用 `file_source` 当键）同时通过。
+
+### 19.5 R1 自证（每条都在**完整重编**后跑；末尾已全部还原，`md5sum` 逐字一致）
+
+| # | 注入 | 结果（原始失败断言） |
+| --- | --- | --- |
+| ① | `AcquireUploadLease` 开头 `if (true) return Ok();`（上传路径不 `Acquire`） | `test_lease_lifecycle` **5 用例全失败**；其中跨实例用例：`REQUIRE_FALSE( up.ok() )`（B 竟然拿到了地址）；TTL 正控：`REQUIRE( leases.ExpiresAtMillis(...).has_value() )`。`assertions: 41 \| 36 passed \| 5 failed` |
+| ② | `LeaseRenewer` 构造里 `return;`（不启动续租线程） | 慢复制用例**失败**：`test_lease_lifecycle.cpp:333 REQUIRE( *expiry > leases.now_millis() )`（无续租 → 租约在复制进行中到期）。`test cases: 3 \| 2 passed \| 1 failed` |
+| ③ | 内存 `ReclaimStaleClaiming` 删掉 `allowed.count(...)` 判据（只按年龄回收） | "只回收集合内 file_source"用例**失败**：`test_lease_lifecycle.cpp:507 REQUIRE( report.value().reclaimed_claiming == 1 )` → **`2 == 1`**（把活租约的 claiming 行也删了）。`assertions: 175 \| 174 passed \| 1 failed` |
+
+三条注入逐一还原后 `md5sum -c` 全部 `OK`：
+
+```text
+296d860aff0170c3ad567bb6346d8c7f  src/app/usecases/usecases.cpp            OK
+4f71735a28af34885e178d94efb1fc37  src/app/services/lease_renewer.cpp      OK
+d757afcd6ffd0eafb423939d3743bbaa  src/infra/metadata/memory/memory_metadata_repository.cpp  OK
+$ grep -rn "R1-INJECT" src/ tests/     # 空
+```
+
+### 19.6 三态净变化
+
+| | 生效 | 拒绝启动 | 已读但无效果 | 合计 |
+| --- | --- | --- | --- | --- |
+| C1 后 | 122 | 16 | 18 | 156 |
+| **C2 后** | **125** | **16** | **15** | **156** |
+
+移动的 3 个键：`leases.ttl_seconds`、`leases.renew_interval_seconds`、`leases.time_source`。
+`test_operations_doc` 的机械断言、`operations.md` §1.2/§1.3 的成员清单与逐键行、§1.3.3 的
+`leases` 前缀行（3 → 0）已同步。`config/fss.example.json` **未改**（键名/默认值不变）。
+
+### 19.7 仍未交付 / 未验证（如实登记）
+
+* **单实例（`leases.enabled=false`）下崩溃者的 `claiming` 行仍无自动回收**：没有租约就没有
+  "领取者已死"的证明；本切片的回收**只能**由"已到期并被 GC 原子领取的租约"驱动。默认
+  `false` → 上传路径不做任何租约动作（行为逐字不变），因此该形态的崩溃恢复**不在本切片**。
+  下一步：若要在单实例也回收，需要一条不依赖跨实例租约的本地 TTL 判据（并说明它为何不会
+  误删在途上传）。
+* **真·多实例 E2E + 进程级崩溃注入（C9.26）**：本切片的"崩溃"是**进程内放弃操作**
+  （直接 `ClaimForWrite`/`Acquire` 后不 MarkReady/ReleaseClaim/释放租约），不是 `kill -9`
+  两个真实进程 + 共享目录；未验证"进程被杀后 PG 会话/租约的真实滞留窗口"。
+* **`leases.enabled=true` 的 `local` 时间基准在多实例下的风险未验证**：本切片只证明它自洽，
+  未做 PG↔本地时钟偏移比对（B2 范围）。
+* **共享挂载探针、readiness 的 PG 探活 + `metadata.postgres.schema_version_check`、
+  PG 连接预算（C9.28）、NFS 语义（C9.27）、`state='deleted'` 软删除语义、`/v2/info` 的
+  `instanceId`**：仍未交付。
+* **`Acquire`/`Release` 失败路径的审计词汇**：新增了 `createMetadataLeaseReleaseFailure`
+  （与既有 `createMetadataClaimReleaseFailure` 同形）；**未**为 `Acquire` 失败新增独立审计
+  （它经 `AuditGuard` 的 `createMetadataFailure` 记录，已可见）。
+* **上传路径跨实例的语义代价（如实标注）**：`createMetadata` 若落在**另一个实例**且签发
+  uploadURL 的实例的租约仍活着 → 该实例 `EnsureLeaseOwnership` **fail-closed 503**（客户端
+  重试或等租约到期）。这是按 pinned 设计实现的结果，但它意味着多实例 + 负载均衡下
+  `getUploadURL` 与 `createMetadata` **应尽量粘在同一实例**；真实 LB 行为未验证。
+* **`AGENTS.md` §0.1 的过时叙述**：仍把"上传路径的租约 `Acquire`/`Renew`（故 `leases.*`
+  仍「已读但无效果」）"与"崩溃者 claiming 行尚未回收"列在"仍未交付"里。按会话约定
+  `AGENTS.md` 受 64 KiB 预算限制且由父代理维护，本轮**未改**，在此如实登记（`phase-status.md`
+  已按 R13 追加 C2 更新段）。
+
+### 19.8 门槛结果
+
+* `./scripts/check_docs.sh`：**通过**（D1 63 链接 / D3 13 ADR / D4 阶段 0~10 / D5 148 条门槛）。
+* `JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh`：**全绿** ——
+  `失败: 无`；`⏱ 总耗时: 10 分 18 秒（618 s，阶段数 11）`；`✅ 全部已启用阶段门槛通过`。
+  其中：`[preflight] 无注入残留`、`[docs] --selftest 检查器有效 + 通过`、C1.7 sanitizer
+  `phase1~phase10` 全绿、`[phase10] 配置面接线 54 条断言通过`。
+* OSDU 线上契约：**未变**（`state` 不进 JSON；REST/gRPC 字段与报文不变）。

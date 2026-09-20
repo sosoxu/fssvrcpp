@@ -38,6 +38,24 @@
 > 一致性、PG 连接预算（C9.28）、PG-vs-本地时钟比较、上传路径租约 `Acquire`/`Renew`、
 > `CreateFileMetadata` 跨步骤原子领取、完整多实例 E2E（C9.26）、NFS 语义（C9.27）、
 > `/v2/info` 暴露 `instanceId`、`storage.posix.one_filesystem_per_partition`。
+>
+> **C2 之后的更新（最新，优先于上面全部）**：ADR-009 §4.2/§4.3 的**在途租约侧已交付**
+> （见 `test-evidence/phase10.md` §19）：上传路径 `GetUploadLocation` 发地址时 `Acquire`
+> （别的实例持有未过期租约 → 503 且不发地址）、`CreateFileMetadata` 在复制/校验和期间
+> `Renew`（新增 L4 `src/app/services/lease_renewer.*`，RAII、每条退出路径 `stop()+join()`、
+> 续租失败在步骤边界 fail-closed）、`MarkReady`/回滚后 `Release`；GC 用 `ClaimExpired` 的返回
+> 驱动新增端口方法 `IMetadataRepository::ReclaimStaleClaiming`（内存/SQLite/PG 三实现）回收
+> **崩溃者留下的 `claiming` 行**（阈值 = `now - leases.ttl_seconds`，集合 = 已原子领取的过期租约）；
+> PG 租约新增 `leases.time_source`（`database` 默认 / `local` 用注入 `IClock`）。
+> 因此 `leases.{ttl_seconds,renew_interval_seconds,time_source}` **不再是「已读但无效果」**，
+> 三态变为 **生效 125 / 拒绝启动 16 / 已读但无效果 15**（`operations.md` §1.3）。
+> **C2 仍未交付/未验证**：`leases.enabled=false`（单实例默认）时崩溃者的 `claiming` 行
+> **仍无自动回收**（没有租约就没有"已死"的证明）；真·多实例 E2E + **进程级 kill** 崩溃注入
+> （C9.26；本切片用"放弃操作"在**进程内**模拟崩溃并如实登记）；共享挂载探针、readiness 的 PG
+> 探活 + `metadata.postgres.schema_version_check`、PG 连接预算（C9.28）、PG↔本地时钟偏移比对、
+> NFS 语义（C9.27）、`state='deleted'` 软删除语义、`/v2/info` 的 `instanceId`。
+> ⚠️ `AGENTS.md` §0.1 的「PG 多实例」行仍写着上传路径租约未交付 —— 该文件受 64 KiB 预算约束，
+> 本轮**未改动**（以本文件与 `operations.md` §1.3 为准）。
 
 ---
 

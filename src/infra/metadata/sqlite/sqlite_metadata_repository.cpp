@@ -103,6 +103,19 @@ constexpr const char* kReleaseClaim = R"sql(
 DELETE FROM metadata
  WHERE partition_id = ? AND id = ? AND version = ? AND state = 'claiming')sql";
 
+//  ★ C2（ADR-009 §4.2/§4.3）：回收崩溃领取者留下的 claiming 行。
+//    `file_source IN (` 之后由代码按调用方给的集合拼 `?,?,…`（占位符数量是**值**，不是 SQL 结构），
+//    再拼 `) ORDER BY … LIMIT ?`。这条前缀是 raw string 且带 partition_id（满足 C3.9 护栏）。
+constexpr const char* kSelectStaleClaiming = R"sql(
+SELECT id, version FROM metadata
+ WHERE partition_id = ? AND state = 'claiming' AND created_at <= ?
+   AND file_source IN ()sql";
+
+//  行级 `state='claiming'` 守卫：在 BEGIN IMMEDIATE 的写锁下，先选后删之间的重确认。
+constexpr const char* kReclaimClaimingRow = R"sql(
+DELETE FROM metadata
+ WHERE partition_id = ? AND id = ? AND version = ? AND state = 'claiming')sql";
+
 constexpr const char* kDeleteAllVersions = R"sql(
 DELETE FROM metadata WHERE partition_id = ? AND id = ?)sql";
 
@@ -265,6 +278,54 @@ fss::Result<domain::FileMetadataRecord> MarkReadyRow(sqlite3* db, std::string_vi
     return Invalid("MarkReady 不得改写 (partition, file_source) 幂等键");
   }
   return NotFound("Record Not Found");
+}
+
+//  ★ C2：`ReclaimStaleClaiming` 的**语句级**实现（无事务控制，调用方负责）。
+//    候选行（同一 partition、claiming、够旧、file_source ∈ 集合）在调用方的事务里选出，
+//    再逐行用 `state='claiming'` 守卫删除 —— 拿到 BEGIN IMMEDIATE 的写锁后，别的连接
+//    无法在"选"与"删"之间把它推成 ready（与 ClaimForWrite 的"事务内重查"同一原理）。
+fss::Result<std::int64_t> ReclaimStaleClaimingStatements(
+    sqlite3* db, std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+    const std::vector<std::string>& live_expired_sources) {
+  if (limit <= 0 || live_expired_sources.empty()) return std::int64_t{0};
+  std::vector<std::pair<std::string, std::int64_t>> victims;
+  {
+    std::string sql(kSelectStaleClaiming);
+    for (std::size_t i = 0; i < live_expired_sources.size(); ++i) {
+      sql += (i == 0) ? "?" : ",?";
+    }
+    sql += ") ORDER BY created_at ASC, id ASC LIMIT ?";
+    Statement stmt(db, sql.c_str());
+    if (!stmt.ok()) return fss::Err(fss::ErrorKind::kInternal, "prepare 回收 claiming 失败");
+    int index = 1;
+    BindText(stmt.get(), index++, partition);
+    sqlite3_bind_int64(stmt.get(), index++, static_cast<sqlite3_int64>(older_than_epoch_seconds));
+    for (const auto& source : live_expired_sources) BindText(stmt.get(), index++, source);
+    sqlite3_bind_int(stmt.get(), index++, limit);
+    while (true) {
+      const int rc = sqlite3_step(stmt.get());
+      if (rc == SQLITE_DONE) break;
+      if (rc != SQLITE_ROW) {
+        return fss::Err(fss::ErrorKind::kInternal,
+                        std::string("遍历 stale claiming 失败：") + sqlite3_errstr(rc));
+      }
+      victims.emplace_back(ColumnText(stmt.get(), 0),
+                           static_cast<std::int64_t>(sqlite3_column_int64(stmt.get(), 1)));
+    }
+  }
+  std::int64_t reclaimed = 0;
+  for (const auto& [record_id, version] : victims) {
+    Statement del(db, kReclaimClaimingRow);
+    if (!del.ok()) return fss::Err(fss::ErrorKind::kInternal, "prepare 回收 claiming 失败");
+    BindText(del.get(), 1, partition);
+    BindText(del.get(), 2, record_id);
+    sqlite3_bind_int64(del.get(), 3, static_cast<sqlite3_int64>(version));
+    if (sqlite3_step(del.get()) != SQLITE_DONE) {
+      return fss::Err(fss::ErrorKind::kInternal, "回收 claiming 失败");
+    }
+    reclaimed += sqlite3_changes(db);
+  }
+  return reclaimed;
 }
 
 }  // namespace
@@ -690,6 +751,56 @@ fss::Result<void> SqliteMetadataRepository::ReleaseClaimInTransaction(
   return Ok();
 }
 
+// =============================================================================
+//  ReclaimStaleClaiming（C2 / ADR-009 §4.3）：GC 回收"崩溃领取者"的 claiming 行
+// =============================================================================
+fss::Result<std::int64_t> SqliteMetadataRepository::ReclaimStaleClaiming(
+    std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+    const std::vector<std::string>& live_expired_sources) {
+  if (partition.empty()) return Invalid("partition 不能为空");
+  //  ★ 空集合 = "没有任何被本 GC 原子领取的过期租约" → 一条都不回收（绝不凭年龄误删活 claim）。
+  if (limit <= 0 || live_expired_sources.empty()) return std::int64_t{0};
+  if (options_.group_commit) {
+    const std::string part(partition);
+    return committer_->Submit<std::int64_t>(
+        [this, part, older_than_epoch_seconds, limit, live_expired_sources](sqlite3* db) {
+          return ReclaimStaleClaimingInTransaction(db, part, older_than_epoch_seconds, limit,
+                                                   live_expired_sources);
+        });
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  return ReclaimStaleClaimingLocked(partition, older_than_epoch_seconds, limit,
+                                    live_expired_sources);
+}
+
+fss::Result<std::int64_t> SqliteMetadataRepository::ReclaimStaleClaimingLocked(
+    std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+    const std::vector<std::string>& live_expired_sources) {
+  char* error = nullptr;
+  sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, &error);
+  if (error != nullptr) {
+    sqlite3_free(error);
+    NotifyBatch(1, false);
+    return fss::Err(fss::ErrorKind::kInternal, "开启事务失败");
+  }
+  const auto reclaimed = ReclaimStaleClaimingStatements(db_, partition, older_than_epoch_seconds,
+                                                        limit, live_expired_sources);
+  if (!reclaimed.ok()) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    NotifyBatch(1, false);
+    return reclaimed;
+  }
+  sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+  NotifyBatch(1, true);
+  return reclaimed;
+}
+
+fss::Result<std::int64_t> SqliteMetadataRepository::ReclaimStaleClaimingInTransaction(
+    sqlite3* db, std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+    const std::vector<std::string>& live_expired_sources) {
+  return ReclaimStaleClaimingStatements(db, partition, older_than_epoch_seconds, limit,
+                                        live_expired_sources);
+}
 
 fss::Result<domain::FileMetadataRecord> SqliteMetadataRepository::GetById(
     std::string_view partition, std::string_view record_id) {

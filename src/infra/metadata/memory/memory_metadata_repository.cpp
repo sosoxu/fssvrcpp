@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <set>
 
 namespace fss::infra {
 
@@ -166,6 +167,58 @@ fss::Result<void> InMemoryMetadataRepository::ReleaseClaim(std::string_view part
     return Ok();
   }
   return NotFound("Record Not Found");
+}
+
+//  ★ C2（ADR-009 §4.2/§4.3）：回收"崩溃的领取者"留下的 claiming 行。
+//  与 `ReleaseClaim` 同一套清理纪律（R10：记录与幂等键索引必须同时消失），
+//  区别只在**判据**：这里按 `(file_source ∈ live_expired_sources) ∧ created_at <= 阈值`
+//  批量回收，而不是按 (id, version)。`live_expired_sources` 由 GC 从 ClaimExpired 的结果
+//  取得 —— 它是"租约已到期并被本 GC 原子领取"的**唯一**证据；空集合 ⇒ 一条都不回收。
+fss::Result<std::int64_t> InMemoryMetadataRepository::ReclaimStaleClaiming(
+    std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+    const std::vector<std::string>& live_expired_sources) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (partition.empty()) return Invalid("partition 不能为空");
+  if (limit <= 0) return std::int64_t{0};
+  if (live_expired_sources.empty()) return std::int64_t{0};  // ★ 没有"已领取的过期租约" → 不凭年龄误删
+  const std::set<std::string> allowed(live_expired_sources.begin(), live_expired_sources.end());
+
+  const std::string part(partition);
+  const auto bucket = by_id_.find(part);
+  if (bucket == by_id_.end()) return std::int64_t{0};
+
+  std::int64_t reclaimed = 0;
+  //  先收集再删除：链在被遍历时不能改（迭代器失效）。claiming 行至多一条（v1 + latest）。
+  std::vector<std::pair<std::string, std::int64_t>> victims;
+  for (const auto& [record_id, chain] : bucket->second) {
+    if (static_cast<int>(victims.size()) >= limit) break;
+    for (const auto& version : chain) {
+      if (version.state != domain::MetadataState::kClaiming) continue;
+      if (version.created_at_epoch_seconds > older_than_epoch_seconds) continue;
+      if (allowed.count(FileSourceOf(version.record)) == 0) continue;
+      victims.emplace_back(record_id, version.record.version);
+      break;  // 一条 claiming 行
+    }
+  }
+  for (const auto& [record_id, version] : victims) {
+    if (reclaimed >= limit) break;
+    const auto found = bucket->second.find(record_id);
+    if (found == bucket->second.end()) continue;
+    Chain& chain = found->second;
+    for (auto it = chain.begin(); it != chain.end(); ++it) {
+      if (it->record.version != version) continue;
+      if (it->state != domain::MetadataState::kClaiming) break;  // 期间被 MarkReady → 放过
+      const std::string file_source = FileSourceOf(it->record);
+      chain.erase(it);
+      if (chain.empty()) {
+        source_index_.erase(SourceKey{part, file_source});
+        bucket->second.erase(found);
+      }
+      ++reclaimed;
+      break;
+    }
+  }
+  return reclaimed;
 }
 
 fss::Result<domain::FileMetadataRecord> InMemoryMetadataRepository::GetById(

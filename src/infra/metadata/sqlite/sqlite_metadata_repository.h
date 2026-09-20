@@ -93,6 +93,9 @@ class SqliteMetadataRepository final : public domain::IMetadataRepository {
       const domain::FileMetadataRecord& record) override;
   fss::Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
                                  std::int64_t version) override;
+  fss::Result<std::int64_t> ReclaimStaleClaiming(
+      std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+      const std::vector<std::string>& live_expired_sources) override;
   fss::Result<domain::FileMetadataRecord> GetById(std::string_view partition,
                                                   std::string_view record_id) override;
   fss::Result<domain::FileMetadataRecord> GetLatestByFileSource(
@@ -147,6 +150,17 @@ class SqliteMetadataRepository final : public domain::IMetadataRepository {
                                        std::int64_t version);
   fss::Result<void> ReleaseClaimInTransaction(sqlite3* db, std::string_view partition,
                                               std::string_view record_id, std::int64_t version);
+
+  //  ---- C2（ADR-009 §4.2/§4.3）：回收崩溃领取者留下的 claiming 行 ----
+  //  ★ 与上面同构：`...Locked` 自己 `BEGIN IMMEDIATE…COMMIT`；`...InTransaction` 由批
+  //    协调器在同一连接的事务内调用。原子性来自 `BEGIN IMMEDIATE` 的写锁：先选出候选行，
+  //    拿到写锁后**重新确认**它们仍是 claiming（行级 `state='claiming'` 守卫）再删。
+  fss::Result<std::int64_t> ReclaimStaleClaimingLocked(
+      std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+      const std::vector<std::string>& live_expired_sources);
+  fss::Result<std::int64_t> ReclaimStaleClaimingInTransaction(
+      sqlite3* db, std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+      const std::vector<std::string>& live_expired_sources);
 
   fss::Result<domain::FileMetadataRecord> UpdateLocked(std::string_view partition,
                                                        const domain::FileMetadataRecord& record);

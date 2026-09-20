@@ -66,6 +66,30 @@ constexpr const char* kReleaseClaim = R"sql(
 DELETE FROM file_metadata_records
  WHERE partition_id = $1 AND id = $2 AND version = $3::int AND state = 'claiming')sql";
 
+//  ★ C2（ADR-009 §4.2/§4.3）：回收崩溃领取者留下的 claiming 行。
+//    一条语句：CTE 选出候选（`partition_id` + `state='claiming'` + `created_at` 够旧 +
+//    `file_source = ANY(已原子领取的过期租约键)`），`FOR UPDATE SKIP LOCKED` 保证并发 GC
+//    互不阻塞且一行只被一个 GC 回收，`DELETE ... RETURNING` 返回实际回收行数。
+//    ★ 由调用方给出 file_source 集合：领取是否"已死"只有租约知道（见 ports.h 的说明）。
+//    ★ 全部是 PG ≤12 语法（`= ANY(array)`、CTE、`FOR UPDATE SKIP LOCKED` 自 9.5 起可用）。
+constexpr const char* kReclaimStaleClaiming = R"sql(
+WITH stale AS (
+  SELECT id, version
+    FROM file_metadata_records
+   WHERE partition_id = $1 AND state = 'claiming'
+     AND created_at <= to_timestamp($2::bigint)
+     AND file_source = ANY($3::text[])
+   ORDER BY created_at ASC, id ASC
+   LIMIT $4::int
+   FOR UPDATE SKIP LOCKED
+)
+DELETE FROM file_metadata_records target
+ USING stale
+ WHERE target.partition_id = $1
+   AND target.id = stale.id
+   AND target.version = stale.version
+RETURNING target.id)sql";
+
 //  ★ 版本链（R6）：先把旧的 is_latest 清零，再插入新版本 —— 两条语句必须在**同一事务**里
 //    （`Update` 用 BEGIN/COMMIT/ROLLBACK 控制），否则中间态会短暂出现"没有 latest"或
 //    "两个 latest"（后者会被 ux_mr_latest 拒绝）。
@@ -125,6 +149,25 @@ std::string DumpStringArray(const std::vector<std::string>& items) {
   json::Value array = json::Value::array();
   for (const auto& item : items) array.push_back(item);
   return json::Dump(array);
+}
+
+//  ★ C2：`text[]` 参数的**数组字面量**（`PQexecParams` 的文本参数按 `$3::text[]` 解析）。
+//    每个元素用双引号包裹并转义 `\` 与 `"`（PostgreSQL 数组输入语法）；空数组不会到这里
+//    （调用方先短路），但仍写成合法的 `{}`。不用 `string_to_array` 是因为分隔符本身需要
+//    转义，数组字面量是唯一无歧义的表达。
+std::string PgTextArrayLiteral(const std::vector<std::string>& items) {
+  std::string out = "{";
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i != 0) out += ',';
+    out += '"';
+    for (const char c : items[i]) {
+      if (c == '\\' || c == '"') out += '\\';
+      out += c;
+    }
+    out += '"';
+  }
+  out += '}';
+  return out;
 }
 
 //  校验参数（与内存 / SQLite 实现逐条对齐；契约里有对应断言）
@@ -336,6 +379,23 @@ fss::Result<void> PostgresMetadataRepository::ReleaseClaim(std::string_view part
     return NotFound("Record Not Found（该版本不是 claiming 状态）");
   }
   return Ok();
+}
+
+//  ★ C2：回收崩溃领取者留下的 claiming 行（见 kReclaimStaleClaiming 的注释）。
+fss::Result<std::int64_t> PostgresMetadataRepository::ReclaimStaleClaiming(
+    std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+    const std::vector<std::string>& live_expired_sources) {
+  if (partition.empty()) return Invalid("partition 不能为空");
+  //  ★ 空集合 = "没有任何被本 GC 原子领取的过期租约" → 一条都不回收（绝不凭年龄误删活 claim）。
+  if (limit <= 0 || live_expired_sources.empty()) return std::int64_t{0};
+  FSS_TRY(handle, pool_->Borrow());
+  const auto result = handle->ExecParams(
+      kReclaimStaleClaiming,
+      {std::string(partition), std::to_string(older_than_epoch_seconds),
+       PgTextArrayLiteral(live_expired_sources), std::to_string(limit)});
+  if (!result.ok()) return Annotate(result.error(), "回收 claiming 记录失败");
+  //  `DELETE … RETURNING` 的结果是 TUPLES_OK：返回行数 = 实际回收的行数。
+  return static_cast<std::int64_t>(result.value().RowCount());
 }
 
 // =============================================================================

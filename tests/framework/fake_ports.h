@@ -502,6 +502,14 @@ class FaultyMetadataRepository final : public domain::IMetadataRepository {
     }
     return inner_.ReleaseClaim(partition, record_id, version);
   }
+  //  ★ C2：回收崩溃领取者的 claiming 行 —— 测试替身只**转发**（故障注入点不在这里：
+  //    该路径的失败语义由三个真实实现的契约测试覆盖）。
+  fss::Result<std::int64_t> ReclaimStaleClaiming(
+      std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+      const std::vector<std::string>& live_expired_sources) override {
+    return inner_.ReclaimStaleClaiming(partition, older_than_epoch_seconds, limit,
+                                       live_expired_sources);
+  }
   fss::Result<domain::FileMetadataRecord> GetById(std::string_view partition,
                                                  std::string_view record_id) override {
     return inner_.GetById(partition, record_id);
@@ -613,6 +621,22 @@ class InMemoryLeaseRepository final : public domain::ILeaseRepository {
   void SetNowMillis(std::int64_t now) {
     std::lock_guard<std::mutex> guard(mutex_);
     now_millis_ = now;
+  }
+
+  //  ★ C2 诊断访问器：某条租约的到期时刻（毫秒）；不存在 → nullopt。
+  //    为什么需要它：续租测试要断言"`expires_at` 真的往后走了"，只看"对象没被删"
+  //    无法区分"续租生效"与"GC 根本没跑"（否定式判据必须配正控，AGENTS §4.3）。
+  std::optional<std::int64_t> ExpiresAtMillis(std::string_view partition,
+                                              std::string_view key) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto it = leases_.find(std::string(partition) + "\x1f" + std::string(key));
+    if (it == leases_.end()) return std::nullopt;
+    return it->second.expires_at_epoch_millis;
+  }
+
+  std::int64_t now_millis() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return now_millis_;
   }
 
  private:

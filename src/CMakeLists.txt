@@ -43,6 +43,7 @@ add_library(fss_app STATIC
   app/services/object_key_policy.cpp
   app/services/clock_skew_guard.cpp
   app/services/location_issuer.cpp
+  app/services/lease_renewer.cpp
   app/usecases/usecases.cpp
   app/usecases/caller_context.cpp
   app/usecases/wire_shapes.cpp

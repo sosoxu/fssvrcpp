@@ -81,12 +81,75 @@ std::int64_t ParseMillis(const std::string& text) {
   return static_cast<std::int64_t>(std::strtoll(text.c_str(), nullptr, 10));
 }
 
+// =============================================================================
+//  ★ C2：`leases.time_source=local` 的变体（时间基准 = 注入的 `IClock`）
+// =============================================================================
+//  与 database 变体**逐字同构**，只把 3 处 `now()` 换成 `to_timestamp($N::bigint)`：
+//    · `$5` = `clock.NowEpochSeconds()`（Acquire/Renew/ClaimExpired 各多带一个参数）；
+//    · `expires_at = to_timestamp($5 + ttl_ms/1000)`（整秒精度，与 `to_timestamp(clock+ttl)` 一致）。
+//  ★ 三个方法必须用**同一个**时间基准，否则 `Acquire` 写进去的 `expires_at` 与
+//    `ClaimExpired` 的比较会互相矛盾（本切片的 time_source 测试就是钉这一点）。
+constexpr const char* kAcquireLocal = R"sql(
+INSERT INTO staging_leases
+  (partition_id, file_source, owner, acquired_at, renewed_at, expires_at)
+VALUES ($1, $2, $3, to_timestamp($5::bigint), to_timestamp($5::bigint),
+        to_timestamp($5::bigint + $4::bigint / 1000))
+ON CONFLICT (partition_id, file_source) DO UPDATE
+   SET owner      = EXCLUDED.owner,
+       renewed_at = EXCLUDED.renewed_at,
+       expires_at = EXCLUDED.expires_at
+ WHERE staging_leases.expires_at <= to_timestamp($5::bigint)
+RETURNING owner, (extract(epoch from expires_at) * 1000)::bigint)sql";
+
+constexpr const char* kRenewLocal = R"sql(
+UPDATE staging_leases
+   SET expires_at = to_timestamp($5::bigint + $4::bigint / 1000),
+       renewed_at = to_timestamp($5::bigint)
+ WHERE partition_id = $1 AND file_source = $2 AND owner = $3
+RETURNING owner)sql";
+
+constexpr const char* kClaimExpiredLocal = R"sql(
+WITH expired AS (
+  SELECT partition_id, file_source
+    FROM staging_leases
+   WHERE partition_id = $1 AND expires_at <= to_timestamp($4::bigint)
+   ORDER BY expires_at ASC, file_source ASC
+   LIMIT $2::int
+   FOR UPDATE SKIP LOCKED
+),
+claimed AS (
+  UPDATE staging_leases lease
+     SET owner = $3,
+         renewed_at = to_timestamp($4::bigint),
+         expires_at = to_timestamp($4::bigint + 60)
+    FROM expired
+   WHERE lease.partition_id = expired.partition_id
+     AND lease.file_source = expired.file_source
+  RETURNING lease.partition_id, lease.file_source, lease.owner,
+            (extract(epoch from lease.expires_at) * 1000)::bigint AS expires_millis
+)
+SELECT claimed.partition_id,
+       claimed.file_source,
+       claimed.owner,
+       claimed.expires_millis,
+       location.file_id
+  FROM claimed
+  LEFT JOIN file_locations location
+    ON location.partition_id = claimed.partition_id
+   AND location.file_source = claimed.file_source)sql";
+
 }  // namespace
 
 fss::Result<std::unique_ptr<PostgresLeaseRepository>> PostgresLeaseRepository::Open(
     PostgresLeaseRepositoryOptions options) {
+  if (options.time_source == LeaseTimeSource::kLocal && options.clock == nullptr) {
+    return Err(fss::ErrorKind::kInvalidArgument,
+               "leases.time_source=local 需要注入 IClock（组合根未提供）");
+  }
   FSS_TRY(pool, PgPool::Create(std::move(options.pg)));
   std::unique_ptr<PostgresLeaseRepository> repository(new PostgresLeaseRepository());
+  repository->time_source_ = options.time_source;
+  repository->clock_ = options.clock;
   repository->pool_ = std::move(pool);
   return Ok(std::move(repository));
 }
@@ -109,11 +172,15 @@ fss::Result<domain::ILeaseRepository::Lease> PostgresLeaseRepository::Acquire(
     std::string_view partition, std::string_view file_id, std::string_view owner_instance_id,
     std::int64_t ttl_millis) {
   FSS_TRY(handle, pool_->Borrow());
-  const auto result = handle->ExecParams(
-      kAcquire, {std::string(partition), std::string(file_id), std::string(owner_instance_id),
-                 std::to_string(ttl_millis)});
-  if (!result.ok()) return Annotate(result.error(), "写入租约失败");
-  //  冲突且未过期 → `DO UPDATE ... WHERE false` 不产生行：与内存实现的
+  const bool local = time_source_ == LeaseTimeSource::kLocal;
+  const std::string now_seconds =
+      local ? std::to_string(clock_->NowEpochSeconds()) : std::string();
+  std::vector<PgConnection::Param> params{std::string(partition), std::string(file_id),
+                                          std::string(owner_instance_id),
+                                          std::to_string(ttl_millis)};
+  if (local) params.emplace_back(now_seconds);
+  const auto result = handle->ExecParams(local ? kAcquireLocal : kAcquire, params);
+  if (!result.ok()) return Annotate(result.error(), "写入租约失败");  //  冲突且未过期 → `DO UPDATE ... WHERE false` 不产生行：与内存实现的
   //  "租约已被占用"（kUnavailable）一致。
   if (result.value().RowCount() == 0) {
     return Err(fss::ErrorKind::kUnavailable, "租约已被占用");
@@ -133,9 +200,12 @@ fss::Result<void> PostgresLeaseRepository::Renew(std::string_view partition,
                                                  std::string_view owner_instance_id,
                                                  std::int64_t ttl_millis) {
   FSS_TRY(handle, pool_->Borrow());
-  const auto result = handle->ExecParams(
-      kRenew, {std::string(partition), std::string(file_id), std::string(owner_instance_id),
-               std::to_string(ttl_millis)});
+  const bool local = time_source_ == LeaseTimeSource::kLocal;
+  std::vector<PgConnection::Param> params{std::string(partition), std::string(file_id),
+                                          std::string(owner_instance_id),
+                                          std::to_string(ttl_millis)};
+  if (local) params.emplace_back(std::to_string(clock_->NowEpochSeconds()));
+  const auto result = handle->ExecParams(local ? kRenewLocal : kRenew, params);
   if (!result.ok()) return Annotate(result.error(), "续租失败");
   //  `UPDATE ... RETURNING` 的结果状态是 TUPLES_OK → 用返回行数判定是否命中（0 = 未命中）。
   if (result.value().RowCount() == 0) {
@@ -165,9 +235,11 @@ fss::Result<std::vector<domain::ILeaseRepository::Lease>> PostgresLeaseRepositor
   std::vector<Lease> claimed;
   if (limit <= 0) return claimed;  // 与内存实现一致：limit <= 0 → 空结果（不是错误）
   FSS_TRY(handle, pool_->Borrow());
-  const auto result =
-      handle->ExecParams(kClaimExpired, {std::string(partition), std::to_string(limit),
-                                         std::string(claimant_instance_id)});
+  const bool local = time_source_ == LeaseTimeSource::kLocal;
+  std::vector<PgConnection::Param> params{std::string(partition), std::to_string(limit),
+                                          std::string(claimant_instance_id)};
+  if (local) params.emplace_back(std::to_string(clock_->NowEpochSeconds()));
+  const auto result = handle->ExecParams(local ? kClaimExpiredLocal : kClaimExpired, params);
   if (!result.ok()) return Annotate(result.error(), "领取过期租约失败");
   for (int row = 0; row < result.value().RowCount(); ++row) {
     Lease lease;

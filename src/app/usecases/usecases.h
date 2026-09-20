@@ -96,6 +96,22 @@ struct UseCasePorts {
   //    `true` → 审计写入失败让**请求失败**（契约 §5 → 500），绝不"审计丢了还报成功"；
   //    `false`（默认，= 接线前的行为）→ 审计失败非致命，只影响记录本身。
   bool audit_fail_closed = false;
+
+  //  ★ C2（ADR-009 §4.2/§4.3）：在途租约。**可选**（指针 + `leases_enabled` 双闸门）：
+  //    · `leases == nullptr` 或 `leases_enabled == false` → 上传/登记路径**完全不做**
+  //      任何租约动作（Acquire / Renew / Release 都不调用），单实例行为与接线前**逐字一致**；
+  //    · `leases_enabled == true`（= 配置 `leases.enabled`）→ `GetUploadLocation` 发地址时
+  //      `Acquire`，`CreateFileMetadata` 在复制/校验和期间 `Renew`（见 `LeaseRenewer`），
+  //      `MarkReady` 之后 / 失败回滚之后 `Release`。
+  //  为什么放在端口集合里（而不是各用例的构造参数）：REST 与 gRPC 共用**同一个**
+  //  `UseCasePorts` ⇒ 两条协议的上传路径按构造拿到**同一份**租约配置（C7.3 的等价性）。
+  domain::ILeaseRepository* leases = nullptr;
+  bool leases_enabled = false;
+  std::int64_t lease_ttl_seconds = 60;             // `leases.ttl_seconds`（1..86400）
+  std::int64_t lease_renew_interval_seconds = 20;  // `leases.renew_interval_seconds`
+  //  在途租约的 owner（= `ILeaseRepository::Acquire` 的第 3 参）。组合根在多实例下
+  //  用自动生成的唯一 id；单实例 / 测试用 `"local"`。
+  std::string instance_id = "local";
 };
 
 // =============================================================================

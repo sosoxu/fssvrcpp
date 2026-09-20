@@ -43,6 +43,7 @@
 #pragma once
 
 #include "common/result/result.h"
+#include "common/time/clock.h"
 #include "domain/ports/ports.h"
 #include "infra/postgres/pg_connection.h"
 
@@ -54,9 +55,20 @@
 
 namespace fss::infra {
 
+//  ★ C2（ADR-009 §6.4）：租约的时间基准。
+//    · `kDatabase`（默认）= SQL `now()`：**跨实例同源**，消除实例间时钟偏移（推荐）。
+//    · `kLocal`             = 注入的 `IClock`：`expires_at = to_timestamp(clock.NowEpochSeconds() + ttl)`。
+//      为什么允许它：单实例 / 受控测试需要让租约判定跟随**可注入时钟**（ManualClock），
+//      否则"到期/续租"只能靠 sleep 或改宿主时钟。代价是**放弃跨实例同源**——
+//      多实例部署必须保持默认 `database`（`leases.time_source` 的语义见 operations.md §1.3）。
+enum class LeaseTimeSource { kDatabase, kLocal };
+
 //  ★ `pg` 必须是**第一个成员**（与 `location.postgres.*` 的配置字段顺序一致）。
 struct PostgresLeaseRepositoryOptions {
   PgOptions pg;
+  LeaseTimeSource time_source = LeaseTimeSource::kDatabase;
+  //  `kLocal` 时必须非空（否则 `Open` 返回 kInvalidArgument，绝不静默回退到数据库钟）。
+  const fss::IClock* clock = nullptr;
 };
 
 class PostgresLeaseRepository final : public domain::ILeaseRepository {
@@ -90,6 +102,9 @@ class PostgresLeaseRepository final : public domain::ILeaseRepository {
   fss::Error OwnerMismatch(std::string_view partition, std::string_view lease_key,
                            PgConnection& connection);
 
+  //  当前生效的时间基准（`kLocal` 时 `clock_` 必非空，由 `Open` 保证）。
+  LeaseTimeSource time_source_ = LeaseTimeSource::kDatabase;
+  const fss::IClock* clock_ = nullptr;
   std::unique_ptr<PgPool> pool_;
 };
 

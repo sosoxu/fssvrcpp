@@ -3,6 +3,7 @@
 
 #include "app/services/expiry_policy.h"
 #include "app/services/kind_validator.h"
+#include "app/services/lease_renewer.h"
 #include "app/services/object_key_policy.h"
 #include "common/bytes/bytes.h"
 #include "common/crypto/crypto.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <set>
 #include <thread>
@@ -353,6 +355,116 @@ bool LooksLikeFileSource(std::string_view value) {
   return !value.empty() && value.front() == '/' && value.find("..") == std::string_view::npos;
 }
 
+// =============================================================================
+//  ★ C2（ADR-009 §4.2/§4.3）：在途租约的共享辅助
+// =============================================================================
+//  开关是**双闸门**（指针 + 配置）：`leases_enabled=false`（默认）或未装配端口时，
+//  上传/登记路径一个租约调用都不做 —— 单实例行为与接线前逐字一致（多条既有测试依赖它）。
+bool LeaseEnabled(const UseCasePorts& ports) {
+  return ports.leases_enabled && ports.leases != nullptr;
+}
+
+std::int64_t LeaseTtlMillis(const UseCasePorts& ports) {
+  return ports.lease_ttl_seconds > 0 ? ports.lease_ttl_seconds * 1000 : 1000;
+}
+
+//  撤销 `IssueUploadLocation` 的副作用（位置记录 + 空 staging 对象）。
+//  为什么必须撤销：租约冲突 → 503 且不发地址；若位置记录留着，同一 file_id 的
+//  下一次重试会在 `IssueUploadLocation` 里先撞 `kLocationAlreadyExists`（400），
+//  永远走不到租约这一步 —— "释放/到期后重试成功"就再也无法发生。
+void RemoveIssuedUpload(UseCasePorts& ports, const CallerContext& caller,
+                        const LocationResult& location) {
+  if (const auto stored = ports.locations.Find(caller.partition, location.file_id);
+      stored.ok()) {
+    if (const auto ref = ObjectRefFromLocation(stored.value()); ref.ok()) {
+      if (auto store = ports.blobs.ForPartition(caller.partition, stored.value().zone);
+          store.ok()) {
+        (void)store.value()->remove(ref.value());
+      }
+    }
+  }
+  (void)ports.locations.Delete(caller.partition, location.file_id);
+}
+
+//  发地址时 `Acquire`：别的实例持有**未过期**租约 → 503（且不发地址）。
+fss::Result<void> AcquireUploadLease(UseCasePorts& ports, const CallerContext& caller,
+                                     const LocationResult& location) {
+  if (!LeaseEnabled(ports)) return Ok();
+  const auto acquired = ports.leases->Acquire(caller.partition, location.file_source,
+                                              ports.instance_id, LeaseTtlMillis(ports));
+  if (acquired.ok()) return Ok();
+  RemoveIssuedUpload(ports, caller, location);
+  if (acquired.error().kind() == fss::ErrorKind::kUnavailable) {
+    return Err(fss::ErrorKind::kUnavailable, "该 fileSource 的在途上传已被其它实例占用");
+  }
+  return Err(fss::ErrorKind::kUnavailable,
+             "获取在途租约失败：" + acquired.error().message());
+}
+
+//  ★ 领取成功后的**确保所有权**：先 `Renew`（大概率是我们自己在上传地址时领的），
+//  `kNotFound`（租约已消失）或 `kPermissionDenied`（换了实例）→ 回退 `Acquire`。
+//  回退仍报"别人活着"（kUnavailable）或任何其它故障 → **fail-closed**，绝不复制：
+//  一个我们无法保持的租约意味着 GC 可以合法地回收我们正在写的对象。
+fss::Result<void> EnsureLeaseOwnership(UseCasePorts& ports, const CallerContext& caller,
+                                       const std::string& file_source) {
+  if (!LeaseEnabled(ports)) return Ok();
+  const auto renewed = ports.leases->Renew(caller.partition, file_source, ports.instance_id,
+                                           LeaseTtlMillis(ports));
+  if (renewed.ok()) return Ok();
+  const auto kind = renewed.error().kind();
+  if (kind != fss::ErrorKind::kNotFound && kind != fss::ErrorKind::kPermissionDenied) {
+    return Err(fss::ErrorKind::kUnavailable, "续租在途租约失败：" + renewed.error().message());
+  }
+  const auto acquired = ports.leases->Acquire(caller.partition, file_source, ports.instance_id,
+                                              LeaseTtlMillis(ports));
+  if (acquired.ok()) return Ok();
+  if (acquired.error().kind() == fss::ErrorKind::kUnavailable) {
+    return Err(fss::ErrorKind::kUnavailable, "该 fileSource 的在途上传已被其它实例占用");
+  }
+  return Err(fss::ErrorKind::kUnavailable, "获取在途租约失败：" + acquired.error().message());
+}
+
+//  ★ RAII：领取成功之后、`MarkReady` / 回滚之前持有租约。析构（= 函数任意 return，
+//  包括提前 return）统一 `Stop()` 续租线程后再 `Release`，因此**不会漏掉**任何一条
+//  失败路径。成功路径显式 `ReleaseNow()`（在 `MarkReady` 之后）让释放时机精确。
+class UploadLeaseGuard {
+ public:
+  UploadLeaseGuard(UseCasePorts& ports, const CallerContext& caller, std::string file_source,
+                   std::string record_id, LeaseRenewer& renewer)
+      : ports_(ports),
+        caller_(caller),
+        file_source_(std::move(file_source)),
+        record_id_(std::move(record_id)),
+        renewer_(renewer) {}
+
+  ~UploadLeaseGuard() { ReleaseNow(); }
+
+  UploadLeaseGuard(const UploadLeaseGuard&) = delete;
+  UploadLeaseGuard& operator=(const UploadLeaseGuard&) = delete;
+
+  //  幂等：停止续租（先 stop+join，绝不留下 joinable 线程）→ Release。
+  //  释放失败**非致命**，但记一条审计（现有审计词汇里的 `...Failure` 后缀形态）。
+  void ReleaseNow() {
+    if (released_) return;
+    released_ = true;
+    renewer_.Stop();
+    const auto released =
+        ports_.leases->Release(caller_.partition, file_source_, ports_.instance_id);
+    if (!released.ok()) {
+      (void)RecordAudit(ports_, "createMetadataLeaseReleaseFailure", caller_, record_id_,
+                        /*success=*/false);
+    }
+  }
+
+ private:
+  UseCasePorts& ports_;
+  const CallerContext& caller_;
+  std::string file_source_;
+  std::string record_id_;
+  LeaseRenewer& renewer_;
+  bool released_ = false;
+};
+
 }  // namespace
 
 // =============================================================================
@@ -397,6 +509,9 @@ fss::Result<LocationResult> GetUploadLocation::Execute(
   if (!result.ok()) {
     return result.error();  // 失败路径由守卫记 `createLocationFailure`
   }
+  //  ★ C2：发地址 = 在途状态开始。`leases.enabled=true` 时先 Acquire：
+  //    别的实例持有未过期租约 → 503 且**不发地址**（并撤销刚建的位置记录/空对象）。
+  FSS_TRY(AcquireUploadLease(ports_, caller, result.value()));
   audit.SetObjectId(result.value().file_id);
   FSS_TRY(audit.Success());
   return result;
@@ -580,6 +695,45 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   //  领取成功：`claim.record` 就是刚插入的 v1 claiming 行，它的 version 是 MarkReady 的锚点。
   const std::int64_t claimed_version = claim.record.version;
 
+  // 4d. ★★ C2（ADR-009 §4.3）：确保本实例持有该 fileSource 的**在途租约**，并在随后的
+  //     长耗时复制/校验和期间周期续租。租约是"这个对象正在被写"的唯一证据：
+  //       · 别的实例活着持有 → fail-closed（kUnavailable），**不复制**；
+  //       · 续租失败 → 每个步骤边界都 fail-closed（回滚 + ReleaseClaim + 释放租约）。
+  //     `leases.enabled=false` → 下面一整段都不执行（单实例行为逐字不变）。
+  std::unique_ptr<LeaseRenewer> renewer;
+  std::unique_ptr<UploadLeaseGuard> lease_guard;
+  if (LeaseEnabled(ports_)) {
+    const auto owned = EnsureLeaseOwnership(ports_, caller, file_source);
+    if (!owned.ok()) {
+      AbortClaimedCreate(ports_, caller, std::nullopt, file_source, out.id, claimed_version);
+      return owned.error();
+    }
+    LeaseRenewer::Options renew_options;
+    renew_options.enabled = true;
+    renew_options.ttl_millis = LeaseTtlMillis(ports_);
+    renew_options.renew_interval_millis = ports_.lease_renew_interval_seconds * 1000;
+    renewer = std::make_unique<LeaseRenewer>(*ports_.leases, caller.partition, file_source,
+                                             ports_.instance_id, renew_options);
+    lease_guard = std::make_unique<UploadLeaseGuard>(ports_, caller, file_source, out.id,
+                                                     *renewer);
+    //  ★ 线程创建失败 / 首轮即失败也要 fail-closed（绝不带着"保不住的租约"去复制）。
+    if (renewer->failed()) {
+      AbortClaimedCreate(ports_, caller, std::nullopt, file_source, out.id, claimed_version);
+      return Err(fss::ErrorKind::kUnavailable, "在途租约续租不可用，拒绝复制（fail-closed）");
+    }
+  }
+
+  //  步骤边界检查：续租失败 → 回滚已复制的对象（此时仍持有 claim）→ 返回 kUnavailable。
+  //  释放租约由 `UploadLeaseGuard` 在返回时完成（回滚与 ReleaseClaim 之后），顺序符合
+  //  "对象仍被 claim 保护 → 放弃 claim → 释放租约"。
+  const auto abort_if_lease_lost = [&](const std::optional<domain::ObjectRef>& rollback_ref)
+      -> std::optional<fss::Error> {
+    if (renewer == nullptr || !renewer->failed()) return std::nullopt;
+    AbortClaimedCreate(ports_, caller, rollback_ref, file_source, out.id, claimed_version);
+    return Err(fss::ErrorKind::kUnavailable,
+               "在途租约续租失败，已回滚复制（fail-closed，防止 GC 回收在途对象）");
+  };
+
   // 5. 位置记录（FileSource → 物理位置）
   const auto location_result = ports_.locations.FindByFileSource(caller.partition, file_source);
   if (!location_result.ok()) {
@@ -645,6 +799,9 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     copied_stat = existing.value();
   }
 
+  //  ★ C2 步骤边界（复制之后）：续租失败 → 回滚复制，fail-closed。
+  if (const auto lost = abort_if_lease_lost(to_ref); lost.has_value()) return *lost;
+
   // 7. 校验和：`checksum = storageUtil.getChecksum(persistentLocation)`，非空则**回写覆盖**
   //    `FileSourceInfo.Checksum` + `ChecksumAlgorithm`（调研 §2.1 第 7 条 / §2.3）。
   //
@@ -692,6 +849,9 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     out.data.checksum_algorithm = source_info.checksum_algorithm;
   }
 
+  //  ★ C2 步骤边界（校验和之后、mark-ready 之前）：续租失败 → 回滚，fail-closed。
+  if (const auto lost = abort_if_lease_lost(to_ref); lost.has_value()) return *lost;
+
   // 8/9. ★ C1：把 claiming 行推到 ready，并一次性落库**最终**记录（含上面刚算出的 checksum）。
   //      ADR-009 §4.2 的顺序：领取（复制之前）→ 复制 → 算校验和 → claiming→ready。
   //      `MarkReady` 必须发生在成功事件/审计**之前**：客户端绝不能看到"SUCCESS 但记录仍 claiming"。
@@ -701,6 +861,11 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
     return Err(fss::ErrorKind::kInternal, "写入元数据记录失败：" + created.error().message());
   }
+
+  //  ★ C2：记录已 ready → 租约使命完成。**必须**在 MarkReady 之后才释放：在此之前
+  //    记录对 GC 还不可见（读路径只认 ready），租约是保护这个 object 的唯一凭据。
+  //    释放失败非致命，但 `ReleaseNow()` 会记审计 `createMetadataLeaseReleaseFailure`。
+  if (lease_guard != nullptr) lease_guard->ReleaseNow();
 
   // 10. 成功事件（非致命）：**两个**事件，顺序与上游一致（先 status，再 datasetDetails）
   PublishStatus(ports_, caller, "SUCCESS", created.value().version, created.value().id);

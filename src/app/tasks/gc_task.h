@@ -43,12 +43,18 @@ struct GcOptions {
   std::int64_t staging_ttl_hours = 24;  // `gc.staging_ttl_hours`
   std::int64_t orphan_grace_hours = 72; // `gc.orphan_grace_hours`
   int claim_limit = 100;                // 单轮最多领取多少条过期租约
+  //  ★ C2（ADR-009 §4.3）：`leases.ttl_seconds`。回收"崩溃领取者"留下的 claiming 行时，
+  //    以 `now - lease_ttl_seconds` 为**二级年龄护栏**（刚领取的行绝不能被年龄判据碰到；
+  //    真正的"已死"证明来自"租约已到期并被本 GC 原子领取"）。
+  std::int64_t lease_ttl_seconds = 60;
 };
 
 //  一轮 GC 的结果。既给测试断言，也给 `/metrics`（P9 暴露）。
 struct GcReport {
   bool dry_run = true;
   std::int64_t expired_leases_claimed = 0;  // 本轮原子领取到的过期租约数
+  //  ★ C2：本轮回收的"崩溃领取者"claiming 行数（只回收"租约已过期并被本 GC 领取"的）。
+  std::int64_t reclaimed_claiming = 0;
   std::int64_t deleted_objects = 0;
   std::int64_t deleted_locations = 0;
   std::int64_t skipped_has_record = 0;    // ★ 有元数据记录 → 永不删

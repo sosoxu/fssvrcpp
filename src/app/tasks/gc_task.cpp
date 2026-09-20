@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -30,6 +31,13 @@ bool IsTempKey(std::string_view key) {
 
 std::string PairKey(std::string_view container, std::string_view key) {
   return std::string(container) + "\x1f" + std::string(key);
+}
+
+//  ★ C2：租约的**键**。端口契约把"租约键"定义为 `file_source`，但两个实现回填方式不同
+//    （PG 回填 `file_source`，内存实现只回填 `file_id`）—— `tests/framework/port_contract.h`
+//    的 `LeaseContractKey` 是这条约定的**唯一**真相，这里逐字复刻它的取值规则。
+std::string LeaseKeyOf(const domain::ILeaseRepository::Lease& lease) {
+  return lease.file_source.empty() ? lease.file_id : lease.file_source;
 }
 
 }  // namespace
@@ -63,7 +71,6 @@ void GcTask::DeleteCandidate(const GcOptions& options, domain::IBlobStore& store
 void GcTask::CollectExpiredLeases(std::string_view partition, const GcOptions& options,
                                   domain::IBlobStore& staging, domain::IBlobStore& persistent,
                                   std::int64_t now_seconds, GcReport& report) {
-  (void)now_seconds;
   //  ★ 原子领取：并发 GC 下同一条租约只会被一个实例领走（`FOR UPDATE SKIP LOCKED` 等价的语义）。
   //    领到之后**仍然**要再看一次元数据记录 —— 纵深防御，别把"领到"当成"可以删"。
   const auto claimed = leases_.ClaimExpired(partition, options.claim_limit, instance_id_);
@@ -73,25 +80,67 @@ void GcTask::CollectExpiredLeases(std::string_view partition, const GcOptions& o
   }
   report.expired_leases_claimed = static_cast<std::int64_t>(claimed.value().size());
 
+  //  ★★ C2（ADR-009 §4.2/§4.3）：**租约驱动**地回收"崩溃领取者"留下的 claiming 行。
+  //     为什么必须用"刚被本 GC 原子领取的过期租约的 file_source"作为集合：
+  //       · 领取是否已死**只有租约知道**；ClaimExpired 的返回 = "这些租约确实到期，
+  //         且现在归本 GC 所有" —— 这是唯一的、跨三个实现完全一致的死亡证明；
+  //       · 阈值 `now - leases.ttl_seconds` 是**二级年龄护栏**：没有它，一个刚刚插入、
+  //         且租约恰好被并发 GC 领走的 claiming 行也会被顺手删掉（本切片的 R1 注入③
+  //         专门锁这条：忽略集合、只按年龄回收必须让正控失败）。
+  //     顺序：先回收 claiming 行，再走下面的"对象/位置"删除 —— `HasMetadataRecord` 只认
+  //     ready，因此 claiming 行是否还在都不影响对象可回收性；先回收让"claim 已释放、
+  //     fileSource 可重试"与"对象被清"在同一轮 GC 内同时成立。
+  if (!claimed.value().empty()) {
+    std::vector<std::string> expired_sources;
+    expired_sources.reserve(claimed.value().size());
+    for (const auto& lease : claimed.value()) expired_sources.push_back(LeaseKeyOf(lease));
+    const auto reclaimed = ports_.metadata.ReclaimStaleClaiming(
+        partition, now_seconds - options.lease_ttl_seconds, options.claim_limit, expired_sources);
+    if (!reclaimed.ok()) {
+      ++report.errors;
+    } else {
+      report.reclaimed_claiming = reclaimed.value();
+    }
+  }
+
   for (const auto& lease : claimed.value()) {
-    const auto location = ports_.locations.Find(partition, lease.file_id);
-    if (!location.ok()) {
+    //  ★ C2：把租约**解析成位置记录**时，必须同时容错两种回填约定（这是本切片记录的
+    //    memory-vs-PG 不对称）：
+    //      · PG `ClaimExpired` 用 `LEFT JOIN file_locations` 反解出真正的 `file_id`；
+    //      · 内存实现的 `ClaimExpired` 只回填租约键（A1 约定：键 = `file_source`）。
+    //    因此先按 `file_id` 查（对上 PG 与既有 `test_gc_lease` 的用法），失败再按
+    //    租约键 = `file_source` 回退（对上"上传路径用 file_source 当键"的真实形态）。
+    const std::string lease_key = LeaseKeyOf(lease);
+    std::optional<domain::FileLocation> resolved;
+    if (!lease.file_id.empty()) {
+      if (auto by_id = ports_.locations.Find(partition, lease.file_id); by_id.ok()) {
+        resolved = by_id.value();
+      }
+    }
+    if (!resolved.has_value() && !lease_key.empty()) {
+      if (auto by_source = ports_.locations.FindByFileSource(partition, lease_key);
+          by_source.ok()) {
+        resolved = by_source.value();
+      }
+    }
+    if (!resolved.has_value()) {
       //  位置记录已经不存在：对象引用无从谈起（可能上一轮已经清过）→ 什么都不做
       ++report.skipped_no_location;
       continue;
     }
-    if (HasMetadataRecord(partition, location.value().file_source)) {
+    const domain::FileLocation& location = *resolved;
+    if (HasMetadataRecord(partition, location.file_source)) {
       ++report.skipped_has_record;  // ★ 有记录 → 永不删
       continue;
     }
-    const auto ref = ObjectRefFromLocation(location.value());
+    const auto ref = ObjectRefFromLocation(location);
     if (!ref.ok()) {
       ++report.errors;
       continue;
     }
     domain::IBlobStore& store =
-        location.value().zone == domain::StorageZone::kPersistent ? persistent : staging;
-    DeleteCandidate(options, store, ref.value(), lease.file_id, /*delete_location=*/true,
+        location.zone == domain::StorageZone::kPersistent ? persistent : staging;
+    DeleteCandidate(options, store, ref.value(), location.file_id, /*delete_location=*/true,
                     partition, report);
   }
 }
@@ -266,6 +315,8 @@ Result<GcReport> GcTask::Run(std::string_view partition, const GcOptions& option
                         "GC 删除的对象数（dry-run 下为候选数）");
     registry_->Register("fss_gc_tmp_removed_total", fss::metrics::Registry::Kind::kCounter,
                         "GC 清理的 .tmp_* 临时文件数（C9.25）");
+    registry_->Register("fss_gc_reclaimed_claiming_total", fss::metrics::Registry::Kind::kCounter,
+                        "GC 回收的崩溃领取者 claiming 行数（C2：租约已过期并被本 GC 领取）");
     registry_->Register("fss_gc_skipped_total", fss::metrics::Registry::Kind::kCounter,
                         "GC 跳过的对象数（按原因）");
     registry_->Register("fss_gc_last_run_epoch_seconds", fss::metrics::Registry::Kind::kGauge,
@@ -343,6 +394,9 @@ Result<GcReport> GcTask::Run(std::string_view partition, const GcOptions& option
     }
     if (report.tmp_removed > 0) {
       registry_->Increment("fss_gc_tmp_removed_total", {}, report.tmp_removed);
+    }
+    if (report.reclaimed_claiming > 0) {
+      registry_->Increment("fss_gc_reclaimed_claiming_total", {}, report.reclaimed_claiming);
     }
     if (report.skipped_has_record > 0) {
       registry_->Increment("fss_gc_skipped_total", {{"reason", "has_record"}},

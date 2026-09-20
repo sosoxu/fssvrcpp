@@ -1881,12 +1881,13 @@ static int RunServer(int argc, char** argv) {
     metadata_repository_backend = "sqlite";
   }
 
-  //  ---- 在途租约（C10.9 / B1）：`leases.enabled` 现在**真的**选择后端 ----
-  //  · false（默认，单实例）→ 内存租约（逐字保持接线前的语义）；
-  //  · true → PG 租约（`staging_leases`；跨实例共享，时间源 = 数据库 now()，ADR-009 §4.3）。
-  //    ★ 生产代码目前仍没有调用方 `Acquire` 租约（上传路径是后续切片）⇒ 选了 PG 后端
-  //      在当前可观测行为上只影响 GC 的 `ClaimExpired` 走哪张表（空表 → 0 条）。
-  //  ★ 租约表与位置记录在**同一个库**，因此 DSN 取 `location.postgres.*`。
+  //  ---- 在途租约（C10.9 / B1 / C2）：`leases.enabled` 现在**真的**选择后端 ----
+  //  · false（默认，单实例）→ 内存租约（逐字保持接线前的语义；上传路径**不**做租约动作）；
+  //  · true → PG 租约（`staging_leases`；跨实例共享）。★ C2 起上传路径**真的**有调用方：
+  //    `GetUploadLocation` 发地址时 `Acquire`，`CreateFileMetadata` 在复制/校验和期间
+  //    `Renew`（`LeaseRenewer`）、`MarkReady`/回滚后 `Release`；GC 用 `ClaimExpired` 的结果
+  //    驱动 `metadata.ReclaimStaleClaiming` 回收崩溃者的 claiming 行。
+  //    `leases.time_source` 决定 PG 租约的时间基准（database / local），见下。
   infra::InMemoryLeaseRepository memory_lease_repository(clock);
 #ifdef FSS_HAVE_LIBPQ
   std::unique_ptr<infra::PostgresLeaseRepository> pg_lease_repository;
@@ -1898,6 +1899,13 @@ static int RunServer(int argc, char** argv) {
     PostgresLeaseRepositoryOptions pg_lease_options;
     pg_lease_options.pg.dsn = location_postgres_dsn;
     pg_lease_options.pg.max_connections = static_cast<int>(location_postgres_max_connections);
+    //  ★ C2：`leases.time_source`。`database`（默认）= 三个原语一致地用 PG `now()`；
+    //    `local` = 三个原语一致地用注入的 `IClock`（组合根这里就是它自己的 `clock`）。
+    //    两种取值下 Acquire/Renew/ClaimExpired 必须**同一时间基准**（PG 实现的注释里钉住了）。
+    pg_lease_options.time_source = leases_time_source == "local"
+                                       ? infra::LeaseTimeSource::kLocal
+                                       : infra::LeaseTimeSource::kDatabase;
+    pg_lease_options.clock = &clock;
     auto opened = PostgresLeaseRepository::Open(std::move(pg_lease_options));
     if (!opened.ok()) {
       std::cerr << "拒绝启动：leases.enabled=true 但打开 PG 租约仓储失败："
@@ -1910,7 +1918,10 @@ static int RunServer(int argc, char** argv) {
     }
     pg_lease_repository = std::move(opened).value();
     lease_port = pg_lease_repository.get();
-    lease_backend = "postgres（staging_leases；时间源 = 数据库 now()）";
+    lease_backend = "postgres（staging_leases；时间源 = " +
+                    std::string(leases_time_source == "local" ? "本地 IClock（leases.time_source=local）"
+                                                              : "数据库 now()（leases.time_source=database）") +
+                    "）";
 #else
     std::cerr << "拒绝启动：leases.enabled=true 需要 libpq（本二进制未编译 PG 支持）。"
                  "下一步：安装 libpq-dev 后重新 cmake + 重编。\n";
@@ -2178,6 +2189,15 @@ static int RunServer(int argc, char** argv) {
   ports.io_uring_available = uring_probe.available();
   //  C10.13：审计失败是否让请求失败（用例层判定；见 usecases.cpp 的 RecordAudit）
   ports.audit_fail_closed = audit_fail_closed;
+  //  ★ C2（ADR-009 §4.2/§4.3）：上传路径的在途租约。
+  //    `leases_enabled=false`（默认）→ `ports.leases_enabled=false` 且不装配端口指针，
+  //    上传/登记路径一个租约调用都不做（单实例行为逐字不变）。
+  //    `true` → `GetUploadLocation` 发地址时 Acquire、`CreateFileMetadata` 复制期间续租。
+  ports.leases = lease_port;
+  ports.leases_enabled = leases_enabled;
+  ports.lease_ttl_seconds = leases_ttl_seconds;
+  ports.lease_renew_interval_seconds = leases_renew_interval_seconds;
+  ports.instance_id = effective_instance_id;
 
   // ===========================================================================
   //  GC（C10.9）：GcTask + 调度参数。`--once` 与周期调度共用同一份 options。
@@ -2187,6 +2207,8 @@ static int RunServer(int argc, char** argv) {
   gc_options.require_lease_expiry = gc_require_lease_expiry;
   gc_options.staging_ttl_hours = gc_staging_ttl_hours;
   gc_options.orphan_grace_hours = gc_orphan_grace_hours;
+  //  ★ C2：`leases.ttl_seconds` 是回收"崩溃领取者 claiming 行"的二级年龄护栏。
+  gc_options.lease_ttl_seconds = leases_ttl_seconds;
   const std::string gc_partition = "opendes";  // 组合根内置的单租户（与 StaticPartitionRegistry 同源）
   app::GcTask gc_task(ports, *lease_port, effective_instance_id, &metrics_registry);
 

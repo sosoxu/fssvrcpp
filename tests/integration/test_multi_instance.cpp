@@ -309,6 +309,19 @@ class NaiveIdKeyedMetadataRepository final : public IMetadataRepository {
     return fss::Ok();
   }
 
+  //  ★ C2：本对照替身只模拟"按随机主键 check-then-insert"的幂等失效，
+  //    不承载租约驱动的 claiming 回收（那条语义由三个**真实**实现各自验证）。
+  //    显式返回 0 而不是"悄悄什么都不做"：调用方看到的是"没有行被回收"这个明确结果。
+  fss::Result<std::int64_t> ReclaimStaleClaiming(
+      std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+      const std::vector<std::string>& live_expired_sources) override {
+    (void)partition;
+    (void)older_than_epoch_seconds;
+    (void)limit;
+    (void)live_expired_sources;
+    return std::int64_t{0};
+  }
+
   fss::Result<FileMetadataRecord> GetById(std::string_view partition,
                                          std::string_view record_id) override {
     std::lock_guard<std::mutex> guard(mutex_);

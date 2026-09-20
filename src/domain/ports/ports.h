@@ -212,6 +212,17 @@ class IMetadataRepository {
   virtual Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
                                     std::int64_t version) = 0;
 
+  //  ★ C2（ADR-009 §4.2/§4.3）：回收"崩溃的领取者"留下的 claiming 行：只回收
+  //    `file_source` 落在 `live_expired_sources` 里、且 `created_at <= older_than_epoch_seconds`
+  //    的 claiming 行（最多 limit 条），返回实际回收数。
+  //  ★ 为什么必须由调用方给出 file_source 集合：领取是否"已死"只有**租约**知道，
+  //    而"租约已到期并被本 GC 原子领取"这个事实由 `ILeaseRepository::ClaimExpired` 提供 ——
+  //    模块化地把它传进来，三个实现（内存/SQLite/PG）才能有完全一致的语义，且不需要跨表 SQL。
+  //    空集合 ⇒ 一条都不回收（调用方"没有领到任何过期租约"时不得凭年龄误删活 claim）。
+  virtual Result<std::int64_t> ReclaimStaleClaiming(
+      std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+      const std::vector<std::string>& live_expired_sources) = 0;
+
   virtual Result<FileMetadataRecord> GetById(std::string_view partition,
                                              std::string_view record_id) = 0;
   //  拿最新版本（`is_latest` 语义，R6：部分唯一索引的谓词要含业务语义）

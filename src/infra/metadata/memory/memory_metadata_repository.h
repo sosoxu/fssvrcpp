@@ -46,6 +46,9 @@ class InMemoryMetadataRepository final : public domain::IMetadataRepository {
       const domain::FileMetadataRecord& record) override;
   fss::Result<void> ReleaseClaim(std::string_view partition, std::string_view record_id,
                                  std::int64_t version) override;
+  fss::Result<std::int64_t> ReclaimStaleClaiming(
+      std::string_view partition, std::int64_t older_than_epoch_seconds, int limit,
+      const std::vector<std::string>& live_expired_sources) override;
   fss::Result<domain::FileMetadataRecord> GetById(std::string_view partition,
                                                   std::string_view record_id) override;
   fss::Result<domain::FileMetadataRecord> GetLatestByFileSource(

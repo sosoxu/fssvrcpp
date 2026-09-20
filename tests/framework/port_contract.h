@@ -1086,6 +1086,53 @@ inline void CheckMetadataRepositoryContract(domain::IMetadataRepository& repo,
     REQUIRE(*got.data.name == "well-formed");
     REQUIRE(json::Dump(got.extra) == json::Dump(rec.extra));
   }
+
+  // ===========================================================================
+  //  ★ C2（ADR-009 §4.2/§4.3）：ReclaimStaleClaiming —— **租约驱动**的 claiming 回收
+  // ===========================================================================
+  //  语义登记（memory / SQLite / PG 必须逐字一致，且必须有正控）：
+  //    · 只回收 `file_source ∈ live_expired_sources` **且** `created_at <= older_than` 的行；
+  //    · 空集合 ⇒ 0（调用方没领到任何过期租约时的安全方向）；
+  //    · 阈值早于 `created_at` ⇒ 0（二级年龄护栏）；
+  //    · `limit` 逐条生效；回收后同一 file_source 可被重新领取（旧行真的没了）。
+  SECTION("★ C2 reclaim：只回收 (file_source ∈ 集合 ∧ created_at <= 阈值) 的 claiming 行") {
+    const std::string s1 = "/u/reclaim/one";
+    const std::string s2 = "/u/reclaim/two";
+    const auto r1 = MakeRecord(pa, "rcl1", s1, "reclaim-1");
+    const auto r2 = MakeRecord(pa, "rcl2", s2, "reclaim-2");
+    ContractOk(repo.ClaimForWrite(pa, r1), "claim r1");
+    ContractOk(repo.ClaimForWrite(pa, r2), "claim r2");
+    const std::int64_t created = clock.NowEpochSeconds();
+
+    //  负断言①：空集合 → 一条都不回收（绝不凭年龄误删活 claim）
+    REQUIRE(ContractOk(repo.ReclaimStaleClaiming(pa, created, 10, {}), "空集合") == 0);
+    //  负断言②：年龄护栏 —— 阈值早于 created_at
+    REQUIRE(ContractOk(repo.ReclaimStaleClaiming(pa, created - 1, 10, {s1, s2}),
+                       "年龄护栏") == 0);
+    //  负断言③：集合里只有**别的** file_source
+    REQUIRE(ContractOk(repo.ReclaimStaleClaiming(pa, created, 10, {"/u/reclaim/other"}),
+                       "集合不匹配") == 0);
+    //  ★ 正控：三条负断言之后两行**确实还在 claiming**（否则"回收 0 条"可能只是"行不存在"）
+    {
+      const auto probe =
+          ContractOk(repo.ClaimForWrite(pa, MakeRecord(pa, "rcl1b", s1, "probe")), "正控：行仍在");
+      REQUIRE_FALSE(probe.claimed);
+      REQUIRE(probe.state == domain::MetadataState::kClaiming);
+      REQUIRE(probe.record.id == r1.id);
+    }
+
+    //  正例：limit 逐条生效
+    REQUIRE(ContractOk(repo.ReclaimStaleClaiming(pa, created, 1, {s1, s2}), "limit=1") == 1);
+    REQUIRE(ContractOk(repo.ReclaimStaleClaiming(pa, created, 10, {s1, s2}), "回收剩余") == 1);
+    //  正控：两行都没了 → 同一 file_source 可被**重新领取**
+    const auto reclaim1 = ContractOk(repo.ClaimForWrite(pa, r1), "回收后可重新领取 r1");
+    REQUIRE(reclaim1.claimed);
+    const auto reclaim2 = ContractOk(repo.ClaimForWrite(pa, r2), "回收后可重新领取 r2");
+    REQUIRE(reclaim2.claimed);
+    //  本 section 收尾：释放，避免影响同一 TEST_CASE 的后续 section
+    ContractOk(repo.ReleaseClaim(pa, r1.id, 1), "cleanup r1");
+    ContractOk(repo.ReleaseClaim(pa, r2.id, 1), "cleanup r2");
+  }
 }
 
 // =============================================================================

@@ -166,6 +166,21 @@ if(FSS_WITH_PG)
     FIXTURES_REQUIRED pg
     TIMEOUT 900)
 
+  # ===========================================================================
+  #  C2（ADR-009 §4.2/§4.3）：PG 租约的 TTL / time_source / 崩溃回收可观测性
+  #    · `leases.ttl_seconds` 真的写进 `staging_leases`（直接查表）；
+  #    · `time_source=local` 跟随注入 IClock（与 database 对照），且三原语自洽；
+  #    · 崩溃→GC 回收 claiming 行→同 fileSource 重试，端到端成立（local 钟，确定性）。
+  # ===========================================================================
+  fss_add_test(test_postgres_lease_lifecycle
+    SOURCES integration/test_postgres_lease_lifecycle.cpp
+    LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory
+            fss_location_postgres fss_metadata_postgres Threads::Threads
+    LABELS  "pg;infra")
+  set_tests_properties(test_postgres_lease_lifecycle PROPERTIES
+    FIXTURES_REQUIRED pg
+    TIMEOUT 300)
+
   if(FSS_PG_TEARDOWN)
     add_test(NAME pg_fixture_teardown COMMAND "${_pg_script}" stop)
     set_tests_properties(pg_fixture_teardown PROPERTIES
@@ -485,6 +500,13 @@ add_dependencies(test_dual_protocol_concurrency fss_server)
 # C6.12：GC 租约（在途不删 / 过期回收 / 原子领取不重复删 / 有记录永不删）
 fss_add_test(test_gc_lease
   SOURCES integration/test_gc_lease.cpp
+  LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory Threads::Threads
+  LABELS  "phase6;integration")
+
+# C2（ADR-009 §4.2/§4.3）：在途租约真的生效 —— 上传路径 Acquire / 慢复制期间 Renew /
+# 崩溃者 claiming 行由 GC 按"已原子领取的过期租约"回收 / 跨实例冲突 503 / 默认不接租约。
+fss_add_test(test_lease_lifecycle
+  SOURCES integration/test_lease_lifecycle.cpp
   LIBS    fss_app fss_blob_memory fss_location_memory fss_metadata_memory Threads::Threads
   LABELS  "phase6;integration")
 
