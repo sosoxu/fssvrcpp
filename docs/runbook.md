@@ -236,14 +236,122 @@ scripts/bench_baseline.sh --check    # 退化 >20% 直接失败（退出码 1）
   **多实例 E2E 与崩溃注入（C9.26）**。
 - ★ **仍未交付/未验证**（不要把"能启动"读成"多实例已完整验证"）：**NFS 语义验证（C9.27）** ——
   B2b 只证明"交叉探针可见 = 共享性"，**不**证明 NFS 的 `rename`/close-to-open/`syncfs` 语义；
-  `syncfs` 干扰评估（C9.24）、`/v2/info` 暴露 `instanceId`、ADR-009 §10 的多实例部署 /
-  PG HA / 按盘分区 / 滚动升级运维手册。多实例前的硬前提仍是 **C9.27**。
+  `syncfs` 干扰评估（C9.24）、`/v2/info` 暴露 `instanceId`、LB 粘性、>2 实例、真实双版本滚动升级、
+  PG 故障转移本身。多实例前的硬前提仍是 **C9.27**。完整清单（含"运行期不清理注册行"等）见
+  [`operations.md`](operations.md) §10.8。
 - 共享 POSIX 挂载上的临时文件命名包含实例标识与**每进程随机 token**
   （`.tmp.<instance_id>.<pid>.<counter>.<random>`；ADR-009 §4.5 的随机后缀已在 B1 补齐）。
   `deployment.instance_id` 在 multi 下未配置/为空时由组合根**自动生成**（默认 `local` 会让
   多实例共享标识 → M1 静默串数据）。**不要**手工清理正在被其它实例写入的 `.tmp.*`
   （用 GC 的 TTL 判定）。
 - `syncfs` 是**文件系统级**操作：建议按 partition 分盘，避免实例间互相拖慢。
+  为什么、以及推荐的挂载布局见 [`operations.md`](operations.md) §10.3
+  （★ `storage.posix.one_filesystem_per_partition` **未接通**，分盘只能靠部署手段）。
+
+> **下面 8.1~8.6 只看"故障怎么判读"**：部署拓扑、PG 高可用与连接预算、分盘、
+> 滚动升级与配置版本的**完整说明**在 [`operations.md`](operations.md) §10，本节不重复长表。
+> 每条都是**症状 → 诊断命令 → 处置 → 禁令**。
+
+### 8.1 通用诊断入口（多实例）
+
+```bash
+BASE=http://127.0.0.1:8080/api/file          # 逐实例替换
+DSN='postgresql://fss@<pg-host>:5432/fss'    # 按部署替换
+
+# ① 谁是 leader：会话级 advisory lock 的持有者（行数应恒为 1）
+psql "$DSN" -Atc "SELECT objid, pid FROM pg_locks WHERE locktype='advisory'"
+# ② 在线实例与心跳年龄（live 窗口 30s；>300s 的陈旧行只在启动期清理）
+psql "$DSN" -Atc "SELECT instance_id, service_version, left(config_hash,12), now()-heartbeat_at FROM instance_registry ORDER BY instance_id"
+# ③ 在途领取行（崩溃者会留下；等租约到期由 leader 的 GC 回收）
+psql "$DSN" -Atc "SELECT partition_id, file_source, created_at FROM file_metadata_records WHERE state='claiming'"
+# ④ 在途租约
+psql "$DSN" -Atc "SELECT partition_id, file_source, expires_at FROM staging_leases ORDER BY expires_at"
+# ⑤ 逐实例 readiness（原因文本会指出是哪一类不一致）
+curl -sS "$BASE/v2/readiness_check"; echo
+# ⑥ GC 是否按 leader 单例跑（非 leader 的 fss_gc_runs_total 不应增长）
+curl -sS http://<host>:8080/metrics | grep -E 'fss_gc_(runs|reclaimed_claiming|objects_deleted)_total'
+```
+
+### 8.2 实例崩溃：幸存者接管、按租约回收
+
+* **症状**：一个实例的进程消失；崩溃前正在 `createMetadata` 的 `fileSource` 重试**先 503、之后才 201**；
+  短时间内在 `pg_locks` 里还能看到原 holder。
+* **诊断**：`pg_locks` 的 advisory holder 是否换到幸存者（§8.1 ①）；`state='claiming'` 的行是否还在（③）；
+  `instance_registry` 里崩溃实例的心跳是否已超出 30 s（②）；`fss_gc_reclaimed_claiming_total` 是否开始增长（⑥）。
+* **处置**：**等**。幸存者接管领导权后，GC 按"**已过期的租约 + 原子领取**"回收崩溃者的 `claiming` 行与
+  孤儿 staging 对象；实测 `kill -9` → 回收完成 ≈ `leases.ttl_seconds`（8 s 档实测 **8.0 s / 9.1 s**，
+  见 [`test-evidence/phase10.md`](test-evidence/phase10.md) §20）。回收后对同一 `fileSource`
+  **幂等重试**即可（201，返回重传字节的 SHA-256）。★ `claiming` 期间的第二次提交"≈2 s 后 503"
+  是**预期**（fail-closed），不是故障。
+* **禁令**：**禁止**手工 `DELETE` `file_metadata_records` / `staging_leases` 的行或删对象来"加速"恢复
+  —— 那会绕过"租约到期 + 原子领取"的判定，可能删掉仍被其它实例持有的在途数据（ADR-009 §4.3）。
+  回收慢只调 `leases.ttl_seconds`（注意 `leases.renew_interval_seconds` 必须 **< TTL**；TTL 越小，
+  慢上传被误回收的风险越大）。
+
+### 8.3 共享挂载掉线
+
+* **症状**：该实例 readiness **not ready**，原因里同时出现对端 `instance_id`、探针路径与两个 root；
+  该实例上的控制面/数据面开始 **503**；`liveness` 仍 200。
+* **诊断**：
+
+  ```bash
+  ls -l "$FSS_STORAGE_ROOT"/.fss_probe.*        # 本实例与对端探针是否都在
+  cat  "$FSS_STORAGE_ROOT"/.fss_probe.<peer>    # 内容里的 instance_id= 必须整行等于对端 id
+  findmnt -T "$FSS_STORAGE_ROOT"                # 挂载点/文件系统类型（是否还是那个共享挂载）
+  curl -sS "$BASE/v2/readiness_check"           # 原因文本
+  ```
+
+* **处置**：恢复挂载/网络；确认对端探针重新可见 → readiness **自动**回到 200。
+* **禁令**：**不要**把 `storage.posix.shared_mount_required` 改成 `false` 绕过 —— multi 下 schema
+  会直接拒绝启动（exit 78），而且它不改变"挂载没共享"这个根因；**不要**手工删除对端探针文件
+  （会让对端也判为不可见）。
+
+### 8.4 PostgreSQL 不可用
+
+* **症状**：readiness not ready（`SELECT 1` / schema 版本探测失败）；控制面与数据面请求返回
+  **503**（`kUnavailable`）；若发生在启动期则 **exit 78**。
+* **诊断**：
+
+  ```bash
+  curl -sS "$BASE/v2/readiness_check"
+  psql "$DSN" -Atc 'SELECT 1'
+  psql "$DSN" -Atc 'SELECT max(version) FROM schema_migrations'   # 期望 = 二进制期望的迁移版本
+  ```
+
+* **处置**：恢复 PG（主从切换属于运维范围）。应用**会自愈**：池在坏连接上 fail-closed，
+  下一次借用重建；PG 恢复后 readiness 自动回到 200（[`test-evidence/phase10.md`](test-evidence/phase10.md) §21 的 B2a-4）。
+* **禁令**：**不要**为了"先服务"把 `metadata.repository` / `location.repository` 降级成 `sqlite`
+  或启用内存仓储 —— 设计上没有这个分支，多实例下会静默丢/串数据；切换新主库前先确认
+  `schema_migrations` 版本与二进制期望一致，否则 readiness 会因 schema 版本不符**一直** not ready。
+
+### 8.5 版本/配置不一致（滚动升级期）
+
+* **症状**：只有某个（些）实例 readiness not ready，原因指出对端 `service_version`
+  （major.minor 不兼容）或 `config_hash` 不一致；该实例**不接流量**（滚动升级期的**正常**形态）。
+* **诊断**：
+
+  ```bash
+  psql "$DSN" -Atc "SELECT instance_id, service_version, left(config_hash,12), now()-heartbeat_at FROM instance_registry ORDER BY instance_id"
+  journalctl -u fss --since '10 min ago' | grep -E 'consistency|instance_reg'
+  # 启动横幅的 consistency / instance reg 行给出本实例的结论
+  ```
+
+* **处置**：完成滚动（把其余旧实例逐个替换）；若只是"某实例被单独改了配置"，把配置回滚成一致，
+  或按滚动流程统一变更（**配置变更同样改变 `config_hash`**，见 [`operations.md`](operations.md) §10.5）。
+* **禁令**：**不要**通过"摘掉 readiness 探针 / 放宽判定"让不一致的实例接流量 —— 不同版本/配置的
+  实例同时写共享状态是本项目明确定义要避免的事故（ADR-009 §5.3）；**不要**"改一个实例的配置就重启它"。
+
+### 8.6 GC 归属（单例）
+
+* **症状**：告警"GC 没跑"，或"所有实例都在跑 GC"（多个实例的 `fss_gc_runs_total` 同时增长）。
+* **诊断**：逐实例抓 `fss_gc_runs_total`（§8.1 ⑥）；`pg_locks` 的 advisory 行数（应恰好 1）；
+  启动横幅的 `leader` 行（backend / `lock_key` / 启动时角色）。
+* **处置**：保证 `leader_election.enabled=true` 且所有实例 `leader_election.lock_key` **相同**
+  （不同键会各自当 leader）。GC 的**周期调度**与 `POST /v2/gc:run` 都由 leader 门控 ——
+  非 leader 的 `fss_gc_runs_total` **不增长**，非 leader 调 `POST /v2/gc:run` 得到 **503** + 可读原因；
+  `gc.enabled` 只决定"是否启动周期调度"（§1.2.13）。
+* **禁令**：**禁止**"每个实例都开 `gc.enabled=true` 当保险" —— GC 是单例任务（ADR-009 §4.4），
+  多实例并行扫描只会互相抢租约/重复删，且会掩盖 leader 选举失效。
 
 ---
 

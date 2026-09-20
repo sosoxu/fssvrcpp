@@ -447,9 +447,14 @@ gc:
 - [x] 实现 `PostgresLocationRepository` / `PostgresLeaseRepository`（L2 + libpq 薄封装；与内存/SQLite 共用 `tests/framework/port_contract.h` 的同一套契约测试；已在 PG 14.24 与 12.6 实测。证据：`docs/test-evidence/phase10.md` §15）
 - [x] 实现 `PostgresMetadataRepository`（上一项里 metadata 那一半）：`file_metadata_records` 的 L2 实现，读路径过滤 `state <> 'deleted'`，`Create` 用 `ON CONFLICT (partition_id, file_source) WHERE state <> 'deleted' AND is_latest DO NOTHING` 做**单条 INSERT 的原子领取**；与内存/SQLite 共用 `tests/framework/port_contract.h` 的同一套 `CheckMetadataRepositoryContract`，并新增"并发 Create 同一 fileSource → 恰好 1 行 / 所有调用者同一个 id"的判据。已在 PG 14.24 与 12.6 实测。证据：`docs/test-evidence/phase10.md` §16
 - [x] 实现 `CreateFileMetadata` 的**跨步骤**原子领取 + `claiming`→`ready` 状态机（C1：端口三原语 `ClaimForWrite`/`MarkReady`/`ReleaseClaim`，用例**先领取再复制**（并发同一 `fileSource` 只复制一次），`claiming` 期间第二个调用者有界等待 ~2s 后 **503 且不复制**；`state` 只做仓储列、读路径只返回 `ready`。证据：`docs/test-evidence/phase10.md` §18）
-- [ ] **崩溃者留下的 `claiming` 行按租约到期回收**（C1 的剩余一半：需要上传路径的租约 `Acquire`/`Renew` + GC 侧的回收；在此之前一个崩溃的领取者会让该 `fileSource` 一直走"2s 后 503"路径，直到有人 `ReleaseClaim`/`Delete`）
+- [x] **崩溃者留下的 `claiming` 行按租约到期回收**（C2 已交付：上传路径按 `file_source` 领取/续租租约、`MarkReady` 之后才释放；GC 以"刚原子领取到的过期租约"驱动 `ReclaimStaleClaiming` 回收它，并在真实两进程 `kill -9` 中实测 8.0 s/9.1 s ≈ TTL。证据：`docs/test-evidence/phase10.md` §19/§20）（C1 的剩余一半：需要上传路径的租约 `Acquire`/`Renew` + GC 侧的回收；在此之前一个崩溃的领取者会让该 `fileSource` 一直走"2s 后 503"路径，直到有人 `ReleaseClaim`/`Delete`）
 - [x] 实现 leader election（PG advisory lock）+ GC 的租约与原子领取（B1：`src/infra/postgres/pg_leader_election.*` + 组合根门控 `GcScheduler`/`GcCallbacks`；PG 租约仓储见 §15。证据：`docs/test-evidence/phase10.md` §17）
-- [x] 实现 `deployment.mode=multi` 的 7 条启动校验 + 组合根装配 PG 仓储/租约/leader election（B1）。⚠️ **PG-vs-本地时钟比较仍未实现**：`deployment.clock_skew_tolerance_seconds` 仍是非默认即 exit 78 的守卫
+- [x] 实现 `deployment.mode=multi` 的 7 条启动校验 + 组合根装配 PG 仓储/租约/leader election（B1）。**PG-vs-本地时钟比较已交付（B2a）**：启动期比对 PG `now()` 与本地钟，超 `deployment.clock_skew_tolerance_seconds` → exit 78（证据 `docs/test-evidence/phase10.md` §21）。仍未验证：真实跨主机 NTP 漂移
 - [x] tmp 名唯一化（B1 补齐 ADR-009 §4.5 的**每进程随机后缀**：`.tmp.<instance_id>.<pid>.<counter>.<random>`；判据 `tests/integration/test_posix_tmp_names.cpp`）。⚠️ 最终键的 `ObjectKeyPolicy` 生成规则未变
 - [ ] 在目标环境验证 NFS 语义（C9.27）——这是**上生产前的硬前提**
-- [ ] 更新 `docs/operations.md`：多实例部署、PG 高可用、分盘建议、滚动升级与配置版本
+- [x] 更新 `docs/operations.md`：多实例部署、PG 高可用、分盘建议、滚动升级与配置版本 —— 落在
+  [`docs/operations.md`](../operations.md) §10「多实例部署与运维（ADR-009）」：§10.1 拓扑与跨实例语义（LB 重试 vs 粘性）、
+  §10.2 PG 高可用与连接预算（C9.28）、§10.3 分盘建议（`syncfs` 隔离；`one_filesystem_per_partition` 仍未接通）、
+  §10.4 上线前存储语义硬前提（C9.27）、§10.5 滚动升级与配置版本（B2b 守卫 + 可操作流程）、§10.6 实例标识与临时文件名、
+  §10.7 可观测性（leader 门控指标 / readiness 语义）、§10.8 未交付与未验证清单。事故级处置（症状 → 诊断 → 处置 → 禁令）
+  在 [`docs/runbook.md`](../runbook.md) §8.1~§8.6。

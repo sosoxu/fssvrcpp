@@ -236,7 +236,7 @@ curl -sS http://127.0.0.1:8080/metrics | head -40
 | `metadata.sqlite.group_commit_max_batch` | 组提交最大批 | `64` | int 1..100000；默认 `64` | **生效**（C10.20）：一票一批的**操作数上限**（批满立即提交，批不会超过上限）；`1` = 每操作一批（无摊销）。可观测：`/metrics` 的 `fss_sqlite_ops_total{repo="metadata"} / fss_sqlite_group_commits_total{repo="metadata"}` = 平均批大小 |
 | `metadata.postgres.dsn` | PG 连接串（密文） | `${ENV:FSS_PG_DSN}` | string，secret；默认 `""` | **生效**（B1）：已接通（`metadata.postgres.dsn`）→ `PostgresMetadataRepositoryOptions.pg.dsn`。`metadata.repository=postgres` 时组合根真的建池；为空或不可达 → **exit 78** + libpq 原文（绝不回退 SQLite）。★ 写进启动横幅的是 `metadata.postgres.dsn=***`（不打印密文） |
 | `metadata.postgres.max_connections` | PG 连接数（实例数 × 该值 ≤ PG `max_connections`） | `16` | int 1..10000；默认 `16` | **生效**（B1）：已接通 → `PgOptions.max_connections`（有界连接池的上限，见 `src/infra/postgres/pg_connection.h`）；启动横幅打印实际取值 |
-| `metadata.postgres.statement_timeout_ms` | 语句超时 | `5000` | int 1..600000；默认 `5000` | **生效**（B1）：已接通 → `PgOptions.statement_timeout_millis`，`PgConnection::Connect` 对新连接下发 `SET statement_timeout`。⚠️ 该键**不**用于 leader election 的锁连接（后者取本键值，见 `leader_election.*` 行）——锁连接只跑短语句，滞留窗口被夹在该值以内（PG 12.6 实测，ADR-009 §4.4） |
+| `metadata.postgres.statement_timeout_ms` | 语句超时 | `5000` | int 1..600000；默认 `5000` | **生效**（B1）：已接通 → `PgOptions.statement_timeout_millis`，`PgConnection::Connect` 对新连接下发 `SET statement_timeout`。⚠️ 该键**也**下发到 leader election 的锁连接（组合根把本键值赋给 `PgLeaderElectionOptions.pg.statement_timeout_millis`，参见 `src/main/server_main.cpp`；锁连接不过池、只跑短语句）——滞留窗口被夹在该值以内（PG 12.6 实测，ADR-009 §4.4；另见 §10.2） |
 | `metadata.postgres.schema_version_check` | readiness 是否校验迁移版本 | `true` | bool；默认 `true` | **生效**（B2a，ADR-009 §5.3）：已接通（`metadata.postgres.schema_version_check` / 通用名 `FSS_METADATA_POSTGRES_SCHEMA_VERSION_CHECK`）。`true`（默认）→ readiness（REST `/v2/readiness_check` 与 gRPC `Check(PROBE_READINESS)` 同源）除 `SELECT 1` 探活外，还比对 `schema_migrations.max(version)` 与二进制期望的 `kExpectedSchemaVersion`（`src/infra/postgres/pg_schema.h`）；「表缺失 / 表为空 / 版本落后 / 版本超前」→ **not ready（REST 503，文本带可读原因）**。`false` → **只**做 `SELECT 1` 探活，跳过版本比对。期望值由 `tests/unit/test_schema_version_constant.cpp` 从 `db/migrations/*.sql` 文件名机械推导（加迁移不改常量 → 测试失败）。★ 只在真的用 PG 时装配探针 |
 | `metadata.remote.base_url` | 远端 Storage Service 地址 | `""` | string；默认 `""` | **已读但无效果**：组合根未接线（登记为未实现） |
 | `metadata.remote.token_provider` | 远端 token 来源 | `static` | string；默认 `static` | **已读但无效果**：组合根未接线（登记为未实现） |
@@ -1081,3 +1081,214 @@ cmake --build build --target test_operations_doc -j"$(nproc)" && ./build/bin/tes
 ./scripts/check_docs.sh              # D1 链接 / D2 作废数字 / D3 ADR 索引 / D4 阶段表 / D5 门槛编号
 ./scripts/verify_config_wiring.sh    # 真实二进制：配置生效 + 非法配置拒绝启动（exit 78）
 ```
+
+---
+
+## 10. 多实例部署与运维（ADR-009）
+
+> **本节对应 ADR-009 §10 的最后一项待办**（多实例部署、PG 高可用、分盘建议、滚动升级与配置版本）。
+> 这里只写运维要知道的"**怎么做、看什么、别做什么**"；一致性模型与失败语义见
+> [`adr/ADR-009-multi-instance-consistency.md`](adr/ADR-009-multi-instance-consistency.md) §4~§6，
+> 实测证据见 [`test-evidence/phase10.md`](test-evidence/phase10.md) §17~§22 与
+> [`test-evidence/phase9.md`](test-evidence/phase9.md) §16。**故障处置**（症状 → 诊断命令 → 处置 → 禁令）
+> 在 [`runbook.md`](runbook.md) §8.1~§8.6，本节不重复。
+
+### 10.1 部署拓扑与跨实例语义
+
+**拓扑 = N 个无状态实例 + 1 个共享 PostgreSQL + 1 份共享存储。**
+
+| 组件 | 要求 | 依据 |
+| --- | --- | --- |
+| 实例 × N | `deployment.mode=multi`；进程本身无状态，**不需要会话亲和** | ADR-009 §8.3 |
+| PostgreSQL × 1（主） | 元数据、位置、在途租约（`staging_leases`）、实例注册表（`instance_registry`）都在同一个库里 | ADR-009 §4.1 / §5.1 |
+| 共享存储 × 1 | 对象存储（S3）**或**所有实例都能看到的 POSIX 挂载；POSIX 形态下 `storage.posix.root` 必须真的共享 | ADR-009 §8.1 item 4 |
+
+**multi 模式必需的配置键**（其余用默认值；**完整 157 键与三态见 §1.2 / §1.3**，此处不重复）：
+
+| 键 | multi 下的取值 | 说明 |
+| --- | --- | --- |
+| `deployment.mode` | `multi` | 触发 7 条跨字段强制校验 + 组合根装配 PG 运行形态（§7.3） |
+| `deployment.instance_id` | 显式唯一值（K8s 注入 `POD_NAME`） | 未配置（有效默认 `local`）/空 → 自动生成；**不要让两个实例共用 `local`**（§10.6） |
+| `deployment.expected_instances` | = 实际实例数 | 连接预算的乘数（§10.2，C9.28） |
+| `metadata.repository` / `location.repository` | `postgres` | 否则 schema 拒绝启动 |
+| `metadata.postgres.*` / `location.postgres.*` | 指向同一个 DSN | 池大小进连接预算（§10.2） |
+| `leases.enabled` / `leases.ttl_seconds` / `leases.renew_interval_seconds` | `true` / 60 / 20 | 租约 = "在途"的唯一死亡证明（§10.5、runbook §8.2） |
+| `leader_election.enabled` / `lock_key` | `true` / 同键 | 同键恰好一个 leader，GC 单例（§10.7、runbook §8.6） |
+| `storage.posix.shared_mount_required` | `true` | 启动期探针 + 运行期复查（§10.4） |
+| `gc.require_lease_expiry` | `true` | 禁止"无元数据记录即删" |
+
+**跨实例语义（与"粘性"的区别）**：
+
+- 请求可以落到**任意**实例；正确性不依赖 LB 选谁（ADR-009 §8.3）。
+- ★ 同一 `fileSource` 的 `createMetadata` 若落到**另一个**实例、而发起方仍持有 `claiming`
+  行/租约，另一方会**有界等待 ≈2s 后返回 503**（fail-closed，且**不会**重复复制）；
+  `GetUploadLocation` 遇到别的实例持有未过期租约时同样 **503 且不发地址**。这是**有意**的：
+  宁可让客户端重试，也不让两个实例同时写同一对象。证据：
+  [`test-evidence/phase10.md`](test-evidence/phase10.md) §18。
+- **LB 必须允许客户端重试**（`503` 是暂时的：赢家 `ready`、或租约到期之后，同一 `fileSource`
+  的**幂等**重试会成功/返回同一 id）。⚠️ **不要**对这类 `503` 做"熔断/摘实例"或改写成 4xx
+  —— 那会把一个可自愈的瞬态变成最终失败。
+- 所有实例必须共享 `auth.jwt.hmac_secret` 与 `self_signed.signing_key`（§7.2），否则 A 签发的
+  URL/token 到 B 会被拒。
+- ⚠️ **未验证**：LB 层的粘性/会话保持策略从未在真实 LB 上验证（§10.8）；runbook §8.5 只给判读方法。
+
+### 10.2 PostgreSQL 高可用与连接预算（C9.28）
+
+- **主从 + 自动故障转移由运维承担**（ADR-009 §8.3）：本项目**不做**自研共识/多主（ADR-009 §6.5），
+  只依赖 PG 单主 + 唯一约束 + advisory lock。**故障转移本身**未在本项目验证（§10.8）。
+- **应用侧行为**：
+  - 运行期连接/语句失败 → `kUnavailable`（HTTP **503**）；启动期 DSN 为空 / PG 不可达 / 建池失败
+    → **exit 78**（+ libpq 原文），**绝不**回退 SQLite（§7.3、runbook §2）。
+  - `statement_timeout` 由 `metadata.postgres.statement_timeout_ms` 在**每条新连接**上
+    `SET statement_timeout` 下发（见 `src/infra/postgres/pg_connection.cpp` 的语句超时下发路径）。
+    ★ **leader 锁连接尤其重要**：它取的就是 `metadata.postgres.statement_timeout_ms`，且只跑短语句
+    —— 崩溃会话**不释放** advisory lock，滞留窗口因此被夹在该值以内（ADR-009 §4.4；
+    [`test-evidence/phase10.md`](test-evidence/phase10.md) §15.9 在目标库 PG 12.6 实测）。
+    ⚠️ `location.postgres.*` 组**没有** `statement_timeout_ms` 键 → 位置池/租约池用 `PgOptions`
+    默认 **5000 ms**（§1.2.8）。
+- **连接预算（C9.28，B2a）**：启动期读 PG 的 `max_connections` 并校验
+
+  ```text
+  deployment.expected_instances
+    × ( metadata.postgres.max_connections
+      + location.postgres.max_connections
+      + （leases.enabled=true 时再加一份 location.postgres.max_connections —— 租约是独立池）
+      + 1（专用 leader 锁连接） )
+    ≤ PG 服务端 max_connections
+  ```
+
+  超限 → **exit 78**（消息给出两组数字与三种修法）；连 `max_connections` 都读不到时同样
+  **fail-closed 拒绝启动**。★ `instance_registry` 的心跳/一致性检查**不另建连接池**
+  （复用组合根已有的共享状态池），因此不改变上式（`src/infra/postgres/pg_instance_registry.h` 头部注释）。
+  证据：[`test-evidence/phase10.md`](test-evidence/phase10.md) §21。
+
+  **规划示例表**（每实例池取示例默认值：metadata 16 + location 8 + 租约 8 + leader 1 = **33**）：
+
+  | 实例数 `deployment.expected_instances` | 每实例最坏连接 | 合计需要 | 服务端 `max_connections` 下限 | 建议 |
+  | --- | --- | --- | --- | --- |
+  | 1（single 用不到本表，仅对照） | 16 + 8 = 24 | 24 | 24 | 见 §1.2 |
+  | 3 | 16 + 8 + 8 + 1 = 33 | **99** | **100** | 建议 **≥120**（给管理会话/巡检/故障转移留余量） |
+  | 6 | 33 | 198 | 200 | 扩容前重算，别只改 `expected_instances` 不改 PG |
+
+  ⚠️ 校验用的是 `≤`：**刚好卡满**（99 ≤ 100）时应用会通过，但 `psql`、监控、HA 切换也要连库，
+  所以实际上线请给服务端留**运维余量**；**扩容实例前先加 `max_connections`**，否则新实例启动即 78。
+
+### 10.3 分盘建议（`syncfs` 隔离）
+
+- `syncfs` 是**文件系统级**操作：`PosixBlobStore` 的批提交取**批次内第一个 rename 目标目录**的 fd
+  调 `SyncFilesystem`（`src/infra/blob/posix/posix_blob_store.cpp` 的 `CommitBatch`），
+  因此一次提交会 flush **该文件系统上的所有写入**（不只是本批、不只是本实例）。
+  多实例共盘 ⇒ 互相牵连（ADR-008 §3.2；ADR-009 §6.3；风险登记 R-28）。
+- ⚠️ **干扰的量级（C9.24）仍未验证**（§8）：本环境没有多租户共盘场景可测。
+- ★ **`storage.posix.one_filesystem_per_partition` 仍未接通**（§1.3.3）：改它对真实进程**没有效果**。
+  所以"按 partition 分盘"目前只能靠**部署手段**（挂载点/路径），不要指望这个键。
+- **强烈建议每个 partition（或每组 partition）独立文件系统**。推荐布局示例（对象落
+  `<root>/blobs/<container>`，容器名由 `partition.file.<p>.{staging,persistent}_container` 决定，
+  见 §1.2.12）：
+
+  | 挂载点 | 放什么 | 理由 |
+  | --- | --- | --- |
+  | `<root>`（共享挂载） | `.fss_probe.<instance_id>` 与 `blobs/` 顶层 | 必须对**所有实例**可见（启动探针，§10.4） |
+  | `<root>/blobs/<partition>-persistent` | 该 partition 的正式对象 | 独立卷 ⇒ 该卷上的 `syncfs` 不牵连别的 partition |
+  | `<root>/blobs/<partition>-staging` | 该 partition 的在途对象 | 上传写入最频繁，独立卷收益最大 |
+
+  ⚠️ 这是**部署层建议**：**没有**配置键、**没有**测试覆盖，挂载布局是否真的生效必须在目标环境
+  用 `stat -f` / `findmnt` 确认。同一 partition 被多个实例服务时，它们仍共享同一个文件系统上的
+  `syncfs` —— 这是共享存储形态的固有代价，分盘只能缩小爆炸半径。
+- 最低限度：给 `storage.posix.root` 一个**专用文件系统**，不要与服务之外的写密集负载共盘。
+
+### 10.4 上线前硬前提：存储语义验证（C9.27）
+
+- **只依赖共享 POSIX 挂载的多实例形态**必须先在生产挂载上跑一次
+  `./scripts/check_nfs_semantics.sh <mount>`；退出码含义、**两台主机各跑一次**、
+  以及"不得用本地盘结果代替"的禁令都在 [`runbook.md`](runbook.md) §11，本节不重复。
+  C9.27 仍**未验证**（探针已交付、执行移交生产，见
+  [`test-evidence/phase9.md`](test-evidence/phase9.md) §16）。
+- ★ 共享性本身已被启动期探针 **fail-closed** 兜住：写 `<root>/.fss_probe.<instance_id>` 并读回自证，
+  再与 `instance_registry` 里的 **live peer** 交叉验证可见性 —— 看不见活对等实例的探针 →
+  **exit 78**（原因给出对端 id、探针路径与两个 root）；运行期复查不可见 → readiness **not ready**
+  （§1.2.4；[`test-evidence/phase10.md`](test-evidence/phase10.md) §22）。
+  ⚠️ 它**只证明"共享性"**，**不证明** `rename` 原子性 / close-to-open / `syncfs` 语义。
+- 若字节面是 S3/对象存储，则本节的语义验证**不适用**（实例不在字节路径上，ADR-009 §4.1）；
+  但元数据仍然需要 PG。
+
+### 10.5 滚动升级与配置版本（B2b 守卫）
+
+**守卫机制**：每个实例启动时 upsert `instance_registry` 一行（`instance_id` / `service_version` /
+`config_hash` / `started_at` / `heartbeat_at`，列定义见 `db/migrations/001_init.sql`），
+后台线程**每 10 s** 刷新心跳，**live 窗口 = 30 s**。`config_hash` = **脱敏后的有效配置**
+（`RedactedDump`，密钥从不上哈希）去掉 6 个**实例本地键**（`deployment.instance_id`、
+`server.http.bind`、`server.http.port`、`server.grpc.bind`、`server.grpc.port`、
+`self_signed.public_base_url`）后的 SHA-256。只要存在一个 **live peer** 的 `config_hash` 与本实例不一致，
+**或** `service_version` 的 **major.minor** 不兼容，本实例 readiness 就 **not ready**（fail-closed）。
+证据：[`test-evidence/phase10.md`](test-evidence/phase10.md) §22、`src/infra/postgres/pg_instance_registry.cpp`。
+
+★ **"not ready = 故意的"**：滚动升级期间新旧实例并存，**本来就不该**让两者同时接流量。
+
+**可操作的升级流程**：
+
+1. ⚠️ **只想换二进制、不改版本号 = 这道闸没有区分力。** 守卫比较的是 `service_version`
+   （默认取 `FSS_BUILD_VERSION`）；`PROJECT_VERSION` 不变则新旧实例版本相同，守卫看不出差异。
+   ⇒ **必须先在构建流水线里递增版本**（major.minor 至少一位变化），否则等于没有滚动升级护栏。
+   （本仓库用测试接缝 `FSS_SERVICE_VERSION_OVERRIDE` 驱动版本不一致分支，见 runbook §10.4；
+   **真实双版本滚动升级未验证**，§10.8。）
+2. **正确的滚动方式**：逐实例替换；在新旧并存的窗口内**接受 not-ready**（新实例不会接流量）；
+   等旧实例退出/排空后再放量。不要一次性重启全部实例（会同时失去全部容量）。
+3. **改配置也走同一条流程**：`config_hash` 覆盖**整个脱敏配置**，例如把 `gc.enabled` 从
+   `true` 改成 `false` 也会改变 `config_hash` ⇒ 只改一个实例并重启它，会让它被判为
+   "与对端配置不一致"而 not ready。**配置变更要与版本升级一样按滚动流程处理**。
+4. `instance_registry` 的**陈旧行**（心跳超过 **300 s**）在**启动期**清理；**运行期只忽略、不删除**
+   （如实登记：没有运行期清理）。判读时以 `heartbeat_at` 的年龄为准，而不是以"表里有这行"为准。
+
+### 10.6 实例标识与临时文件命名
+
+- `deployment.instance_id`：multi 下**未配置**（有效默认 `local`）或为空 → 组合根**自动生成**唯一 id
+  并在横幅打印。K8s 建议注入 `POD_NAME`。**不要**让两个实例都保持默认 `local`
+  —— 共享挂载上的临时名会确定性撞名（ADR-009 M1 的静默串数据）。
+- 临时文件名 = `<最终键>.tmp.<instance_id>.<pid>.<counter>.<random>`（ADR-009 §4.5）。
+  **不要**手工清理正在被其它实例写入的 `.tmp.*` —— 交给 GC 的租约/TTL 判定（runbook §4）。
+
+### 10.7 可观测性：多实例要盯什么
+
+| 看什么 | 怎么读 | 多实例注意 |
+| --- | --- | --- |
+| `GET /v2/readiness_check` | 组合根注入的 `shared_state_probe`：PG `SELECT 1` + `schema_migrations.max(version)` 比对（B2a）+ 心跳/共享挂载/版本/`config_hash` 一致性（B2b）；失败 **503** + 可读原因 | 用它做**流量准入**；原因文本会指出是 PG、schema 版本、对端探针还是对端配置 |
+| `GET /v2/liveness_check` | 只证明进程活着，**不碰依赖** | 用它做**重启判定**；不要拿它做准入 |
+| `GET /v2/info` | `buildVersion`、`authMode`、`ioEngine` / `ioUringAvailable` | ⚠️ **不暴露 `instanceId`**（未交付，§10.8）——要按实例定位请查 `instance_registry` 或启动横幅 |
+| `fss_gc_runs_total` | 只统计**真的跑了** `GcTask::Run` 的轮次 | ★ 由 leader 门控：**非 leader 不增长**。全员都涨 = leader 选举失效；全员都不涨 = 没有 leader / `gc.enabled=false` / 调度未起 |
+| `fss_gc_reclaimed_claiming_total` | 回收的"崩溃领取者"`claiming` 行数 | 崩溃后该值增长是**预期**（§10.2、runbook §8.2） |
+| `fss_gc_objects_deleted_total` + `fss_gc_skipped_total{reason}` | 删除量 / 跳过原因（含 `tmp_too_young` = 在途上传被保护） | 多实例下由 leader 单跑；`skipped` 突然归零要怀疑租约/时钟 |
+| `fss_sqlite_*`（`fss_sqlite_ops_total` / `fss_sqlite_group_commits_total`） | 内置 SQLite 仓储的组提交 | ⚠️ **只与单实例相关**：multi 下仓储是 PG，这两族**不产生**，不要因为它们在 multi 实例上缺失而告警 |
+| `fss_posix_{syncfs,group_commits,batch_objects}_total` | 两阶段批提交的可证事实 | 只在 `storage.driver=posix` 且 `durability=batch` 下增长；多实例共盘时用它对照"谁在 flush" |
+| `fss_io_engine{engine,requested}` / `fss_io_uring_available` | 实际引擎 / 宿主能力 | **可用 ≠ 已启用**（引擎未交付，§1.2.4）；跨实例应一致但**未验证** |
+
+**PG 侧直接观察**（排障时最有用；建议只读账号）：
+
+```sql
+-- 谁是 leader（会话级 advisory lock；行数应恒为 1）
+SELECT objid, pid FROM pg_locks WHERE locktype = 'advisory';
+-- 在线实例与心跳年龄（live 窗口 30s；>300s 的陈旧行只在启动期清理）
+SELECT instance_id, service_version, left(config_hash, 12), now() - heartbeat_at AS age
+  FROM instance_registry ORDER BY instance_id;
+-- 在途领取（崩溃后会留下这些行，等租约到期由 leader 的 GC 回收）
+SELECT partition_id, file_source, created_at FROM file_metadata_records WHERE state = 'claiming';
+-- 在途租约
+SELECT partition_id, file_source, expires_at FROM staging_leases ORDER BY expires_at;
+```
+
+启动横幅里的 `pg budget` / `clock skew` / `pg schema check` / `instance reg` / `consistency` /
+`shared mount` / `leader` / `lease backend` 各行给出这些判定的**实际结论**（§2.1）。
+
+### 10.8 未交付 / 未验证（如实登记）
+
+| 项 | 状态 | 说明 / 依据 |
+| --- | --- | --- |
+| LB 粘性 / 会话保持 | **未验证** | 正确性不依赖它（§10.1），但"真实 LB 上是否需要粘性"从未验证 |
+| > 2 个实例的实测 | **未验证** | C9.26 是两个真实进程；3 实例及以上只能由连接预算（§10.2）与 leader 单例外推 |
+| 运行期清理过期注册行 | **未交付** | 只在**启动期**清理 >300 s 的行；运行期只忽略、不删除（§10.5 item 4） |
+| 真实双版本滚动升级 | **未验证** | 版本不一致分支由测试接缝 `FSS_SERVICE_VERSION_OVERRIDE` 驱动（runbook §10.4）；没有跑过两个不同二进制 |
+| NFS 语义（C9.27） | **未验证** | 上生产硬前提；探针已交付，见 [`runbook.md`](runbook.md) §11 与 [`test-evidence/phase9.md`](test-evidence/phase9.md) §16 |
+| K8s（restricted PodSecurity / `readOnlyRootFilesystem` / `runAsNonRoot` / `fsGroup`） | **未验证** | 无集群；Docker 的等价项已实测（§8），但**不等价于** K8s 的具体实现 |
+| `/v2/info` 暴露 `instanceId` | **未交付** | 目前只能从 `instance_registry` 或启动横幅取实例标识（§10.7） |
+| PG 故障转移本身 | **未验证** | 主从 + 自动切换是运维范围（ADR-009 §8.3）；应用侧只保证"PG 不可用 → fail-closed"与"恢复后自愈"（§10.2） |
+| `syncfs` 跨实例干扰量级（C9.24） | **未验证** | 只能靠部署纪律分盘（§10.3）；`one_filesystem_per_partition` 未接通 |
