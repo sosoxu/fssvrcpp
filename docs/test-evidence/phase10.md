@@ -2860,3 +2860,202 @@ $ JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh   # 见 §20.8
 * 收尾状态：`build/CMakeCache.txt` 的 `FSS_WITH_PG:BOOL=OFF`（`ctest --test-dir build -N` =
   **Total Tests: 87**）；`build-pg` 保持 `FSS_WITH_PG=ON`（9 个 pg 测试）。
 * OSDU 线上契约：**未变**（`state` 不进 JSON；REST/gRPC 字段与报文不变）。
+
+---
+
+## 21. B2a（本切片）：把生产就绪检查做成真的 —— readiness 探活 + schema 版本、C9.28 连接预算、PG↔本地钟偏移
+
+### 21.1 结论（先说答案）
+
+ADR-009 的三条"共享状态可用 / 可比较"判据已交付，且**逐条有真实进程证据**（两个引擎）：
+
+| 判据 | 落地 | 判据（真实进程） |
+| --- | --- | --- |
+| readiness 的 **PG 探活 + 迁移版本校验** | 新 L2 `src/infra/postgres/pg_schema.{h,cpp}`（`SELECT 1` + `SELECT max(version) FROM schema_migrations`）+ 组合根注入 `ports.shared_state_probe`（REST 与 gRPC **同源**） | `tests/integration/test_production_readiness.cpp` **B2a-2**（版本不符 → 503 且原因可读；正确迁移 → 200；`schema_version_check=false` → 跳过版本比对仍 200） |
+| **C9.28 PG 连接预算** | 新配置键 `deployment.expected_instances`；组合根读 PG `max_connections` 并比对，超限 **exit 78** | 同文件 **B2a-1**（过大 → 78 + 数字；拟合 → 200 正控） |
+| **PG↔本地钟偏移** | `deployment.clock_skew_tolerance_seconds` 变为**生效**；启动期 `|本地钟 − PG now()| > 容忍` → **exit 78**；测试接缝 `FSS_CLOCK_SKEW_INJECT_MS` | 同文件 **B2a-3**（注入 120s → 78；注入 1s → 200；不注入 → 200；容忍改 300s + 同一注入 → 200） |
+| readiness 探针**失败 + 恢复** | 池在坏连接上 fail-closed、下一次借用重建 | 同文件 **B2a-4**（按 `application_name` 只杀本实例后端 → 503；随后恢复 200） |
+
+**三态与键数**：**生效 125 / 拒绝启动 16 / 已读但无效果 15（合计 156）** →
+**生效 128 / 拒绝启动 15 / 已读但无效果 14（合计 157）**。
+净变化 = 新增 1 键（`deployment.expected_instances` → 生效）+ 2 键移入生效
+（`metadata.postgres.schema_version_check` 从「已读但无效果」、`deployment.clock_skew_tolerance_seconds`
+从「拒绝启动」）。逐键见 `docs/operations.md` §1.2/§1.3，由 `tests/unit/test_operations_doc.cpp`
+机械比对（计数断言已同步为 128/15/14 + 157）。
+
+### 21.2 实现点（可点击）
+
+* `src/infra/postgres/pg_schema.h` / `pg_schema.cpp`（**新增**）：`kExpectedSchemaVersion`（**单一真相**）、
+  `ProbePgLiveness`（`SELECT 1`）、`ReadAppliedSchemaVersion`（表缺失按 SQLSTATE **42P01** 判定，
+  不匹配被本地化的文本）、`ProbePgSharedState`（存活 + 可选版本比对）、`ReadPgMaxConnections`（C9.28）。
+  这两条 SQL 不访问分区表 → 按 `pg_connection.cpp` 的先例用 `R"pgsql(...)pgsql"` 定界符（C3.9 的
+  `partition_id` 扫描器只认 `R"sql(...)sql"`，让它看见会产生假阳性）。
+* `tests/unit/test_schema_version_constant.cpp`（**新增**）：从 `db/migrations/*.sql` **文件名前缀**
+  推导最大编号（十进制，`010`→10），断言 `kExpectedSchemaVersion` 相等；带 R1/R16 自证
+  （合成清单 `002` 必须推导为 2、非法文件名不计入、两位数不能只取一位）。**加 `002_*.sql` 不改常量 →
+  本用例失败**（这就是"不能静默漂移"）。
+* `src/main/server_main.cpp`：读 `metadata.postgres.schema_version_check` 与
+  `deployment.expected_instances`；持有 PG 仓储/租约的**具体类型非拥有指针**；
+  新增 §④ 之后的"B2a 生产就绪检查"（连接预算 + 时钟偏移 + `ports.shared_state_probe` 装配）；
+  删除 `deployment.clock_skew_tolerance_seconds != 60 → exit 78` 的旧守卫；横幅新增
+  `pg budget` / `clock skew` / `pg schema check`（`FSS_CLOCK_SKEW_INJECT_MS` 生效时另打
+  `clock inject`）；`SystemClock` 外包一层 `OffsetClock`（偏移 0 = 逐字不变）。
+* `src/app/usecases/usecases.h`：`UseCasePorts::shared_state_probe`（`std::function<Result<void>()>`，
+  默认空 = 未使用 PG → 适配层退回原有最小探针）。
+* `src/adapters/http/router.cpp` + `src/adapters/grpc/file_service_adapter.cpp`：readiness 先跑
+  共享状态探针；失败时 REST 503 / gRPC UNAVAILABLE，**文本带可读原因**。原有"仓储可达"探针的
+  失败体**保持固定文本**（不经控制地外抛仓储错误会泄漏内部细节给免鉴权端点）。
+* `src/common/config/core_schema.cpp` / `config/fss.example.json`：新增 `deployment.expected_instances`
+  （int 1..100000，默认 1）。`--set` 与通用环境变量 `FSS_DEPLOYMENT_EXPECTED_INSTANCES` **自动可用**
+  （加载器的既定映射，无需登记旧别名）。
+* `docs/operations.md` §1.2/§1.3、`docs/runbook.md` §10.3、`docs/phase-status.md`：逐键行 + 三态计数 +
+  接缝文档。
+* `tests/integration/test_production_readiness.cpp`（**新增**，`pg;infra;b2a`，4 用例 / 133 断言）。
+
+### 21.3 实测命令与输出摘要
+
+**默认构建（`FSS_WITH_PG=OFF`）**
+```
+$ cmake --build build -j4                     # 0 error；改动文件 0 warning
+$ ctest --test-dir build --output-on-failure
+100% tests passed, 0 tests failed out of 88    # 原 87/87 + 新增 test_schema_version_constant
+```
+（`./scripts/check_docs.sh` 后 `build` 被 `run_all_gates.sh` 以 `-DFSS_WITH_PG=ON` 重配；收尾已
+`cmake -S . -B build -DFSS_WITH_PG=OFF` + 重编 + 重跑，`grep FSS_WITH_PG build/CMakeCache.txt`
+= `FSS_WITH_PG:BOOL=OFF`，`ctest -N` = **Total Tests: 88**。）
+
+**PG 套件（`build-pg`，`FSS_WITH_PG=ON`）**
+```
+# 本机 PG 14.24
+$ ctest --test-dir build-pg -L pg --output-on-failure
+100% tests passed, 0 tests failed out of 10   # Total Test time 48.59 s（最终一致构建；注入前一次 47.13 s）
+
+# 目标 PG 12.6（FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss）
+$ ctest --test-dir build-pg -L pg --output-on-failure
+100% tests passed, 0 tests failed out of 10   # Total Test time 63.37 s（最终一致构建；注入前一次 62.76 s）
+
+# 新增用例本体（两引擎逐字一致）
+$ ./build-pg/bin/test_production_readiness
+All tests passed (133 assertions in 4 test cases)
+$ FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ./build-pg/bin/test_production_readiness
+All tests passed (133 assertions in 4 test cases)
+```
+
+**残留（两引擎都为 0）**
+```
+$ psql <DSN> -c "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'pgtest%';"      -> 0
+$ psql <DSN> -c "SELECT count(*) FROM pg_locks WHERE locktype='advisory';"             -> 0
+```
+版本不符的用例指向**独立 scratch schema**（`pgtest_b2a_<tag>_<pid>_<n>`，在事务外 `CREATE SCHEMA` 后
+`SET search_path`，应用只读的 `db/migrations/001_init.sql`，结束时 `DROP SCHEMA ... CASCADE`）。
+**共享库的 `schema_migrations` 在用例前后一字未改**；`test_production_readiness` 直接 `DROP` 自己的
+schema，因此不需要 `pgtest-%` 的测试名/residue 约定（仍按同一前缀命名以便巡检）。
+
+**门槛**
+```
+$ ./scripts/check_docs.sh
+全部检查通过（D1~D5）                    # D1 64 链接 / D3 13 ADR / D4 阶段 0~10 / D5 148 条门槛
+
+$ JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh
+  [preflight] ✅ 无注入残留
+  [docs]      ✅ 通过（--selftest 检查器有效）
+  [infra]     ✅ 10/10（ctest -L pg，本机 14.24）
+  [phaseN]    ✅ 各阶段通过（含 sanitizer phase0~phase10 全绿）
+  汇总
+    失败: 无
+  ⏱  总耗时: 9 分 43 秒（583 s，阶段数 11）
+  ✅ 全部已启用阶段门槛通过
+```
+
+### 21.4 三态 / 键数净变化
+
+| 键 | 之前 | 之后 | 理由 |
+| --- | --- | --- | --- |
+| `deployment.expected_instances` | —（不存在） | **生效** | 新键；启动期真正参与 C9.28 判定 |
+| `metadata.postgres.schema_version_check` | 已读但无效果 | **生效** | 真的决定 readiness 是否比对迁移版本 |
+| `deployment.clock_skew_tolerance_seconds` | 拒绝启动（非默认 → 78） | **生效** | 真的成为"本地钟 vs PG now()"的容忍值 |
+
+计数：**生效 125 → 128**、**拒绝启动 16 → 15**、**已读但无效果 15 → 14**、键数 **156 → 157**。
+`docs/operations.md` §1.3 的三个清单与逐键行已同步；`tests/unit/test_operations_doc.cpp` 的
+`REQUIRE` 与正文数字串（`生效 128 / 拒绝启动 15 / 已读但无效果 14`、`**128 + 15 + 14 = 157**`）同步。
+
+### 21.5 R1 自证（3 条注入；每条都在**完整重编**后跑，末尾已全部还原，`md5sum` 逐字一致）
+
+基线：`src/main/server_main.cpp fd51c0aa…`、`src/infra/postgres/pg_schema.cpp 3925e278…`、
+`src/infra/postgres/pg_schema.h d73e3019…`。
+
+| # | 注入 | 重编后的**原始失败** | 还原 |
+| --- | --- | --- | --- |
+| 1 | `if (required > pg_max_connections)` → `if (false && required > …)` | `B2a-1`：`REQUIRE(outcome.exit_code == 78)` → **`124 == 78`**（预算检查被去掉后进程真的启动，被 `timeout` 收尸） | `md5sum -c` **OK** |
+| 2 | `if (applied != kExpectedSchemaVersion)` → `if (false && applied != …)` | `B2a-2`：`REQUIRE(not_ready)` → **`false`**（版本比对恒通过 → 不一致的库也报 ready） | `md5sum -c` **OK** |
+| 3 | `if (std::llabs(skew_millis) > tolerance_millis)` → `if (false && …)` | `B2a-3`：`REQUIRE(outcome.exit_code == 78)` → **`124 == 78`** | `md5sum -c` **OK** |
+
+三条注入分别命中"预算判定 / 版本判定 / 偏移判定"的**唯一比较**；还原后
+`grep -rn "R1-INJECT" src/ tests/` **为空**，且 `test_production_readiness` 重新 **133/133 通过**。
+
+### 21.6 判断记录（本切片的取舍，逐条给理由）
+
+1. **时钟键的选择**：本比较的容忍值是 **`deployment.clock_skew_tolerance_seconds`**（schema 描述
+   原文就是"与数据库 now() 的偏移容忍"）；`deployment.max_clock_skew_seconds` **仍生效**，但它
+   继续服务**另外两处**（multi 跨字段 `0 < 值 ≤ 60`、`LocalJwtOptions.clock_skew_seconds` 的
+   JWT `exp`/`nbf` 容忍）—— 它不是本比较的容忍值，已写进 `operations.md` §1.2 的该行与 §21.4。
+   `app::ClockSkewGuard` 仍是**未被组合根装配**的纯策略（L4，单测覆盖）；组合根用
+   `PgConnection::NowEpochMillis()` 直接比对，因为 `IClock` 接口无法把"读 PG 失败"表达成错误，
+   而启动期这条失败必须 exit 78 并给出 libpq 原文。
+2. **连接预算的公式**：任务给出 `metadata + location + 1`。实现按**真实创建的池**计数，并
+   **额外计入租约池**（`leases.enabled=true` 时 `PostgresLeaseRepository` 是**独立池**，用的是
+   同一份 `location.postgres.max_connections`）—— 否则"实例数 × 上限"会**静默低估** 8 条/实例，
+   正是 C9.28 要防的事。`+1`（专用 leader 锁连接）即使当前未启用也计入（最坏上界）。
+3. **readiness 失败体的措辞**：新增的共享状态探针失败 → `File service is not ready: <原因>`
+   （原因由组合根控制、面向运维）；原有"仓储可达"最小探针的失败体**保持固定文本**
+   `File service is not ready`，避免把未经控制的仓储错误（可能含 DSN/主机信息）暴露给免鉴权端点。
+   `200` 体 `File service is ready` 逐字不变（契约 §2.12）。
+4. **被合法更新的既有测试**：`tests/integration/test_config_wiring.cpp` 的"未实现键非默认 → 78"
+   清单里原有 `{"deployment.clock_skew_tolerance_seconds","30",…}`。该键已变为**生效**，这条
+   反例**不再成立**，因此删除该行并在原位留下指针；"它真的改变判定"改由 B2a-3 的**双向**用例
+   钉住（容忍 60s + 注入 120s → 78；容忍 300s + 同一注入 → 200），不是"取消断言"。
+5. **版本检查的作用域**：探针优先用**元数据池**（`metadata.postgres.*` 是键的命名空间），
+   没有元数据池时用位置池（single + `location.repository=postgres` 的合法形态，DSN 同库）。
+   `schema_version_check=false` **只**跳过版本比对，`SELECT 1` 存活探针仍跑（因此"PG 不可达"
+   在两种取值下都报 not ready）。
+6. **目标 PG 12.6 的前置状态修正（必须记录）**：目标库 `public.schema_migrations`
+   **原本是空表**（001 的所有表/视图都在，但迁移从未被记录）。新的默认
+   `schema_version_check=true` 会让它（以及既有 `test_multi_mode` 的 readiness 断言）变红。因此
+   在目标库执行了一次幂等的
+   `INSERT INTO schema_migrations(version,name) VALUES(1,'001_init.sql') ON CONFLICT DO NOTHING;`
+   —— 这是**填补"DDL 已应用但版本未记录"的漂移**，不是新残留（本地 dev PG 由
+   `scripts/dev_postgres.sh` 正确记录，本机不需要该操作）。
+7. **readiness 探针失败/恢复的做法**：用 DSN 的 `application_name=pgtest_b2a_probe_<pid>` 精确定位
+   本实例的连接再 `pg_terminate_backend`，**不误伤**同库上别的测试；恢复是"池丢弃坏连接 → 下一次
+   借用重建"（PG 全程可达），因此两次都是**轮询到的真实条件**，没有固定 sleep 赌时序。
+
+### 21.7 仍未交付 / 未验证（如实登记）
+
+* **共享挂载探针**（`storage.posix.shared_mount_required` 的跨实例探针可见性）与
+  **`instance_registry` 心跳 / config-version 一致性** —— **B2b**，本切片未做（这两个键仍留在
+  `operations.md` §1.3.3 的「已读但无效果」清单）。
+* **NFS 语义（C9.27）**：仍未验证（本切片与 C9.26 的"共享存储"都是本地目录被进程共用）。
+* **`state='deleted'` 软删除、`/v2/info` 的 `instanceId`、LB 粘性**：仍未交付（不在本切片）。
+* `metadata.postgres.schema_version_check=true` 时版本不符只让 **readiness** 变 not ready；
+  进程**仍然监听并服务其它路由**（本切片的判据就是 readiness；"不放流量"依赖 LB 尊重 readiness）。
+  **未交付**：启动期直接把版本不符升级为 exit 78（任务明确要求的是 readiness 语义）。
+* 版本检查只在**真的用 PG** 时装配；纯 SQLite/内存单实例的 readiness 行为与接线前**逐字一致**
+  （未变）。
+* `app::ClockSkewGuard` 仍是未被组合根装配的纯策略；本切片未把它接进启动路径（理由见 §21.6.1）。
+* **未在两台时钟真的偏 > 60s 的物理主机上验证**：偏移由测试接缝 `FSS_CLOCK_SKEW_INJECT_MS`
+  注入（正控证明结论确实由注入翻转）；真实跨主机 NTP 漂移仍属"未验证"。
+* **连接预算的 `cap` 与 PG 实际 `max_connections` 的对抗**：只用"预期实例数 × 上限"建模；
+  **未验证**"多实例同时打满池"的真实峰值（需要多台主机/多进程并发压测）。
+
+### 21.8 门槛结果
+
+* `cmake --build build -j4`：0 error，改动文件 0 warning。
+* `ctest --test-dir build --output-on-failure`：**88/88**（原 87/87 + 新增 `test_schema_version_constant`）；
+  收尾 `build/CMakeCache.txt` = `FSS_WITH_PG:BOOL=OFF`。
+* `ctest --test-dir build-pg -L pg`：本机 **14.24 → 10/10（48.59 s）**；目标 **12.6 → 10/10（63.37 s）**。
+* `./scripts/check_docs.sh`：**通过**（D1~D5）。
+* `JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh`：**全绿**（失败 无；9 分 43 秒 / 583 s / 11 阶段）。
+* OSDU 线上契约：**未变**（`state` 不进 JSON；REST/gRPC 字段与报文不变；readiness 的 200 体逐字不变）。
+* ⚠️ `AGENTS.md` 未改动（父代理所有，受 64 KiB 预算约束）：其 §0.1 的"readiness 的 PG 探活 +
+  `schema_version_check`、PG 连接预算（C9.28）、PG↔本地时钟偏移比对"三处"仍未交付"叙述**已过时**，
+  以本 §21 与 `docs/phase-status.md` 的 B2a 更新段为准。

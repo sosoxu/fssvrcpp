@@ -166,7 +166,23 @@ void Router::Register(fss::http::Server& server) {
 
   server.Get(base + "/v2/readiness_check", MakeRoute("ops.readiness", kSmallBodyLimit),
              Wrap([this](fss::http::Request&, const app::CallerContext&) -> fss::Result<fss::http::Response> {
-               //  依赖就绪的**最小探针**：仓储可达即可（存储可达性在 P9 的 readiness 细化）
+               //  ★ B2a（ADR-009 §5.3）：readiness 必须验证**共享状态**真的可用。
+               //    组合根注入的 `shared_state_probe` = PG 存活（SELECT 1）+ 迁移版本
+               //    （schema_migrations.max(version) == kExpectedSchemaVersion，可在
+               //    `metadata.postgres.schema_version_check=false` 时跳过版本比对）。
+               //    未装配（单实例 SQLite/内存）→ 退回下面的"仓储可达"最小探针（逐字不变）。
+               //    ★ 失败原因必须**可读**：REST 的 503 文本带上它（gRPC 侧同源）。
+               if (ports_.shared_state_probe) {
+                 const auto shared = ports_.shared_state_probe();
+                 if (!shared.ok()) {
+                   return fss::http::Response::Text(
+                       503, "File service is not ready: " + shared.error().message());
+                 }
+               }
+               //  依赖就绪的**最小探针**：仓储可达即可
+               //  （共享状态探针为空时它是唯一判据，与接线前逐字一致；
+               //   失败体**保持**固定文本 —— 未经控制的仓储错误不往外抛，避免
+               //   无鉴权的运维端点泄漏内部细节）
                const auto probe = ports_.metadata.List("__readiness__", domain::MetadataQuery{});
                if (!probe.ok()) {
                  return fss::http::Response::Text(503, "File service is not ready");
@@ -475,7 +491,7 @@ void Router::Register(fss::http::Server& server) {
     return fss::http::Response::Json(200, fss::json::Dump(ToJson(results)));
   };
 
-  for (const std::string& prefix : {"/v2/files", "/v2/file-collections"}) {
+  for (std::string prefix : {"/v2/files", "/v2/file-collections"}) {
     const bool collection = prefix == "/v2/file-collections";
     server.Post(base + prefix + "/storageInstructions", MakeRoute("dms.storage_instructions"),
                 Wrap(make_storage_instructions(collection)));

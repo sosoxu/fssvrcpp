@@ -103,7 +103,7 @@ IoEngineProbe ProbeIoUring(int entries) {
   //     （就是 `=blocked` 之外的那条分支）—— 注入**不放宽任何启动判据**。
   //
   //  为什么不做成配置键（与 `FSS_STARTUP_FAULT_INJECT` / `FSS_AUDIT_FAULT_INJECT`
-  //  同一理由）：① `docs/operations.md` 的 156 个叶子键三态清单由
+  //  同一理由）：① `docs/operations.md` 的 157 个叶子键三态清单由
   //  `test_operations_doc` 与 `config/fss.example.json` **机械比对**，"让探测说假话"
   //  不是运维语义；② 生产上改写能力探测的结果只会误导 R11 的可观测性，
   //  没有任何合法用途（真正要开 uring 得先满足 U1~U4 并交付引擎实现）。

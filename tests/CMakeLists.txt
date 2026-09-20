@@ -167,6 +167,24 @@ if(FSS_WITH_PG)
     TIMEOUT 900)
 
   # ===========================================================================
+  #  B2a（ADR-009 §5.3/§6.4/§8.1 + C9.28）：**生产就绪检查**的真实进程判据
+  #    · `metadata.postgres.schema_version_check`：版本不符 → not ready（原因可读）；
+  #      正确迁移 → ready；`false` → 跳过版本比对（仍 ready）；
+  #    · C9.28 连接预算：`deployment.expected_instances` 过大 → exit 78（数字可读）；
+  #    · ADR-009 §6.4 时钟偏移 + 测试接缝 `FSS_CLOCK_SKEW_INJECT_MS`（环境变量，非配置键）；
+  #    · readiness 探针失败 + 恢复（按 `application_name` 只杀本实例后端）。
+  #  ★ 版本不符/跳过的用例用独立 scratch schema（`pgtest_b2a_*`），结束即 DROP，共享库零改动。
+  # ===========================================================================
+  fss_add_test(test_production_readiness
+    SOURCES integration/test_production_readiness.cpp
+    LIBS    fss_pg Threads::Threads
+    LABELS  "pg;infra;b2a")
+  add_dependencies(test_production_readiness fss_server)
+  set_tests_properties(test_production_readiness PROPERTIES
+    FIXTURES_REQUIRED pg
+    TIMEOUT 900)
+
+  # ===========================================================================
   #  C2（ADR-009 §4.2/§4.3）：PG 租约的 TTL / time_source / 崩溃回收可观测性
   #    · `leases.ttl_seconds` 真的写进 `staging_leases`（直接查表）；
   #    · `time_source=local` 跟随注入 IClock（与 database 对照），且三原语自洽；
@@ -677,6 +695,16 @@ fss_add_test(test_operations_doc
   SOURCES unit/test_operations_doc.cpp
   LIBS    fss_config fss_json
   LABELS  "phase9;docs")
+
+# =============================================================================
+#  B2a：schema 版本常量的机械防漂移（不需要 libpq：只包含 `kExpectedSchemaVersion`）
+#    · 常量必须等于从 `db/migrations/*.sql` 文件名推导出的最大编号；
+#    · "加 002_*.sql 但不改常量" → 本用例失败（这就是判据要的"不能静默漂移"）；
+#    · 推导函数本身配 R1/R16 自证（合成清单能失败、非法文件名不计入、两位数按十进制）。
+# =============================================================================
+fss_add_test(test_schema_version_constant
+  SOURCES unit/test_schema_version_constant.cpp
+  LABELS  "phase10;unit;b2a")
 
 # =============================================================================
 #  C9.31（P9 补交，P10 期间完成）：按需 GC 的 HTTP 端点 `POST {base}/v2/gc:run`

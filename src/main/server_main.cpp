@@ -54,6 +54,7 @@
 #include "infra/metadata/postgres/postgres_metadata_repository.h"
 #include "infra/metadata/sqlite/sqlite_metadata_repository.h"
 #include "infra/postgres/pg_leader_election.h"
+#include "infra/postgres/pg_schema.h"
 #include "infra/schema/remote_schema_validator.h"
 #include "infra/transfer/blob_byte_source.h"
 #include "infra/transfer/transfer_endpoint.h"
@@ -134,7 +135,7 @@ std::string Env(const char* key, const std::string& fallback) {
 //
 //  ★ 为什么不做成配置键（与 `FSS_AUDIT_FAULT_INJECT` / P9 的 `mock_entitlements
 //    --fail-file` 同一理由）：
-//    ① 156 个叶子键的三态清单（生效 107 / 拒绝启动 18 / 已读但无效果 31）是
+//    ① 157 个叶子键的三态清单（生效 128 / 拒绝启动 15 / 已读但无效果 14）是
 //       `test_operations_doc` **机械比对** `config/fss.example.json` 与
 //       `docs/operations.md` 的；凭空加一个键会让计数与逐键语义双双失真；
 //    ② 它也不是运维语义 —— 没有"生产上要不要让启动抛异常"这种配置项；
@@ -182,7 +183,7 @@ void MaybeInjectStartupFaultAfterStart() {
 //    **不是配置键**；见 docs/runbook.md §10.2、证据 docs/test-evidence/phase10.md §20）。
 //    `CreateFileMetadata` 在原子领取成功 + 在途租约就绪之后、复制之前阻塞该毫秒数。
 //    为什么不做成配置键（与 `FSS_STARTUP_FAULT_INJECT` / `FSS_AUDIT_FAULT_INJECT` 同一理由）：
-//      ① 它是测试接缝，没有运维语义 —— 三态清单（生效 125 / 拒绝启动 16 / 已读但无效果 15）
+//      ① 它是测试接缝，没有运维语义 —— 三态清单（生效 128 / 拒绝启动 15 / 已读但无效果 14）
 //         由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**，凭空加键会让
 //         计数与逐键语义双双失真；
 //      ② 生产上"让每个 createMetadata 故意卡住 N 毫秒"只会制造事故。
@@ -196,6 +197,49 @@ std::int64_t ClaimHoldMillisFromEnv() {
   if (end == value || *end != '\0' || parsed <= 0) return 0;
   return static_cast<std::int64_t>(parsed);
 }
+
+//  ★ B2a：**测试专用**的"时钟偏移注入"接缝（环境变量 `FSS_CLOCK_SKEW_INJECT_MS`，
+//    **不是配置键**；见 docs/runbook.md §10.3）。
+//    > 0 时把**本实例的本地钟**向前拨该毫秒数（负值 = 向后拨）；未设置 / 空 / 非数字 → 0
+//    （= 不注入，生产路径逐字节不变）。
+//    为什么必须有它：ADR-009 §6.4/§8.1 的"实例钟必须在数据库钟的容忍范围内"这条判据，
+//    在真实机器上**无法**用配置制造出可控偏差（改系统时间会波及整机，且测试没有 root）。
+//    注入点选在**本地钟**（而不是只改比较那一行）：这样进程内的本地钟真的偏了，与
+//    "一台钟走偏的实例"形态一致；横幅会显式打印注入值，避免演练结论被误读。
+//    为什么不做成配置键（同 `FSS_STARTUP_FAULT_INJECT` / `FSS_CLAIM_HOLD_MS`）：
+//      ① 三态清单（生效/拒绝启动/已读但无效果）由 `test_operations_doc` 与
+//         `config/fss.example.json` **机械比对**，凭空加键会让计数失真；
+//      ② "让实例钟故意走偏 N 毫秒"不是运维语义，生产上只会制造事故。
+std::int64_t ClockSkewInjectMillisFromEnv() {
+  const char* const value = std::getenv("FSS_CLOCK_SKEW_INJECT_MS");
+  if (value == nullptr || *value == '\0') return 0;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0') return 0;
+  return static_cast<std::int64_t>(parsed);
+}
+
+//  本地钟装饰器：`NowEpochMillis/Seconds` 加上注入偏移；单调钟（用于耗时）**不偏移**
+//  （偏移只该影响"墙上时间"，不该影响延迟测量）。
+class OffsetClock final : public fss::IClock {
+ public:
+  OffsetClock(const fss::IClock& base, std::int64_t offset_millis)
+      : base_(base), offset_millis_(offset_millis) {}
+
+  std::int64_t NowEpochSeconds() const override {
+    return base_.NowEpochSeconds() + offset_millis_ / 1000;
+  }
+  std::int64_t NowEpochMillis() const override {
+    return base_.NowEpochMillis() + offset_millis_;
+  }
+  std::chrono::steady_clock::time_point NowSteady() const override {
+    return base_.NowSteady();
+  }
+
+ private:
+  const fss::IClock& base_;
+  std::int64_t offset_millis_ = 0;
+};
 
 //  schema 默认的脱敏键清单（与 config/fss.example.json 的 `observability.redact_keys`
 //  逐项一致）。组合根在没有配置来源时用它，保证"接线前日志就打码"这一行为不变。
@@ -602,7 +646,7 @@ class Resolver {
 // =============================================================================
 //  为什么不能用 `Resolver::Str/List`：schema 用 `AllowDynamicPrefix("auth.local_roles")`
 //  放行该子树，但**没有逐键声明**，因此 `Load` 不为这些键登记来源 —— 只能从
-//  `effective()` 里自己枚举。键名是邮箱，**不能**进 CoreSchema（否则 156 键的计数
+//  `effective()` 里自己枚举。键名是邮箱，**不能**进 CoreSchema（否则 157 键的计数
 //  与 `test_operations_doc` 的机械比对都会失真，见 operations.md §1.2）。
 std::map<std::string, std::vector<std::string>, std::less<>> CollectLocalRoles(
     const fss::config::Config& cfg, Resolver& resolver) {
@@ -631,7 +675,7 @@ std::map<std::string, std::vector<std::string>, std::less<>> CollectLocalRoles(
 // =============================================================================
 //  与 `auth.local_roles.*` 同源：schema 用 `AllowDynamicPrefix("partition.file")` 放行，
 //  但**没有逐键声明**，`Load` 不登记来源 → 只能从 `effective()` 自己枚举
-//  （键名含 partition，不能进 CoreSchema，否则 156 键的计数会失真）。
+//  （键名含 partition，不能进 CoreSchema，否则 157 键的计数会失真）。
 //
 //  ★ 只接**真实存在**的字段：`PartitionConfig` 的成员只有 `max_object_bytes`
 //    （-1 = 不限）。容器名（`staging_container`/`persistent_container`）与
@@ -937,7 +981,7 @@ class NoopAuditLogger final : public fss::domain::IAuditLogger {
 
 //  ★ C10.13 的**故障注入接缝**（仅用于验证 fail-closed 路径；`FSS_AUDIT_FAULT_INJECT=1`
 //    时装配）：一个"必然失败"的审计后端，让"审计写入失败 → 请求失败"这条路径在**真实
-//    进程**上可被驱动。为什么不做成配置键：156 个叶子键的三态清单是机械比对的
+//    进程**上可被驱动。为什么不做成配置键：157 个叶子键的三态清单是机械比对的
 //    （`test_operations_doc`），加键会让清单失真；而它本身也不是运维语义的一部分，
 //    只是测试/演练用的故障开关（与 P9 的 mock_entitlements --fail-file 同族）。
 class FailingAuditLogger final : public fss::domain::IAuditLogger {
@@ -1201,8 +1245,14 @@ static int RunServer(int argc, char** argv) {
   const std::string location_postgres_dsn = resolver.Str("location.postgres.dsn", "");
   const long location_postgres_max_connections =
       resolver.Int("location.postgres.max_connections", 8);
-  //  ★ `metadata.postgres.schema_version_check` 仍然**未接线**（需要 readiness 的
-  //    `SELECT 1` + 迁移版本校验，留给后续切片）→ 不读它，如实留在「已读但无效果」。
+  //  ★ B2a：readiness 的迁移版本校验开关（`metadata.postgres.schema_version_check`）。
+  //    `true`（默认）→ readiness 除 `SELECT 1` 存活探针外，还比对
+  //    `schema_migrations.max(version)` 与 `infra::kExpectedSchemaVersion`；
+  //    `false` → **只**做存活探针（跳过版本比对）。
+  //    落点：`ports.shared_state_probe`（组合根注入的 PG 连接池探针）→ REST
+  //    `/v2/readiness_check` 与 gRPC `Check(PROBE_READINESS)` 同源。
+  const bool metadata_postgres_schema_version_check =
+      resolver.Bool("metadata.postgres.schema_version_check", true);
   const std::string metadata_db_path =
       resolver.Str("metadata.sqlite.path", storage_root + "/metadata.db");
   const std::string sqlite_path =
@@ -1339,6 +1389,8 @@ static int RunServer(int argc, char** argv) {
   const std::string partition_registry = resolver.Str("partition.registry", "file");
   const long clock_skew_tolerance_seconds =
       resolver.Int("deployment.clock_skew_tolerance_seconds", 60);
+  //  ★ B2a（C9.28）：部署在该 PG 上的实例数（含本实例）。启动期连接预算的因子。
+  const long expected_instances = resolver.Int("deployment.expected_instances", 1);
 
   //  ---- 阶段 10（C10.16 续）：`storage.posix.*` 细节键 ----
   //  ★ 5 个**真接通**（驱动层有对应字段），2 个只做拒绝启动守卫（批提交协议未实现）。
@@ -1486,12 +1538,9 @@ static int RunServer(int argc, char** argv) {
         "partition.registry=remote —— 远端租户注册表未交付（组合根只装配内置租户 opendes）。"
         "下一步：保持 file，或先实现 partition.registry=remote 的拉取与校验。");
   }
-  if (clock_skew_tolerance_seconds != 60) {
-    return reject_startup(
-        "deployment.clock_skew_tolerance_seconds 非默认 —— 该键用于「本地钟与数据库 now() "
-        "的偏移容忍」，而 **PG-vs-本地时钟的比较本身未实现**（B1 虽已让 multi 启动，但组合根"
-        "不做偏移测量/拒绝判定）。下一步：保持 60；实现偏移比较后再放开。");
-  }
+  //  ★ B2a：`deployment.clock_skew_tolerance_seconds` **不再**是"未实现 → 拒绝启动"的守卫
+  //    —— 它现在是**生效**键：组合根在启动期用它比对「本地钟 vs PG now()」，超限 exit 78
+  //    （见本文件 §④ 之后的"B2a 生产就绪检查"）。非默认值因此被真正使用，而不是被拒。
   //  ★ 本轮（ADR-008 的 P4 已交付）：`group_commit_max_batch` **生效**（不再拒绝启动）；
   //    `sync_dir_after_batch=false` 仍然**拒绝启动** —— ADR-008 §5 的 R2（"rename 之后
   //    必须 fsync 目录"）是**不变量**，schema 描述也写明"必须 true"。为了多一个"生效"
@@ -1649,7 +1698,12 @@ static int RunServer(int argc, char** argv) {
   // ===========================================================================
   //  ④ 依赖构造（R12：唯一实例化具体实现的位置）
   // ===========================================================================
-  SystemClock clock;
+  //  ★ B2a：本地钟 = `SystemClock` + **测试专用**的偏移注入（`FSS_CLOCK_SKEW_INJECT_MS`）。
+  //    未设置（默认）时偏移 = 0 ⇒ 行为与接线前**逐字一致**（每次读多一次虚调用与加法）。
+  //    注入生效时横幅显式打印，避免演练结论被误读成"这台机器钟真的偏了"。
+  SystemClock system_clock;
+  const std::int64_t clock_skew_inject_millis = ClockSkewInjectMillisFromEnv();
+  OffsetClock clock(system_clock, clock_skew_inject_millis);
   const auto log_level = logging::ParseLevel(log_level_text).value_or(logging::Level::kInfo);
   logging::StreamLogger logger(
       logging::OptionsFromConfig(log_level, log_format, log_service, Join(redact_keys)), clock);
@@ -1803,6 +1857,15 @@ static int RunServer(int argc, char** argv) {
   //  ★ B1：仓储的**后端选择**（sqlite | postgres）。具体实现只在这里创建（R12）；
   //    上层（LocationIssuer / UseCasePorts / GcTask）只见 `domain::I*Repository` 端口。
   //    创建失败一律 exit 78 + libpq 原文，**绝不**静默回退到 SQLite（ADR-009 §4.1）。
+  //
+  //  ★ B2a：组合根另外持有 PG 仓储/租约的**具体类型非拥有指针**。readiness 的
+  //    共享状态探针、C9.28 的连接预算、ADR-009 §6.4 的时钟偏移都需要直接访问
+  //    连接池（`PgPool&`），而这些访问**只能在组合根**发生（R12：适配层不依赖 L2）。
+#ifdef FSS_HAVE_LIBPQ
+  PostgresLocationRepository* pg_location_repo = nullptr;
+  PostgresMetadataRepository* pg_metadata_repo = nullptr;
+  PostgresLeaseRepository* pg_lease_repo = nullptr;
+#endif
   std::unique_ptr<domain::IFileLocationRepository> location_repository;
   std::string location_repository_backend;
   if (location_repository_name == "postgres") {
@@ -1821,6 +1884,7 @@ static int RunServer(int argc, char** argv) {
                 << "，确认 PG 可达且已执行 db/migrations/001_init.sql。\n";
       return kExitConfigError;
     }
+    pg_location_repo = opened.value().get();
     location_repository = std::move(opened).value();
     location_repository_backend = "postgres";
 #else
@@ -1872,6 +1936,7 @@ static int RunServer(int argc, char** argv) {
                 << "，确认 PG 可达且已执行 db/migrations/001_init.sql。\n";
       return kExitConfigError;
     }
+    pg_metadata_repo = opened.value().get();
     metadata_repository = std::move(opened).value();
     metadata_repository_backend = "postgres";
 #else
@@ -1935,6 +2000,7 @@ static int RunServer(int argc, char** argv) {
                 << "），并确认 PG 可达且已执行 db/migrations/001_init.sql。\n";
       return kExitConfigError;
     }
+    pg_lease_repo = opened.value().get();
     pg_lease_repository = std::move(opened).value();
     lease_port = pg_lease_repository.get();
     lease_backend = "postgres（staging_leases；时间源 = " +
@@ -1998,6 +2064,115 @@ static int RunServer(int argc, char** argv) {
     return kExitConfigError;
 #endif
   }
+
+  // ===========================================================================
+  //  ⑤ B2a：生产就绪检查（真实进程、启动期、fail-closed → exit 78）
+  // ===========================================================================
+  //  ADR-009 的三条"共享状态可用"判据在本节落地：
+  //    ① readiness 的 PG 探活（`SELECT 1`）——探针在下面装配给 `ports`（REST/gRPC 同源）；
+  //    ② C9.28 PG 连接预算：`expected_instances × 每实例池上限 ≤ PG max_connections`；
+  //    ③ ADR-009 §6.4/§8.1 时钟偏移：`|本地钟 − PG now()| ≤ clock_skew_tolerance_seconds`。
+  //  ★ 三条都只在**真的用了 PG**（元数据或位置仓储 = postgres）时才有意义；
+  //    single + SQLite/内存 → 全部跳过，行为与接线前逐字一致。
+  // ===========================================================================
+  std::string pg_budget_banner = "未校验（本进程未使用 PG 仓储）";
+  std::string clock_skew_banner = "未校验（本进程未使用 PG 仓储）";
+#ifdef FSS_HAVE_LIBPQ
+  //  共享状态连接池：优先元数据池（`metadata.postgres.*` 是版本检查键的命名空间），
+  //  否则用位置池（single + `location.repository=postgres` 的合法形态，DSN 同库）。
+  infra::PgPool* shared_state_pool = nullptr;
+  if (pg_metadata_repo != nullptr) {
+    shared_state_pool = &pg_metadata_repo->pool();
+  } else if (pg_location_repo != nullptr) {
+    shared_state_pool = &pg_location_repo->pool();
+  }
+  if (shared_state_pool != nullptr) {
+    //  ---- ① C9.28：PG 连接预算 ----
+    //  ★ 每实例"最坏连接数"的构成（全部来自**组合根实际创建的池**，不是配置里写了什么）：
+    //      · `metadata.postgres.max_connections`（元数据池）；
+    //      · `location.postgres.max_connections`（位置池）；
+    //      · 启用租约时**再加一份** `location.postgres.max_connections` ——
+    //        `PostgresLeaseRepository` 是**独立池**（server_main 用它自己的 PgOptions），
+    //        任务给出的公式 `metadata + location + 1` 会漏掉这一份；这里按真实池计数，
+    //        宁可保守拒绝，也不让"实例数 × 上限"静默超过 PG 的 `max_connections`；
+    //      · **+1**：`PgLeaderElection` 的专用会话级 advisory lock 连接（不过池）。
+    //        即使 `leader_election.enabled=false`（当前不建那条连接）也按 +1 计 ——
+    //        最坏情况上界，避免"开了选举就超预算"的静默漂移。
+    const auto pg_max_connections_result = infra::ReadPgMaxConnections(*shared_state_pool);
+    if (!pg_max_connections_result.ok()) {
+      return reject_startup(
+          "PG 连接预算无法校验（fail-closed）：" + pg_max_connections_result.error().ToString() +
+          "\n  下一步：确认运行账号可读 pg_settings（`SELECT setting::int FROM pg_settings "
+          "WHERE name='max_connections'`）。");
+    }
+    const long pg_max_connections = pg_max_connections_result.value();
+    const long metadata_pool_cap =
+        pg_metadata_repo != nullptr ? metadata_postgres_max_connections : 0;
+    const long location_pool_cap =
+        pg_location_repo != nullptr ? location_postgres_max_connections : 0;
+    const long lease_pool_cap =
+        pg_lease_repo != nullptr ? location_postgres_max_connections : 0;
+    const long leader_lock_cap = 1;
+    const long per_instance_cap =
+        metadata_pool_cap + location_pool_cap + lease_pool_cap + leader_lock_cap;
+    const long required = expected_instances * per_instance_cap;
+    if (required > pg_max_connections) {
+      std::ostringstream message;
+      message << "PG 连接预算不足（C9.28：实例数 × 每实例池上限 ≤ PG max_connections）。\n"
+              << "  PG max_connections            = " << pg_max_connections << "\n"
+              << "  每实例最坏连接数               = " << per_instance_cap << " = metadata("
+              << metadata_pool_cap << ") + location(" << location_pool_cap << ") + lease("
+              << lease_pool_cap << "，独立池) + leader_lock(" << leader_lock_cap << ")\n"
+              << "  deployment.expected_instances  = " << expected_instances << "\n"
+              << "  需要 " << expected_instances << " × " << per_instance_cap << " = " << required
+              << " > " << pg_max_connections << "\n"
+              << "  下一步：提高 PG max_connections（当前 " << pg_max_connections
+              << "），或调低 metadata/location.postgres.max_connections（每实例当前 "
+              << per_instance_cap << "），或调低 deployment.expected_instances（当前 "
+              << expected_instances << "）。";
+      return reject_startup(message.str());
+    }
+    pg_budget_banner = "OK（每实例 " + std::to_string(per_instance_cap) + " = metadata(" +
+                       std::to_string(metadata_pool_cap) + ") + location(" +
+                       std::to_string(location_pool_cap) + ") + lease(" +
+                       std::to_string(lease_pool_cap) + ") + leader_lock(" +
+                       std::to_string(leader_lock_cap) + ")；expected_instances=" +
+                       std::to_string(expected_instances) + " → 需要 " +
+                       std::to_string(required) + " ≤ PG max_connections=" +
+                       std::to_string(pg_max_connections) + "）";
+
+    //  ---- ② ADR-009 §6.4/§8.1：本地钟 vs 数据库 now() ----
+    //  容忍值来自 `deployment.clock_skew_tolerance_seconds`（语义 = "与数据库 now() 的
+    //  偏移容忍"）。★ 另一个相关键 `deployment.max_clock_skew_seconds` **不是**本比较的
+    //  容忍值：它继续用于 multi 跨字段校验与 JWT `exp`/`nbf` 的容忍（C8.10），见 §1.3。
+    const auto pg_now = shared_state_pool->NowEpochMillis();
+    if (!pg_now.ok()) {
+      return reject_startup("时钟偏移校验失败：无法读取数据库 now()：" +
+                            pg_now.error().ToString() +
+                            "\n  下一步：确认 PG 可达且运行账号可执行 `SELECT now()`。");
+    }
+    const std::int64_t local_now_millis = clock.NowEpochMillis();
+    const std::int64_t skew_millis = local_now_millis - pg_now.value();
+    const std::int64_t tolerance_millis =
+        static_cast<std::int64_t>(clock_skew_tolerance_seconds) * 1000;
+    if (std::llabs(skew_millis) > tolerance_millis) {
+      std::ostringstream message;
+      message << "实例时钟与数据库 now() 偏差超限（ADR-009 §6.4/§8.1）。\n"
+              << "  本地钟（本实例）  = " << local_now_millis << " ms (epoch)\n"
+              << "  数据库 now()      = " << pg_now.value() << " ms (epoch)\n"
+              << "  偏差              = " << skew_millis << " ms（正 = 本地快）\n"
+              << "  容忍范围          = deployment.clock_skew_tolerance_seconds="
+              << clock_skew_tolerance_seconds << "s（" << tolerance_millis << " ms）\n"
+              << "  下一步：校准宿主机 NTP/chrony（本实例与数据库主机都要），"
+                 "或按部署现实的偏差上界调大 deployment.clock_skew_tolerance_seconds。";
+      return reject_startup(message.str());
+    }
+    clock_skew_banner =
+        "OK（本地 " + std::to_string(local_now_millis) + " ms vs 数据库 " +
+        std::to_string(pg_now.value()) + " ms，偏差 " + std::to_string(skew_millis) +
+        " ms，容忍 " + std::to_string(tolerance_millis) + " ms）";
+  }
+#endif
 
   HmacTransferTokenCodec token_codec(transfer_secret, clock, transfer_key_id);
 
@@ -2217,6 +2392,19 @@ static int RunServer(int argc, char** argv) {
   ports.lease_ttl_seconds = leases_ttl_seconds;
   ports.lease_renew_interval_seconds = leases_renew_interval_seconds;
   ports.instance_id = effective_instance_id;
+  //  ★ B2a（ADR-009 §5.3）：readiness 的**共享状态**探针 —— PG 存活（`SELECT 1`）+
+  //    迁移版本（`schema_migrations.max(version) == kExpectedSchemaVersion`）。
+  //    组合根在这里把连接池包成回调注入（R12：适配层不依赖 L2）；REST 与 gRPC 从
+  //    **同一份** `ports` 取值 ⇒ 两条协议的 readiness 判据按构造一致。
+  //    未使用 PG（`shared_state_pool == nullptr`）时不装配 ⇒ 适配层退回原有最小探针。
+#ifdef FSS_HAVE_LIBPQ
+  if (shared_state_pool != nullptr) {
+    const bool check_schema_version = metadata_postgres_schema_version_check;
+    ports.shared_state_probe = [shared_state_pool, check_schema_version]() -> fss::Result<void> {
+      return infra::ProbePgSharedState(*shared_state_pool, check_schema_version);
+    };
+  }
+#endif
   //  ★ C9.26：测试专用的崩溃窗口接缝（`FSS_CLAIM_HOLD_MS`，**不是配置键**）。
   //    默认未设置 → 0 → `CreateFileMetadata` 与接线前逐字一致（不 sleep）。
   const std::int64_t claim_hold_millis = ClaimHoldMillisFromEnv();
@@ -2608,13 +2796,28 @@ static int RunServer(int argc, char** argv) {
                     : std::string("（来自 deployment.instance_id，未改动）"))
             << "\n"
             << "  lease backend  : " << lease_backend << "\n"
-            << "  leader         : " << leader_state_banner << "\n";
+            << "  leader         : " << leader_state_banner << "\n"
+            //  ★ B2a：三条生产就绪判据的实际结论必须可见（否则"检查过没过"只能靠猜）。
+            << "  pg budget      : " << pg_budget_banner << "\n"
+            << "  clock skew     : " << clock_skew_banner << "\n"
+            << "  pg schema check: "
+            << (metadata_postgres_schema_version_check
+                    ? "true（readiness 比对 schema_migrations.max(version) 与期望 " +
+                          std::to_string(infra::kExpectedSchemaVersion) + "）"
+                    : std::string("false（readiness 只做 SELECT 1 探活，不比对迁移版本）"))
+            << "\n";
   //  ★ C9.26：测试接缝生效时**必须可见**（可运维：横幅回答"它会不会故意卡住"）。
   //    未设置时不打印该行 → 既有横幅逐字不变（既有测试只做子串断言，不受影响）。
   if (claim_hold_millis > 0) {
     std::cout << "  claim hold ms  : " << claim_hold_millis
               << "（★ C9.26 测试接缝 FSS_CLAIM_HOLD_MS：createMetadata 在原子领取后、"
                  "复制前阻塞该毫秒数；**生产禁止设置**）\n";
+  }
+  //  ★ B2a：时钟偏移注入接缝生效时同样必须可见（避免演练结论被误读成"这台机器钟真的偏了"）。
+  if (clock_skew_inject_millis != 0) {
+    std::cout << "  clock inject   : " << clock_skew_inject_millis
+              << " ms（★ B2a 测试接缝 FSS_CLOCK_SKEW_INJECT_MS：本地钟被拨动该毫秒数；"
+                 "**生产禁止设置**）\n";
   }
   //  C10.2：逐键打印来源缩写（cli/env/file/default），`(别名 FSS_X)` 表示旧环境变量。
   std::cout << "  config sources :\n";

@@ -813,7 +813,11 @@ TEST_CASE("★ C10.11：未实现能力的非默认值必须拒绝启动（exit 
         {"self_signed.single_use_nonce", "true", "single_use_nonce=true"},
         {"self_signed.nonce_store", "postgres", "nonce_store=postgres"},
         {"partition.registry", "remote", "partition.registry=remote"},
-        {"deployment.clock_skew_tolerance_seconds", "30", "clock_skew_tolerance_seconds"},
+        //  ★ B2a：`deployment.clock_skew_tolerance_seconds` **不再**是"未实现 → 拒绝启动"
+        //    的守卫键 —— 它现在是**生效**键（启动期用它比对本地钟 vs PG now()，超限 exit 78）。
+        //    这里**删除**该反例（"非默认 → 78" 已不成立）；"它真的改变判定"由
+        //    `tests/integration/test_production_readiness.cpp` 的 B2a-3 用
+        //    「容忍 60s + 注入 120s → exit 78」与「容忍 300s + 同一注入 → 启动」双向钉住。
     };
     for (const auto& test_case : cases) {
       const std::string assignment = std::string(test_case.key) + "=" + test_case.value;

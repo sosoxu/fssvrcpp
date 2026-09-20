@@ -33,7 +33,12 @@
     // ★ multi 会强制校验 5 条，任一条不满足 → 拒绝启动（ADR-009 §8.1）
     "mode": "single",
     "instance_id": "",
-    "clock_skew_tolerance_seconds": 60
+    "clock_skew_tolerance_seconds": 60,
+    // ★ 部署在该 PostgreSQL 上的实例数（含本实例）。启动时组合根读 PG 的
+    //   `max_connections`，要求 `expected_instances × 每实例最坏连接数 ≤ max_connections`，
+    //   否则 exit 78（C9.28）。每实例最坏连接数 = metadata 池 + location 池
+    //   （+ 启用租约时再 + location 池，租约是独立池）+ 1 条专用 leader 锁连接。
+    "expected_instances": 1
   },
 
   "server": {

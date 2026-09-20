@@ -31,6 +31,7 @@
 #include "domain/ports/ports.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -122,6 +123,22 @@ struct UseCasePorts {
   //    会得到 flaky 判据，而 flaky 的判据比没有判据更糟（R1：判据必须能稳定复现）。
   //    `ports` 是 REST 与 gRPC 共用的同一份 ⇒ 两条协议拿到同一取值（按构造一致）。
   std::int64_t claim_hold_millis = 0;
+
+  //  ★ B2a（ADR-009 §5.3）：readiness 的"**共享状态可用**"探针。
+  //    ADR-009 的 readiness 不能只靠"元数据仓储能列一条空查询"来判断 —— multi 下
+  //    还必须验证 ① PG 存活（`SELECT 1`）② 迁移版本与本二进制一致
+  //    （`SELECT max(version) FROM schema_migrations` == `kExpectedSchemaVersion`）。
+  //
+  //  为什么是 `std::function` 而不是让适配层直接调 L2：R12 规定具体实现只在组合根
+  //  `src/main/` 创建；适配层（L5）不得依赖 `src/infra/postgres/`。组合根把 PG 连接池
+  //  包成这个回调注入 ⇒ REST 的 `/v2/readiness_check` 与 gRPC 的 `Check(PROBE_READINESS)`
+  //  读的是**同一份**判据（与 `auth_mode`/`io_engine` 同一条纪律：两条协议按构造一致）。
+  //
+  //  语义：返回 ok = 共享状态可用（ready）；否则 `error().message()` 是**给运维看的
+  //  可读原因**（会出现在 REST 的 503 响应体与 gRPC 的 UNAVAILABLE 文本里）。
+  //  为空（默认）= 组合根没有 PG 依赖（单实例 SQLite/内存）→ 适配层退回原有的
+  //  "仓储可达"最小探针，行为与接线前逐字一致。
+  std::function<fss::Result<void>()> shared_state_probe = nullptr;
 };
 
 // =============================================================================

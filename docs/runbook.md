@@ -274,8 +274,8 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 #   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
 ```
 
-**为什么它不是配置键**：`docs/operations.md` 的 156 个叶子键三态清单（生效 125 / 拒绝启动 16 /
-已读但无效果 15）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 128 / 拒绝启动 15 /
+已读但无效果 14）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
 它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动
@@ -306,7 +306,7 @@ FSS_IO_PROBE_INJECT=available ./build/bin/fss_server --set storage.io_engine=uri
 > `blocking`。因此它**不是**"偷偷启用 io_uring"的后门。注入**自身可见**（横幅带
 > `(injected)` 与 `FSS_IO_PROBE_INJECT=…` 字样），避免演练结论被误读成"这台机器真的可用"。
 >
-> **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 156 键三态清单由
+> **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单由
 > `test_operations_doc` **机械比对**；"让能力探测说假话"不是运维语义（生产上改写探测
 > 结果只会误导 R11 的可观测性）。若写成配置项会按**未知键 → exit 78** 被拒。
 >
@@ -335,10 +335,43 @@ FSS_CLAIM_HOLD_MS=15000 ./build/bin/fss_server --config config/fss.json &
 > ⚠️ **它只加延迟**：不改变领取/回收/领导权任何判定，也不放宽任何门禁。**默认不注入**，
 > 所以生产路径（未设置该变量）的行为与引入本接缝之前逐字节一致。
 >
-> **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 156 键三态清单
-> （生效 125 / 拒绝启动 16 / 已读但无效果 15）由 `test_operations_doc` **机械比对**；
+> **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
+> （生效 128 / 拒绝启动 15 / 已读但无效果 14）由 `test_operations_doc` **机械比对**；
 > "让每个 `createMetadata` 故意卡住 N 毫秒"不是运维语义，生产上只会制造事故。
 > 若写成配置项会按**未知键 → exit 78** 被拒。
 >
 > **禁令**：**不要**在生产/预发设置 `FSS_CLAIM_HOLD_MS`。它只用于 C9.26 的进程级崩溃
 > 回归与故障演练；演练结束请确认该变量已从环境 / systemd unit 文件中移除。
+
+### 10.3 时钟偏移**注入**接缝（B2a；⚠️ 同样**不要在生产设置**）
+
+ADR-009 §6.4/§8.1 要求"实例钟必须在数据库钟的容忍范围内"，而"让实例钟故意偏 N 毫秒"
+在真实机器上无法用配置制造（改系统时间会波及整机，且测试没有 root）。本接缝把实例的
+**本地钟**整体拨动一个可控偏移，用于在两台引擎上驱动 startup 判据与正控：
+
+| 环境变量 | 取值 | 行为 |
+| --- | --- | --- |
+| `FSS_CLOCK_SKEW_INJECT_MS` | `n > 0` | 本地钟**向前**拨 `n` 毫秒；`n < 0` → 向后拨；与 PG `now()` 的偏差因此可控 |
+| 同上 | 未设置 / 空 / 非数字 | **不注入**（偏移 = 0）：本地钟与接线前**逐字一致** |
+
+```bash
+# 演练：本地钟快 120 秒（默认容忍 deployment.clock_skew_tolerance_seconds=60s）→ 期望 exit 78
+FSS_CLOCK_SKEW_INJECT_MS=120000 ./build/bin/fss_server --config config/fss.json; echo "exit=$?"
+# → 拒绝启动：实例时钟与数据库 now() 偏差超限（ADR-009 §6.4/§8.1）。
+#     本地钟（本实例）  = ... ms   数据库 now() = ... ms   偏差 = 1200xx ms
+#     容忍范围          = deployment.clock_skew_tolerance_seconds=60s（60000 ms）
+
+# 演练：本地钟快 1 秒（< 60s）→ 正常启动，横幅打印实际偏差
+FSS_CLOCK_SKEW_INJECT_MS=1000 ./build/bin/fss_server --config config/fss.json &
+```
+
+> ⚠️ **它只拨本地钟，不改任何门禁**：容忍值仍由 `deployment.clock_skew_tolerance_seconds`
+> 决定；注入自身**可见**（横幅打印 `clock inject   : <n> ms（★ B2a 测试接缝 ...）`），
+> 避免演练结论被误读成"这台机器钟真的偏了"。**默认不注入**，生产路径逐字节不变。
+>
+> **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
+> （生效 128 / 拒绝启动 15 / 已读但无效果 14）由 `test_operations_doc` **机械比对**；
+> "让实例钟走偏"不是运维语义，生产上只会制造事故。若写成配置项会按**未知键 → exit 78** 被拒。
+>
+> **禁令**：**不要**在生产/预发设置 `FSS_CLOCK_SKEW_INJECT_MS`。它只用于 B2a 的
+> PG↔本地钟偏移判据的回归与故障演练；演练结束请确认该变量已从环境 / systemd unit 中移除。

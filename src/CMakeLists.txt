@@ -230,7 +230,8 @@ if(PostgreSQL_FOUND)
   # + 领导者选举（会话级 advisory lock，专用锁连接；ADR-009 §4.4）
   add_library(fss_pg STATIC
     infra/postgres/pg_connection.cpp
-    infra/postgres/pg_leader_election.cpp)
+    infra/postgres/pg_leader_election.cpp
+    infra/postgres/pg_schema.cpp)
   target_include_directories(fss_pg PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(fss_pg PUBLIC fss_domain PostgreSQL::PostgreSQL)
   #  发布给 tests/：PG 仓储的契约测试必须能看见"libpq 真的可用"

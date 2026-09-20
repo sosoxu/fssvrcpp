@@ -60,7 +60,15 @@ Schema CoreSchema() {
           .Enum({"single", "multi"}).Default("single"));
   s.Add(FieldSpec{"deployment.instance_id"}.Str("空则自动生成；K8s 下建议注入 POD_NAME").Default(""));
   s.Add(FieldSpec{"deployment.clock_skew_tolerance_seconds"}
-          .Int(0, 86400, "与数据库 now() 的偏移容忍；超限拒绝启动").Default("60"));
+          .Int(0, 86400, "与数据库 now() 的偏移容忍（秒）；超限拒绝启动").Default("60"));
+  //  ★ B2a（C9.28）：PG 连接预算的实例数因子。
+  //    `实例数 × 每实例池上限 ≤ PG max_connections`。启动时组合根真的读 PG 的
+  //    `max_connections` 并比对，超限 → exit 78（见 src/main/server_main.cpp 的
+  //    连接预算检查）。默认 1 = 单实例形态的既有行为。
+  s.Add(FieldSpec{"deployment.expected_instances"}
+          .Int(1, 100000,
+               "部署该 PG 的实例数（含本实例）；与各池上限相乘后必须 ≤ PG max_connections")
+          .Default("1"));
 
   // ---------------- server.http ----------------
   s.Add(FieldSpec{"server.http.base_path"}.Str("必须与上游 context path 一致").Required().Default("/api/file"));

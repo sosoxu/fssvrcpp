@@ -69,6 +69,21 @@
 > 多于 2 个实例、`fileSource` 的产品级重试（LB 粘性）、gRPC 侧的 kill -9。
 > ⚠️ 上面的搬迁快照、`AGENTS.md` §0.1、`04-implementation-plan.md` 的 C9.26 行仍写着"多实例 E2E
 > 未交付" —— 以本段与 `test-evidence/phase10.md` §20 为准。
+>
+> **B2a 之后的更新（最新，优先于上面全部）**：ADR-009 的三条"共享状态可用/可比较"判据已交付
+> （见 `test-evidence/phase10.md` §21）：① readiness 的 **PG 探活（`SELECT 1`）+ 迁移版本校验**
+> （`src/infra/postgres/pg_schema.*`；期望值 `kExpectedSchemaVersion` 由
+> `tests/unit/test_schema_version_constant.cpp` 从 `db/migrations/*.sql` 文件名**机械推导**，
+> 加迁移不改常量 → 测试失败）⇒ `metadata.postgres.schema_version_check` **生效**；
+> ② **C9.28 连接预算**（`deployment.expected_instances` **新键**；`实例数 × 每实例最坏池上限 ≤ PG
+> max_connections` 否则 **exit 78**）；③ **PG↔本地钟偏移比对**（容忍 = `deployment.clock_skew_tolerance_seconds`
+> —— 它**生效**；`deployment.max_clock_skew_seconds` 仍生效但只用于 multi 跨字段 + JWT `exp`/`nbf`）
+> 否则 exit 78。测试接缝 `FSS_CLOCK_SKEW_INJECT_MS`（**环境变量，不是配置键**，runbook §10.3）。
+> 三态 **生效 125 / 拒绝启动 16 / 已读但无效果 15 → 生效 128 / 拒绝启动 15 / 已读但无效果 14**，
+> 键数 **156 → 157**。`ctest` 默认构建 **88/88**（+1 常量机械测试）；`ctest -L pg` 两引擎 **10/10**
+> （含新增 `tests/integration/test_production_readiness.cpp`，4 用例 / 133 断言）。
+> **仍未交付（B2b）**：共享挂载探针、`instance_registry` 心跳 / config-version 一致性；NFS 语义
+> （C9.27）仍未验证。
 
 ---
 

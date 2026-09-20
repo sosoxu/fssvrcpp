@@ -49,6 +49,18 @@ namespace fss::adapters::grpc {
       return ::grpc::Status::OK;
     }
     case osdu::file::v1::CheckRequest::PROBE_READINESS: {
+      //  ★ B2a：与 REST `/v2/readiness_check` 读**同一份**判据（`ports_.shared_state_probe`，
+      //    由组合根注入 = PG 存活 + 迁移版本；空则只有"仓储可达"最小探针）。
+      //    失败原因带在文本里，与 REST 的 503 体同源。
+      if (ports_.shared_state_probe) {
+        const auto shared = ports_.shared_state_probe();
+        if (!shared.ok()) {
+          const std::string text = "File service is not ready: " + shared.error().message();
+          response->set_status(osdu::file::v1::CheckResponse::SERVING_STATUS_NOT_SERVING);
+          response->set_text(text);
+          return ::grpc::Status(::grpc::StatusCode::UNAVAILABLE, text);
+        }
+      }
       const auto probe = ports_.metadata.List("__readiness__", fss::domain::MetadataQuery{});
       if (!probe.ok()) {
         response->set_status(osdu::file::v1::CheckResponse::SERVING_STATUS_NOT_SERVING);

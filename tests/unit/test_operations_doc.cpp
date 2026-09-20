@@ -135,7 +135,7 @@ TEST_CASE("★ C9.9 operations.md 覆盖 example 的全部叶子键且不写不�
 
   // ---------------------------------------------------------------------------
   // ② 非空洞性（R16）：先钉住"被检查的集合本身足够大"。
-  //    下限取得比真实值（本例 156）低，但只要有人把示例文件删到只剩骨架，
+  //    下限取得比真实值（本例 157）低，但只要有人把示例文件删到只剩骨架，
   //    或 operations.md 退化成占位符，这里就会失败。
   // ---------------------------------------------------------------------------
   INFO("example 叶子键数: " << leaves.size() << "；operations.md 字节数: " << doc.size());
@@ -194,11 +194,11 @@ TEST_CASE("★ C9.9 operations.md 覆盖 example 的全部叶子键且不写不�
 //            `拒绝启动（列出触发条件）` / `已读但无效果（必须给出理由与下一步）`"。
 //  这条测试把"计数"变成机械断言（否则文档里的数字只是人写的字，会漂移）：
 //    ① 示例文件的每个叶子键都必须在 §1.2 的某一行里以状态标记开头；
-//    ② 三态计数 = 生效 125 / 拒绝启动 16 / 已读但无效果 15，且相加 = 156；
+//    ② 三态计数 = 生效 128 / 拒绝启动 15 / 已读但无效果 14，且相加 = 157；
 //    ③ 文档正文里声明的数字也必须一致（防止只改表格不改正文）。
 //  ★ 只认"最后一列以状态标记开头"的行：同一个键在别处（如 §5.1 的档位表）出现不算。
 // =============================================================================
-TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 125 / 拒绝启动 16 / 已读但无效果 15）",
+TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 128 / 拒绝启动 15 / 已读但无效果 14）",
           "[phase10][docs][c10.11]") {
   const std::string example_path = std::string(FSS_REPO_ROOT) + "/config/fss.example.json";
   const std::string doc_path = std::string(FSS_REPO_ROOT) + "/docs/operations.md";
@@ -256,11 +256,11 @@ TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 125 / 拒绝启�
   REQUIRE(unmarked.empty());
   INFO("生效=" << n_effective << " 拒绝启动=" << n_reject << " 已读但无效果=" << n_ineffective
                << " 合计=" << leaves.size());
-  REQUIRE(n_effective == 125);
-  REQUIRE(n_reject == 16);
-  REQUIRE(n_ineffective == 15);
+  REQUIRE(n_effective == 128);
+  REQUIRE(n_reject == 15);
+  REQUIRE(n_ineffective == 14);
   REQUIRE(n_effective + n_reject + n_ineffective == leaves.size());
   //  正文声明的数字也必须一致（防止"只改表格、不改正文"）
-  REQUIRE(doc.find("生效 125 / 拒绝启动 16 / 已读但无效果 15") != std::string::npos);
-  REQUIRE(doc.find("**125 + 16 + 15 = 156**") != std::string::npos);
+  REQUIRE(doc.find("生效 128 / 拒绝启动 15 / 已读但无效果 14") != std::string::npos);
+  REQUIRE(doc.find("**128 + 15 + 14 = 157**") != std::string::npos);
 }
