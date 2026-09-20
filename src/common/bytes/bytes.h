@@ -106,6 +106,21 @@ class ByteSource {
     return Err(ErrorKind::kUnimplemented, "该来源不支持随机访问");
   }
 
+  // ★ ADR-006（大文件下载数据面）：**可选**的零拷贝能力（默认 = 没有）。
+  //   返回值语义（这是调用方唯一可以依赖的契约）：
+  //     · `-1`  → 该来源**没有**可用的原生 fd，调用方**必须**回退到用户态拷贝
+  //               （`Read` 循环 / `PumpTo`）。这是绝大多数来源的默认值。
+  //     · `>=0` → 一个可以 `sendfile(2)` 读取的只读 fd。
+  //  所有权与生命周期：
+  //     · fd **归来源所有**（lifetime ≥ 来源对象）；调用方**不得** `close` 它，
+  //       也不得 `dup` 后留着超出来源的生命周期。
+  //     · 返回 fd 后来源仍可正常 `Read`/`Seek`；但调用方若改用 fd 直接读，
+  //       必须**自己**跟踪文件偏移（`sendfile` 的 `offset` 参数不共享来源内部游标）。
+  //  为什么放在 L1 的基类而不是某个具体类型上：它是"传输层可以选择走零拷贝"这个
+  //  能力的**唯一**抽象点 —— 上层拿到的永远是 `shared_ptr<ByteSource>`，无法知道
+  //  底层是 POSIX 文件还是内存字符串（`docs/02-design.md` §4 的依赖倒置）。
+  virtual int NativeFd() const { return -1; }
+
   // 读满 n 字节；不足则报 `kUnavailable`（只在"长度已承诺"的场景用）
   Result<void> ReadFully(char* out, std::size_t n);
   // 读到 EOF；超过 max_bytes 立即报错（不做无界累积）

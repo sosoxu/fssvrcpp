@@ -602,6 +602,7 @@ checksum = storageUtil.getChecksum(persistentLocation)
 | ★ `ioEngine` | string | `UseCasePorts.io_engine`（组合根的 `io_engine_active`） | **当前生效**的 I/O 引擎名。当前实现恒为 `"blocking"`（ADR-010 的 U1~U4 未满足） |
 | ★ `ioUringAvailable` | bool | `UseCasePorts.io_uring_available`（`sys::IoEngineProbe::available()`） | **宿主能力探测结果**：本部署的内核/seccomp 是否允许 `io_uring_setup`。见下方 ⚠️ |
 | ★ `instanceId` | string | `app::GetInfo` ← `UseCasePorts.instance_id`（组合根算出的 `effective_instance_id`） | 本进程的**实例身份**。`deployment.mode=multi` 且 `deployment.instance_id` 未设置/为默认 `local` 时，组合根会**自动生成**一个唯一 id ⇒ 该值是**每进程**的，不是每配置的。用它可把进程映射到 `instance_registry` 的对应行与 `.fss_probe.<instance_id>` 文件（E1a） |
+| ★ `largeFilePlane` | string | `app::GetInfo` ← `UseCasePorts.large_file_plane`（组合根算出的数据面形态） | 大文件**下载**数据面（ADR-006）的**实际形态**：`disabled`（默认，未启用）/ `sendfile`（已启用且 `use_sendfile=true`）/ `userspace`（已启用但 `use_sendfile=false`）。**恒渲染**。⚠️ `sendfile` 表示"配置允许零拷贝"，**不**保证每个请求都走了零拷贝（来源没有原生 fd 时会回退用户态 pump，功能不变）——"这一秒真的走了没有"看 `/metrics` 的 `fss_large_file_plane_{sendfile,userspace}_*`（R11） |
 
 > ⚠️ **`ioUringAvailable=true` 只表示"这台机器 / 这个 seccomp 下 io_uring 可用"，
 > 不表示"服务正在使用 io_uring"**（C9.30 / ADR-010 的 R11）。引擎实现尚未交付 ⇒
@@ -820,17 +821,21 @@ P8-D05，普通构建碰不到）。显式标记把这个判定变成**确定性
 | `InfoResponse.io_engine` | `ioEngine` | ❌ **扩展字段**（C9.30 / ADR-010 的 R11；与 REST 同源） |
 | `InfoResponse.io_uring_available` | `ioUringAvailable` | ❌ **扩展字段**（C9.30；**可用 ≠ 已启用**，见 §2.12） |
 | `InfoResponse.instance_id` | `instanceId` | ❌ **扩展字段**（E1a；与 REST 同源） |
+| `InfoResponse.large_file_plane` | `largeFilePlane` | ❌ **扩展字段**（ADR-006 / R11；与 REST 同源；`disabled` \| `sendfile` \| `userspace`） |
 | `StorageZone` / `StorageDriver` / 各扩展 RPC | — | ❌ **扩展** |
 
-> **字段号约定**（`InfoResponse`）：既有字段占 `1..9`（`group_id`…`auth_mode`），三个
-> 扩展字段取 **10 / 11 / 12**（`io_engine` / `io_uring_available` / `instance_id`）——
-> **不改动任何既有字段号**，因此旧客户端按 `1..9` 解析不受影响（proto3 未知字段按规范忽略）。
-> `instance_id` 取 **12**。
+> **字段号约定**（`InfoResponse`）：既有字段占 `1..9`（`group_id`…`auth_mode`），四个
+> 扩展字段取 **10 / 11 / 12 / 13**（`io_engine` / `io_uring_available` / `instance_id` /
+> `large_file_plane`）—— **不改动任何既有字段号**，因此旧客户端按 `1..9` 解析不受影响
+> （proto3 未知字段按规范忽略）。`instance_id` 取 **12**，`large_file_plane` 取 **13**
+> （E1a 先占 12；本切片**不重编号**）。
 > `tests/integration/test_io_engine_exposure.cpp` 用真实 proto3-JSON 序列化断言
 > `json_name` 逐字对齐（C7.5），并记录 proto3"默认值省略"这一既有语义（`false` 会被
 > proto3-JSON 省略，而 REST 会渲染 `"ioUringAvailable":false` —— 两者语义一致）。
 > `tests/integration/test_instance_identity_exposure.cpp`（`[e1a]`）同样用 proto3-JSON
 > 钉住 `instanceId` 的 `json_name`。
+> `largeFilePlane` 的 REST 侧由 `tests/integration/test_large_file_plane.cpp`（`[adr006]`）
+> 钉住（`disabled`/`sendfile`/`userspace` 三态各出现一次）。
 
 ### 4.6 审计与事件的操作名（C8.6/C8.7）
 
@@ -1002,7 +1007,8 @@ REST 与 RPC 两次调用会生成**不同的**签名 URL（含不同时间戳/n
 | 远端 schema 校验器 | **出站** POST 到 `schema.remote.base_url`（运维给的完整 URL） | 配置驱动（`schema.validator=remote`）；不新增入站路径 | 关闭（`noop`，不发请求） |
 | 事件 webhook（出站） | **出站** POST 到 `events.webhook.url`（运维给的完整 URL，**不追加路径**） | 配置驱动（`events.publisher=webhook`）；不新增入站路径 | 关闭（`events.publisher=log`，默认；`none` = 显式关闭且不发请求） |
 | **按需 GC（入站扩展）** | `POST /api/file/v2/gc:run` | `/v2` 下的**新路径**（`gc:run` 不是上游端点；字段用 snake_case） | 启用（需 `service.file.admin`；与 `gc.enabled` **无关**） |
-| `/v2/info` 的 `authMode` / `ioEngine` / `ioUringAvailable` / `instanceId` | `GET /api/file/v2/info` 的**新增响应字段**（camelCase） | 既有端点上的**追加字段**（不改既有字段名/语义；不改任何状态码） | 恒渲染 `ioEngine`/`ioUringAvailable`/`instanceId`（`authMode` 非空时渲染） |
+| `/v2/info` 的 `authMode` / `ioEngine` / `ioUringAvailable` / `instanceId` / `largeFilePlane` | `GET /api/file/v2/info` 的**新增响应字段**（camelCase） | 既有端点上的**追加字段**（不改既有字段名/语义；不改任何状态码） | 恒渲染 `ioEngine`/`ioUringAvailable`/`instanceId`/`largeFilePlane`（`authMode` 非空时渲染） |
+| **大文件下载数据面（入站扩展，ADR-006）** | 第二个监听面上的 `GET/HEAD /api/file/v1/transfer/{token}` | **同一个端点路径/同一个 handler**，只是换了一个可选的监听面（配置驱动：`server.http.large_file_plane.enabled`） | 关闭（默认 `false`：不建监听；`/v2/info` 的 `largeFilePlane=disabled`） |
 
 **原则**：任何扩展都**不得**修改 OSDU 端点的既有状态码、字段名或字段语义。
 扩展只能以"新端口 / 新路径段 / 新响应头 / 配置开关"的形式存在。
@@ -1184,6 +1190,7 @@ datasetDetails : {"topic":T,"kind":"datasetDetails",
 | `tests/integration/test_instance_identity_exposure.cpp` | §2.12 的 `instanceId`（恒渲染 + camelCase + **proto3-JSON `json_name`** + REST/gRPC 同源 + multi 自动生成与 `instance_registry` 最新心跳行一致）+ `instance_registry` **运行期**陈旧行清理（含启动期清理回归与"指标族只在 PG 模式存在"反面对照） | 10 |
 | `tests/integration/test_upload_flow_posix.cpp` | 端到端：uploadURL→PUT→metadata→downloadURL→GET→delete | 4 |
 | `tests/integration/test_upload_flow_s3.cpp` | 同上，S3 驱动 + mock-S3 独立验签 | 5 |
+| `tests/integration/test_large_file_plane.cpp` | §2.12 的 `largeFilePlane` + ADR-006 下载数据面：基本/ Range 矩阵 / 鉴权租户 / 硬化 / 零拷贝计数 / 连接上限 / RSS / **等价性矩阵** / `enabled=false` / HEAD / 访问日志字段同源 / 启动失败 exit 78（P1~P12；`[adr006]`） | 13 |
 
 **门槛规则**：阶段 N 的测试失败 → 不得进入阶段 N+1。
 阶段测试证据（命令、输出摘要、结论）归档到 `docs/test-evidence/phaseN.md`。

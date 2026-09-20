@@ -149,6 +149,10 @@ class PosixBlobStore final : public domain::IBlobStore {
                         const domain::PutOptions& options) override;
   fss::Result<void> get(const domain::ObjectRef& ref, bytes::ByteSink& sink,
                         const domain::ByteRange& range) override;
+  //  ★ ADR-006：给出持有**原生 fd** 的只读来源（`sendfile` 的数据面用）。
+  //    语义与 `get()` 一致；`storage.posix.fadvise_random` 同样在 open 后下发。
+  fss::Result<std::shared_ptr<bytes::ByteSource>> OpenNativeRead(
+      const domain::ObjectRef& ref) override;
   fss::Result<domain::ObjectStat> stat(const domain::ObjectRef& ref) override;
   fss::Result<void> remove(const domain::ObjectRef& ref) override;
   fss::Result<domain::ObjectStat> copy(const domain::ObjectRef& from,

@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <span>
@@ -78,6 +79,23 @@ class IBlobStore {
   virtual Result<SignedLocation> presign_get(const ObjectRef&, const PresignOptions&) = 0;
   virtual Result<void> put(const ObjectRef&, bytes::ByteSource&, const PutOptions&) = 0;
   virtual Result<void> get(const ObjectRef&, bytes::ByteSink&, const ByteRange&) = 0;
+
+  //  ★ ADR-006：**可选**的零拷贝能力 —— 打开一个"持有原生 fd 的字节源"。
+  //    语义与默认值：
+  //      · 默认实现返回 `kUnimplemented`，表示"该驱动没有原生 fd"（内存/S3 都是如此）
+  //        → 调用方**必须**回退到用户态拷贝（`get()` 或普通 `Read`）。这是**唯一**
+  //        允许的探测方式：能力以"调用结果"表达，而不是让上层去问驱动类型。
+  //      · POSIX 驱动覆盖它，返回一个 `NativeFd() >= 0` 的来源（`sendfile` 可直读）。
+  //      · 返回的源与 `get()` 读到的是**同一个对象**，`Size`/`Seek` 语义一致。
+  //    为什么放在端口上（而不是让组合根 `dynamic_cast` 到具体驱动）：R12 要求上层的
+  //    能力分支只认端口；加一个 defaulted 虚函数让"没有该能力的驱动"自动得到一个
+  //    明确的 `kUnimplemented`，而不是编译期分支。
+  virtual Result<std::shared_ptr<bytes::ByteSource>> OpenNativeRead(const ObjectRef& ref) {
+    (void)ref;
+    return Err(ErrorKind::kUnimplemented,
+               "该存储不支持原生 fd 读取（调用方需回退到用户态拷贝）");
+  }
+
   virtual Result<ObjectStat> stat(const ObjectRef&) = 0;
   virtual Result<void> remove(const ObjectRef&) = 0;
   virtual Result<ObjectStat> copy(const ObjectRef& from, const ObjectRef& to) = 0;

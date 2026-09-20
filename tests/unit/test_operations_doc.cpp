@@ -200,7 +200,7 @@ TEST_CASE("★ C9.9 operations.md 覆盖 example 的全部叶子键且不写不�
 //    ③ 文档正文里声明的数字也必须一致（防止只改表格不改正文）。
 //  ★ 只认"最后一列以状态标记开头"的行：同一个键在别处（如 §5.1 的档位表）出现不算。
 // =============================================================================
-TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 130 / 拒绝启动 15 / 已读但无效果 12）",
+TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 137 / 拒绝启动 14 / 已读但无效果 6）",
           "[phase10][docs][c10.11]") {
   const std::string example_path = std::string(FSS_REPO_ROOT) + "/config/fss.example.json";
   const std::string doc_path = std::string(FSS_REPO_ROOT) + "/docs/operations.md";
@@ -258,13 +258,13 @@ TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 130 / 拒绝启�
   REQUIRE(unmarked.empty());
   INFO("生效=" << n_effective << " 拒绝启动=" << n_reject << " 已读但无效果=" << n_ineffective
                << " 合计=" << leaves.size());
-  REQUIRE(n_effective == 130);
-  REQUIRE(n_reject == 15);
-  REQUIRE(n_ineffective == 12);
+  REQUIRE(n_effective == 137);
+  REQUIRE(n_reject == 14);
+  REQUIRE(n_ineffective == 6);
   REQUIRE(n_effective + n_reject + n_ineffective == leaves.size());
   //  正文声明的数字也必须一致（防止"只改表格、不改正文"）
-  REQUIRE(doc.find("生效 130 / 拒绝启动 15 / 已读但无效果 12") != std::string::npos);
-  REQUIRE(doc.find("**130 + 15 + 12 = 157**") != std::string::npos);
+  REQUIRE(doc.find("生效 137 / 拒绝启动 14 / 已读但无效果 6") != std::string::npos);
+  REQUIRE(doc.find("**137 + 14 + 6 = 157**") != std::string::npos);
 }
 
 // =============================================================================
@@ -277,7 +277,7 @@ TEST_CASE("★ C10.11 operations.md 三态计数自洽（生效 130 / 拒绝启�
 //  漂移类（`docs/04` 的"陈旧数字复活"）。护栏做法：
 //    ① 从 `docs/operations.md` 取**权威三元组**（`std::regex` 的第一次匹配，默认 flags
 //       —— ECMAScript 的 `\s` 覆盖换行，因此 `runbook.md` 里跨行书写的三元组也能匹配）；
-//       要求恰为 130/15/12、N+M+K == 157，并要求正文含字面 `**130 + 15 + 12 = 157**`；
+//       要求恰为 137/14/6、N+M+K == 157，并要求正文含字面 `**137 + 14 + 6 = 157**`；
 //    ② 扫描**每一个**受管文件的**每一处**该正则，任何一处三元组 != 权威值 → 失败，
 //       并报出 `文件:行`（含多处时的全部位置）。
 //
@@ -316,16 +316,16 @@ TEST_CASE("★ E1b 三态计数跨文档一致（权威值取自 operations.md�
   //  ---- 抽取器小自证（R1：判据本身要能失败）----
   {
     int n = 0, m = 0, k = 0;
-    REQUIRE(extract("……（生效 130 / 拒绝启动 15 / 已读但无效果 12）……", 0, &n, &m, &k));
-    REQUIRE((n == 130 && m == 15 && k == 12));
+    REQUIRE(extract("……（生效 137 / 拒绝启动 14 / 已读但无效果 6）……", 0, &n, &m, &k));
+    REQUIRE((n == 137 && m == 14 && k == 6));
     //  跨行（runbook.md 的真实形态）：`\s` 必须覆盖换行
     n = m = k = 0;
-    REQUIRE(extract("清单（生效 130 / 拒绝启动 15 /\n已读但无效果 12；E1b 后）", 0, &n, &m, &k));
-    REQUIRE((n == 130 && m == 15 && k == 12));
-    //  反面对照：历史净变化条目里的 `129/15/13` **不带三态词**，不得被当成一处声明
+    REQUIRE(extract("清单（生效 137 / 拒绝启动 14 /\n已读但无效果 6；ADR-006 后）", 0, &n, &m, &k));
+    REQUIRE((n == 137 && m == 14 && k == 6));
+    //  反面对照：历史净变化条目里的 `130/15/12` **不带三态词**，不得被当成一处声明
     //  （否则 operations.md 的历史日志会自己把自己判失败）。
     n = m = k = 0;
-    REQUIRE_FALSE(extract("三态从 **129/15/13** 变为 **130/15/12**", 0, &n, &m, &k));
+    REQUIRE_FALSE(extract("三态从 **130/15/12** 变为 **137/14/6**", 0, &n, &m, &k));
   }
 
   //  ---- ① 权威值：docs/operations.md 的第一次匹配 ----
@@ -336,11 +336,11 @@ TEST_CASE("★ E1b 三态计数跨文档一致（权威值取自 operations.md�
   INFO("权威文件: " << operations_path);
   REQUIRE(extract(operations_text, 0, &auth_n, &auth_m, &auth_k));
   INFO("权威三元组 = " << auth_n << "/" << auth_m << "/" << auth_k);
-  REQUIRE(auth_n == 130);
-  REQUIRE(auth_m == 15);
-  REQUIRE(auth_k == 12);
+  REQUIRE(auth_n == 137);
+  REQUIRE(auth_m == 14);
+  REQUIRE(auth_k == 6);
   REQUIRE(auth_n + auth_m + auth_k == 157);
-  REQUIRE(operations_text.find("**130 + 15 + 12 = 157**") != std::string::npos);
+  REQUIRE(operations_text.find("**137 + 14 + 6 = 157**") != std::string::npos);
 
   //  ---- ② 受管文件逐处比对 ----
   //  ★ `AGENTS.md` 由父代理维护（本切片改它之外的文件）；这里只**读它**做一致性比对。

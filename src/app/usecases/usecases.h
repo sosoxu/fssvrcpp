@@ -93,6 +93,13 @@ struct UseCasePorts {
   //      这正是 R11 要的"探测结果可见"——避免运维把"可用"读成"已启用"。
   std::string io_engine = "blocking";
   bool io_uring_available = false;
+  //  ★ ADR-006（R11）：大文件下载数据面的**实际形态**必须可见：
+  //    `"disabled"`（未启用，默认）/ `"sendfile"`（启用且 `use_sendfile=true`）/
+  //    `"userspace"`（启用但 `use_sendfile=false`）。
+  //  ⚠️ 这是**数据面的配置形态**，不是"这一秒每个请求都走了零拷贝"：
+  //    `"sendfile"` 仍会在"来源没有原生 fd"（内存/S3 驱动）时回退到用户态 pump。
+  //    两条协议从 `GetInfo` 取同一份值 ⇒ 一致性按构造保证（与 `io_engine` 同一纪律）。
+  std::string large_file_plane = "disabled";
   //  ★ C10.13：`observability.audit_fail_closed`。
   //    `true` → 审计写入失败让**请求失败**（契约 §5 → 500），绝不"审计丢了还报成功"；
   //    `false`（默认，= 接线前的行为）→ 审计失败非致命，只影响记录本身。
@@ -231,6 +238,9 @@ struct VersionInfo {
   //      文件。没有这个字段时，runbook 的若干诊断步骤只能写"去看启动横幅或查 PG"。
   //    与 `auth_mode` / `io_engine` 同一条纪律：只在组合根计算一次，这里只转发。
   std::string instance_id;  // → JSON `instanceId` / proto `instance_id`
+  //  ★ ADR-006：数据面形态（`UseCasePorts::large_file_plane` 的原值转发）。
+  //    REST 键名 `largeFilePlane` / proto `large_file_plane`。
+  std::string large_file_plane;  // → JSON `largeFilePlane` / proto `large_file_plane`
 };
 
 // =============================================================================

@@ -1116,7 +1116,7 @@ fssvrcpp/
 | **禁止在读路径算校验和** | 否则范围读退化为 O(文件大小)。**硬性禁令**，有专门回归测试 |
 | Range 处理 | 声明**完整** `content_length`，由 httplib 计算 `(offset,length)`；`fss_http` 只做越界/416 归一化 |
 | I/O 引擎 | **默认 `blocking`**（`pread`/`pwrite` + 有界线程池，到处能跑）；`IIoEngine` 抽象保留 `uring` 可选实现（启动探测 + 回退）。**默认容器 seccomp 阻断 io_uring（实测 EPERM）** → [ADR-010](adr/ADR-010-io-engine-choice.md) |
-| 零拷贝 | **ADR-006（已采纳方向，P9 定稿）**：大文件数据面走自持 socket + `sendfile`（循环处理 >2 GiB 上限）；**实现未交付**。受控 A/B（同一负载生成器）实测 `sendfile` 比 httplib 内容提供者快 **2.12x**（几何平均；~~旧值 ~5–7x 来自不同探针的拼装比较，方法学不成立，已作废~~）。`sendfile` 比 `pread+write` 快 **2.05x**、每 GiB CPU 少 **42%**（探针） |
+| 零拷贝 | **ADR-006（下载面已交付；P9 受控复核定方向，本轮落地）**：大文件**下载**数据面走自持 socket + `sendfile`（循环处理 >2 GiB 上限）；进程内第二个监听面（方案③），复用控制面**同一个**已包装 handler；`server.http.large_file_plane.enabled=false` **默认关闭**。受控 A/B（同一负载生成器）实测 `sendfile` 比 httplib 内容提供者快 **2.12x**（几何平均；~~旧值 ~5–7x 来自不同探针的拼装比较，方法学不成立，已作废~~）。`sendfile` 比 `pread+write` 快 **2.05x**、每 GiB CPU 少 **42%**（探针）。⚠️ **范围**：只 `GET/HEAD`（`PUT` 留在控制面）；**多段 Range 降级为 200 全量**；`sendfile` 绕过 `get()` ⇒ 计数点分裂（见 §5.bb）。⚠️ ADR-006 §6 第 5 条（真实存储/网卡复核）**未完成** |
 | io_uring | ~~ADR-006 范围已扩展：数据面文件侧用 io_uring~~ ⚠️ **已由 [ADR-010](adr/ADR-010-io-engine-choice.md) 取代**：`io_engine` 默认 `blocking`，`uring` 为**可选加速**（默认容器 seccomp **阻断**，实测 `EPERM`）。探针数字仍有效（1 线程 132,934 IOPS vs 128 线程 118,148；写路径 1 线程 20,497 文件/s），但它证明的是"省线程"，不是"提高上限"；**ADR-006 定稿后不要求 io_uring** |
 | 页缓存 | 随机读 `posix_fadvise(RANDOM)`；大段顺序读后可 `DONTNEED`（可配） |
 | 超时 | 数据面**无整体超时**，只有"空闲无进展"超时，否则 TB 级传输会被打断 |
@@ -1236,7 +1236,7 @@ flush、`BeforeCommit` 把"事务开着"变成确定性可观察点）、`ISqlit
 | R-08 | 领域层被"便利地"污染（如直接 include json/http） | 中 | 中 | 编译期目标图 + 源码检索双护栏（§4） | 护栏测试被绕过或禁用 |
 | **R-12** | **`TCP_NODELAY` 未开启导致小请求 40ms 停顿** | 高 | **已实测** | 强制 `set_tcp_nodelay(true)` + 阶段 1 门槛断言（含"关闭时必须复现 40ms"的自证测试） | 升级 httplib 后默认值变化；见 `docs/05-capacity-and-concurrency.md` §1.2 |
 | **R-13** | **线程池过小 = 并发硬上限**（默认 15） | 高 | **已实测** | 显式配置 + 控制面/数据面池分离 + 503 背压 + 容量门槛 | 见 §1.3 |
-| **R-14** | 集中存储模式下大文件传输占用线程且无法零拷贝 | 高 | **已实测** | [ADR-006](adr/ADR-006-large-file-data-plane.md)：受控复核 **2.12x ≥ 1.5x → 采纳 sendfile 方向**（实现未交付，落地必须与控制面校验同源、可关闭）；在此之前**显式接受** httplib 路径的带宽/CPU 上限 | 真实存储/网卡上复核 <1.5x；或"复用控制面校验"做不到；或 TLS 成为硬需求（ADR-006 §7） |
+| **R-14** | 集中存储模式下大文件传输占用线程且无法零拷贝 | 中 | **已交付（下载面）** | [ADR-006](adr/ADR-006-large-file-data-plane.md)：受控复核 **2.12x ≥ 1.5x → 采纳 sendfile 方向**，**下载面已落地**（进程内第二个监听面；与控制面校验**同源**、可关闭、默认关闭）。⚠️ **剩余风险**：真实存储/网卡上的比值未测（本环境 loopback 绝对值无结论，ADR-006 §6.5 未完成）；TLS 一旦成为硬需求需重评（ADR-006 §7.3） | 真实存储/网卡上复核 <1.5x；或"复用控制面校验"做不到；或 TLS 成为硬需求（ADR-006 §7） |
 | **R-15** | 小文件逐文件 fsync 把上限压到 ~1.2k/s | 高 | **已实测** | `storage.posix.durability=batch`（ADR-008 的两阶段批提交，C9.23 交付）+ `per_file` 精确档 + SQLite `synchronous=NORMAL` + 有界写并发 8 | 见 §1.8；⚠️ `batch` 的旧实测数字（`kBySize` 近似）已作废，见 §13.4 |
 | **R-16** | 容量测量方法本身不可信（进程内客户端压测） | 中 | **已发生** | 负载生成器必须独立进程 + 绑核；保留错误方法探针作对照；门槛 C9.11 | 见 `docs/appendix/capacity-probe/README.md` |
 | **R-23** | **多实例下 tmp 名冲突导致静默内容错乱** | 高（数据悄悄被换成别人的） | ADR-009 M1；tmp 名含实例标识；门槛 C6.13 | 已实测复现 21/40 |
@@ -1268,7 +1268,7 @@ flush、`BeforeCommit` 把"事务开着"变成确定性可观察点）、`ISqlit
 | R-08 领域层被污染 | ✅ | CMake 目标图（编译期）+ `test_layering_guard` 源码检索 + `scripts/verify_link_graph.sh`（含越层注入自证） | — |
 | R-12 `TCP_NODELAY` | ✅ | 强制 `set_tcp_nodelay(true)`；H-2/C1.2 自证（关闭时复现停顿）；容量基线顶部标注协议 | — |
 | R-13 线程池=并发上限 | ✅ | `max_connections ≤ worker_threads` 启动校验 + 503 背压（C9.3 ⑤）+ 容量基线（C9.11：c4 之后吞吐不再提升，延迟显著上升） | 生产线程/连接取值需按目标硬件重算（C9.14 未验证） |
-| R-14 大文件零拷贝 | 🟡 | ADR-006 受控复核 **2.12x** → 采纳方向（`docs/test-evidence/phase9-adr006.md`）；落地边界与 4 条重开条件已定 | **sendfile 数据面未实现**（判据只要求定稿）：在此之前**显式接受** httplib 路径的上限 |
+| R-14 大文件零拷贝 | 🟡 | ADR-006 受控复核 **2.12x** → 采纳方向（`docs/test-evidence/phase9-adr006.md`）；**下载面已交付**（`tests/integration/test_large_file_plane.cpp` P1~P12；`docs/test-evidence/phase10.md` §25），落地边界与 4 条重开条件已定 | **剩余未验证**：真实存储/网卡上的受控基线（ADR-006 §6.5 未完成，脚本移交生产）、TLS/mTLS、真实跨主机数据面、>2 GiB 对象（实测最大 1 GiB）；`splice`/上传加速刻意未做 |
 | R-15 逐文件 fsync | ✅ | 三档 `durability` + ADR-008 的**真两阶段批提交**（C9.23：`tests/integration/test_posix_batch_commit.cpp` 的摊销/顺序不变量/失败路径判据；真实进程 `fss_posix_syncfs_total`） | ⚠️ P9 的 4.3x（`per_file` 110 → ~~`batch` 469~~ files/s，C9.15）是在 P4 交付**之前**测的（`kBySize` 近似）→ **`batch` 数字已作废**，本切片未重测；组合根现已接 JSON 配置（切片 1） |
 | R-16 容量测量方法 | ✅ | 独立进程 + 互不重叠绑核 + 每点位 3 次取中位数（`scripts/bench_baseline.sh`）+ 保留错误方法探针（`docs/appendix/capacity-probe/`）+ 门槛 C9.11；本轮新增"批量删除不得与测量并发""报告型点位"两条方法学约束 | 跨会话机器漂移 ≈40%（共享 WSL2 主机）⇒ 20% 判据的判定力受限，已如实登记 |
 | R-23 tmp 名冲突 | ✅ | tmp 名含 `instance_id`+`pid`+计数；`test_posix_tmp_names`（C6.13） | — |
@@ -1283,11 +1283,10 @@ flush、`BeforeCommit` 把"事务开着"变成确定性可观察点）、`ISqlit
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
 exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、`expiry.*` 接进组合根，
 并把 16 个未实现键改为"非默认值 → 拒绝启动"（后续切片与 C10.16 / C10.16 续 / 切片 4 / 切片 5 / **切片 6a（C10.18）** 继续收敛，当前三态为
-**生效 130 / 拒绝启动 15 / 已读但无效果 12**（E1b 后）；逐键登记在 `docs/operations.md` §1.2/§1.3）；
+**生效 137 / 拒绝启动 14 / 已读但无效果 6**（ADR-006 后）；逐键登记在 `docs/operations.md` §1.2/§1.3）；
 ② 多实例相关的 `one_filesystem_per_partition` 已接通（**E1b**：`true` 时启动期校验规则 A/B，
 违规 → exit 78；§1.2/§1.3.1 的该键行；`shared_mount_required` 已在 **B2b** 接通；
-§1.3.3 的「已读但无效果」清单已在 E1b 后**清空**）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ sendfile 数据面
-实现（ADR-006 §6 的门槛）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
+§1.3.3 的「已读但无效果」清单已在 E1b 后清空至「能力未实现」的 6 个键）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ ~~sendfile 数据面实现（ADR-006 §6 的门槛）~~ **已交付（本轮）**；剩余的是 ADR-006 **§6 第 5 条**（真实存储/网卡上的受控基线复核）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
 
 ---
 
@@ -1300,7 +1299,7 @@ exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、
 | [ADR-003](adr/ADR-003-storage-abstraction.md) | 以单一 `IBlobStore` 端口统一"集中存储"与"对象存储" | 已采纳 |
 | [ADR-004](adr/ADR-004-persistence-strategy.md) | 位置/元数据持久化：内置 SQLite + 可选远端 Storage Service | 已采纳（阶段 6 复核） |
 | [ADR-005](adr/ADR-005-s3-driver.md) | S3 驱动：**自研 SigV4**（OpenSSL）+ libcurl 数据面 + 原生预签名；编码/签名/寻址/错误映射约定与兼容矩阵 | 已采纳（P5 定稿；与 libcurl/Go SDK 的 4 处实测差异见其 §4） |
-| [ADR-006](adr/ADR-006-large-file-data-plane.md) | 大文件数据面：**采纳 `sendfile` 方向**（P9 受控复核几何平均 **2.12x ≥ 1.5x**），但**实现未交付**；落地必须与控制面校验**同源**、可关闭、默认仍走 httplib 内容提供者 | 已采纳（P9/C9.12 定稿；证据 `docs/test-evidence/phase9-adr006.md`） |
+| [ADR-006](adr/ADR-006-large-file-data-plane.md) | 大文件数据面：**采纳 `sendfile` 方向**（P9 受控复核几何平均 **2.12x ≥ 1.5x**）；**下载面已交付**（进程内第二个监听面，复用控制面**同一个**已包装 handler；可关闭、默认关闭）。⚠️ §6 第 5 条（真实存储/网卡复核）**未完成** | 已交付（下载面）/ §6 第 5 条未完成；证据 `docs/test-evidence/phase9-adr006.md` + `docs/test-evidence/phase10.md` §25 |
 | [ADR-007](adr/ADR-007-async-and-coroutines.md) | 异步/协程采纳策略：分层决策 + 量化触发条件（T1–T3），现在不整体重写 | 已采纳 |
 | [ADR-008](adr/ADR-008-write-durability-protocol.md) | 小文件写入耐久性协议：两阶段批提交（同步先行、改名后置），更正了 ADR-007 的错误数字 | 已采纳（含机器可检查的不变量验证） |
 | [ADR-009](adr/ADR-009-multi-instance-consistency.md) | 多实例一致性与共享状态设计：强一致控制面（PG）+ 租约 + 领导者选举 | 已采纳（5 个竞态已实测复现并验证修复） |

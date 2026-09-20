@@ -4,6 +4,7 @@
 #include "common/crypto/crypto.h"
 #include "common/fs/fs.h"
 #include "common/json/json.h"
+#include "infra/transfer/posix_file_byte_source.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -650,6 +651,17 @@ fss::Result<void> PosixBlobStore::get(const domain::ObjectRef& ref, bytes::ByteS
   ::close(fd);
   FSS_TRY(sink.Close());
   return Ok();
+}
+
+//  ★ ADR-006：POSIX 驱动是唯一有"原生 fd"的驱动，因此只有它覆盖 `OpenNativeRead`。
+//    语义与 `get()` 完全一致（同一个对象、同样的 `Size`/`Seek` 边界），只是把
+//    "用户态拷贝"换成"调用方可以直接 sendfile 的 fd"。
+//    `fadvise_random` 由来源在 open 时按同一配置下发（见 PosixFileByteSource::Open）。
+fss::Result<std::shared_ptr<bytes::ByteSource>> PosixBlobStore::OpenNativeRead(
+    const domain::ObjectRef& ref) {
+  FSS_TRY(path, ObjectPath(ref.container, ref.key));
+  FSS_TRY(source, PosixFileByteSource::Open(path, options_.fadvise_random));
+  return std::static_pointer_cast<bytes::ByteSource>(source);
 }
 
 fss::Result<domain::ObjectStat> PosixBlobStore::stat(const domain::ObjectRef& ref) {

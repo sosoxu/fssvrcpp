@@ -67,6 +67,10 @@ json::Value ToJson(const VersionInfoResponse& response) {
   //    实际上组合根总会把它设成至少 `"local"`（单实例默认值），因此非空是常态；
   //    这里不做空值判断，正是为了让"字段是否存在"只由**版本**决定。
   body["instanceId"] = response.instance_id;
+  //  ★ ADR-006/R11：数据面形态**恒渲染**（`disabled` | `sendfile` | `userspace`）——
+  //    与 `ioUringAvailable`/`instanceId` 同一条理由：一个"始终有意义"的字段在空值
+  //    时消失，会让运维分不清「本版本没有这个字段」与「字段存在但值为空」。
+  body["largeFilePlane"] = response.large_file_plane;
   return body;
 }
 

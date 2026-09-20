@@ -1138,6 +1138,9 @@ fss::Result<VersionInfo> GetInfo::Execute() {
   //  ★ E1a：实例身份的**唯一来源**仍是组合根（`ports_.instance_id`，multi 下可能
   //    是自动生成的）—— 这里只转发，**不重算**、不查 PG、不读配置。
   info.instance_id = ports_.instance_id;
+  //  ★ ADR-006：数据面形态只由组合根计算一次（R11/R12），这里只转发 —— 两条协议
+  //    （REST `/v2/info` 与 gRPC `InfoResponse`）因此读到**同一个**值。
+  info.large_file_plane = ports_.large_file_plane;
   return info;
 }
 

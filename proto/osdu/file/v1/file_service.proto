@@ -546,6 +546,17 @@ message InfoResponse {
   //    ⚠️ 字段号 12：1..11 已被占用，**不重编号**任何既有字段。
   //    ⚠️ 不用 `optional`：本仓库的 protobuf 是 3.12.4，不支持 proto3 optional。
   string instance_id = 12 [json_name = "instanceId"];
+  //  ★ 扩展字段（非 OSDU 规范，ADR-006 / R11）：大文件**下载**数据面的实际形态。
+  //    与 REST `/v2/info` 的 `largeFilePlane` **同源**（同一个 `app::GetInfo`
+  //    返回值，即组合根的 `UseCasePorts::large_file_plane`）：
+  //      · `"disabled"`  —— 未启用（默认；行为与接线前逐字一致，走 httplib）；
+  //      · `"sendfile"`  —— 第二个监听面已开，且允许零拷贝 `sendfile(2)`；
+  //      · `"userspace"` —— 第二个监听面已开，但 `use_sendfile=false`（一律用户态 pump）。
+  //    ⚠️ `"sendfile"` 表示"配置允许零拷贝"，**不**保证每个请求都走了零拷贝：
+  //       来源没有原生 fd（内存/S3 驱动）时会回退到用户态 pump，功能不变。
+  //    ⚠️ 字段号 13：1..12 已被占用（E1a 的 `instanceId` 是 12），**不重编号**。
+  //    ⚠️ 不用 `optional`：本仓库的 protobuf 是 3.12.4，不支持 proto3 optional。
+  string large_file_plane = 13 [json_name = "largeFilePlane"];
 }
 
 message ConnectedService {

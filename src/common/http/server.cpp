@@ -102,40 +102,10 @@ std::string JsonEscape(std::string_view s) {
 //  为什么必须自己生成：httplib 在解析失败时会给一个纯文本小页面（"Bad Request"），
 //  直接漏出去就破坏了错误体契约。适配层（P4）还没进来，所以这里先按契约形态输出。
 //  详细映射（含 OSDU 的固定消息）由 P4 的 ErrorMapping 接管，本层只保证"格式合法 + 状态正确"。
+//  匿名包装：保留既有的 `ErrorBody(options, status, detail)` 调用形态，
+//  实现转发到 `fss::http::ErrorBody`（**同源**；见 http.h 的说明）。
 std::string ErrorBody(const ServerOptions& options, int status, std::string_view detail) {
-  const char* message = "Error";
-  switch (status) {
-    case 400: message = "Bad Request"; break;
-    case 404: message = "Not Found"; break;
-    case 405: message = "Method Not Allowed"; break;
-    case 409: message = "Conflict"; break;
-    case 413: message = "Payload Too Large"; break;
-    case 416: message = "Range Not Satisfiable"; break;
-    case 429: message = "Too Many Requests"; break;
-    case 500: message = "Internal Server Error"; break;
-    case 501: message = "Not Implemented"; break;
-    case 502: message = "Bad Gateway"; break;
-    case 503: message = "Service Unavailable"; break;
-    default: break;
-  }
-  const std::string esc = JsonEscape(detail);
-  if (options.error_format == "legacy") {
-    std::string out = "{\"error\":{\"code\":" + std::to_string(status) + ",\"message\":\"" +
-                      message + "\",\"errors\":[";
-    if (!esc.empty()) out += "{\"reason\":\"" + esc + "\"}";
-    out += "]}}";
-    return out;
-  }
-  if (options.error_format == "api_error") {
-    std::string out = "{\"code\":" + std::to_string(status) + ",\"reason\":\"" + message +
-                      "\",\"message\":\"" + (esc.empty() ? std::string(message) : esc) + "\"}";
-    return out;
-  }
-  std::string out = "{\"code\":" + std::to_string(status) + ",\"message\":\"" + message +
-                    "\",\"details\":[";
-  if (!esc.empty()) out += "{\"reason\":\"" + esc + "\"}";
-  out += "]}";
-  return out;
+  return fss::http::ErrorBody(status, detail, options.error_format);
 }
 
 Response ErrorResponse(const ServerOptions& options, int status, std::string detail) {
@@ -754,18 +724,9 @@ struct Server::Impl {
 
   void AccessLog(const Request& req, const Response& res, std::int64_t duration_ms,
                  std::string_view note) {
-    if (!logger->Enabled(logging::Level::kInfo)) return;
-    logging::Fields fields;
-    fields.emplace_back("method", req.method_raw);
-    fields.emplace_back("path", req.path);
-    fields.emplace_back("status", static_cast<std::int64_t>(res.status));
-    fields.emplace_back("duration_ms", duration_ms);
-    if (!req.correlation_id.empty()) fields.emplace_back("correlation_id", req.correlation_id);
-    if (!req.remote_addr.empty()) fields.emplace_back("remote_addr", req.remote_addr);
-    if (!req.route_name.empty()) fields.emplace_back("route", req.route_name);
-    if (req.content_length >= 0) fields.emplace_back("content_length", req.content_length);
-    if (!note.empty()) fields.emplace_back("note", std::string(note));
-    logging::Info(*logger, "http_request", fields);
+    //  ★ ADR-006：字段集与 emitter 只有一份（`fss::http::LogAccess`）——
+    //    大文件数据面也调它，因此"两条路径的访问日志字段"按构造不会漂移。
+    fss::http::LogAccess(*logger, req, res, duration_ms, note);
   }
 
   static HeaderMap CopyHeaders(const httplib::Request& src) {
@@ -1394,6 +1355,64 @@ void Server::ResetStats() {
   impl_->stats = Stats{};
   impl_->stats.worker_threads = workers;
   impl_->stats.max_connections = max_conn;
+}
+
+// =============================================================================
+//  传输层公共件（**同源**；见 http.h）
+// =============================================================================
+std::string ErrorBody(int status, std::string_view detail, std::string_view error_format) {
+  const char* message = "Error";
+  switch (status) {
+    case 400: message = "Bad Request"; break;
+    case 404: message = "Not Found"; break;
+    case 405: message = "Method Not Allowed"; break;
+    case 408: message = "Request Timeout"; break;
+    case 409: message = "Conflict"; break;
+    case 413: message = "Payload Too Large"; break;
+    case 414: message = "URI Too Long"; break;
+    case 416: message = "Range Not Satisfiable"; break;
+    case 429: message = "Too Many Requests"; break;
+    case 431: message = "Request Header Fields Too Large"; break;
+    case 500: message = "Internal Server Error"; break;
+    case 501: message = "Not Implemented"; break;
+    case 502: message = "Bad Gateway"; break;
+    case 503: message = "Service Unavailable"; break;
+    default: break;
+  }
+  const std::string esc = JsonEscape(detail);
+  if (error_format == "legacy") {
+    std::string out = "{\"error\":{\"code\":" + std::to_string(status) + ",\"message\":\"" +
+                      message + "\",\"errors\":[";
+    if (!esc.empty()) out += "{\"reason\":\"" + esc + "\"}";
+    out += "]}}";
+    return out;
+  }
+  if (error_format == "api_error") {
+    std::string out = "{\"code\":" + std::to_string(status) + ",\"reason\":\"" + message +
+                      "\",\"message\":\"" + (esc.empty() ? std::string(message) : esc) + "\"}";
+    return out;
+  }
+  std::string out = "{\"code\":" + std::to_string(status) + ",\"message\":\"" + message +
+                    "\",\"details\":[";
+  if (!esc.empty()) out += "{\"reason\":\"" + esc + "\"}";
+  out += "]}";
+  return out;
+}
+
+void LogAccess(const logging::ILogger& logger, const Request& req, const Response& res,
+               std::int64_t duration_ms, std::string_view note) {
+  if (!logger.Enabled(logging::Level::kInfo)) return;
+  logging::Fields fields;
+  fields.emplace_back("method", req.method_raw);
+  fields.emplace_back("path", req.path);
+  fields.emplace_back("status", static_cast<std::int64_t>(res.status));
+  fields.emplace_back("duration_ms", duration_ms);
+  if (!req.correlation_id.empty()) fields.emplace_back("correlation_id", req.correlation_id);
+  if (!req.remote_addr.empty()) fields.emplace_back("remote_addr", req.remote_addr);
+  if (!req.route_name.empty()) fields.emplace_back("route", req.route_name);
+  if (req.content_length >= 0) fields.emplace_back("content_length", req.content_length);
+  if (!note.empty()) fields.emplace_back("note", std::string(note));
+  logging::Info(logger, "http_request", fields);
 }
 
 }  // namespace fss::http

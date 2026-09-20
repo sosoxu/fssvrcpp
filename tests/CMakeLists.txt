@@ -254,7 +254,7 @@ if(FSS_WITH_PG)
     SOURCES integration/test_instance_identity_exposure.cpp
     LIBS    fss_pg fss_app fss_http_adapter fss_grpc_adapter fss_blob_memory
             fss_location_memory fss_metadata_memory Threads::Threads
-    LABELS  "pg;integration;e1a")
+    LABELS  "pg;integration;e1a;phase10")
   add_dependencies(test_instance_identity_exposure fss_server)
   set_tests_properties(test_instance_identity_exposure PROPERTIES
     FIXTURES_REQUIRED pg
@@ -856,6 +856,20 @@ add_dependencies(test_io_engine_exposure fss_server)
 fss_add_test(test_partition_filesystem_check
   SOURCES integration/test_partition_filesystem_check.cpp
   LIBS    fss_blob_posix Threads::Threads
-  LABELS  "integration;e1b")
+  LABELS  "integration;e1b;phase10")
 add_dependencies(test_partition_filesystem_check fss_server)
 set_tests_properties(test_partition_filesystem_check PROPERTIES TIMEOUT 300)
+
+# =============================================================================
+#  ADR-006：大文件**下载**数据面（进程内第二个监听 socket + sendfile）
+#    P1~P10 见文件头；P11 = ADR-006 §6.2 的访问日志字段集同源。
+#    · 真实 `fss_server`（组合根）→ add_dependencies；
+#    · **无 pg 标签**（默认构建即全绿）；
+#    · P7 传输 ≥1 GiB ⇒ TIMEOUT 600。
+# =============================================================================
+fss_add_test(test_large_file_plane
+  SOURCES integration/test_large_file_plane.cpp
+  LIBS    fss_blob_posix fss_app fss_http_adapter fss_transfer Threads::Threads
+  LABELS  "integration;adr006;phase10")
+add_dependencies(test_large_file_plane fss_server)
+set_tests_properties(test_large_file_plane PROPERTIES TIMEOUT 600)

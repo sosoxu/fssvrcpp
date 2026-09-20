@@ -3668,7 +3668,7 @@ L2 规则与组合根接线（U2/U3 + W1），I2 只打掉接线而保留 L2（W
   （这是刻意的显式清单，避免把 `phase-status.md` 这类**只追加历史日志**误纳）。
 
 
-## 父代理独立复核
+## 父代理独立复核（E1b）
 
 **复核人：父代理（不采信子代理自报数字；以下每条都是我自己跑出来的）。**
 
@@ -3756,3 +3756,254 @@ test cases:  3 |  2 passed | 1 failed
   结构问题（重名标题）由我修正；
 - 未验证项以 §24.6 与 `AGENTS.md` §0.1 的登记为准（尤其：规则 B 在生产形态是空集、
   C9.24 干扰量级仍未测、`/dev/shm` 不等价于真实独立卷或挂载点）。
+
+---
+
+## 25. ADR-006（本切片）：sendfile 大文件数据面落地
+
+**目标**：把 ADR-006 的**方案 ③**（进程内自持 socket + `sendfile`）从"只采纳方向"落成
+**可运行的下载数据面**，且**不得出现第二套 HTTP 语义**（§4 第 1 条）、默认关闭、可观测、可回退。
+
+### 25.1 交付物
+
+| 层 | 交付物 | 说明 |
+| --- | --- | --- |
+| L1 | `src/common/bytes/bytes.h` 的 `ByteSource::NativeFd()` | 可选零拷贝能力；默认 `-1` = 必须回退用户态；fd 归来源所有 |
+| L1 | `src/common/http/large_file_plane.{h,cpp}` | 第二个监听 socket：请求解析 → 调**注入的** `fss::http::Handler` → 按 `sendfile`/用户态 pump 送出；Range 自帧 |
+| L1 | `src/common/http/http.h` 的 `ErrorBody(int,string_view,string_view)` / `LogAccess(...)` | 解析错误体与访问日志的**唯一**实现；httplib 包装层与数据面**同源**（字段/正文逐字一致） |
+| L2 | `src/infra/transfer/posix_file_byte_source.{h,cpp}` | `::open(O_RDONLY|O_CLOEXEC)` + `fstat` + `pread`（自有偏移、EINTR 重试）+ `Seek` 边界与 `BlobByteSource` 一致（越界 → `kInvalidArgument` "Seek 越界"）+ RAII `::close`；`fadvise_random` 与 `get()` 读路径同一条提示 |
+| L3 | `domain::IBlobStore::OpenNativeRead`（**defaulted**） | 默认 `kUnimplemented`（内存/S3）；**只有 POSIX 覆盖** |
+| L2 | `MeteredBlobStore::{OpenNativeRead,RecordNativeRead}` + `MeteredNativeSource` | 转发能力；用户态拷贝在 `Read` 上记字节/`op=get`，`sendfile` 由数据面调 `RecordNativeRead` 补记**同族同标签** |
+| L5 | `Router::BuildTransferGetHandler()` | 把**已包装**的 `transfer.get` handler 暴露给组合根；`Register` 与数据面用的是**同一个** |
+| 组合根 | `src/main/server_main.cpp` | 7 个键接线；`transfers.open_get` 优先 `OpenNativeRead`（`kUnimplemented` 才回退 `BlobByteSource`）；`/v2/info` 的 `largeFilePlane`；横幅 `plane bind :`；启动失败 → exit 78；`Stop()` 在统一退出路径上 |
+| 契约/协议 | `dto.{h,cpp}`、`proto` 字段 **13** `large_file_plane`、`grpc_dto.cpp`、`docs/03-api-contract.md` §2.12/§4/§7、`docs/operations.md` | `disabled` \| `sendfile` \| `userspace`，REST 与 gRPC 同源（R11） |
+| 测试 | `tests/integration/test_large_file_plane.cpp` | P1~P12（P11 = §6.2 的访问日志字段同源；P12 = 数据面端口被占 → exit 78），`LABELS "integration;adr006"`、`TIMEOUT 600`、**无 pg 标签**、`add_dependencies(... fss_server)` |
+
+### 25.2 命令与输出摘要
+
+```text
+$ cmake -S . -B build && cmake --build build -j4
+[100%] Built target ...（0 error；新增文件 0 warning）
+
+$ ./build/bin/test_large_file_plane
+All tests passed (648 assertions in 13 test cases)          # 正常构建
+
+$ ctest --test-dir build -L adr006
+1/1 Test #100: test_large_file_plane ... Passed   ~13 s
+
+$ ctest --test-dir build          # 全量（含新增 1 个测试）
+100% tests passed, 0 tests failed out of 90                  # 接线前 89 → 本切片 +1
+```
+
+> ★ **如实登记（一次 flake）**：本切片期间有一次 `ctest --test-dir build -j4` 报
+> `99% tests passed, 1 tests failed out of 90`，失败的是**与本切片无关的既有**
+> `test_sqlite_group_commit`（phase10 的并发/时序用例）；`--rerun-failed` 单跑
+> **Passed 2.68 s**，随后整轮 `-j4` 又 **100% / 90**。这是**并行负载下的既有时序敏感性**，
+> 不是本切片引入的失败；不把它写成"全绿"，也不据此改判据。
+
+```text
+$ ./build/bin/test_operations_doc
+All tests passed (43 assertions in 3 test cases)
+
+$ ./scripts/check_docs.sh
+全部检查通过（D1~D5）
+```
+
+**P7（RSS / ≥1 GiB）**：直接落盘 1 GiB **非稀疏**对象（`RepeatingSource`，不经控制面），
+自签 token 指向它，数据面下载并**只丢弃**字节。
+
+```text
+对象大小 1073741824 字节
+服务进程 VmHWM 增长 240 KiB（上限 65536 KiB）
+sendfile_bytes_total 增量 == 1073741824（一次调用循环到 EOF）
+All tests passed
+```
+
+**吞吐（本环境 = WSL2 + 虚拟盘 + loopback + 页缓存，单连接，`curl -w %{speed_download}`，
+各 3 次；★ 不是产品数字、不迁移）**：
+
+| 路径 | 3 次（MiB/s） | 中位数 |
+| --- | --- | --- |
+| 控制面（httplib 内容提供者） | 2955.6 / 2938.6 / 3024.4 | **2956 MiB/s** |
+| 数据面（`sendfile`） | 7204.2 / 6963.4 / 7004.8 | **7005 MiB/s** |
+| 比值 | —— | **2.37x** |
+
+> ⚠️ 上述绝对值是**页缓存已热 + loopback** 的路径成本，**不含磁盘 I/O、不含真实网卡**，
+> 与 ADR-006 §5 的"绝对值无结论"一致；可复现的是**同条件紧邻测得的比值**。
+
+### 25.3 等价性矩阵结果（P8）
+
+同一批 14 个请求分别打到控制面端口与数据面端口，逐字段比对
+`status` / `Content-Type` / `Content-Range` / `Content-Length` / `X-FSS-Error-Kind` /
+`Retry-After` / body 字节：
+
+| 类别 | 行 | 结果 |
+| --- | --- | --- |
+| 正常 | `full` / `range-0-99` / `range-100-` / `range-suffix` | ✅ 全字段一致 |
+| 错误 | `range-unsatisfiable`(416) / `range-malformed`(200) / `wrong-partition`(403) / `tampered-token`(401) / `missing-sig`(401) / `missing-object`(404) / `duplicate-content-length`(400) / `cl-plus-chunked`(400) / `unknown-path`(404) | ✅ 全字段一致（含 `X-FSS-Error-Kind` 与 body 字节） |
+| **唯一的文档化差异** | `multi-range`（`bytes=0-4,6-9`） | 控制面 **206 + `multipart/byteranges`**；数据面 **200 全量**（ADR-006 §6.1 的"多段降级"）——P2/P8 **双向断言**两侧的实际值，不静默 |
+
+**另有 1 处不在矩阵内的实测差异（P4，已登记）**：**超长 URI**（target ≥ 8180）数据面回
+**414**，而控制面因 httplib 的 header reader 在 URI 长度检查**之前**失败而**不返回任何 HTTP
+响应**（`transport_ok=false`）。因此"与控制面同状态"在这一条上**不可满足**，P4 显式断言
+"数据面 414 / 控制面无响应"，并在 `docs/00-final-design.md` §5.bb、`docs/runbook.md` §3.1 登记。
+
+### 25.4 R1 注入表（每条：注入 → 重建 → 失败断言 → 回退 → 重建 → 全绿）
+
+| id | 注入 | 观察到的失败（原文） | 结论 |
+| --- | --- | --- | --- |
+| **I1** | 组合根让数据面**绕过** `router.BuildTransferGetHandler()`，自己调 `transfers.open_get`（`partition` 传空、错误不映射） | `test_large_file_plane "★ P3*"`：`REQUIRE( p.status == 401 )` → `200 == 401`；`200 == 403`；`200 == 404`（4 断言失败） | 抓得住"第二套 HTTP 语义" |
+| **I2** | `PosixFileByteSource::NativeFd()` 恒 `return -1` | P5：`REQUIRE( MetricValue(after_plane, "fss_large_file_plane_sendfile_calls_total") == sf_calls0 + 1 )` → `-1 == 1`；**P1 也在它的 sendfile 断言上失败**（`-1 == 1`）；**P2 全绿（154 断言）** | P5（与 P1 的零拷贝子句）**度量零拷贝**；P2 度量**正确性**。★ 任务书预期"P1 保持绿色"**不成立** —— 因为 P1 自己就按任务书要求断言了 sendfile 计数 |
+| **I3** | `Prepare()` 在算 Range 之前直接 `return`（永远 200 全量） | P2：`REQUIRE( p.status == 206 )` → `200 == 206` ×3、`200 == 416`；P8：`REQUIRE( all_diffs.empty() )` → false，明细 `range-0-99：status 控制面=[206] 数据面=[200]` 等 | Range 判定是承重的 |
+| **I4** | `AcceptLoop` 去掉 `now > max_connections` 判定 | P6：`REQUIRE( second.transport_ok )` → `false`（第二条被排队、单 worker 被第一条占住 ⇒ 永不响应） | 在途上限是承重的 |
+| **I5** | 删掉 worker 的 `pthread_sigmask(SIGPIPE)` 与 `SendAll` 的 `MSG_NOSIGNAL` | **进程不死**：`SERVER_ALIVE`。实测组合根链接的库已把 SIGPIPE 设为 `SIG_IGN`（`/proc/<pid>/status` 的 `SigIgn` 含 bit12）⇒ 仅删本段**不可观测**。**扩展注入**：再在 `Start()` 加 `::signal(SIGPIPE, SIG_DFL)` → 客户端中途断开后 `SERVER_DEAD`、`server_exit=141`（128+13） | ① 中途断开**确实**触发 SIGPIPE（故保护必要）；② 进程级 `SIG_IGN` 掩盖了本段，故它是**纵深防御**；③ 本段的真实效果只能在"没有被库预置 `SIG_IGN`"的进程里观察到 —— 如实登记为**局限** |
+| **I6** | 数据面 `finish` 跳过 `fss::http::LogAccess` | P11：`REQUIRE( plane_records.size() == 1 )` → `0 == 1` | 访问日志同源是承重的（字段集不能漂移） |
+
+> 每条注入后都 `git diff` 确认无注入残留（`grep -rn "I1-INJECT|...|I6-INJECT" src/` → 无输出），
+> 重建后 `./build/bin/test_large_file_plane` **All tests passed (648 assertions in 13 test cases)**。
+
+### 25.5 未覆盖与未验证（如实登记）
+
+| 项 | 说明 |
+| --- | --- |
+| **ADR-006 §6 第 5 条（真实存储/网卡受控复核）** | **未完成，本环境做不到**：WSL2 + 虚拟盘 + loopback，绝对值无结论。**不新增任何绝对数字**；脚本 `scripts/bench_sendfile_ab.sh` 与前置条件移交生产环境（与 C9.27 探针同一处置）。§6 该条是 6 条里**唯一**未勾选的一条 |
+| **> 2 GiB 对象** | 代码按 `sendfile_chunk_bytes` 循环，但**实测最大对象 = 1 GiB**（P7）。>2 GiB / >5 GiB 分片未测 |
+| **TLS / mTLS** | **未评估**（ADR-006 §7.3 的重开条件仍然有效：TLS 一旦成为硬需求，零拷贝收益需重评） |
+| **真实跨主机 / 多实例数据面** | 只在**单进程 + loopback**上验证；跨主机 LB 粘性、多实例下的数据面未测 |
+| **超长 URI 的"同状态"** | 控制面对该输入**没有响应**（库行为），因此不可比；数据面 414 是**更明确**的行为，已登记为差异 |
+| **I5 的进程级 SIG_IGN 来源** | 只测出"组合根进程的 SIGPIPE 已被置为 `SIG_IGN`"，**未定位**是哪一个链接库（libcurl/OpenSSL/…）在何时设置的；因此"plane 线程屏蔽 SIGPIPE"在**当前**组合根里是冗余的纵深防御 |
+| **`splice` / 上传加速** | **刻意未做**（ADR-006 的实现门槛只要求下载面） |
+| **P7 不含磁盘 I/O** | 1 GiB 对象在页缓存内（`RepeatingSource` 写入后立即传输）；RSS 判据成立，但"冷缓存/真实盘的 `sendfile` 收益"**无结论** |
+| **`op=get` 计数语义变化** | 计数点分裂后，用户态路径的 `op=get` 从"每个读块一次"变成"每次打开一次"（族名/标签不变）。已登记，未做兼容处理 |
+| **P4 的 405 vs 404** | 数据面对非 GET/HEAD 回 405（范围决策），控制面对同样方法回 404（方法不匹配语义）——**已知差异**，P4 双向断言，未纳入 P8 的"唯一差异"矩阵 |
+
+## 父代理独立复核（ADR-006）
+
+
+**复核人：父代理（不采信子代理自报数字；以下每条都是我自己跑出来的）。**
+
+### 复核方式
+
+- 消融用**运行期环境开关**（临时加在 `PosixFileByteSource::NativeFd()` 与
+  `large_file_plane.cpp` 的记账点，复核后**已删除**：`grep -rn "PARENT-ABLATION\|FSS_PARENT_" src/ tests/` 无输出；
+  我顺手 `sed` 加进去的 `<cstdlib>` 也已移除）。基线 `HEAD=46889d2`（E1b 已推送）。
+- 真实进程复核**不经过测试夹具**：我自己写配置、自己挑空闲端口、自己 `curl`。
+
+### 1. 数字复核（我自己跑）
+
+| 命令 | 我的实测 |
+| --- | --- |
+| `./build/bin/test_large_file_plane` | **All tests passed（649 assertions in 13 test cases）**（649 = 子代理的 648 + 我在 §5 加的 1 条谓词） |
+| `./build/bin/test_operations_doc` | 43 断言 / 3 用例 |
+| `./scripts/check_docs.sh` | 全部检查通过（D1~D5，148 条门槛未变） |
+
+### 2. ★ 复核中发现并**修复**的判据缺陷：`>=` 抓不到「重复计数」
+
+子代理本切片的实现引入了一处**新语义**：`sendfile` 绕过 `ByteSource::Read`，因此出流量必须由
+数据面补记，且必须与计量装饰器的 `Read` 路径**互斥、不重复**（它自己还修掉了早期"只让数据面补记
+⇒ 控制面出流量归零"的真缺陷）。但 P5/P5b 对 `fss_storage_bytes_total{direction="out"}` 用的是
+**`>=`**。我先注入"sendfile 路径重复记一次"：
+
+```text
+Filters: *P5*
+All tests passed (59 assertions in 2 test cases)      ← 重复计数下仍然全绿 ⇒ 该判据无区分力
+```
+
+于是我把三处改成**恰好相等**，并给 P5b（用户态路径）**新增**一处存储出流量的等值断言：
+
+```text
+REQUIRE( storage_out2 == storage_out1 + static_cast<std::int64_t>(payload.size()) )
+test cases:  2 |   1 passed | 1 failed            ← 同一注入下立刻失败
+```
+
+还原注入后 649/13 全绿。**结论**：子代理"两条路互斥、不重复计数"的声明在修复前
+是**没有被机械守住的**；现在守住了。
+
+### 3. 独立消融：零拷贝计数器测的确实是零拷贝
+
+让 `NativeFd()` 恒返回 `-1`（运行期开关，同一二进制两种跑法）：
+
+```text
+Filters: *P1*,*P5*
+All tests passed (166 assertions in 6 test cases)                    ← 基线（有原生 fd）
+FSS_PARENT_NO_NATIVE_FD=1 →  REQUIRE( ... sendfile_calls_total == ... + 1 ) ×2
+                            test cases: 6 | 4 passed | 2 failed      ← P1/P5 按设计失败
+Filters: *P2* 同注入 → All tests passed (154 assertions)             ← Range 功能仍全绿（用户态回退）
+```
+
+⇒ 零拷贝判据只对"真的走了 `sendfile`"敏感，且无 fd 时功能不缺（与 ADR-006 §4.4 的"可回退"一致）。
+
+### 4. 真机端到端复核（我自己起进程 + 自己 `curl`）
+
+**(a) 可见性与横幅**：`/v2/info` → `"largeFilePlane":"sendfile"`（`ioEngine` 仍 `blocking`，未受影响）；
+横幅打印 `plane bind : 127.0.0.1:<port>（workers=4 max_conn=2 sendfile=on chunk_bytes=1073741824；
+只服务 GET/HEAD 的 /v1/transfer/{token}）`。
+
+**(b) 错误路径逐字节一致（ADR-006 §6.6 的安全姿态）**：
+
+| 请求 | 控制面 | 数据面 |
+| --- | --- | --- |
+| `GET /api/file/v1/transfer/bogus`（无鉴权） | 401 `kUnauthenticated` `{"code":401,"message":"transfer token 缺少 exp 或 sig","reason":"Unauthorized"}` | **逐字节相同** |
+| 同上 + 伪造 token | 401，同上 | **逐字节相同** |
+| `POST` 同一路径 | 404 | 405（**已登记的范围差异**：数据面只 GET/HEAD） |
+| 超长 URI | **无任何 HTTP 响应**（curl 超时） | 414（**已登记差异**） |
+
+**(c) Range 矩阵（我自己播种并下载，payload 10240 B）**：
+
+| 请求 | 控制面 | 数据面 |
+| --- | --- | --- |
+| 无 Range | 200 / 10240 B | 200 / 10240 B，**逐字节一致** |
+| `bytes=10-19` | 206 `Content-Range: bytes 10-19/10240` | **相同**，字节一致 |
+| `bytes=-8`（后缀） | 206 `bytes 10232-10239/10240` | **相同** |
+| `bytes=999999-`（越界） | 416 + `Content-Range: bytes */10240` | **相同** |
+| `bytes=0-3,8-11`（多段） | 206 `multipart/byteranges; boundary=…` | **200 全量**（ADR-006 §6.1 的"多段降级"，我方独立复现） |
+
+**(d) 计数不变量（用我自己的流量做算术核对）**：
+
+```text
+fss_large_file_plane_sendfile_calls_total 4          = 4 次数据面下载（全量+单段+后缀+多段）
+fss_large_file_plane_sendfile_bytes_total 20498      = 10240 + 10 + 8 + 10240
+fss_storage_bytes_total{direction="out"}  30764      = 10266（控制面 userspace）+ 20498（数据面 sendfile）
+```
+
+⇒ 出流量**既不重复也不归零** —— 即子代理修掉的那个缺陷在真实进程上确实不存在了
+（这条独立于它的用例，是父代理自己算出来的）。
+
+### 5. ★ 复核中发现的门槛覆盖漏洞：新测试从不被门槛执行
+
+`run_all_gates.sh` 只跑 `ctest -L phaseN`（外加 `-L pg`），而本切片与 E1a/E1b 的三个新测试
+分别只带 `adr006` / `e1a` / `e1b` 标签、**不带任何 `phaseN`** ⇒ **`./scripts/run_all_gates.sh`
+永远不会运行它们**（门槛全绿，而这三块功能无人守）。已给三者补上 `phase10`：
+
+```text
+ctest --test-dir build    -N -L phase10   → Total Tests: 9   （原 7）
+ctest --test-dir build-pg -N -L phase10   → Total Tests: 12
+```
+
+并把这作为 AGENTS §4.3「空集合」陷阱的**第三个实例**写进 AGENTS（"探针/标签没进集合 =
+通过是空集"，与 P2-D07 的 `phase012` 同类）。
+
+### 6. 其它由我修正的文档
+
+| 位置 | 问题 | 处置 |
+| --- | --- | --- |
+| `docs/operations.md` 6 处 | `*.sqlite.max_write_concurrency` 写着"下一步：连接池交付后才接通/才有意义" —— 一句**不会兑现**的承诺（生产用 PG） | 改为「**按决策不投入**（不是待办）」，并写明理由：生产用 PostgreSQL、SQLite 只是开发/单实例形态，且「单连接 + 互斥」是**有意的正确性设计**（组提交的读必须与批事务互斥） |
+| `AGENTS.md` §0.1 / §7 / 未验证行 | sendfile 行仍写"实现未交付"；ADR-006 行与"未验证"行未含本切片 | 分别改为"下载面已交付（默认关闭）+ 范围与已知差异 + §6.5 未完成"、"方案③已落地"+§6.5 未完成、"真实存储受控复核"进未验证清单 |
+| `docs/test-evidence/phase10.md` | E1b 与新切片两个同名 `## 父代理独立复核` | 分别标注 (E1a)/(E1b)/(ADR-006) |
+
+### 7. 我自己的复核事故（如实记录）
+
+第一次做"重复计数"注入时，我用 Python heredoc 生成补丁，字符串里写了**ASCII 双引号**
+（`「两条路互斥"…"」`），Python 直接 `SyntaxError`，补丁根本没落盘 —— 而 `cmake --build`
+仍报成功（没有源文件变化），我差点把"旧判据全绿"当成"加强后仍全绿"。这正是 AGENTS §4.3
+「把 ASCII 双引号写进字符串字面量」那条陷阱；改用编辑工具逐个改后结论才成立。
+
+### 8. 复核结论
+
+- 子代理的 649/13、等价性矩阵、I1~I6 注入**成立**；我用**不同机制**独立复现了三条最关键的：
+  零拷贝判据的敏感性（运行期开关）、Range/错误路径的逐字段一致与唯一差异（自己 curl）、
+  出流量计数不重复（自己算算术）；
+- 但它的 **P5/P5b 判据原本抓不到"重复计数"**，这条由我修复并自证；
+- 它的**新测试不被门槛执行**，这条由我修复并自证；
+- 未验证项以 §25.6 与 `AGENTS.md` §0.1 为准，其中 **ADR-006 §6 第 5 条（真实存储上的受控基线复核）
+  在本环境不可能完成** ⇒ 本切片**未达"§6 全部满足"**，不得写成"门槛通过"。

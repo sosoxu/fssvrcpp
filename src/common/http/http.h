@@ -115,6 +115,25 @@ struct Response {
 
 using Handler = std::function<Response(Request&)>;
 
+// =============================================================================
+//  传输层公共件（**同源**给 httplib 包装层与大文件数据面用）
+// =============================================================================
+//  ★ ADR-006 §4 第 1 条 / §6 第 2 条：数据面不得出现"第二套 HTTP 语义"。
+//    访问日志字段集与解析阶段的错误体因此必须是**同一份实现**（同一函数），
+//    而不是两处"看起来一样"的复制 —— 复制必然漂移，而这正是本 ADR 要避免的。
+//
+//  契约错误体（`docs/03-api-contract.md` §1.6/§1.7）：三种形态由 `error_format` 选。
+//  仅用于**解析阶段/传输层**的错误（400/404/405/408/413/414/416/431/503…）；
+//  handler 抛出的契约错误由适配层的 `ErrorToResponse` 渲染（含 `X-FSS-Error-Kind`）。
+std::string ErrorBody(int status, std::string_view detail, std::string_view error_format);
+
+//  访问日志：**唯一**的字段集与调用点（`logging::Info(logger, "http_request", fields)`）。
+//  两个调用方：`Server::Impl::Dispatch`（httplib 包装层）与大文件数据面。
+//  为什么必须是 free function 而不是 Server 的成员：数据面不是 `Server` 的实例
+//  （它是第二个监听 socket），但它的日志必须与 HTTP 面逐字段一致。
+void LogAccess(const logging::ILogger& logger, const Request& request, const Response& response,
+               std::int64_t duration_ms, std::string_view note);
+
 struct RouteOptions {
   // 请求体上限；0 = 不限（数据面）。超限：有 Content-Length → 413；chunked → 400。
   std::int64_t max_body_bytes = 10 * 1024 * 1024;

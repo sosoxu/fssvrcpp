@@ -30,6 +30,7 @@
 #include "common/config/config.h"
 #include "common/crypto/crypto.h"
 #include "common/http/http.h"
+#include "common/http/large_file_plane.h"
 #include "common/ids/id_generator.h"
 #include "common/json/json.h"
 #include "common/logging/logging.h"
@@ -1589,9 +1590,23 @@ static int RunServer(int argc, char** argv) {
   const long gc_orphan_grace_hours = resolver.Int("gc.orphan_grace_hours", 72);
   const long gc_interval_seconds = resolver.Int("gc.interval_seconds", 3600);
 
-  //  ---- 未实现能力的守卫键（C10.11：非默认值必须**拒绝启动**，不许静默无效）----
+  //  ---- ADR-006：大文件**下载**数据面（`server.http.large_file_plane.*`，7 键）----
+  //  ★ 不再是"未实现 → exit 78"的守卫键：下面 6 个真的决定第二个监听面的行为
+  //    （`.enabled` 仍是开关；`false`（默认）→ 不建监听、行为与接线前逐字一致）。
   const bool large_file_plane_enabled =
       resolver.Bool("server.http.large_file_plane.enabled", false);
+  const std::string large_file_plane_bind =
+      resolver.Str("server.http.large_file_plane.bind", "0.0.0.0");
+  const long large_file_plane_port = resolver.Int("server.http.large_file_plane.port", 8081);
+  const bool large_file_plane_use_sendfile =
+      resolver.Bool("server.http.large_file_plane.use_sendfile", true);
+  const long large_file_plane_sendfile_chunk_bytes =
+      resolver.Int("server.http.large_file_plane.sendfile_chunk_bytes", 1LL << 30);
+  const long large_file_plane_workers =
+      resolver.Int("server.http.large_file_plane.workers", 0);
+  const long large_file_plane_max_connections =
+      resolver.Int("server.http.large_file_plane.max_connections", 0);
+  //  ---- 未实现能力的守卫键（C10.11：非默认值必须**拒绝启动**，不许静默无效）----
   const long max_connections_per_partition =
       resolver.Int("server.http.max_connections_per_partition", 0);
   const long grpc_max_message_bytes = resolver.Int("server.grpc.max_message_bytes", 4194304);
@@ -1742,12 +1757,8 @@ static int RunServer(int argc, char** argv) {
     return kExitConfigError;
   };
 
-  if (large_file_plane_enabled) {
-    return reject_startup(
-        "server.http.large_file_plane.enabled=true —— 独立大文件数据面（sendfile）尚未交付"
-        "（ADR-006 只定稿方向，实现未交付）。下一步：保持 false（默认，走 httplib 内容提供者），"
-        "或在 ADR-006 §6 落地后开启。");
-  }
+  //  ★ ADR-006：`server.http.large_file_plane.*` 已**不再**是守卫键 —— 数据面已交付，
+  //    上面 7 个键真的决定第二个监听面的行为（见 §数据面装配）。
   if (max_connections_per_partition != 0) {
     return reject_startup(
         "server.http.max_connections_per_partition 非 0 —— 每租户并发上限尚未实现"
@@ -3053,6 +3064,13 @@ static int RunServer(int argc, char** argv) {
       domain::ObjectRef ref;
       ref.container = resolved.container;
       ref.key = resolved.object_key;
+      //  ★ ADR-006：优先返回"持有**原生 fd** 的来源"（大文件数据面据此 `sendfile`）。
+      //    · POSIX 驱动覆盖了 `OpenNativeRead`；内存/S3 走端口默认实现 → `kUnimplemented`
+      //      → 回退到既有的 `BlobByteSource`（**控制面行为逐字不变**：它只用 Read/Seek）。
+      //    · 其它错误（对象消失等）如实传播，绝不静默降级成"空文件"。
+      auto native = store->OpenNativeRead(ref);
+      if (native.ok()) return native;
+      if (native.error().kind() != fss::ErrorKind::kUnimplemented) return native.error();
       return std::static_pointer_cast<bytes::ByteSource>(
           std::make_shared<infra::BlobByteSource>(*store, std::move(ref), stat.size));
     };
@@ -3107,6 +3125,59 @@ static int RunServer(int argc, char** argv) {
   http::Server server(server_options, logger, clock);
   router.Register(server);
 
+  // ---------------------------------------------------------------------------
+  //  ---- ADR-006：大文件**下载**数据面（第二个监听 socket + sendfile）----
+  //  · 与控制面**共用** `router.BuildTransferGetHandler()`：鉴权/租户/错误体/HTTP 指标
+  //    全部是同一份代码（ADR-006 §4 第 1 条）。
+  //  · 只服务 GET/HEAD；`PUT` 仍在控制面（数据面不搬上传字节）。
+  //  · `enabled=false`（默认）→ 不建监听、不启动线程，行为与接线前**逐字一致**。
+  //  · 启动失败（端口被占等）→ **exit 78 + 可读修法**，绝不静默降级成"数据面关着"。
+  // ---------------------------------------------------------------------------
+  if (large_file_plane_enabled && !with_self_signed_data_plane) {
+    return reject_startup(
+        "server.http.large_file_plane.enabled=true 但自签数据面未启用 —— 数据面复用"
+        "控制面的 `/v1/transfer/{token}` 下载校验，因此需要 storage.driver=posix 且 "
+        "self_signed.enabled=true（s3 用原生预签名、客户端直连存储端点，不经本服务）。"
+        "下一步：把 storage.driver 设为 posix 并打开 self_signed.enabled，"
+        "或把 large_file_plane.enabled 设回 false。");
+  }
+  //  `/v2/info` 必须暴露**实际**数据面形态（R11；只看配置不够——还要能被真实进程回答）。
+  if (!large_file_plane_enabled) {
+    ports.large_file_plane = "disabled";
+  } else {
+    ports.large_file_plane = large_file_plane_use_sendfile ? "sendfile" : "userspace";
+  }
+  std::unique_ptr<fss::http::LargeFilePlane> large_file_plane;
+  if (large_file_plane_enabled) {
+    fss::http::LargeFilePlaneOptions plane_options;
+    plane_options.bind_address = large_file_plane_bind;
+    plane_options.port = static_cast<int>(large_file_plane_port);
+    plane_options.use_sendfile = large_file_plane_use_sendfile;
+    plane_options.sendfile_chunk_bytes = large_file_plane_sendfile_chunk_bytes;
+    plane_options.worker_threads = static_cast<int>(large_file_plane_workers);
+    plane_options.max_connections = static_cast<int>(large_file_plane_max_connections);
+    plane_options.base_path = base_path;
+    plane_options.error_format = error_format;
+    plane_options.idle_timeout_sec = static_cast<int>(idle_timeout);
+    plane_options.keep_alive_timeout_sec = server_options.keep_alive_timeout_sec;
+    plane_options.keep_alive_max_count = server_options.keep_alive_max_count;
+    plane_options.max_uri_bytes = max_uri_bytes;
+    plane_options.max_header_bytes = max_header_bytes;
+    plane_options.metrics = &metrics_registry;
+    //  ★ 计数点移动（ADR-006）：sendfile 绕过 `get()`，字节/操作数由数据面回补到
+    //    **同一个**指标族与标签（`MeteredBlobStore::RecordNativeRead`）。
+    plane_options.on_native_bytes = [&metered_blob](std::int64_t plane_bytes, bool ok) {
+      metered_blob.RecordNativeRead(plane_bytes, ok);
+    };
+    large_file_plane = std::make_unique<fss::http::LargeFilePlane>(
+        plane_options, router.BuildTransferGetHandler(), logger, clock);
+    if (!large_file_plane->Start()) {
+      std::cerr << "拒绝启动：大文件数据面（server.http.large_file_plane.*）启动失败："
+                << large_file_plane->last_error() << "\n";
+      return kExitConfigError;
+    }
+  }
+
   //  ---- GC 周期调度（C10.9）：先判定，再在横幅里如实说明"跑/不跑 + 原因" ----
   //  ★ `gc_schedule` 已在构造按需端点回调时判定（响应里的 `scheduled` 必须与它一致）。
   std::unique_ptr<GcScheduler> gc_scheduler;
@@ -3142,6 +3213,23 @@ static int RunServer(int argc, char** argv) {
             << (config_path.empty() ? "无配置文件（仅环境变量）" : config_path) << "\n"
             << "fss_server 已启动\n"
             << "  bind           : " << bind_address << ":" << server.port() << "\n"
+            //  ★ ADR-006 / R11：数据面的**实际状态**必须可见（绑定/端口/线程/连接上限/
+            //    零拷贝开关），否则"配了但没走"只能靠猜。
+            << "  plane bind     : "
+            << (large_file_plane
+                    ? large_file_plane_bind + ":" + std::to_string(large_file_plane->port()) +
+                          "（workers=" +
+                          std::to_string(large_file_plane->stats().worker_threads) +
+                          " max_conn=" +
+                          std::to_string(large_file_plane->stats().max_connections) +
+                          " sendfile=" + (large_file_plane_use_sendfile ? "on" : "off") +
+                          " chunk_bytes=" + std::to_string(large_file_plane_sendfile_chunk_bytes) +
+                          "；只服务 GET/HEAD 的 /v1/transfer/{token}）"
+                    : ports.large_file_plane == "disabled"
+                          ? std::string("disabled（server.http.large_file_plane.enabled=false，"
+                                        "默认；下载走 httplib 内容提供者）")
+                          : std::string("未启动"))
+            << "\n"
             << "  grpc bind      : "
             << (grpc_handle ? grpc_bind + ":" + std::to_string(grpc_handle->port())
                             : std::string("disabled（") +
@@ -3341,6 +3429,8 @@ static int RunServer(int argc, char** argv) {
   //  统一退出路径：先停 GC 调度（signal + join；绝不留 joinable thread），
   //  再停 HTTP（Server::Stop 会 join 自己的 runner），最后 shutdown gRPC。
   if (gc_scheduler) gc_scheduler->Stop();
+  //  ★ ADR-006：数据面同样是"必须先 Stop 再析构"的资源（accept/worker 线程 join）。
+  if (large_file_plane) large_file_plane->Stop();
   server.Stop();
 
   //  ★ 退出路径必须**显式**关掉 gRPC 服务：`grpc::Server` 是 joinable 的资源，

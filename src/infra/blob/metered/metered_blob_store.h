@@ -13,6 +13,8 @@
 #include "common/metrics/metrics.h"
 #include "domain/ports/ports.h"
 
+#include <cstdint>
+#include <memory>
 #include <string>
 
 namespace fss::infra {
@@ -32,6 +34,16 @@ class MeteredBlobStore final : public domain::IBlobStore {
                         const domain::PutOptions& options) override;
   fss::Result<void> get(const domain::ObjectRef& ref, fss::bytes::ByteSink& sink,
                         const domain::ByteRange& range) override;
+  //  ★ ADR-006：**转发**原生 fd 能力（内存/S3 得到端口默认的 `kUnimplemented`），
+  //    并把返回的来源包一层计量（用户态拷贝的字节/操作在装饰器里记）。
+  //    ⚠️ 计数点移动：`sendfile` 会绕过 `Read`，所以 sendfile 的字节/操作由数据面
+  //    服务完成后调 `RecordNativeRead` 补记（见 .cpp 与头文件顶部说明）。
+  fss::Result<std::shared_ptr<fss::bytes::ByteSource>> OpenNativeRead(
+      const domain::ObjectRef& ref) override;
+  //  把"走了 `sendfile` 的下载"计入与 `get()` **完全相同**的指标族/标签：
+  //  `fss_storage_bytes_total{direction="out"}` + `fss_storage_operations_total{...,op="get"}`。
+  //  ⚠️ 只允许在真的用了 sendfile 的路径上调用（用户态拷贝由装饰器自己记）。
+  void RecordNativeRead(std::int64_t bytes, bool ok) const;
   fss::Result<domain::ObjectStat> stat(const domain::ObjectRef& ref) override;
   fss::Result<void> remove(const domain::ObjectRef& ref) override;
   fss::Result<domain::ObjectStat> copy(const domain::ObjectRef& from,

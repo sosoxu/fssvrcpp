@@ -163,7 +163,10 @@ add_library(fss_blob_posix STATIC
   infra/blob/posix/partition_filesystem_check.cpp
   infra/blob/posix/shared_mount_probe.cpp)
 target_include_directories(fss_blob_posix PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(fss_blob_posix PUBLIC fss_domain fss_crypto fss_fs fss_io fss_metrics)
+# ★ ADR-006：POSIX 是唯一能给出"原生 fd"的驱动 → `OpenNativeRead` 返回
+#   `infra/transfer/posix_file_byte_source.h` 的来源（L2 → L2，同层组合）。
+target_link_libraries(fss_blob_posix PUBLIC fss_domain fss_crypto fss_fs fss_io fss_metrics
+                                           fss_transfer)
 
 # S3 驱动（P5）：SigV4 签名器 + S3BlobStore（逐步补齐）
 add_library(fss_blob_s3 STATIC
@@ -201,7 +204,8 @@ target_link_libraries(fss_location_sqlite PUBLIC fss_domain fss_metrics SQLite::
 # L2：集中存储的自签传输 token 与 `/v1/transfer` 内核（ADR-003 §6.3）
 add_library(fss_transfer STATIC
   infra/transfer/transfer_token.cpp
-  infra/transfer/transfer_endpoint.cpp)
+  infra/transfer/transfer_endpoint.cpp
+  infra/transfer/posix_file_byte_source.cpp)
 target_include_directories(fss_transfer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fss_transfer PUBLIC fss_domain fss_crypto)
 

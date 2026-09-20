@@ -193,6 +193,8 @@ void FillInfoProto(const fss::app::VersionInfo& info, osdu::file::v1::InfoRespon
   out->set_io_uring_available(info.io_uring_available);
   //  ★ E1a：实例身份（与 REST 的 `instanceId` 同源；见 `VersionInfo::instance_id`）。
   out->set_instance_id(info.instance_id);
+  //  ★ ADR-006/R11：大文件下载数据面形态（与 REST 的 `largeFilePlane` 同源）。
+  out->set_large_file_plane(info.large_file_plane);
 }
 
 void FillMetadataProto(const fss::domain::FileMetadataRecord& record,

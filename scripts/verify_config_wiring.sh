@@ -385,8 +385,9 @@ assert_reject "events.publisher=webhook" "events.webhook.url" \
   "events.publisher=webhook + 空 url"
 assert_reject "self_signed.single_use_nonce=true" "single_use_nonce=true" \
   "self_signed.single_use_nonce=true"
-assert_reject "server.http.large_file_plane.enabled=true" "large_file_plane" \
-  "server.http.large_file_plane.enabled=true"
+#  ★ ADR-006：`server.http.large_file_plane.enabled=true` 已**不再是**"未实现 → exit 78"
+#    的守卫键 —— 大文件下载数据面已交付，它的正向/负向覆盖在
+#    `tests/integration/test_large_file_plane.cpp`（P1~P10）。
 assert_reject "leader_election.enabled=true" "leader_election.enabled=true" \
   "leader_election.enabled=true + 空 metadata.postgres.dsn（选举 fail-closed）"
 

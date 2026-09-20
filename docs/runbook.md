@@ -106,6 +106,35 @@ curl -sS -D- -o /dev/null "<signed_url>"      # 直接看状态码与 x-fss-erro
 **不要**用 `curl -T` 对着 `/v1/transfer/<token>` 之外的路径 PUT（那是 404 的常见来源：
 自签 URL 的 base path 是 `/api/file`）。
 
+### 3.1 大文件**下载**数据面（ADR-006）：怎么判读 / 怎么关
+
+`server.http.large_file_plane.enabled=true` 时，服务会**额外**监听一个只服务
+`GET/HEAD /<base>/v1/transfer/{token}` 的下载面；它复用控制面**同一个**已包装 handler
+（鉴权/租户/错误体/HTTP 指标同源），字节优先用 `sendfile(2)` 送出。
+
+```bash
+# ① 它到底开没开、什么形态？—— 看 /v2/info 的 largeFilePlane 与启动横幅的 plane bind
+curl -sS "$BASE/v2/info" | grep -o '"largeFilePlane":"[^"]*"'   # disabled | sendfile | userspace
+grep "plane bind" <启动日志>            # 127.0.0.1:8081（workers=… max_conn=… sendfile=on/off）
+
+# ② 零拷贝真的走了吗？—— 数据面诊断计数（只有真的走 sendfile 才增长）
+curl -sS "$METRICS" | grep -E 'fss_large_file_plane_(sendfile|userspace)_(calls|bytes)_total'
+#   数据面下载：sendfile_calls_total +1；use_sendfile=false 或来源无原生 fd：userspace_* 增长
+#   控制面下载：两者都**不**增长（它走 httplib 内容提供者）
+
+# ③ 存储出流量等价性（sendfile 绕过 get()，所以数据面补记**同一族**）
+curl -sS "$METRICS" | grep 'fss_storage_bytes_total{direction="out"}'
+```
+
+| 症状 | 诊断 | 处置 |
+| --- | --- | --- |
+| 数据面端口连不上/进程没起来 | `server.http.large_file_plane.port` 被占用、或 `bind` 非法 IPv4、或 `storage.driver≠posix`/`self_signed.enabled=false` | 启动期就是 **exit 78 + 可读修法**（绝不静默禁用）；按消息改端口/绑定/驱动后重启 |
+| 数据面 `405` + `Allow: GET, HEAD` | 用 `PUT`/`POST` 打了数据面端口 | **上传只走控制面**（数据面只做下载）；把 `PUT` 打到控制面的 `<base>/v1/transfer/{token}` |
+| 数据面 `414 URI Too Long` | 请求 target 超过 `server.http.max_uri_bytes` | 缩短 URL；★ 控制面对同样输入**不返回任何响应**（httplib 的 header reader 先失败），这是已登记的实测差异 |
+| 多段 Range（`bytes=a-b,c-d`）返回 **200 全量**（控制面是 multipart 206） | 数据面**刻意**降级（ADR-006 §6.1"多段降级"） | 需要 multipart 时改打控制面端口；单段 Range 两侧一致 |
+| 第二个并发下载拿到 `503` + `Retry-After: 1` | 数据面在途连接上限（`large_file_plane.max_connections`） | 调大 `max_connections`/`workers`；看 `fss_large_file_plane_rejected_busy_total` |
+| **怎么关** | —— | 把 `server.http.large_file_plane.enabled` 设回 `false`（默认）并重启：**不建监听、不启动线程**，下载完全回到 httplib 内容提供者（行为与接线前逐字一致） |
+
 ---
 
 ## 4. GC 与残留临时文件
@@ -400,8 +429,8 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 #   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
 ```
 
-**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 130 / 拒绝启动 15 /
-已读但无效果 12；E1b 后）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 137 / 拒绝启动 14 /
+已读但无效果 6；ADR-006 后）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
 它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动
@@ -462,7 +491,7 @@ FSS_CLAIM_HOLD_MS=15000 ./build/bin/fss_server --config config/fss.json &
 > 所以生产路径（未设置该变量）的行为与引入本接缝之前逐字节一致。
 >
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 130 / 拒绝启动 15 / 已读但无效果 12）由 `test_operations_doc` **机械比对**；
+> （生效 137 / 拒绝启动 14 / 已读但无效果 6）由 `test_operations_doc` **机械比对**；
 > "让每个 `createMetadata` 故意卡住 N 毫秒"不是运维语义，生产上只会制造事故。
 > 若写成配置项会按**未知键 → exit 78** 被拒。
 >
@@ -496,7 +525,7 @@ FSS_CLOCK_SKEW_INJECT_MS=1000 ./build/bin/fss_server --config config/fss.json &
 > 避免演练结论被误读成"这台机器钟真的偏了"。**默认不注入**，生产路径逐字节不变。
 >
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 130 / 拒绝启动 15 / 已读但无效果 12）由 `test_operations_doc` **机械比对**；
+> （生效 137 / 拒绝启动 14 / 已读但无效果 6）由 `test_operations_doc` **机械比对**；
 > "让实例钟走偏"不是运维语义，生产上只会制造事故。若写成配置项会按**未知键 → exit 78** 被拒。
 >
 > **禁令**：**不要**在生产/预发设置 `FSS_CLOCK_SKEW_INJECT_MS`。它只用于 B2a 的
@@ -520,7 +549,7 @@ FSS_SERVICE_VERSION_OVERRIDE=9.9.9 ./build/bin/fss_server --config config/fss.js
 ```
 
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 130 / 拒绝启动 15 / 已读但无效果 12）由 `test_operations_doc` **机械比对**；
+> （生效 137 / 拒绝启动 14 / 已读但无效果 6）由 `test_operations_doc` **机械比对**；
 > "让实例谎报版本"不是运维语义（真实滚动升级应通过部署流程控制），
 > 若写成配置项会按**未知键 → exit 78** 被拒。
 >

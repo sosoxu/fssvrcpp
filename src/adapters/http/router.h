@@ -113,6 +113,16 @@ class Router {
   //  注册契约 §2 的端点（运维 + 位置 + 元数据 + DMS/delivery/revoke + 数据面 + /metrics）
   void Register(fss::http::Server& server);
 
+  //  ★ ADR-006：把**已经包装好**的 `transfer.get` handler 暴露给组合根，
+  //    供进程内的大文件下载数据面复用。语义与 `Register` 注册的**完全同一个**：
+  //      构造 `CallerContext` → 角色查表 → `authorizer.AuthorizeAny` →
+  //      `ErrorToResponse(..., error_format)` → `metrics_.Observe(...)`。
+  //    数据面**不得**绕过它去直接调 `transfers_.open_get`（那就是 ADR-006 §4 第 1 条
+  //    禁止的"第二套 HTTP 语义"；用例 I1 专门注入这个错误实现并断言 P3 失败）。
+  //    `transfers_.open_get` 为空时仍返回一个 handler（调用它会得到可读错误），
+  //    由调用方决定要不要建数据面。
+  fss::http::Handler BuildTransferGetHandler();
+
   //  供组合根打印生效配置
   const RouterOptions& options() const { return options_; }
 

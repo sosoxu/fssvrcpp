@@ -787,7 +787,9 @@ TEST_CASE("★ C10.11：未实现能力的非默认值必须拒绝启动（exit 
       const char* needle;  // 稳定出现在拒绝原因里的片段
     };
     const std::vector<RejectCase> cases = {
-        {"server.http.large_file_plane.enabled", "true", "large_file_plane"},
+        //  ★ ADR-006：`server.http.large_file_plane.enabled` 已**不再是**守卫键
+        //    （数据面已交付）。它的正向覆盖在 `tests/integration/test_large_file_plane.cpp`；
+        //    这里只保留仍然"未实现 → exit 78"的键。
         {"server.http.max_connections_per_partition", "3", "max_connections_per_partition"},
         {"server.grpc.max_message_bytes", "1024", "max_message_bytes"},
         {"server.grpc.streaming_chunk_bytes", "4096", "streaming_chunk_bytes"},

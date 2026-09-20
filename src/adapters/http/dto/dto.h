@@ -104,6 +104,11 @@ struct VersionInfoResponse {
   //    组合根自动生成 ⇒ 每进程唯一）。运维用它把进程映射到 `instance_registry`
   //    行与 `.fss_probe.<instance_id>` 文件。与 gRPC 同源。
   std::string instance_id;  // → `instanceId`（**恒渲染**，见 dto.cpp）
+  //  ★ 非 OSDU 规范字段（扩展，ADR-006）：`largeFilePlane` —— 大文件下载数据面的
+  //    **实际形态**（`disabled` | `sendfile` | `userspace`），值 = `app::GetInfo`
+  //    转发的 `UseCasePorts::large_file_plane`。R11 要求"可选加速能力必须可见且
+  //    默认关闭"：没有这个字段，运维无法区分"数据面没开"与"开了但没走零拷贝"。
+  std::string large_file_plane;  // → `largeFilePlane`（**恒渲染**，见 dto.cpp）
 };
 
 json::Value ToJson(const VersionInfoResponse& response);

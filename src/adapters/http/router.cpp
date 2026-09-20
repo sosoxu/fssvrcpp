@@ -211,6 +211,8 @@ void Router::Register(fss::http::Server& server) {
                response.io_uring_available = info.io_uring_available;
                //  E1a：实例身份（与 gRPC 同源，都来自 `app::GetInfo`）
                response.instance_id = info.instance_id;
+               //  ★ ADR-006（R11）：大文件下载数据面的实际形态（与 gRPC 同源）。
+               response.large_file_plane = info.large_file_plane;
                return fss::http::Response::Json(200, fss::json::Dump(ToJson(response)));
              }));
 
@@ -617,26 +619,31 @@ void Router::Register(fss::http::Server& server) {
   }
   if (transfers_.open_get) {
     server.Get(base + "/v1/transfer/:token", MakeRoute("transfer.get", 0),
-               Wrap([this](fss::http::Request& request, const app::CallerContext& caller)
-                        -> fss::Result<fss::http::Response> {
-                 const auto token = request.Param("token");
-                 if (!token.has_value()) {
-                   return Err(fss::ErrorKind::kInvalidArgument, "缺少路径参数 token");
-                 }
-                 const auto opened =
-                     transfers_.open_get(*token, request.Query("exp").value_or(""),
-                                         request.Query("sig").value_or(""), caller.partition);
-                 if (!opened.ok()) {
-                   RecordTransferRejection(opened.error());
-                   return opened.error();
-                 }
-                 auto source = opened.value();
-                 const std::int64_t length =
-                     source != nullptr ? source->Size().value_or(-1) : 0;
-                 return fss::http::Response::Stream(200, "application/octet-stream",
-                                                    std::move(source), length);
-               }));
+               BuildTransferGetHandler());
   }
+}
+
+//  ★ ADR-006：数据面与控制面**共用**的唯一实现（唯一差别是字节怎么送出）。
+//    把这段从 `Register` 里提出来，是为了让"复用控制面校验"成为**结构上必然**，
+//    而不是"两边各写一遍、祈祷它们一致"。
+fss::http::Handler Router::BuildTransferGetHandler() {
+  return Wrap([this](fss::http::Request& request, const app::CallerContext& caller)
+                  -> fss::Result<fss::http::Response> {
+    const auto token = request.Param("token");
+    if (!token.has_value()) {
+      return Err(fss::ErrorKind::kInvalidArgument, "缺少路径参数 token");
+    }
+    const auto opened =
+        transfers_.open_get(*token, request.Query("exp").value_or(""),
+                            request.Query("sig").value_or(""), caller.partition);
+    if (!opened.ok()) {
+      RecordTransferRejection(opened.error());
+      return opened.error();
+    }
+    auto source = opened.value();
+    const std::int64_t length = source != nullptr ? source->Size().value_or(-1) : 0;
+    return fss::http::Response::Stream(200, "application/octet-stream", std::move(source), length);
+  });
 }
 
 }  // namespace fss::adapters::http
