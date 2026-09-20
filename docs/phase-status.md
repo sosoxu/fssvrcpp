@@ -38,6 +38,9 @@
 > 一致性、PG 连接预算（C9.28）、PG-vs-本地时钟比较、上传路径租约 `Acquire`/`Renew`、
 > `CreateFileMetadata` 跨步骤原子领取、完整多实例 E2E（C9.26）、NFS 语义（C9.27）、
 > `/v2/info` 暴露 `instanceId`、`storage.posix.one_filesystem_per_partition`。
+> ⚠️ **更正（E1a）**：上面列出的「`/v2/info` 暴露 `instanceId`」**已被 E1a 交付**
+> （REST `instanceId` + gRPC `InfoResponse.instance_id`，双协议同源；见 `test-evidence/phase10.md` §23）。
+> 上文作为历史登记保留。
 >
 > **C2 之后的更新（最新，优先于上面全部）**：ADR-009 §4.2/§4.3 的**在途租约侧已交付**
 > （见 `test-evidence/phase10.md` §19）：上传路径 `GetUploadLocation` 发地址时 `Acquire`
@@ -54,8 +57,11 @@
 > （C9.26；本切片用"放弃操作"在**进程内**模拟崩溃并如实登记）；共享挂载探针、readiness 的 PG
 > 探活 + `metadata.postgres.schema_version_check`、PG 连接预算（C9.28）、PG↔本地时钟偏移比对、
 > NFS 语义（C9.27）、`state='deleted'` 软删除语义、`/v2/info` 的 `instanceId`。
-> ⚠️ `AGENTS.md` §0.1 的「PG 多实例」行仍写着上传路径租约未交付 —— 该文件受 64 KiB 预算约束，
-> 本轮**未改动**（以本文件与 `operations.md` §1.3 为准）。
+> ⚠️ **更正（E1a）**：上面两处「`/v2/info` 的 `instanceId`」（第 40 行与第 59 行）**已被 E1a 交付**
+> （REST `instanceId` + gRPC `InfoResponse.instance_id`，双协议同源；见
+> `test-evidence/phase10.md` §23）。上文作为历史登记保留（不删原句）。
+> ⚠️ `AGENTS.md` §0.1 的「PG 多实例」行**已同步**（ADR-009 §10 收口时更新，E1a 亦在其未交付
+> 清单里做了对应删减）；三态计数以 `operations.md` §1.3 为准。
 >
 > **C9.26 之后的更新（最新，优先于上面全部）**：ADR-009 §4.2/§4.3 的**进程级崩溃 E2E 已交付**
 > （见 `test-evidence/phase10.md` §20）：`tests/integration/test_multi_crash_recovery.cpp` 拉起
@@ -102,6 +108,13 @@
 > runbook §10.4）。**仍未交付/未验证**：NFS 语义（C9.27 —— B2b 只证明"共享性"）、`/v2/info` 的
 > `instanceId`、ADR-009 §10 的多实例部署/PG HA/按盘分区/滚动升级运维手册。见
 > `docs/test-evidence/phase10.md` §22。
+> ⚠️ **更正（后续两个切片）**：上面这段 B2b 的"仍未交付"三条**已全部收口**：
+> ①「stale 行被忽略（**启动期**按 300s 阈值清理）」→ 陈旧行现在**启动期 + 运行期每 10 s tick**
+> 都做一次尽力而为清理（阈值不变，仍是 300 s；清理失败只告警、不影响 readiness）—— **E1a**；
+> ② 同段列出的「`/v2/info` 的 `instanceId`」已交付（REST/gRPC 双协议同源暴露）—— **E1a**；
+> ③「ADR-009 §10 的多实例部署/PG HA/按盘分区/滚动升级运维手册」已交付 —— 落在
+> `docs/operations.md` §10 + `docs/runbook.md` §8.1~§8.6。
+> 见 `test-evidence/phase10.md` §23；上文作为历史登记保留（不删原句）。
 
 ---
 

@@ -209,6 +209,8 @@ void Router::Register(fss::http::Server& server) {
                //  C9.30（ADR-010 R11）：当前引擎 + 宿主能力探测结果
                response.io_engine = info.io_engine;
                response.io_uring_available = info.io_uring_available;
+               //  E1a：实例身份（与 gRPC 同源，都来自 `app::GetInfo`）
+               response.instance_id = info.instance_id;
                return fss::http::Response::Json(200, fss::json::Dump(ToJson(response)));
              }));
 

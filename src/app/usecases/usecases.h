@@ -220,6 +220,17 @@ struct VersionInfo {
   //    `io_uring_available` = **宿主能力**（可用 ≠ 已启用）。REST 与 gRPC 同源。
   std::string io_engine;      // → JSON `ioEngine` / proto `io_engine`
   bool io_uring_available = false;  // → JSON `ioUringAvailable` / proto `io_uring_available`
+  //  ★ E1a：实例身份必须**可见**（`UseCasePorts::instance_id` 的原值转发）。
+  //    · 取值 = `UseCasePorts::instance_id`；`deployment.mode=multi` 下若
+  //      `deployment.instance_id` 未设置或是默认 `"local"`，**组合根**会
+  //      自动生成一个唯一 id（见 `server_main.cpp` 的 `effective_instance_id`）
+  //      ⇒ 该值因此是**每进程**的，而不是每配置的。
+  //    · 非 OSDU 规范字段（扩展）：REST 键名 `instanceId` / proto `instance_id`。
+  //    · 为什么必须可见：运维要能把"活着的进程 / 一次 HTTP 响应"映射到它在
+  //      `instance_registry` 里的那一行、以及共享挂载上的 `.fss_probe.<instance_id>`
+  //      文件。没有这个字段时，runbook 的若干诊断步骤只能写"去看启动横幅或查 PG"。
+  //    与 `auth_mode` / `io_engine` 同一条纪律：只在组合根计算一次，这里只转发。
+  std::string instance_id;  // → JSON `instanceId` / proto `instance_id`
 };
 
 // =============================================================================

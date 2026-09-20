@@ -3298,3 +3298,241 @@ $ grep -rn "R1-INJECT" src/ tests/     # 无输出（0 处）
 * **`service_version` 的来源**：`FSS_BUILD_VERSION`（CMake `PROJECT_VERSION`，当前 `0.1.0`），
   非 git 描述；不同构建若 `PROJECT_VERSION` 相同则版本判据无区分力（构建流水线需要保证
   patch 单调，本切片不改 CMake 版本注入）。
+
+---
+
+## 23. E1a（本切片）：`/v2/info` 的 `instanceId` + `instance_registry` 的运行期清理
+
+> 本切片交付两个"已登记但未交付"的项（`AGENTS.md` §0.1、`operations.md` §10.7/§10.8）：
+> ① `/v2/info`（REST + gRPC）暴露实例身份；② `instance_registry` 陈旧行改为**运行期**
+> （每个 10 s 心跳 tick）尽力而为清理，而不只是启动期一次。
+
+### 23.1 交付内容（单一来源）
+
+* `src/app/usecases/usecases.h` / `.cpp`：`VersionInfo` 新增 `instance_id`；
+  `GetInfo::Execute()` 只做 `info.instance_id = ports_.instance_id;`（**不重算**）。
+* `src/adapters/http/dto/dto.{h,cpp}`：`VersionInfoResponse::instance_id`；
+  `ToJson` **无条件**渲染 `body["instanceId"]`（与 `ioUringAvailable` 同一条"恒渲染"纪律）。
+* `src/adapters/http/router.cpp`：`/v2/info` handler 从 `app::GetInfo` 转发。
+* `proto/osdu/file/v1/file_service.proto`：`InfoResponse` 新增 `string instance_id = 12
+  [json_name = "instanceId"]`（字段 1..11 未动；**不用** `optional`——protobuf 3.12.4 不支持）。
+* `src/adapters/grpc/dto/grpc_dto.cpp`：`FillInfoProto` 加 `out->set_instance_id(info.instance_id);`。
+* `src/main/server_main.cpp`：`InstanceConsistencyMonitor` 每 tick 调 `RunStaleCleanup()`
+  （在 `Evaluate()` **之外**，因此 not-ready 提前返回也照做）；构造点（PG 装配分支）
+  注册 `fss_instance_registry_cleanup_runs_total` / `fss_instance_registry_stale_rows_removed_total`
+  两个计数器并传入 `&metrics_registry`。清理失败只 `Warn`，**不影响 readiness**。
+* 文档：`docs/03-api-contract.md`（§2.12 字段表 / §4 映射与字段号 / §7 扩展清单 / 测试登记表）、
+  `docs/operations.md`（§10.5 item 4 / §10.7 两张表 / §10.8 删两条未交付 / §10.2 观察 SQL）、
+  `docs/runbook.md`（§8.1 ⓪②⑥ / §8.5）、`docs/phase-status.md`（三处历史登记后追加"已被 E1a 交付"指针，
+  **未删除**原句）。`AGENTS.md` **未改**（父代理负责）。
+
+### 23.2 命令与输出摘要
+
+```bash
+# 默认构建（FSS_WITH_PG=OFF）
+cmake --build build -j4                     # 绿（exit 0）
+ls build/bin/test_instance_identity_exposure  # No such file（PG 门控 ⇒ 默认构建没有该二进制）
+ctest --test-dir build -N -L e1a             # Total Tests: 0
+
+# PG 构建（FSS_WITH_PG=ON）
+cmake --build build-pg -j4                   # 绿（exit 0）
+
+# 本机 dev PG 14.24
+FSS_PG_DSN=postgresql://fss@127.0.0.1:15432/fss \
+  ./build-pg/bin/test_instance_identity_exposure
+#   → All tests passed (169 assertions in 7 test cases)
+
+# 目标 PG 12.6（LAN）
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss \
+  ./build-pg/bin/test_instance_identity_exposure
+#   → All tests passed (169 assertions in 7 test cases)
+
+# 全量 PG 标签（两引擎）
+FSS_PG_DSN=postgresql://fss@127.0.0.1:15432/fss ctest --test-dir build-pg -L pg --output-on-failure
+#   → 100% tests passed, 0 tests failed out of 12；Total Test time = 90.66 s
+FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg --output-on-failure
+#   → 100% tests passed, 0 tests failed out of 12；Total Test time = 110.85 s
+
+# 文档与配置三态
+./build/bin/test_operations_doc              # All tests passed (24 assertions in 2 test cases)
+./scripts/check_docs.sh                      # 全部检查通过（D1~D5）；D5 = 11 阶段 / 148 条门槛（未变）
+```
+
+两引擎的全量 PG 用例逐条一致（`pg_fixture_setup` / `pg_schema_invariants` / `pg_advisory_lock` /
+`pg_concurrent_claim` / `test_postgres_repositories` / `test_multi_mode` / `test_production_readiness` /
+`test_postgres_lease_lifecycle` / `test_multi_crash_recovery` / `test_shared_mount_and_registry` /
+`test_instance_identity_exposure` / `pg_fixture_teardown`），**12/12 通过**；其中
+`test_instance_identity_exposure` 本机 10.72 s、目标 11.91 s。
+
+### 23.3 用例与断言计数
+
+| 用例（`★ E1a-*`，全部带 `[e1a]`） | 判据 |
+| --- | --- |
+| E1a-1 | DTO 恒渲染（非空 + 空值两段）+ camelCase（无 `instance_id`/`InstanceId`） |
+| E1a-proto | `InfoResponse.instance_id` 的 proto3-JSON 键名 == `instanceId`（真实序列化） |
+| E1a-2 | `app::GetInfo` 原样转发端口值（改值即变；默认 `local`） |
+| E1a-3 | 真实 single 进程：REST 与 gRPC 同源（`ws-77` / `ws-88` 负控 / 未配置→`local` 正控） |
+| E1a-4/5 | multi+PG 自动生成 id == 注册表最新心跳行；同进程运行期删除 `ghost-stale`、保留 `ghost-live`、指标 >= 1 |
+| E1a-6 | single 的 `/metrics` **没有** `fss_instance_registry_` 族（反面对照） |
+| E1a-7 | 回归：启动期清理仍然删除启动前插入的 400 s 陈旧行 |
+
+计数：**169 断言 / 7 用例**，本机与目标 PG **两引擎逐字相同**。
+
+### 23.4 运行期清理时延（实测，非推算）
+
+在 multi 进程 ready 之后插入 `ghost-stale`（`heartbeat_at = now() - 400s`）与 `ghost-live`
+（`now()`），**不重启进程**，每 500 ms 轮询直到 `ghost-stale` 消失：
+
+| 引擎 | 插入→消失 | 观察到的指标 |
+| --- | --- | --- |
+| dev PG 14.24 | **10 029 ms** | `fss_instance_registry_stale_rows_removed_total = 1`，`cleanup_runs_total = 2` |
+| 目标 PG 12.6 | **10 047 ms** | `fss_instance_registry_stale_rows_removed_total = 1`，`cleanup_runs_total = 2` |
+
+即"阈值 300 s + 下一个 10 s tick"；两引擎同量级（差 18 ms，属调度噪声）。`ghost-live` 在两次
+运行中都仍在（阈值被尊重）。
+
+### 23.5 R1 注入自证（每个注入都：注入 → 重编 → 看到指定用例失败 → 还原 → 重编 → 绿）
+
+| 注入 | 改动 | 失败用例 | 观察到的失败信息 | 还原后 |
+| --- | --- | --- | --- | --- |
+| **I1** | `dto.cpp` 把 `body["instanceId"]` 改为 `if (!empty)` 才渲染 | E1a-1（空值段） | `REQUIRE( value.contains("instanceId") )` → `false`；JSON = `{"buildVersion":"","connectedOuterServices":[],"ioUringAvailable":false,"version":"v2"}` | E1a-1 绿（11 断言） |
+| **I2** | `usecases.cpp` 硬编码 `info.instance_id = "local"` | E1a-2、E1a-3 | E1a-2：`"local" == "peer-alpha"`（`first.value().instance_id == "peer-alpha"`）；E1a-3：`"local" == "ws-77"`（`RestInstanceId(...) == "ws-77"`） | E1a-2+E1a-3 绿（58 断言 / 2 用例） |
+| **I3** | `server_main.cpp` 注释掉 `RunStaleCleanup()`（只留启动期清理） | E1a-4/5（**最关键**） | `REQUIRE( removed )` → `false`，`ghost-stale 从插入到消失耗时 = 40100 ms`（轮询超时）；**同一注入下 E1a-7 仍绿（21 断言）** | E1a-4/5 绿（66 断言） |
+| **I4** | `pg_instance_registry.cpp` 的 `CleanupStale` 谓词加 `($2::int >= 0 OR …)` ⇒ 变成"删所有非自己行" | E1a-4/5 | `REQUIRE( scratch.HasRow(live_id) )` → `false`（`ghost-stale` 在同一次 tick 被删，实测 10 026 ms） | E1a-4/5 绿（66 断言） |
+| **I5** | `dto.cpp` 键名写成 `instance_id` | E1a-1（非空段 + 空值段） | 两次 `REQUIRE( value.contains("instanceId") )` → `false` | E1a-1 绿（11 断言）→ 最终整文件 169/7 绿 |
+
+**没有任何注入**出现"注入了但用例仍绿"的情况——5 个注入全部产生预期失败，判据都有区分力。
+其中 **I3** 正是"启动期清理 vs 运行期清理"的差值：E1a-4/5 失败而 E1a-7 保持绿，证明 E1a-4/5
+测的是**运行期**路径、E1a-7 测的是**启动期**路径，两者互不替代。
+
+注入残留自检：`grep -rn "INJECTED" src/ tests/` → 无输出；`git diff -- src` 无注入标记。
+
+### 23.6 未覆盖 / 未验证（如实登记）
+
+* **`ghost-*` 是合成行**（直接 `INSERT`），不是真实崩溃进程留下的行；真实崩溃路径由既有
+  C9.26（`test_multi_crash_recovery`）覆盖，但那条用例的阈值窗口内不会触发 300 s 清理。
+* **300 s 阈值不可配置**（编译期常量 `kInstanceStaleCleanupSeconds = 10 × 30`），本切片未加配置键
+  ⇒ 157 键三态计数不变（`test_operations_doc` + `check_docs.sh` 通过）。
+* **清理失败路径未实测**：`CleanupStale` 返回错误时的"只 Warn、不影响 readiness"只有设计注释，
+  没有注入"PG DELETE 权限被回收"来跑这条分支（**未验证**）。需要造一个只读 PG 账号才能在目标库上验证。
+* **只测 2 类实例数（1 个 multi 实例）**：没有 >2 实例同时在线地互相清理；没有真实跨主机 NTP 漂移。
+* **单实例 + PG**（`mode=single` + `metadata.repository=postgres`）也会装配注册表 ⇒ 那两个指标会存在；
+  本切片只验证了"默认单实例（posix+sqlite）无该指标族"，**single+PG 组合未验证**。
+* **`ghost-live` 的"保留"只证明了阈值方向**；没有验证"两个都 stale 时都被删"或"自己永不被删"
+  （后者由 `CleanupStale` 的 `instance_id <> self` 保证，但本片的 synthetic 行都不是 self，
+  **未直接断言**）。
+* **proto3-JSON 空值语义未断言**：REST 对空 `instance_id` 渲染 `""`，而 proto3-JSON 会**省略**
+  默认值字段（proto3 既有行为）；本片只断言非空值 `"ws-77"` 的键名。
+* **`/v2/info` 的 REST 字段顺序 / `Content-Type`** 未在本片新增断言（既有 `test_ops_endpoints` 覆盖）。
+
+## 父代理独立复核
+
+**复核人：父代理（不采信子代理自报数字；以下每条都是我自己跑出来的）。**
+
+### 复核方式
+
+- **不看子代理的结论，只看我自己的命令输出**；消融用**运行期环境开关**注入（临时加在
+  `RunStaleCleanup()` 顶部，复核后**已删除**，`grep -rn "PARENT-ABLATION\|FSS_PARENT_" src/ tests/` 无输出），
+  因此"同一二进制两种跑法"排除了"重编不同/看错二进制"的可能。
+- 复核前的基线：`HEAD=5d20bef`（本切片**未提交**、工作树改动即子代理交付），`git status --short AGENTS.md` 为空。
+
+### 1. 数字复核（我自己跑）
+
+| 命令 | 我的实测 |
+| --- | --- |
+| `FSS_PG_DSN=postgresql://fss@127.0.0.1:15432/fss ./build-pg/bin/test_instance_identity_exposure` | **All tests passed (169 assertions in 7 test cases)** |
+| `FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ./build-pg/bin/test_instance_identity_exposure` | **169 assertions / 7 test cases**（与 14.24 逐字相同） |
+| `build/bin/test_instance_identity_exposure` | 不存在（PG 门控），与子代理一致 |
+
+### 2. 独立消融 I3（本切片**最关键**的判据）
+
+环境开关关掉运行期清理后，**只跑 E1a-4/5 与 E1a-7**（`"*E1a-4/5*,*E1a-7*"`）：
+
+```text
+★ E1a-4/5：multi 自动生成 instanceId ...
+  REQUIRE( removed )
+  elapsed := 40110 (0x9cae)
+test cases:   2 |   1 passed | 1 failed
+assertions: 137 | 136 passed | 1 failed
+```
+
+- **E1a-4/5 失败于轮询超时 40 110 ms**（`ghost-stale` 始终没被删 —— 因为只剩启动期清理）；
+- **E1a-7 仍然绿**（启动前插入的 400 s 陈旧行被启动期清理删掉）；
+- 同一个二进制**打开**开关 → 169/7 全绿。
+
+⇒ 子代理的 I3 结论成立，并且我用**不同机制**独立复现：E1a-4/5 测的是**运行期**路径、
+E1a-7 测的是**启动期**路径，两者互不替代。**若没有这条消融，"运行期清理"这个交付就无法与
+"只有启动期清理"区分**（这正是 R1 要防的"判据无区分力"）。
+
+### 3. 独立消融 I4（阈值方向：不是无差别 DELETE）
+
+同一条环境开关把阈值改成 **1 s**（即"所有非己行都算过期"）：
+
+```text
+  REQUIRE( scratch.HasRow(live_id) )
+  elapsed := 10026 (0x272a)
+test cases:  1 |  0 passed | 1 failed
+```
+
+脏行在 10 026 ms（一个 tick）被删，但**新鲜行 `ghost-live` 也被删** ⇒ 用例按设计失败。
+我把子代理的 I4（谓词恒真）换成"阈值=1 s"这一**等价但机制不同**的注入，结论一致：
+"新鲜行必须仍在"这条断言有区分力。
+
+### 4. 真实进程复核（不走测试夹具，我自己拉进程 + 自己 curl）
+
+**(a) single 模式**（自选空闲端口 54251，自己的 `--set`）：
+
+```text
+$ curl -sS http://127.0.0.1:54251/api/file/v2/info
+{"authMode":"disabled","buildVersion":"0.1.0","connectedOuterServices":["storage"],
+ "instanceId":"ws-PARENT","ioEngine":"blocking","ioUringAvailable":true,"version":"v2"}
+```
+
+- `instanceId == "ws-PARENT"`（= 我传的 `deployment.instance_id`）；
+- `/metrics` 中 `fss_instance_registry_` **命中 0 次**；同一份文本 `fss_io_engine` **命中 1 次**
+  （正控：证明"找不到"不是因为抓到空文本）⇒ "指标族只在 PG 模式存在"成立。
+
+**(b) multi + PG（本机 14.24，自建 scratch schema，`deployment.instance_id` 未配置）**：
+
+```text
+readiness=200
+REST instanceId = f067a56a-521b-4c9b-a7a1-937d88b129e0
+registry_rows=1 rest_row_present=1              # REST 值 == 注册表行
+插入后 stale=1 live=1
+ghost-stale 消失耗时 = 9478 ms                  # 进程存活期间（kill -0 通过）
+清理后 stale=0 live=1                           # 阈值方向正确
+fss_instance_registry_cleanup_runs_total 2
+fss_instance_registry_stale_rows_removed_total 1
+```
+
+⇒ 自动生成 id、`/v2/info` 与注册表一致、**运行期**清理（≈一个 10 s tick）、阈值方向、
+两个计数器，全部由我独立复现；**时延 9 478 ms 与子代理的 10 029 / 10 047 ms 同量级**。
+
+### 5. 复核中发现并修正的**文档错误**（子代理交付里的）
+
+| 位置 | 问题 | 处置 |
+| --- | --- | --- |
+| `docs/03-api-contract.md` §8 测试清单新增行 | 末列是**阶段**号，子代理写成 `6`（应为 **10**）；且描述漏了 `E1a-proto` 用例 | 已改为 `10`，描述补上"**proto3-JSON `json_name`**" |
+| `docs/phase-status.md` 的 E1a 更正注记（两处） | ① 把"运行期清理"写成"上面列出的"项，但被引用的历史原文**没有**列这条（真正被取代的是 B2b 段"stale 行被忽略（启动期按 300s 阈值清理）"）；② 另一处写"`AGENTS.md` 本轮未改动"，与本轮实际（父代理已同步 §0.1）不符 | 两句都改成**精确指向**（B2b 段原句 + 第 40/59 行的 `instanceId` 登记），`AGENTS.md` 那句改为"已同步" |
+| `AGENTS.md` §0.1 PG 行 | 仍把 `/v2/info` 的 `instanceId` 与"运行期清理过期行"列为未交付 | 已改为 **E1a 已交付**（含"清理失败分支未用只读账号实测"这条如实登记） |
+
+### 6. 残留与副作用核查
+
+- PG **两引擎**均无 `pgtest%` schema 残留；`instance_registry` **0 行**；无 `fss_server` 残留进程。
+- 我自己的 scratch 目录（`build/parent-e1a*`）已删。**唯一**的复核事故：第一次手工核实
+  `/v2/info` 时，我的 shell 把 `&` 绑到了整条 `&&` 列表 ⇒ 父 shell 里 `$PORT` 为空 ⇒ curl 打到
+  **80 端口**（nginx→drogon 反代）收到 404 HTML。我在把"字段不存在"写进结论前先核对了
+  响应头 `Server: nginx` 与端口家底，定位为**自己的调用错误**，该次运行**作废**（上面所有数字
+  都来自修正后的运行）。与 AGENTS §4.3「探针没真的执行过就别把它当成环境结论」同族。
+- ★ **顺带观察（非本切片引入，登记备查）**：多实例进程被 `SIGTERM` 正常停止后，
+  `<root>/.fss_probe.<instance_id>` **会留下**（`SharedMountProbe` 没有析构清理，组合根也从不调用
+  `RemoveOwn`）—— 同一 id 重启会覆盖它，其它陈旧探针由 `CleanupStale`（**1 h** 阈值，且
+  **只在启动期**调用一次）清掉。这是 B2b 的既有行为，E1a 未改动（E1a 只把**注册表行**的清理做成
+  运行期，**探针文件没有**）；已记入 `docs/operations.md` §10.6。
+
+### 7. 复核结论
+
+- 子代理的 5 条注入结论**成立**（我用不同机制独立复现了最关键的 I3 与 I4）；
+- 交付的两个功能在**真实进程**上成立（single 的字段暴露与指标族缺席、multi 的自动 id + 运行期清理）；
+- 子代理的**文档**有 3 处不准确，已由我修正；
+- 未验证项以子代理 §23.6 与 `AGENTS.md` §0.1 的登记为准（尤其：清理**失败**分支未用只读账号实测）。

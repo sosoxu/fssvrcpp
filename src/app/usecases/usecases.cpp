@@ -1135,6 +1135,9 @@ fss::Result<VersionInfo> GetInfo::Execute() {
   //    这里只做转发：探测与决策发生在组合根（R12），用例与适配层都不重算。
   info.io_engine = ports_.io_engine;
   info.io_uring_available = ports_.io_uring_available;
+  //  ★ E1a：实例身份的**唯一来源**仍是组合根（`ports_.instance_id`，multi 下可能
+  //    是自动生成的）—— 这里只转发，**不重算**、不查 PG、不读配置。
+  info.instance_id = ports_.instance_id;
   return info;
 }
 

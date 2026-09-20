@@ -1007,14 +1007,16 @@ gc.require_lease_expiry=true      0 < deployment.max_clock_skew_seconds <= 60
 
 ⚠️ **B2b 之后仍未交付（不要把"能启动"读成"多实例已完整验证"）**：NFS 语义（C9.27 ——
 B2b 只证明"交叉探针可见 = 共享性"，不证明 `rename`/close-to-open/`syncfs` 语义）、
-`/v2/info` 暴露 `instanceId`、ADR-009 §10 的多实例部署/租户/PG HA/按盘分区运维手册、
+ADR-009 §10 的多实例部署/租户/PG HA/按盘分区运维手册、
 跨实例 `createMetadata` 的 LB 粘性建议。**已交付**（不要重复列为未交付）：readiness 的
 PG `SELECT 1` + 迁移版本校验（B2a）、`instance_registry` 心跳 / 配置版本一致性 +
-共享挂载探针（B2b）、PG 连接预算（C9.28，B2a）、PG-vs-本地时钟比较（B2a）、上传路径的
+共享挂载探针（B2b）、**`/v2/info` 的 `instanceId`（E1a）**、
+**`instance_registry` 陈旧行的运行期清理（E1a）**、
+PG 连接预算（C9.28，B2a）、PG-vs-本地时钟比较（B2a）、上传路径的
 租约 `Acquire`/`Renew`、`CreateFileMetadata` 跨步骤原子领取 + `claiming→ready`、
 完整多实例 E2E 与崩溃注入（C9.26）。见 §8 与
 [`docs/adr/ADR-009-multi-instance-consistency.md`](adr/ADR-009-multi-instance-consistency.md)、
-`docs/test-evidence/phase10.md` §17。
+`docs/test-evidence/phase10.md` §17、§23。
 
 ---
 
@@ -1027,7 +1029,7 @@ PG `SELECT 1` + 迁移版本校验（B2a）、`instance_registry` 心跳 / 配�
 | `storage.io_engine=uring` | **不可用（引擎未启用）** | 组合根会真实探测（`sys::ProbeIoUring`）并按 ADR-010 拒绝/回退；但 `UringIoEngine::enabled()=false`（U1~U4 未满足）→ 显式要求 `uring` 一律 **exit 78**，`auto` 回退 blocking（横幅 + `fss_io_engine` 可见） |
 | `metadata.repository`/`location.repository` 的 `postgres` | **已实现（B1）** | 组合根创建 `PostgresMetadataRepository` / `PostgresLocationRepository`，DSN 不可达 → **exit 78**（+ libpq 原文），绝不静默降级为 SQLite。`metadata.repository=remote` 仍**未实现**（显式拒绝） |
 | PG 租约 / leader election | **已实现（B1 + B2a）** | `leases.enabled=true` → `PostgresLeaseRepository`（`staging_leases`）；`leader_election.enabled=true` → `PgLeaderElection`（专用锁连接 + GC 门控）。数据库时钟 `now()` 用于租约判定；**PG↔本地时钟偏移比对已实现（B2a）**：启动期 `|本地钟 − now()| > deployment.clock_skew_tolerance_seconds` → **exit 78**（横幅 `clock skew :` 可见） |
-| 多实例运行形态（启动 + PG 落库 + 两进程一主 + 一致性/共享挂载判定） | **已实测（B1 + C9.26 + B2a + B2b）** | 真实进程 + 直连 libpq：multi/single 落 PG、`pg_locks` 持锁与释放、共键两进程恰好一个 leader（非 leader 的 `fss_gc_runs_total` 不增加）、空 instance_id 自动生成；崩溃注入（C9.26 的 kill -9 + 租约回收）、**PG 连接预算（C9.28，B2a）**、**时钟偏移（B2a）**、**readiness 的 PG 探活 + 迁移版本校验（B2a）**、**`instance_registry` 心跳 + config_hash/服务版本一致性（B2b）**、**共享挂载交叉探针（B2b）** 均已交付（`tests/integration/test_shared_mount_and_registry.cpp`）。**未有**：NFS 语义（C9.27 —— B2b 只证明共享性，不证明 `rename`/close-to-open/`syncfs`）、`/v2/info` 的 `instanceId` |
+| 多实例运行形态（启动 + PG 落库 + 两进程一主 + 一致性/共享挂载判定） | **已实测（B1 + C9.26 + B2a + B2b + E1a）** | 真实进程 + 直连 libpq：multi/single 落 PG、`pg_locks` 持锁与释放、共键两进程恰好一个 leader（非 leader 的 `fss_gc_runs_total` 不增加）、空 instance_id 自动生成；崩溃注入（C9.26 的 kill -9 + 租约回收）、**PG 连接预算（C9.28，B2a）**、**时钟偏移（B2a）**、**readiness 的 PG 探活 + 迁移版本校验（B2a）**、**`instance_registry` 心跳 + config_hash/服务版本一致性（B2b）**、**共享挂载交叉探针（B2b）**、**`/v2/info` 的 `instanceId` 双协议同源（E1a）**、**运行期陈旧行清理（E1a）** 均已交付（`tests/integration/test_shared_mount_and_registry.cpp`、`tests/integration/test_instance_identity_exposure.cpp`）。**未有**：NFS 语义（C9.27 —— B2b 只证明共享性，不证明 `rename`/close-to-open/`syncfs`） |
 | `metadata.sqlite.{journal_mode,synchronous}` / `location.sqlite.synchronous` | **已接通（切片 4）** | 两个 `Sqlite*RepositoryOptions` 新增 `wal` / `synchronous_level` 真实字段并真的执行 PRAGMA；`synchronous` **不落盘**，用同连接访问器 `AppliedPragma("synchronous")` 验证（另开 sqlite3 连接读回无效）。真实进程侧：`metadata.sqlite.journal_mode=DELETE` 用 `python3 sqlite3` 读回 `delete`，横幅打印 `synchronous=<实际取值>`；TRUNCATE / 非枚举值 → exit 78（§1.3.1） |
 | `metadata.sqlite.max_write_concurrency` / `location.sqlite.max_write_concurrency` | **未接通（如实登记）** | 两个仓储都是「单连接 + 互斥」⇒ 实际写并发恒为 1 ≤ 上限，改它不改变行为。下一步：连接池交付后才接通（`group_commit*` 三键已由 **C10.20** 接通，见 §1.3.1） |
 | `storage.posix.{atomic_write,dir_mode,file_mode,fadvise_random,fadvise_dontneed_after_large_read,group_commit_max_batch}` 与 `partition.file.opendes.{staging_container,persistent_container,storage_driver}` | **已定案（C10.16 续 + ADR-008 的 P4）** | `PosixBlobStoreOptions` 已加 6 个真实字段（atomic_write/dir_mode/file_mode/fadvise_*/batch_commit+group_commit_max_batch）并接通；`PartitionConfig` 已加容器名/分区驱动字段：容器名接通、分区驱动冲突 → 拒绝启动；`sync_dir_after_batch=false` → 拒绝启动（R2 不变量，§1.3.2） |
@@ -1237,8 +1239,18 @@ cmake --build build --target test_operations_doc -j"$(nproc)" && ./build/bin/tes
 3. **改配置也走同一条流程**：`config_hash` 覆盖**整个脱敏配置**，例如把 `gc.enabled` 从
    `true` 改成 `false` 也会改变 `config_hash` ⇒ 只改一个实例并重启它，会让它被判为
    "与对端配置不一致"而 not ready。**配置变更要与版本升级一样按滚动流程处理**。
-4. `instance_registry` 的**陈旧行**（心跳超过 **300 s**）在**启动期**清理；**运行期只忽略、不删除**
-   （如实登记：没有运行期清理）。判读时以 `heartbeat_at` 的年龄为准，而不是以"表里有这行"为准。
+4. `instance_registry` 的**陈旧行**（心跳超过 **300 s**，阈值未变）在**启动期**清理，
+   **并且**运行期每个 10 s 心跳 tick 还做一次**尽力而为**的清理（E1a 交付）：
+   · 清理失败（例如运行账号没有 DELETE 权限）**只记一条告警，绝不影响 readiness** ——
+     心跳超过 300 s 的行早已被 `ListLivePeers` 的 30 s 存活窗口过滤掉，它在不在表里都
+     改变不了任何判定，这条 DELETE 是**纯家务**（与之相对，`TouchHeartbeat` 是 fail-closed
+     的正确性前置条件，不走"尽力而为"）。
+   · `CleanupStale` 删除 `instance_id <> self` 的行，**永远不会删掉自己**。
+   · 两个计数器（只在与 PG 装配时才存在）：`fss_instance_registry_cleanup_runs_total`
+     （每次 tick 尝试 +1）、`fss_instance_registry_stale_rows_removed_total`（+删除行数）。
+   · ⇒ 崩溃实例留下的行现在会在 **≤ 300 s + 一个 tick（10 s）** 内自行消失，不再依赖
+     "某个别的实例重启"。判读时仍以 `heartbeat_at` 的年龄为准，而不是以"表里有这行"为准。
+   证据：[`test-evidence/phase10.md`](test-evidence/phase10.md) §23。
 
 ### 10.6 实例标识与临时文件命名
 
@@ -1247,6 +1259,13 @@ cmake --build build --target test_operations_doc -j"$(nproc)" && ./build/bin/tes
   —— 共享挂载上的临时名会确定性撞名（ADR-009 M1 的静默串数据）。
 - 临时文件名 = `<最终键>.tmp.<instance_id>.<pid>.<counter>.<random>`（ADR-009 §4.5）。
   **不要**手工清理正在被其它实例写入的 `.tmp.*` —— 交给 GC 的租约/TTL 判定（runbook §4）。
+- ⚠️ **探针文件在正常停止后不会被删除**（如实登记）：`SharedMountProbe` 没有析构清理，组合根也
+  不调用 `RemoveOwn` ⇒ `SIGTERM` 之后 `<root>/.fss_probe.<instance_id>` **会留下**。同一
+  `instance_id` 重启会覆盖它；其它陈旧探针由 `CleanupStale` 按 **mtime 1 h** 阈值清掉 ——
+  注意这一条**只在启动期**执行（`server_main.cpp` 的探针清理是启动期一次；
+  E1a 只把**注册表行**的清理做成了运行期，**探针文件没有**）。因此"共享挂载上多了几个探针
+  文件"是**预期**，不是泄漏；但**不要**手工删 —— 删掉一个**活着的**对等实例的探针，会让本实例
+  在下一次 10 s 复查里判为"挂载没共享"而 **not ready**（runbook §8.3）。
 
 ### 10.7 可观测性：多实例要盯什么
 
@@ -1254,20 +1273,22 @@ cmake --build build --target test_operations_doc -j"$(nproc)" && ./build/bin/tes
 | --- | --- | --- |
 | `GET /v2/readiness_check` | 组合根注入的 `shared_state_probe`：PG `SELECT 1` + `schema_migrations.max(version)` 比对（B2a）+ 心跳/共享挂载/版本/`config_hash` 一致性（B2b）；失败 **503** + 可读原因 | 用它做**流量准入**；原因文本会指出是 PG、schema 版本、对端探针还是对端配置 |
 | `GET /v2/liveness_check` | 只证明进程活着，**不碰依赖** | 用它做**重启判定**；不要拿它做准入 |
-| `GET /v2/info` | `buildVersion`、`authMode`、`ioEngine` / `ioUringAvailable` | ⚠️ **不暴露 `instanceId`**（未交付，§10.8）——要按实例定位请查 `instance_registry` 或启动横幅 |
+| `GET /v2/info` | `buildVersion`、`authMode`、`ioEngine` / `ioUringAvailable`、**`instanceId`** | ★ **E1a 起暴露 `instanceId`**（= 本进程的 `instance_registry.instance_id`，也是 `.fss_probe.<instance_id>` 的文件名后缀）—— 一次 HTTP 响应即可定位到注册表行与探针文件，不必再查 PG 或翻启动横幅。multi 下该值是**每进程**的（未配置时组合根自动生成）。**恒渲染**（无空值省略） |
 | `fss_gc_runs_total` | 只统计**真的跑了** `GcTask::Run` 的轮次 | ★ 由 leader 门控：**非 leader 不增长**。全员都涨 = leader 选举失效；全员都不涨 = 没有 leader / `gc.enabled=false` / 调度未起 |
 | `fss_gc_reclaimed_claiming_total` | 回收的"崩溃领取者"`claiming` 行数 | 崩溃后该值增长是**预期**（§10.2、runbook §8.2） |
 | `fss_gc_objects_deleted_total` + `fss_gc_skipped_total{reason}` | 删除量 / 跳过原因（含 `tmp_too_young` = 在途上传被保护） | 多实例下由 leader 单跑；`skipped` 突然归零要怀疑租约/时钟 |
 | `fss_sqlite_*`（`fss_sqlite_ops_total` / `fss_sqlite_group_commits_total`） | 内置 SQLite 仓储的组提交 | ⚠️ **只与单实例相关**：multi 下仓储是 PG，这两族**不产生**，不要因为它们在 multi 实例上缺失而告警 |
 | `fss_posix_{syncfs,group_commits,batch_objects}_total` | 两阶段批提交的可证事实 | 只在 `storage.driver=posix` 且 `durability=batch` 下增长；多实例共盘时用它对照"谁在 flush" |
 | `fss_io_engine{engine,requested}` / `fss_io_uring_available` | 实际引擎 / 宿主能力 | **可用 ≠ 已启用**（引擎未交付，§1.2.4）；跨实例应一致但**未验证** |
+| `fss_instance_registry_cleanup_runs_total` / `fss_instance_registry_stale_rows_removed_total` | 运行期陈旧行清理的**尝试次数** / **删除行数**（E1a；每 10 s tick 一次，阈值 300 s） | `runs` 应每 10 s 增长；`removed` 只在真有崩溃实例留下陈旧行时增长（为 0 是正常的，**不**代表功能坏掉）。⚠️ **单实例/无 PG 时这两族指标不存在**（不是恒 0）—— 组合根只在 PG 注册表被装配时才注册它们；`/metrics` 里找不到它们属于预期 |
 
 **PG 侧直接观察**（排障时最有用；建议只读账号）：
 
 ```sql
 -- 谁是 leader（会话级 advisory lock；行数应恒为 1）
 SELECT objid, pid FROM pg_locks WHERE locktype = 'advisory';
--- 在线实例与心跳年龄（live 窗口 30s；>300s 的陈旧行只在启动期清理）
+-- 在线实例与心跳年龄（live 窗口 30s；>300s 的陈旧行由**启动期 + 运行期每 10s tick** 的
+-- 尽力而为清理删除 —— 一个崩溃实例的行会在 ≤300s + 一个 tick 内自行消失）
 SELECT instance_id, service_version, left(config_hash, 12), now() - heartbeat_at AS age
   FROM instance_registry ORDER BY instance_id;
 -- 在途领取（崩溃后会留下这些行，等租约到期由 leader 的 GC 回收）
@@ -1285,10 +1306,8 @@ SELECT partition_id, file_source, expires_at FROM staging_leases ORDER BY expire
 | --- | --- | --- |
 | LB 粘性 / 会话保持 | **未验证** | 正确性不依赖它（§10.1），但"真实 LB 上是否需要粘性"从未验证 |
 | > 2 个实例的实测 | **未验证** | C9.26 是两个真实进程；3 实例及以上只能由连接预算（§10.2）与 leader 单例外推 |
-| 运行期清理过期注册行 | **未交付** | 只在**启动期**清理 >300 s 的行；运行期只忽略、不删除（§10.5 item 4） |
 | 真实双版本滚动升级 | **未验证** | 版本不一致分支由测试接缝 `FSS_SERVICE_VERSION_OVERRIDE` 驱动（runbook §10.4）；没有跑过两个不同二进制 |
 | NFS 语义（C9.27） | **未验证** | 上生产硬前提；探针已交付，见 [`runbook.md`](runbook.md) §11 与 [`test-evidence/phase9.md`](test-evidence/phase9.md) §16 |
 | K8s（restricted PodSecurity / `readOnlyRootFilesystem` / `runAsNonRoot` / `fsGroup`） | **未验证** | 无集群；Docker 的等价项已实测（§8），但**不等价于** K8s 的具体实现 |
-| `/v2/info` 暴露 `instanceId` | **未交付** | 目前只能从 `instance_registry` 或启动横幅取实例标识（§10.7） |
 | PG 故障转移本身 | **未验证** | 主从 + 自动切换是运维范围（ADR-009 §8.3）；应用侧只保证"PG 不可用 → fail-closed"与"恢复后自愈"（§10.2） |
 | `syncfs` 跨实例干扰量级（C9.24） | **未验证** | 只能靠部署纪律分盘（§10.3）；`one_filesystem_per_partition` 未接通 |

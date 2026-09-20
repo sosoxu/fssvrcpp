@@ -239,6 +239,27 @@ if(FSS_WITH_PG)
     FIXTURES_REQUIRED pg
     TIMEOUT 900)
 
+  # ===========================================================================
+  #  E1a：`/v2/info` 的 `instanceId`（REST/gRPC 同源）+ `instance_registry`
+  #       陈旧行的**运行期**清理（不是只启动期）
+  #    · ①/② 进程内：DTO 恒渲染 + camelCase；`app::GetInfo` 原样转发端口值；
+  #    · ③ 真实 single 进程：REST 与 gRPC 同源（ws-77 / ws-88 / 未配置→local）；
+  #    · ⑥ single 的 `/metrics` **没有** `fss_instance_registry_*` 族（反面对照）；
+  #    · ④ multi + PG + 未配置 id：REST 值 == 注册表最新心跳行的 instance_id；
+  #    · ⑤ 同一存活进程里 synthetic 陈旧行被**运行期**删除（新鲜行保留 + 指标 >= 1）；
+  #    · ⑦ 回归：启动期清理仍然工作。
+  #  参数（钉住的设计，非配置键）：心跳 10s / live 窗口 30s / 陈旧阈值 300s。
+  # ===========================================================================
+  fss_add_test(test_instance_identity_exposure
+    SOURCES integration/test_instance_identity_exposure.cpp
+    LIBS    fss_pg fss_app fss_http_adapter fss_grpc_adapter fss_blob_memory
+            fss_location_memory fss_metadata_memory Threads::Threads
+    LABELS  "pg;integration;e1a")
+  add_dependencies(test_instance_identity_exposure fss_server)
+  set_tests_properties(test_instance_identity_exposure PROPERTIES
+    FIXTURES_REQUIRED pg
+    TIMEOUT 900)
+
   if(FSS_PG_TEARDOWN)
     add_test(NAME pg_fixture_teardown COMMAND "${_pg_script}" stop)
     set_tests_properties(pg_fixture_teardown PROPERTIES

@@ -1191,15 +1191,34 @@ fss::Result<int> StartupMountVisibilityCheck(fss::infra::PgInstanceRegistry& reg
 //  （共享挂载可见性 / 服务版本兼容性 / config_hash），把"不 ready 的可读原因"
 //  缓存在内存里。readiness 探针（`ports.shared_state_probe`）只读缓存 ——
 //  与 B2a 的 PG 探针合成**同一个**判据（REST 与 gRPC 按构造一致）。
+//
+//  ---- E1a：每个 tick 还做一次**运行期**陈旧行清理 ----
+//  `PgInstanceRegistry::CleanupStale(kInstanceStaleCleanupSeconds)` 过去只在启动期
+//  调用一次，于是崩溃实例留下的行在**没有别的实例重启**之前永远不会被删。现在
+//  每个心跳 tick（10s）都**尽力而为**地删一次（阈值不变，仍是 300s）。
+//
+//  ★ 钉住的设计决策：清理失败**不影响 readiness**。
+//    理由：心跳超过 `kInstanceStaleCleanupSeconds`（300s）的行，早已被
+//    `ListLivePeers` 的存活窗口（`kInstanceLivenessSeconds`=30s）过滤掉 ⇒
+//    它**在不在表里**都改变不了任何判定，这条 DELETE 是**纯家务**。
+//    因此"没有 DELETE 权限"只应是一条告警，而不是 fail-closed 条件；
+//    与之相对，`TouchHeartbeat` **是** fail-closed —— 那是正确性前置条件
+//    （写不进心跳 ⇒ 别的实例会误判本实例已死）。
+//    这也是为什么清理放在 `Tick()` 里、`Evaluate()` 之外：即便 `Evaluate()` 在
+//    ①/②/③ 的任一条提前 return（not ready），清理**仍然**会被尝试。
 class InstanceConsistencyMonitor {
  public:
   InstanceConsistencyMonitor(fss::infra::PgInstanceRegistry& registry,
                              fss::infra::SharedMountProbe* probe,
-                             std::string self_service_version, std::string self_config_hash)
+                             std::string self_service_version, std::string self_config_hash,
+                             const fss::logging::ILogger& logger,
+                             fss::metrics::Registry* metrics = nullptr)
       : registry_(registry),
         probe_(probe),
         self_service_version_(std::move(self_service_version)),
-        self_config_hash_(std::move(self_config_hash)) {}
+        self_config_hash_(std::move(self_config_hash)),
+        logger_(&logger),
+        metrics_(metrics) {}
   ~InstanceConsistencyMonitor() { Stop(); }
   InstanceConsistencyMonitor(const InstanceConsistencyMonitor&) = delete;
   InstanceConsistencyMonitor& operator=(const InstanceConsistencyMonitor&) = delete;
@@ -1238,8 +1257,36 @@ class InstanceConsistencyMonitor {
 
   void Tick() {
     std::string reason = Evaluate();
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    reason_ = std::move(reason);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      reason_ = std::move(reason);
+    }
+    //  ★ E1a：运行期清理放在 `Evaluate()` **之外** —— 即便上面因 not ready 提前
+    //    return，这里的 DELETE 仍然会被尝试。尽力而为，绝不影响 readiness。
+    RunStaleCleanup();
+  }
+
+  //  每个 tick 一次：删掉心跳超过 `kInstanceStaleCleanupSeconds` 的行（不含自己 ——
+  //  `CleanupStale` 的 SQL 谓词是 `instance_id <> self`）。失败只告警。
+  void RunStaleCleanup() {
+    const auto cleaned = registry_.CleanupStale(kInstanceStaleCleanupSeconds);
+    //  `cleanup_runs_total`：每次**尝试** +1（成功或失败都算一次尝试）。
+    if (metrics_ != nullptr) {
+      metrics_->Increment("fss_instance_registry_cleanup_runs_total");
+    }
+    if (!cleaned.ok()) {
+      //  最佳努力：删不掉（例如运行账号没有 DELETE 权限）不是 fail-closed 条件
+      //  （见类注释）。原因要可读，否则运维无法判断"清理有没有在工作"。
+      fss::logging::Warn(*logger_, "instance_registry 运行期陈旧行清理失败（best-effort，"
+                                   "不影响 readiness）",
+                         {{"component", "instance_consistency_monitor"},
+                          {"error", cleaned.error().ToString()}});
+      return;
+    }
+    if (metrics_ != nullptr) {
+      metrics_->Increment("fss_instance_registry_stale_rows_removed_total", {},
+                          static_cast<std::int64_t>(cleaned.value()));
+    }
   }
 
   std::string Evaluate() {
@@ -1279,6 +1326,10 @@ class InstanceConsistencyMonitor {
   fss::infra::SharedMountProbe* probe_;  // 可空（shared_mount_required=false）
   std::string self_service_version_;
   std::string self_config_hash_;
+  const fss::logging::ILogger* logger_;
+  //  可空：单实例 / 内存 / SQLite 模式下组合根**不注册**这两个指标族
+  //  （见构造点的注释），传 nullptr ⇒ 只做清理、不记账。
+  fss::metrics::Registry* metrics_;
   mutable std::mutex state_mutex_;
   std::string reason_;
   std::mutex wait_mutex_;
@@ -2486,8 +2537,22 @@ static int RunServer(int argc, char** argv) {
           " + 服务版本兼容性 + config_hash；不一致 → readiness not ready）";
 
       //  ④ 启动运行时监视器（readiness 从第一次请求起就读它的结论）。
+      //  ★ E1a：两个运行期清理指标在**这里**注册 —— 即"注册表真的被装配"的那条
+      //    分支，而**不是**文件顶部与 `fss_posix_*`/`fss_sqlite_*` 一起无条件注册。
+      //    理由：这两个计数器只有在"存在 PG 支撑的注册表"时才有意义；单实例
+      //    SQLite/内存模式下指标族必须**缺席**于 `/metrics`，而不是一个永远为 0
+      //    的计数器（那看起来像坏掉的功能，见 runbook 的判读纪律）。
+      metrics_registry.Register("fss_instance_registry_cleanup_runs_total",
+                                metrics::Registry::Kind::kCounter,
+                                "instance_registry 运行期陈旧行清理的尝试次数（每次心跳 tick "
+                                "一次；成功或失败都计数）");
+      metrics_registry.Register("fss_instance_registry_stale_rows_removed_total",
+                                metrics::Registry::Kind::kCounter,
+                                "instance_registry 运行期陈旧行清理删除的行数累计（阈值 "
+                                "300s；只删 instance_id <> self 的行）");
       consistency_monitor = std::make_unique<InstanceConsistencyMonitor>(
-          *instance_registry, shared_mount_probe.get(), self_service_version, self_config_hash);
+          *instance_registry, shared_mount_probe.get(), self_service_version, self_config_hash,
+          logger, &metrics_registry);
       consistency_monitor->Start();
     }
   }

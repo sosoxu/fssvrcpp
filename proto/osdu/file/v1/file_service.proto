@@ -537,6 +537,15 @@ message InfoResponse {
   //       引擎实现未交付（ADR-010 U1~U4）⇒ `io_engine` 仍是 "blocking"。
   string io_engine = 10 [json_name = "ioEngine"];
   bool io_uring_available = 11 [json_name = "ioUringAvailable"];
+  //  ★ 扩展字段（非 OSDU 规范，E1a）：本进程的**实例身份**。与 REST `/v2/info`
+  //    的 `instanceId` **同源**（同一个 `app::GetInfo` 返回值，即组合根的
+  //    `UseCasePorts::instance_id`）。multi 模式下若 `deployment.instance_id`
+  //    未设置/为默认 `local`，组合根会**自动生成**唯一 id ⇒ 该值是**每进程**的。
+  //    用途：把活着的进程映射到 `instance_registry` 的对应行与共享挂载上的
+  //    `.fss_probe.<instance_id>` 文件。
+  //    ⚠️ 字段号 12：1..11 已被占用，**不重编号**任何既有字段。
+  //    ⚠️ 不用 `optional`：本仓库的 protobuf 是 3.12.4，不支持 proto3 optional。
+  string instance_id = 12 [json_name = "instanceId"];
 }
 
 message ConnectedService {

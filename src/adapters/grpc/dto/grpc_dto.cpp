@@ -191,6 +191,8 @@ void FillInfoProto(const fss::app::VersionInfo& info, osdu::file::v1::InfoRespon
   //    （**可用 ≠ 已启用**）。
   out->set_io_engine(info.io_engine);
   out->set_io_uring_available(info.io_uring_available);
+  //  ★ E1a：实例身份（与 REST 的 `instanceId` 同源；见 `VersionInfo::instance_id`）。
+  out->set_instance_id(info.instance_id);
 }
 
 void FillMetadataProto(const fss::domain::FileMetadataRecord& record,

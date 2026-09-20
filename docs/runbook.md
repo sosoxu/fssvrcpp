@@ -258,9 +258,13 @@ scripts/bench_baseline.sh --check    # 退化 >20% 直接失败（退出码 1）
 BASE=http://127.0.0.1:8080/api/file          # 逐实例替换
 DSN='postgresql://fss@<pg-host>:5432/fss'    # 按部署替换
 
+# ⓪ 本进程是谁：直接问进程自己，**不必**查 PG 或翻启动横幅（E1a）。
+#    取到的值 == instance_registry.instance_id == `.fss_probe.<instance_id>` 的文件名后缀。
+curl -sS "$BASE/v2/info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["instanceId"])'
 # ① 谁是 leader：会话级 advisory lock 的持有者（行数应恒为 1）
 psql "$DSN" -Atc "SELECT objid, pid FROM pg_locks WHERE locktype='advisory'"
-# ② 在线实例与心跳年龄（live 窗口 30s；>300s 的陈旧行只在启动期清理）
+# ② 在线实例与心跳年龄（live 窗口 30s；>300s 的陈旧行由**启动期 + 运行期每 10s tick** 的
+#    尽力而为清理删除 —— 崩溃实例的行会在 ≤300s + 一个 tick 内自行消失）
 psql "$DSN" -Atc "SELECT instance_id, service_version, left(config_hash,12), now()-heartbeat_at FROM instance_registry ORDER BY instance_id"
 # ③ 在途领取行（崩溃者会留下；等租约到期由 leader 的 GC 回收）
 psql "$DSN" -Atc "SELECT partition_id, file_source, created_at FROM file_metadata_records WHERE state='claiming'"
@@ -268,8 +272,9 @@ psql "$DSN" -Atc "SELECT partition_id, file_source, created_at FROM file_metadat
 psql "$DSN" -Atc "SELECT partition_id, file_source, expires_at FROM staging_leases ORDER BY expires_at"
 # ⑤ 逐实例 readiness（原因文本会指出是哪一类不一致）
 curl -sS "$BASE/v2/readiness_check"; echo
-# ⑥ GC 是否按 leader 单例跑（非 leader 的 fss_gc_runs_total 不应增长）
-curl -sS http://<host>:8080/metrics | grep -E 'fss_gc_(runs|reclaimed_claiming|objects_deleted)_total'
+# ⑥ GC 是否按 leader 单例跑（非 leader 的 fss_gc_runs_total 不应增长）；
+#    以及运行期陈旧行清理是否在动（runs 每 10s +1；removed 只在该实例真清掉陈旧行时 +）
+curl -sS http://<host>:8080/metrics | grep -E 'fss_gc_(runs|reclaimed_claiming|objects_deleted)_total|fss_instance_registry_(cleanup_runs|stale_rows_removed)_total'
 ```
 
 ### 8.2 实例崩溃：幸存者接管、按租约回收
@@ -332,9 +337,16 @@ curl -sS http://<host>:8080/metrics | grep -E 'fss_gc_(runs|reclaimed_claiming|o
 
   ```bash
   psql "$DSN" -Atc "SELECT instance_id, service_version, left(config_hash,12), now()-heartbeat_at FROM instance_registry ORDER BY instance_id"
+  # 本进程的 instanceId（§8.1 ⓪）：用来确认"我在表里的哪一行"
+  curl -sS "$BASE/v2/info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["instanceId"])'
   journalctl -u fss --since '10 min ago' | grep -E 'consistency|instance_reg'
   # 启动横幅的 consistency / instance reg 行给出本实例的结论
   ```
+
+* **澄清（E1a）**：`instance_registry` 里心跳 >300s 的陈旧行现在由**运行期**清理
+  （每 10s tick，尽力而为，失败只告警、不影响 readiness）⇒ 崩溃实例的行不会永远留着，
+  等它自行消失即可，**不要**手工 `DELETE`。清理是否在动看 §8.1 ⑥ 的
+  `fss_instance_registry_{cleanup_runs,stale_rows_removed}_total`。
 
 * **处置**：完成滚动（把其余旧实例逐个替换）；若只是"某实例被单独改了配置"，把配置回滚成一致，
   或按滚动流程统一变更（**配置变更同样改变 `config_hash`**，见 [`operations.md`](operations.md) §10.5）。

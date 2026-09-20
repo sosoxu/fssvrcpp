@@ -61,6 +61,12 @@ json::Value ToJson(const VersionInfoResponse& response) {
   //    运维分不清"探测说不可用"与"这个版本还没这个字段"。
   if (!response.io_engine.empty()) body["ioEngine"] = response.io_engine;
   body["ioUringAvailable"] = response.io_uring_available;
+  //  ★ E1a：`instanceId` **无条件渲染**（即使取值为空串）—— 与 `ioUringAvailable`
+  //    同一条理由：一个"始终有意义"的字段若在空值时消失，运维就无法区分
+  //    「这个版本还没有这个字段」与「字段存在但值为空/未设置」。
+  //    实际上组合根总会把它设成至少 `"local"`（单实例默认值），因此非空是常态；
+  //    这里不做空值判断，正是为了让"字段是否存在"只由**版本**决定。
+  body["instanceId"] = response.instance_id;
   return body;
 }
 

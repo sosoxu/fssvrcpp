@@ -99,6 +99,11 @@ struct VersionInfoResponse {
   //      不代表服务正在用它。两者都经 `app::GetInfo` 取值，与 gRPC 同源。
   std::string io_engine;            // → `ioEngine`
   bool io_uring_available = false;  // → `ioUringAvailable`
+  //  ★ 非 OSDU 规范字段（扩展，E1a）：`instanceId` —— 本进程的实例身份，
+  //    值 = `app::GetInfo` 转发的 `UseCasePorts::instance_id`（multi 下可能由
+  //    组合根自动生成 ⇒ 每进程唯一）。运维用它把进程映射到 `instance_registry`
+  //    行与 `.fss_probe.<instance_id>` 文件。与 gRPC 同源。
+  std::string instance_id;  // → `instanceId`（**恒渲染**，见 dto.cpp）
 };
 
 json::Value ToJson(const VersionInfoResponse& response);
