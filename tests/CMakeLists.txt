@@ -181,6 +181,26 @@ if(FSS_WITH_PG)
     FIXTURES_REQUIRED pg
     TIMEOUT 300)
 
+  # ===========================================================================
+  #  C9.26（本切片）：**两个真实 `fss_server` 进程** + **真实 `kill -9`** 的
+  #  多实例崩溃回收 E2E（ADR-009 §4.2/§4.3 的进程级判据；C2 只在进程内模拟过崩溃）
+  #    · 两个进程共享**同一个** PG DSN 与**同一个** `storage.posix.root`
+  #      （★ 本地目录被两个进程共用，**不是 NFS** ⇒ C9.27 仍未验证）；
+  #    · A 带 `FSS_CLAIM_HOLD_MS`（测试接缝，**不是配置键**）停在 claiming 窗口里，
+  #      被 `kill -9`；B 轮询接管并回收 claiming 行 + 孤儿对象；
+  #    · 同一 file_source 重试 → 201 + SHA-256 与重传字节一致。
+  #  ★ 两进程 + 强杀 + 等租约到期 → 慢；给足超时。
+  # ===========================================================================
+  fss_add_test(test_multi_crash_recovery
+    SOURCES integration/test_multi_crash_recovery.cpp
+    LIBS    fss_app fss_crypto fss_json fss_pg fss_location_postgres Threads::Threads
+    LABELS  "pg;infra")
+  # 被测进程就是 build/bin/fss_server → 构建它必须先于本测试
+  add_dependencies(test_multi_crash_recovery fss_server)
+  set_tests_properties(test_multi_crash_recovery PROPERTIES
+    FIXTURES_REQUIRED pg
+    TIMEOUT 900)
+
   if(FSS_PG_TEARDOWN)
     add_test(NAME pg_fixture_teardown COMMAND "${_pg_script}" stop)
     set_tests_properties(pg_fixture_teardown PROPERTIES

@@ -274,8 +274,8 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 #   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
 ```
 
-**为什么它不是配置键**：`docs/operations.md` 的 156 个叶子键三态清单（生效 122 / 拒绝启动 16 /
-已读但无效果 18）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+**为什么它不是配置键**：`docs/operations.md` 的 156 个叶子键三态清单（生效 125 / 拒绝启动 16 /
+已读但无效果 15）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
 它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动
@@ -313,3 +313,32 @@ FSS_IO_PROBE_INJECT=available ./build/bin/fss_server --set storage.io_engine=uri
 > **本机真值提醒**：探测真值随部署变化 —— WSL2 宿主（`kernel.io_uring_disabled=0`）
 > **可用**，Docker 默认 seccomp 下 `EPERM`（**不可用**）。所以"不注入时必须为 false"
 > **不是**合法判据；判据必须是"字段随探测结果变化"（本接缝提供）。
+
+### 10.2 claiming 窗口**保持**接缝（C9.26；⚠️ 同样**不要在生产设置**）
+
+用来把"一个实例**正持着 `claiming` 行**时崩溃"变成**确定性**前置条件，从而让
+C9.26 的"两进程 + 真实 `kill -9`"用例有稳定的正控（判据：
+`tests/integration/test_multi_crash_recovery.cpp`）：
+
+| 环境变量 | 取值 | 行为 |
+| --- | --- | --- |
+| `FSS_CLAIM_HOLD_MS` | `n > 0` | `CreateFileMetadata` 在**原子领取成功 + 在途租约就绪之后、复制之前**阻塞 `n` 毫秒，然后照常继续（`claiming` 行已落库、租约在续租 ⇒ 正是"登记中途"的形态）。横幅打印 `claim hold ms  : <n>`，日志有一条 `claim_hold_seam_active` |
+| 同上 | 未设置 / 空 / 非数字 / `<= 0` | **不注入**：`CreateFileMetadata` 与接线前**逐字一致**（不 sleep、不改变任何判定/顺序/落库语义） |
+
+```bash
+# 演练：让 leader 在"持有 claiming 行"的状态下停 15 秒，便于观察/强杀（真实进程）
+FSS_CLAIM_HOLD_MS=15000 ./build/bin/fss_server --config config/fss.json &
+# 期间可直连 PG 看到 state='claiming' 的行与 staging_leases 里活着的租约：
+#   SELECT state FROM file_metadata_records WHERE file_source='<...>';
+```
+
+> ⚠️ **它只加延迟**：不改变领取/回收/领导权任何判定，也不放宽任何门禁。**默认不注入**，
+> 所以生产路径（未设置该变量）的行为与引入本接缝之前逐字节一致。
+>
+> **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 156 键三态清单
+> （生效 125 / 拒绝启动 16 / 已读但无效果 15）由 `test_operations_doc` **机械比对**；
+> "让每个 `createMetadata` 故意卡住 N 毫秒"不是运维语义，生产上只会制造事故。
+> 若写成配置项会按**未知键 → exit 78** 被拒。
+>
+> **禁令**：**不要**在生产/预发设置 `FSS_CLAIM_HOLD_MS`。它只用于 C9.26 的进程级崩溃
+> 回归与故障演练；演练结束请确认该变量已从环境 / systemd unit 文件中移除。

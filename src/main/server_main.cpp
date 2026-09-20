@@ -178,6 +178,25 @@ void MaybeInjectStartupFaultAfterStart() {
   if (StartupFaultInjection() == "throw_after_start") ThrowStartupFault("throw_after_start");
 }
 
+//  ★ C9.26：**测试专用**的"持 claim 窗口"接缝（环境变量 `FSS_CLAIM_HOLD_MS`，
+//    **不是配置键**；见 docs/runbook.md §10.2、证据 docs/test-evidence/phase10.md §20）。
+//    `CreateFileMetadata` 在原子领取成功 + 在途租约就绪之后、复制之前阻塞该毫秒数。
+//    为什么不做成配置键（与 `FSS_STARTUP_FAULT_INJECT` / `FSS_AUDIT_FAULT_INJECT` 同一理由）：
+//      ① 它是测试接缝，没有运维语义 —— 三态清单（生效 125 / 拒绝启动 16 / 已读但无效果 15）
+//         由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**，凭空加键会让
+//         计数与逐键语义双双失真；
+//      ② 生产上"让每个 createMetadata 故意卡住 N 毫秒"只会制造事故。
+//    取值解析：非数字 / <= 0 / 空 → **不注入**（与其它接缝一致的宽容策略：测试接缝不做
+//    fail-fast，避免误伤启动）。默认（未设置）= 0 = 生产路径逐字不变。
+std::int64_t ClaimHoldMillisFromEnv() {
+  const char* const value = std::getenv("FSS_CLAIM_HOLD_MS");
+  if (value == nullptr || *value == '\0') return 0;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0) return 0;
+  return static_cast<std::int64_t>(parsed);
+}
+
 //  schema 默认的脱敏键清单（与 config/fss.example.json 的 `observability.redact_keys`
 //  逐项一致）。组合根在没有配置来源时用它，保证"接线前日志就打码"这一行为不变。
 constexpr const char* kDefaultRedactKeys =
@@ -2198,6 +2217,17 @@ static int RunServer(int argc, char** argv) {
   ports.lease_ttl_seconds = leases_ttl_seconds;
   ports.lease_renew_interval_seconds = leases_renew_interval_seconds;
   ports.instance_id = effective_instance_id;
+  //  ★ C9.26：测试专用的崩溃窗口接缝（`FSS_CLAIM_HOLD_MS`，**不是配置键**）。
+  //    默认未设置 → 0 → `CreateFileMetadata` 与接线前逐字一致（不 sleep）。
+  const std::int64_t claim_hold_millis = ClaimHoldMillisFromEnv();
+  ports.claim_hold_millis = claim_hold_millis;
+  if (claim_hold_millis > 0) {
+    logging::Warn(logger, "claim_hold_seam_active",
+                  {{"component", "server_main"},
+                   {"claim_hold_ms", std::to_string(claim_hold_millis)},
+                   {"reason", "★ 测试接缝 FSS_CLAIM_HOLD_MS 已生效：createMetadata 将在"
+                              "原子领取后、复制前阻塞该毫秒数；生产禁止设置"}});
+  }
 
   // ===========================================================================
   //  GC（C10.9）：GcTask + 调度参数。`--once` 与周期调度共用同一份 options。
@@ -2579,6 +2609,13 @@ static int RunServer(int argc, char** argv) {
             << "\n"
             << "  lease backend  : " << lease_backend << "\n"
             << "  leader         : " << leader_state_banner << "\n";
+  //  ★ C9.26：测试接缝生效时**必须可见**（可运维：横幅回答"它会不会故意卡住"）。
+  //    未设置时不打印该行 → 既有横幅逐字不变（既有测试只做子串断言，不受影响）。
+  if (claim_hold_millis > 0) {
+    std::cout << "  claim hold ms  : " << claim_hold_millis
+              << "（★ C9.26 测试接缝 FSS_CLAIM_HOLD_MS：createMetadata 在原子领取后、"
+                 "复制前阻塞该毫秒数；**生产禁止设置**）\n";
+  }
   //  C10.2：逐键打印来源缩写（cli/env/file/default），`(别名 FSS_X)` 表示旧环境变量。
   std::cout << "  config sources :\n";
   for (const auto& [path, row] : resolver.rows()) {

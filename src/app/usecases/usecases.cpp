@@ -723,6 +723,17 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     }
   }
 
+  //  ★★ C9.26：**测试专用**的确定性崩溃窗口接缝（`FSS_CLAIM_HOLD_MS`；默认 0 =
+  //     生产路径**逐字不变**，连一次 `sleep_for(0)` 都不做）。
+  //     位置刻意选在"原子领取成功 + 在途租约已就绪（续租线程已在跑）"之后、复制之前：
+  //     此刻 PG 里有一条 `state='claiming'` 的行、且租约是**活的** —— 正是"登记中途崩溃"
+  //     的真实形态（而不是"领取前一瞬间"或"复制完之后"）。两进程 kill -9 用例（C9.26）
+  //     据此把"进程确实持着 claiming 行时被杀"变成**确定性**前置条件，而不是赌时序。
+  //     ⚠️ 该接缝只加延迟、**不改变**任何判定/顺序/落库语义；生产禁止设置（runbook §10.2）。
+  if (ports_.claim_hold_millis > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ports_.claim_hold_millis));
+  }
+
   //  步骤边界检查：续租失败 → 回滚已复制的对象（此时仍持有 claim）→ 返回 kUnavailable。
   //  释放租约由 `UploadLeaseGuard` 在返回时完成（回滚与 ReleaseClaim 之后），顺序符合
   //  "对象仍被 claim 保护 → 放弃 claim → 释放租约"。

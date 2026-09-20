@@ -2634,3 +2634,229 @@ $ grep -rn "R1-INJECT" src/ tests/     # 空
   其中：`[preflight] 无注入残留`、`[docs] --selftest 检查器有效 + 通过`、C1.7 sanitizer
   `phase1~phase10` 全绿、`[phase10] 配置面接线 54 条断言通过`。
 * OSDU 线上契约：**未变**（`state` 不进 JSON；REST/gRPC 字段与报文不变）。
+
+---
+
+## 20. C9.26（本切片）：两个真实进程 + 真实 `kill -9` —— 幸存者接管并回收崩溃者的 `claiming` 行
+
+> **共享存储的诚实标注（不要外推）**：本切片的"共享存储"是**同一台机器上的一个本地目录被两个进程
+> 共同使用**，**不是 NFS**，也没有任何网络文件系统语义参与（没有 `mount`、没有 NFSv3/v4 的锁/
+> 缓存/`rename`/`syncfs` 语义）。因此本切片**不能**替代 **C9.27（NFS 语义）**：NFS 相关语义
+> **仍未验证**（见 §20.7）。
+
+### 20.1 结论（先说答案）
+
+* **交付**：`tests/integration/test_multi_crash_recovery.cpp`（1 个 `TEST_CASE`）—— **两个真实
+  `build/bin/fss_server` 进程**：同一个 PG DSN、**同一个** `storage.posix.root`（本地目录）、
+  同一个 `leader_election.lock_key`，**不同**的 `deployment.instance_id` 与 HTTP 端口；
+  `deployment.mode=multi` + `metadata/location.repository=postgres` + `leases.enabled=true` +
+  `leader_election.enabled=true` + `storage.posix.shared_mount_required=true` +
+  `gc.require_lease_expiry=true` + `gc.interval_seconds=1` + `leases.ttl_seconds=8` +
+  `renew_interval_seconds=1`。
+* **真实崩溃**：A 在"**原子领取成功 + 在途租约就绪**、复制尚未发生"的窗口里被 **`kill -9`**；
+  `pg_locks` 里该 advisory lock 的 backend pid 从 A 换成 B（接管是真的），B 的 GC 回收了
+  A 留下的 `claiming` 行、孤儿 staging 对象与位置记录。
+* **窗口由测试接缝确定化**：`FSS_CLAIM_HOLD_MS`（**环境变量，不是配置键**）让
+  `CreateFileMetadata` 在领取后、复制前阻塞 N 毫秒。没有它这个窗口只有毫秒级 → 判据会 flaky
+  （flaky 的判据比没有判据更糟）；**默认不设置 = 生产路径逐字不变**。
+* **实测量（两引擎一致）**：`kill -9` → 回收完成 = **8022 ms（本机 14.24）/ 9090 ms（目标 12.6）**
+  （≈ `leases.ttl_seconds=8`）；回收后 `claiming` 行 / 位置记录 / staging 对象**同时归零**；
+  同一 `(partition, file_source)` 重试 → **201**，`data.Checksum` = 重传字节的 SHA-256。
+* **三态计数未动**：**125 / 16 / 15**（合计 156）。本切片**未新增任何配置键**：接缝是环境变量，
+  `config/fss.example.json` **未改**，`docs/operations.md` 的逐键表 **未改**；若把它写成配置项会按
+  **未知键 → exit 78** 被拒（`test_operations_doc` 仍机械断言 125/16/15）。
+* **实测计数**：默认构建（`FSS_WITH_PG=OFF`）`ctest` **87/87**；`build-pg` 的 `ctest -L pg` 在
+  **本机 PG 14.24** 与**目标 PG 12.6** 都是 **9/9**（原 8/8 + 本切片 1）；两库 `pgtest-%` 残留 **0**、
+  advisory lock **0**、无残留 `fss_server` 进程。
+
+### 20.2 实现点（可点击）
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/app/usecases/usecases.h` | `UseCasePorts` 末尾追加 `std::int64_t claim_hold_millis = 0;`（带默认值 → 既有聚合初始化不受影响；REST 与 gRPC 共用同一份 ⇒ 两协议符号一致） |
+| `src/app/usecases/usecases.cpp` | `CreateFileMetadata` 在"领取成功 + `EnsureLeaseOwnership`/`LeaseRenewer` 就绪"之后、位置解析/复制之前：`if (ports_.claim_hold_millis > 0) sleep_for(...)`。**只加延迟**，不改任何判定/顺序/落库语义；默认 0 → 不执行 |
+| `src/main/server_main.cpp` | 新增 `ClaimHoldMillisFromEnv()`（读 `FSS_CLAIM_HOLD_MS`；空/非数字/`<=0` → 不注入）；装配 `ports.claim_hold_millis`；设置时打印 warn 日志 `claim_hold_seam_active` 与横幅行 `claim hold ms  : <n>`（可运维：横幅回答"它会不会故意卡住"） |
+| `tests/integration/test_multi_crash_recovery.cpp`（新增） | 两进程共享 PG + 本地目录；`uploadURL→PUT→`异步`createMetadata`→轮询 `claiming` 行→`kill -9`→B 接管→到期前 GC 不回收（守卫正控）→到期后回收→同一 fileSource 重试 201 + SHA-256 |
+| `tests/CMakeLists.txt` | 注册 `test_multi_crash_recovery`（`LABELS "pg;infra"`、`FIXTURES_REQUIRED pg`、`TIMEOUT 900`、`add_dependencies ... fss_server`）；仅在 `FSS_WITH_PG=ON` 下存在 ⇒ 默认构建仍是 87 个测试 |
+| `docs/runbook.md` | 新增 §10.2 `FSS_CLAIM_HOLD_MS`（取值/行为/演练/禁令/"为什么不是配置键"）；顺手把 §10 里过时的三态数字 `122/16/18` 改成 **125/16/15**（与 `operations.md`/AGENTS §0.1 一致） |
+| `docs/test-evidence/phase10.md` | 本节 |
+
+### 20.3 判据与实测（崩溃 → 接管 → 回收 → 重试；全部为**轮询到的真实条件**，无固定 sleep 赌时序）
+
+测试自己打印的观测值（`[C9.26]` 行；`leader_backend_pid`/`survivor_backend_pid` 是 **PG 后端的 pid**，
+不是进程 pid）——**本机 PG 14.24**：
+
+```text
+[C9.26] ① leader = A pid(process)=525405 lock_key=1810905147 leader_backend_pid=525409 advisory_lock_rows=1
+[C9.26] ③ file_source=/osdu-user/1789879744178-.../6d535c48... file_id=6d535c48... claiming_rows=1 ready_rows=0 窗口稳定≥5s lease_owner=c926-a lease_ttl_left_s=8
+[C9.26] ④ kill -9 pid=525405 alive_after=false claiming_rows_after=1 location_rows_after=1 staging_exists_after=1 async_post_status=0
+[C9.26] ⑤ survivor_backend_pid=525483 lease_left_s=7 gc_round_http=200 reclaimed_before=0 claiming_rows=1 staging_exists=1 fss_gc_runs_total=2
+[C9.26] ⑥ reclaimed_total=1 claiming_rows=0 location_rows=0 staging_exists=0 kill_to_reclaim_ms=8022
+[C9.26] ⑦a fresh_status=201 fresh_sha256=20bd97821ff619bd… persistent_bytes=362
+[C9.26] ⑦b retry_same_file_source=/osdu-user/1789879744178-.../6d535c48... status=201 retry_sha256=c747dd6409e33464… persistent_bytes=809 staging_removed=1
+All tests passed (268 assertions in 1 test case)
+```
+
+**目标 PG 12.6**（`FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss`）：
+
+```text
+[C9.26] ① leader = A pid(process)=525810 lock_key=1810905576 leader_backend_pid=13664 advisory_lock_rows=1
+[C9.26] ③ file_source=/osdu-user/1789879768967-.../aa82a3fd... claiming_rows=1 ready_rows=0 窗口稳定≥5s lease_owner=c926-a lease_ttl_left_s=8
+[C9.26] ④ kill -9 pid=525810 alive_after=false claiming_rows_after=1 location_rows_after=1 staging_exists_after=1 async_post_status=0
+[C9.26] ⑤ survivor_backend_pid=16552 lease_left_s=7 gc_round_http=200 reclaimed_before=0 claiming_rows=1 staging_exists=1 fss_gc_runs_total=2
+[C9.26] ⑥ reclaimed_total=1 claiming_rows=0 location_rows=0 staging_exists=0 kill_to_reclaim_ms=9090
+[C9.26] ⑦a fresh_status=201 fresh_sha256=20bd97821ff619bd… persistent_bytes=362
+[C9.26] ⑦b retry_same_file_source=/osdu-user/1789879768967-.../aa82a3fd... status=201 retry_sha256=c747dd6409e33464… persistent_bytes=809 staging_removed=1
+All tests passed (253 assertions in 1 test case)
+```
+
+逐步判据（括号内是"如果它坏了会怎样"的对照）：
+
+1. **恰好一个 leader**：`pg_locks` 里该 `lock_key` 的行数恒为 `1`（A 持锁），A 横幅 `启动时本实例=leader`、
+   B 横幅 `启动时本实例=非 leader`，且 B 上**没有**接缝横幅（接缝只在 A 上）。
+   （对照：R1 注入④ 禁止接管 → 步骤⑤的 `REQUIRE(takeover)` 失败。）
+2. **真的在崩溃窗口里**：轮询 PG 到 `state='claiming'` 的行存在，且该窗口**至少稳定 5 秒**
+   （轮询后台 POST 的"尚未返回"标志）—— 没有接缝时请求几十~几百毫秒就返回，窗口不成立
+   （对照：R1 注入① 关掉接缝 → `REQUIRE(stayed_in_flight)` 失败）。此时 `ready` 行 = 0、
+   `staging_leases` 行存在且未到期（`lease_owner=c926-a`、`lease_ttl_left_s=8`）、磁盘上 staging 对象
+   大小 = PUT 字节数（PUT 的正控）。
+3. **真实 `kill -9`**：进程消失后 `claiming_rows=1`、位置记录 = 1、staging 对象仍在 —— 崩溃**不会**
+   替我们清理。后台 POST 的结局是连接被切断（`async_post_status=0`，不可能 201）。
+4. **接管**：轮询 `pg_locks` 到该键的 backend pid ≠ A 的 backend pid（实测 `525409 → 525483`；
+   目标库 `13664 → 16552`），锁行数仍为 1，B 的 readiness 仍 200。
+5. **到期之前不回收（守卫正控）**：租约仍未到期（`lease_left_s=7`）时在 B 上强制一轮
+   `POST /v2/gc:run`（HTTP 200 = `GcTask::Run` 真的跑了一轮，`fss_gc_runs_total=2`），
+   `fss_gc_reclaimed_claiming_total` **不变（0）**、行/对象仍在。
+   （对照：R1 注入③ 无视租约/年龄门 → `REQUIRE(CountMetadataRows(...,"claiming")==1)` 得到 `0 == 1`。）
+6. **到期之后回收**：`fss_gc_reclaimed_claiming_total >= 1`，随后**轮询到** `claiming` 行 = 0、
+   位置记录 = 0、staging 对象不存在；耗时 `kill_to_reclaim_ms ≈ 8022/9090`（≈ TTL）。
+   （对照：R1 注入② GC 不调用 `ReclaimStaleClaiming` → `REQUIRE(reclaimed)` 失败。）
+7. **survivor 完整可用**：B 上全新的 `uploadURL→PUT→createMetadata` → **201**，`GET metadata` 回到同一条、
+   `data.ChecksumAlgorithm=SHA256`、`data.Checksum` = 新字节的 SHA-256，persistent 对象字节 = 新字节。
+8. **同一 `file_source` 重试**：GC 已（正确地）删掉位置记录，因此测试**显式恢复前置条件**
+   （用真实 `PostgresLocationRepository` 写回同 `file_id/container/object_key` 的 staging 位置记录；
+   `PUT` 复用步骤 2 那张仍有效的自签 URL —— `single_use_nonce` 默认 false），随后 `POST metadata`
+   → **201**，`data.Checksum` = **重传**字节的 SHA-256（与崩溃前那份不同），persistent 对象字节 =
+   重传字节，staging 被清理。
+9. **数据卫生**：用例只删自己的 `file_source` 行；结束时 `claiming/ready` 行 = 0、位置记录 = 0、
+   租约 = 0；B 收到 SIGTERM 后轮询到 advisory lock 归零。
+
+### 20.4 R1 自证（4 条注入；每条都在**完整重编 `cmake --build build-pg -j4`** 之后跑；末尾已全部还原，`md5sum` 逐字一致）
+
+| # | 注入（含 `R1-INJECT` 标记） | 结果（原始失败断言，注入当时的行号） |
+| --- | --- | --- |
+| ① | `src/app/usecases/usecases.cpp`：接缝条件改成 `if (false && ports_.claim_hold_millis > 0)`（接缝恒不生效） | `test_multi_crash_recovery.cpp:698 REQUIRE( stayed_in_flight )` → **`false`**；`assertions: 65 \| 64 passed \| 1 failed`。★ 说明：关掉接缝后 `claiming` 行**有时**仍能被 50 ms 的轮询撞上（claim→ready 只要几十毫秒），所以"行存在"这条单独看**没有区分力**；同段落里"窗口稳定 ≥5 s"的 `stayed_in_flight` 才是"窗口由接缝创造"的可区分判据 —— 注入①让**它**失败 |
+| ② | `src/app/tasks/gc_task.cpp`：`if (false && !claimed.value().empty())`（GC 不调用 `ReclaimStaleClaiming`） | `test_multi_crash_recovery.cpp:780 REQUIRE( reclaimed )` → **`false`**；`assertions: 143 \| 142 passed \| 1 failed` |
+| ③ | **三处**（守卫有两层 + 调用点一层，缺一不可）：`gc_task.cpp` `if (true)`（无条件尝试回收）＋ `postgres_metadata_repository.cpp` 的 `kReclaimStaleClaiming` 把 `created_at <= ...` 与 `file_source = ANY(...)` 换成 `IS NOT NULL`（年龄门/租约集合门失效）＋ 同文件 `reclaim` 入口去掉 `live_expired_sources.empty()` 短路 | `test_multi_crash_recovery.cpp:759 REQUIRE( CountMetadataRows(uploaded.file_source, "claiming") == 1 )` → **`0 == 1`**（到期前就被回收）；`assertions: 128 \| 127 passed \| 1 failed`。★ 这条证明守卫真的承重：三层里任一层保留都不会误删活 claim |
+| ④ | `src/infra/postgres/pg_leader_election.cpp`：`IsLeader()` 的非 leader 分支直接 `return false`（永不 `TryAcquire`） | `test_multi_crash_recovery.cpp:732 REQUIRE( takeover )` → **`false`**；`assertions: 694 \| 693 passed \| 1 failed`（B 永不接管 ⇒ 回收永远不发生） |
+
+四条注入逐一还原后 `md5sum -c` 全部 `OK`（这是还原的**逐字节**证明）：
+
+```text
+6c83eee6ce2c24881361ee3fa591c07e  src/app/usecases/usecases.cpp                              OK
+02374b5e7ff54566907d097686922716  src/app/tasks/gc_task.cpp                                  OK
+39cad5422f51da741a476ab56cf41355  src/infra/metadata/postgres/postgres_metadata_repository.cpp  OK
+9b9998b81a6090417af2bb0f8e68ec91  src/infra/postgres/pg_leader_election.cpp                  OK
+$ grep -rn "R1-INJECT" src/ tests/     # 空
+```
+
+★ **一次真实的 flaky 与其根因（已修，记录在案）**：第一版测试在 `REQUIRE` 失败时留下 joinable
+`std::thread`（后台 POST）→ Catch2 抛异常展开时 `std::thread` 析构调用 `terminate`（rc=134），
+**不跑 RAII 析构** ⇒ 两个 `fss_server` **泄漏**。泄漏的实例（`instance_id` 恰为 `c926-a`）继续跑
+`gc.enabled=true` 的 GC，并按 **partition**（`opendes`）扫描 —— 于是它**抢在本用例的 survivor 之前**
+领取了本用例的过期租约、回收了本用例的 claiming 行（指标记在它自己的 `/metrics` 上），本用例以
+"survivor 没回收"的形式**偶发失败**（实测 5 次里失败 3 次）。修法有两处：① `ThreadJoiner` RAII
+（早退也 join，绝不 terminate）；② 用例开头的前置条件"不得有残留 `fss_server`"（失败信息给出
+`pkill -9 -x fss_server`）。修后**连续 6 次通过、0 泄漏**。
+
+### 20.5 实测命令与输出摘要
+
+```text
+$ cmake --build build -j4                          # FSS_WITH_PG=OFF（收尾保持 OFF）
+# 触碰文件（src/app/usecases/usecases.{h,cpp}、src/main/server_main.cpp）0 warning
+$ ctest --test-dir build                           # 100% tests passed, 0 tests failed out of 87
+
+$ cmake --build build-pg -j4
+$ ctest --test-dir build-pg -L pg                  # 本机 PG 14.24：9/9 passed（48.0 s）
+      test_multi_crash_recovery ....   Passed   13.33 sec
+$ FSS_PG_DSN=postgresql://fss@172.17.64.1:5555/fss ctest --test-dir build-pg -L pg
+                                                   # 目标 PG 12.6：9/9 passed（61.0 s）
+      test_multi_crash_recovery ....   Passed   15.20 sec
+
+# 直接用测试二进制看观测值（两引擎）：
+$ ./build-pg/bin/test_multi_crash_recovery          # 268 assertions（1 test case）
+$ FSS_PG_DSN=... ./build-pg/bin/test_multi_crash_recovery  # 253 assertions（1 test case）
+# （断言条数随轮询次数浮动：查询型助手每条查询一条 REQUIRE）
+
+# 两库残留（每项各查一次）：
+#   file_locations / staging_leases / file_metadata_records 的 partition_id LIKE 'pgtest-%' = 0/0/0
+#   pg_locks 的 locktype='advisory' AND objsubid=1 = 0
+#   pgrep -x fss_server = 0
+
+$ ./scripts/check_docs.sh                          # D1~D5 通过（63 链接 / 13 ADR / 148 条门槛）
+$ JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh   # 见 §20.8
+```
+
+### 20.6 判断记录（接缝设计与"如何避免 flaky"）
+
+* **接缝放在 `UseCasePorts`（组合根读环境变量），而不是用例里 `getenv`**：与
+  `FSS_STARTUP_FAULT_INJECT`/`FSS_AUDIT_FAULT_INJECT` 的纪律一致（具体配置来源只在组合根），
+  且 REST 与 gRPC 共用同一份 `UseCasePorts` ⇒ 两条协议按构造同取值。默认 0 ⇒ 生产路径**不 sleep**，
+  逐字不变。
+* **接缝位置 = "领取成功 + 在途租约就绪"之后、复制之前**：这样窗口里同时有 `state='claiming'` 的行
+  **和**一条**活的**租约 —— 正是"登记中途"的真实形态；也才能让步骤⑤的"守卫正控"（租约未到期 →
+  不许回收）与步骤⑥的"到期回收"都成立。放在领取之前就没有行，放在复制之后就没有窗口。
+* **"窗口存在"必须用"持续"表达，而不是"撞上瞬时状态"**：`claim → ready` 只要几十毫秒，轮询**可能**
+  撞到行（注入① 实测就撞到了）。因此步骤③除"行存在"外，还断言**后台请求在随后 5 秒里始终没有返回**
+  （轮询 `post_done`，不是 `sleep(5)` 后断言）—— 只有接缝能产生"阻塞 15 s"的窗口。这条才是可区分判据。
+* **`leases.time_source=local`（偏离默认 `database`，为可复现性）**：本用例的"租约到期"
+  （`ClaimExpired`）与"claiming 行够老"（`ReclaimStaleClaiming` 的 `created_at <= now - ttl`）必须落在
+  **同一个钟**上。目标 PG 12.6 在**另一台主机**，用 `database` 会把判据变成"两台机器时钟偏移"的函数。
+  `local` 让两者都用组合根自己的 `IClock`（C2 已交付）。代价：**没有**验证 `database` 模式在跨主机
+  时钟偏移下的行为（B2 范围，已登记）。
+* **A 上关闭周期 GC（`gc.enabled=false`）、B 上开启**：C9.26 的判据是"**幸存者**的 GC 接管后回收"。
+  若 A 也跑周期 GC，正常情况下无害（租约活着），但在 R1 注入③（无视租约门）时 A 会在 `kill` **之前**
+  就回收掉自己的 claiming 行，让失败点落在步骤③而不是步骤⑤。关掉 A 的周期 GC 只去掉这个混淆项，
+  不改变"谁最终回收"（B 接管后才跑）。这也顺带让步骤⑤的"到期前不回收"完全由 B 的 GC 决定。
+* **同一 `file_source` 重试的前置条件由测试恢复（诚实登记）**：`uploadURL` 的 `file_source` 内嵌服务端
+  生成的 epoch + `file_id`（`ObjectKeyPolicy::MakeFileSource`），公开 HTTP 面**无法**重现同一个
+  `file_source`；而 GC 会（正确地）把位置记录连同孤儿对象删掉。因此"重试同一个 `file_source`"里
+  "位置记录还在"这一步由测试用**真实 `PostgresLocationRepository`** 恢复（与 §19 的进程内用例
+  `fx.locations.Save` 同一手法），并在恢复后**显式断言**（R9）。`PUT` 仍走步骤②签发的真实自签 URL
+  （token 可复用），`createMetadata` 仍走真实 HTTP。
+* **R1 注入③ 需要三处改动，不是一处**：`ReclaimStaleClaiming` 的"不许误删活 claim"有三层防线 ——
+  调用点（只在领到过期租约时才调用）、入口短路（空集合直接返回 0）、SQL 两条谓词（年龄 + 租约集合）。
+  只改任一层都**不会**误删，这本身是纵深防御的正面证据；注入③ 同时打掉三层才复现失败。
+
+### 20.7 仍未交付 / 未验证（如实登记）
+
+* **NFS 语义（C9.27）**：**未验证**。本切片的共享存储是**本地目录被两个进程共用**，没有 NFS 的
+  锁/缓存/`rename`/`syncfs` 语义。C9.27 需要用户的目标挂载，本环境（无 root、不能 `mount`）不具备。
+* **默认 `leases.time_source=database` + 跨主机时钟偏移**：本用例为确定性改用 `local`；
+  `database`（PG `now()`）与本地年龄护栏在**时钟偏移**下的相互作用**未验证**（B2 / `deployment.max_clock_skew_seconds` 范围）。
+* **同一 `file_source` 的"产品级重试"**：如 §20.6 所述，公开 HTTP 面无法重现同一 `file_source`；
+  本用例证明的是"崩溃者的 claim 被回收后，该幂等键**重新可用**"（重试用例显式恢复了位置记录这一前置
+  条件）。真实的客户端重试通常是"重新 `uploadURL`（新的 file_source）"或由上层持有同一记录体 ——
+  这两种形态的 LB 粘性/跨实例 `createMetadata` 503 路径**未验证**（与 §19.7 同一条）。
+* **多于 2 个实例 / 并发 GC 竞争同一过期租约**：未验证（本用例只有 A、B 两个进程）。
+* **接缝在 gRPC 路径上的 kill -9**：接缝在 `CreateFileMetadata` 用例层，REST 与 gRPC 共用 `UseCasePorts`
+  ⇒ 按构造同取值；但本用例只从 REST 驱动。
+* **共享挂载探针、readiness 的 PG 探活 + `metadata.postgres.schema_version_check`、PG 连接预算
+  （C9.28）、`state='deleted'` 软删除、`/v2/info` 的 `instanceId`**：仍未交付（与本切片无关）。
+* **`docs/04-implementation-plan.md` 的 C9.26 行、`docs/phase-status.md` 的搬迁快照**：已按 R13 更新
+  （C9.26 标 ✅ 并写明"本地目录共享，非 NFS"；`phase-status.md` 追加"最新，优先于上面全部"的更新段）。
+  **`AGENTS.md` 未动**（父代理所有，受 64 KiB 预算约束）；其中 §0.1 的"多实例 E2E（C9.26）未验证"
+  已过时，由父代理决定是否修订。**C9.27（NFS）仍必须保持"未验证"**。
+
+### 20.8 门槛结果
+
+* `./scripts/check_docs.sh`：**通过**（D1 63 链接 / D3 13 ADR / D4 阶段 0~10 / D5 148 条门槛）；
+  `--selftest`：**检查器有效**（D1/D2/D4/D5 都能检出注入的错误）。
+* `JOBS=4 FSS_GATES_WITH_PG=1 ./scripts/run_all_gates.sh`：**全绿** ——
+  `失败: 无`；`⏱ 总耗时: 9 分 8 秒（548 s，阶段数 11）`；`✅ 全部已启用阶段门槛通过`。
+  其中：`[preflight] 无注入残留`、`[docs] --selftest 检查器有效 + 通过`、C1.7 sanitizer
+  `phase1~phase10` 全绿、**`[infra] ctest -L pg` 9/9（本机 14.24，含 `test_multi_crash_recovery`
+  13.37 s）**、`[phase10] 配置面接线 6 测试通过`。
+* 收尾状态：`build/CMakeCache.txt` 的 `FSS_WITH_PG:BOOL=OFF`（`ctest --test-dir build -N` =
+  **Total Tests: 87**）；`build-pg` 保持 `FSS_WITH_PG=ON`（9 个 pg 测试）。
+* OSDU 线上契约：**未变**（`state` 不进 JSON；REST/gRPC 字段与报文不变）。

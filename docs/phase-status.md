@@ -56,6 +56,19 @@
 > NFS 语义（C9.27）、`state='deleted'` 软删除语义、`/v2/info` 的 `instanceId`。
 > ⚠️ `AGENTS.md` §0.1 的「PG 多实例」行仍写着上传路径租约未交付 —— 该文件受 64 KiB 预算约束，
 > 本轮**未改动**（以本文件与 `operations.md` §1.3 为准）。
+>
+> **C9.26 之后的更新（最新，优先于上面全部）**：ADR-009 §4.2/§4.3 的**进程级崩溃 E2E 已交付**
+> （见 `test-evidence/phase10.md` §20）：`tests/integration/test_multi_crash_recovery.cpp` 拉起
+> **两个真实 `fss_server` 进程**（共享同一 PG DSN 与同一 `storage.posix.root`），A 在"持 `claiming`
+> 行 + 活租约"时被 **`kill -9`**，B 轮询接管 leader（`pg_locks` 的 backend pid 换人）并回收
+> `claiming` 行、孤儿 staging 对象与位置记录；同一 `file_source` 重试 → **201** + SHA-256 与重传
+> 字节一致。★ **共享存储是本地目录被两个进程共用，不是 NFS** ⇒ **C9.27（NFS 语义）仍未验证**。
+> 崩溃窗口由**环境变量接缝 `FSS_CLAIM_HOLD_MS`**（**不是配置键**，故三态**不变**：仍
+> **125 / 16 / 15**）确定化。`ctest` 默认构建 **87/87**；`ctest -L pg` 两引擎 **9/9**（原 8/8 + 新增 1）。
+> **本切片仍未验证**：NFS 语义（C9.27）、默认 `leases.time_source=database` 的跨主机时钟偏移、
+> 多于 2 个实例、`fileSource` 的产品级重试（LB 粘性）、gRPC 侧的 kill -9。
+> ⚠️ 上面的搬迁快照、`AGENTS.md` §0.1、`04-implementation-plan.md` 的 C9.26 行仍写着"多实例 E2E
+> 未交付" —— 以本段与 `test-evidence/phase10.md` §20 为准。
 
 ---
 
