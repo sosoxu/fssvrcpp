@@ -295,32 +295,9 @@ fss::Result<std::string> ReturnExistingRecord(UseCasePorts& ports, const CallerC
   return existing.id;
 }
 
-//  ★ C1（ADR-009 §4.2）：领取成功后的**放弃**路径（复制 / 校验和 / mark-ready 失败时）。
-//
-//  顺序是**先删对象、再释放领取**，理由：
-//    · 删除对象时我们**仍持有 claim** ⇒ 没有别的实例能领到同一个 (partition, file_source)，
-//      因此也没有别的实例会写同一个 `to_ref` —— 我们删掉的一定是自己复制的对象，
-//      不会删掉"别人刚写好的对象"。
-//    · 反过来（先 ReleaseClaim 再删对象）会打开一个真实的窗口：另一个实例领到后开始复制，
-//      而我们随后按同样的 to_ref 把它删掉 ⇒ 对方返回 201 但对象已经没了（P6-D13 的反方向）。
-//    · `RollbackCreatedObject` 的守卫（按 file_source 查到**记录**就不删）保持不变。注意
-//      读取路径只认 `ready`，因此它**看不到**我们自己的 claiming 行 —— 这正是我们要的：
-//      在我们持有 claim 期间，to_ref 只可能由我们创建，删它是安全的。若存在既有 ready
-//      记录（理论上不可能：ClaimForWrite 会返回 claimed=false），守卫会保留对象。
-//    · 释放失败 = claiming 行残留（该 file_source 在 GC 回收前无法被重新领取）。这是
-//      **非致命但必须可见**的异常：记一条审计告警，原来的错误照常返回。
-void AbortClaimedCreate(UseCasePorts& ports, const CallerContext& caller,
-                        const std::optional<domain::ObjectRef>& to_ref,
-                        std::string_view file_source, std::string_view record_id,
-                        std::int64_t version) {
-  if (to_ref.has_value()) {
-    RollbackCreatedObject(ports, caller, *to_ref, file_source, record_id);
-  }
-  const auto released = ports.metadata.ReleaseClaim(caller.partition, record_id, version);
-  if (!released.ok()) {
-    (void)RecordAudit(ports, "createMetadataClaimReleaseFailure", caller, record_id, false);
-  }
-}
+//  ★ C1（ADR-009 §4.2）的"领取成功后放弃"逻辑现在是 `CreateFileMetadata` 里的
+//  `abort_create` 局部 lambda（它要按 `capabilities().atomic_claim` 决定是否 ReleaseClaim，
+//  理由见那里的注释）。原 `AbortClaimedCreate` 自由函数在引入能力分支后已无调用方。
 
 //  ★ C1：另一个实例正在 `claiming` 同一个 fileSource 时的**有界等待**。
 //  为什么是"等待而不是直接 503"：最常见的形态是并发重试——赢家通常几十毫秒内就 mark
@@ -673,39 +650,84 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     return ReturnExistingRecord(ports_, caller, existing.value());
   }
 
-  // 4c. ★★ C1（ADR-009 §4.2）：**复制之前先原子领取**。
-  //     在此之前只做了纯校验与一次廉价读取（没有外部副作用）；从这里往后才动存储。
-  //     领取成功 = 本调用是唯一会复制 staging→persistent 的实例（并发下另一个会
-  //     claimed=false，**不复制**）。失败路径必须 `ReleaseClaim`，否则该 fileSource
-  //     在本进程的后续重试里永远领不到（崩溃回收是下一个切片）。
-  FSS_TRY(claim, ports_.metadata.ClaimForWrite(caller.partition, out));
-  if (!claim.claimed) {
-    if (claim.state == domain::MetadataState::kReady) {
-      //  另一个实例已经登记完成 → 幂等返回同一条（与 4b 同义，只是竞态发生在中间）。
-      return ReturnExistingRecord(ports_, caller, claim.record);
-    }
-    if (claim.state == domain::MetadataState::kClaiming) {
-      //  ★ 另一个实例正在登记：**有界等待**（≈2 s）后 503，**绝不复制**（这就是本切片的目的）。
-      return WaitForExistingClaim(ports_, caller, file_source);
-    }
-    //  kDeleted / 其它不一致状态：fail closed —— 宁可控地失败，也不复制一个语义不明的对象。
-    return Err(fss::ErrorKind::kInternal,
-               "元数据状态不一致：fileSource 已有非 ready/claiming 的活动记录，拒绝复制");
-  }
-  //  领取成功：`claim.record` 就是刚插入的 v1 claiming 行，它的 version 是 MarkReady 的锚点。
-  const std::int64_t claimed_version = claim.record.version;
+  // 4c. ★★ 能力分支（本切片：`metadata.repository=remote`）。
+  //     `capabilities().atomic_claim` 为 false 的仓储（当前只有 remote Storage Service）
+  //     **没有** ADR-009 §4.2 的原子领取原语，因此走下面这条**无领取路径**：
+  //       · 已经过了 4b 的幂等预检（未命中才走到这里）；
+  //       · 不调用 ClaimForWrite / MarkReady / ReleaseClaim；
+  //       · **完全不做任何租约动作**（Acquire / Renew / Release 都不调用 —— 租约存在的意义
+  //         是让 claim 可回收，而这条路径没有 claim）。
+  //     ⚠️ **有意的降级（不是 bug，必须让运维知道）**：并发同一 `fileSource` 的创建在这条
+  //        路径上**没有互斥** —— 两个并发请求都可能复制并各写一条版本（对象的物理位置相同，
+  //        因此不会丢数据，但会产生两条内容相同的版本）。这是"生产用 PG（multi 强制
+  //        postgres）、remote 仅单实例"的代价；组合根也强制 `deployment.mode=single` +
+  //        `leases.enabled=false` + `metadata.remote.token_provider=static`（否则 exit 78）。
+  //        登记在 `docs/operations.md`、`docs/runbook.md` 与 `docs/test-evidence/phase10.md` §26。
+  const bool atomic_claim = ports_.metadata.capabilities().atomic_claim;
 
-  // 4d. ★★ C2（ADR-009 §4.3）：确保本实例持有该 fileSource 的**在途租约**，并在随后的
+  //  ★ 统一的回滚入口（ADR-009 §4.2 的"领取成功后的放弃路径"）。
+  //
+  //  顺序是**先删对象、再释放领取**，理由：
+  //    · 删除对象时我们**仍持有 claim** ⇒ 没有别的实例能领到同一个 (partition, file_source)，
+  //      因此也没有别的实例会写同一个 `to_ref` —— 我们删掉的一定是自己复制的对象。
+  //    · 反过来（先 ReleaseClaim 再删对象）会打开一个真实窗口：另一个实例领到后开始复制，
+  //      而我们随后按同样的 to_ref 把它删掉 ⇒ 对方返回 201 但对象已经没了（P6-D13 的反方向）。
+  //    · `RollbackCreatedObject` 的守卫（按 file_source 查到**记录**就不删）保持不变。
+  //    · 释放失败 = claiming 行残留（该 file_source 在 GC 回收前无法被重新领取）。非致命但
+  //      **必须可见**：记一条审计告警，原来的错误照常返回。
+  //  ★ `atomic_claim=false`（remote，无领取路径）时**没有 claim 可释放** —— 只删对象。
+  //    这条路径本来就是"尽力回滚"，`RollbackCreatedObject` 同样按 file_source 查记录。
+  const auto abort_create = [&](const std::optional<domain::ObjectRef>& rollback_ref,
+                                std::int64_t version) {
+    if (rollback_ref.has_value()) {
+      RollbackCreatedObject(ports_, caller, *rollback_ref, file_source, out.id);
+    }
+    if (atomic_claim) {
+      const auto released = ports_.metadata.ReleaseClaim(caller.partition, out.id, version);
+      if (!released.ok()) {
+        (void)RecordAudit(ports_, "createMetadataClaimReleaseFailure", caller, out.id, false);
+      }
+    }
+  };
+
+  std::int64_t claimed_version = 0;
+  if (atomic_claim) {
+    // 4d. ★★ C1（ADR-009 §4.2）：**复制之前先原子领取**。
+    //     在此之前只做了纯校验与一次廉价读取（没有外部副作用）；从这里往后才动存储。
+    //     领取成功 = 本调用是唯一会复制 staging→persistent 的实例（并发下另一个会
+    //     claimed=false，**不复制**）。失败路径必须 `ReleaseClaim`，否则该 fileSource
+    //     在本进程的后续重试里永远领不到（崩溃回收是下一个切片）。
+    FSS_TRY(claim, ports_.metadata.ClaimForWrite(caller.partition, out));
+    if (!claim.claimed) {
+      if (claim.state == domain::MetadataState::kReady) {
+        //  另一个实例已经登记完成 → 幂等返回同一条（与 4b 同义，只是竞态发生在中间）。
+        return ReturnExistingRecord(ports_, caller, claim.record);
+      }
+      if (claim.state == domain::MetadataState::kClaiming) {
+        //  ★ 另一个实例正在登记：**有界等待**（≈2 s）后 503，**绝不复制**（这就是本切片的目的）。
+        return WaitForExistingClaim(ports_, caller, file_source);
+      }
+      //  kDeleted / 其它不一致状态：fail closed —— 宁可控地失败，也不复制一个语义不明的对象。
+      return Err(fss::ErrorKind::kInternal,
+                 "元数据状态不一致：fileSource 已有非 ready/claiming 的活动记录，拒绝复制");
+    }
+    //  领取成功：`claim.record` 就是刚插入的 v1 claiming 行，它的 version 是 MarkReady 的锚点。
+    claimed_version = claim.record.version;
+  }
+
+  // 4e. ★★ C2（ADR-009 §4.3）：确保本实例持有该 fileSource 的**在途租约**，并在随后的
   //     长耗时复制/校验和期间周期续租。租约是"这个对象正在被写"的唯一证据：
   //       · 别的实例活着持有 → fail-closed（kUnavailable），**不复制**；
   //       · 续租失败 → 每个步骤边界都 fail-closed（回滚 + ReleaseClaim + 释放租约）。
   //     `leases.enabled=false` → 下面一整段都不执行（单实例行为逐字不变）。
+  //     ★ `atomic_claim=false`（remote）时**整段跳过**：没有 claim 的路径也不需要租约，
+  //       且组合根强制要求 `leases.enabled=false`（否则 exit 78）—— 双保险。
   std::unique_ptr<LeaseRenewer> renewer;
   std::unique_ptr<UploadLeaseGuard> lease_guard;
-  if (LeaseEnabled(ports_)) {
+  if (atomic_claim && LeaseEnabled(ports_)) {
     const auto owned = EnsureLeaseOwnership(ports_, caller, file_source);
     if (!owned.ok()) {
-      AbortClaimedCreate(ports_, caller, std::nullopt, file_source, out.id, claimed_version);
+      abort_create(std::nullopt, claimed_version);
       return owned.error();
     }
     LeaseRenewer::Options renew_options;
@@ -718,7 +740,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
                                                      *renewer);
     //  ★ 线程创建失败 / 首轮即失败也要 fail-closed（绝不带着"保不住的租约"去复制）。
     if (renewer->failed()) {
-      AbortClaimedCreate(ports_, caller, std::nullopt, file_source, out.id, claimed_version);
+      abort_create(std::nullopt, claimed_version);
       return Err(fss::ErrorKind::kUnavailable, "在途租约续租不可用，拒绝复制（fail-closed）");
     }
   }
@@ -740,7 +762,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   const auto abort_if_lease_lost = [&](const std::optional<domain::ObjectRef>& rollback_ref)
       -> std::optional<fss::Error> {
     if (renewer == nullptr || !renewer->failed()) return std::nullopt;
-    AbortClaimedCreate(ports_, caller, rollback_ref, file_source, out.id, claimed_version);
+    abort_create(rollback_ref, claimed_version);
     return Err(fss::ErrorKind::kUnavailable,
                "在途租约续租失败，已回滚复制（fail-closed，防止 GC 回收在途对象）");
   };
@@ -748,7 +770,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   // 5. 位置记录（FileSource → 物理位置）
   const auto location_result = ports_.locations.FindByFileSource(caller.partition, file_source);
   if (!location_result.ok()) {
-    AbortClaimedCreate(ports_, caller, std::nullopt, file_source, out.id, claimed_version);
+    abort_create(std::nullopt, claimed_version);
     //  ★ 消息逐字对齐上游：源路径在存储侧不存在时，上游（Azure/GCP provider 的 copyFile
     //    失败分支）抛 `INVALID_SOURCE_EXCEPTION + "/" + <path>`，期望报文见
     //    `output_payloads/File_invalid_fileSource_msg.json`。此前这里给的是中文消息，
@@ -781,10 +803,12 @@ fss::Result<std::string> CreateFileMetadata::Execute(
       //    完成登记），但保留接线前的行为：既有 ready 记录存在 → 幂等返回，并释放我们自己的领取。
       if (auto existing = ports_.metadata.GetLatestByFileSource(caller.partition, file_source);
           existing.ok()) {
-        (void)ports_.metadata.ReleaseClaim(caller.partition, out.id, claimed_version);
+        if (atomic_claim) {
+          (void)ports_.metadata.ReleaseClaim(caller.partition, out.id, claimed_version);
+        }
         return ReturnExistingRecord(ports_, caller, existing.value());
       }
-      AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
+      abort_create(to_ref, claimed_version);
       //  依赖服务（存储）异常 → 502（契约 §2.6：失败 → 502/500）
       return Err(fss::ErrorKind::kBadGateway,
                  "复制到 persistent 失败：" + copied.error().message());
@@ -795,7 +819,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     const auto persistent_store = ports_.blobs.ForPartition(caller.partition,
                                                             domain::StorageZone::kPersistent);
     if (!persistent_store.ok()) {
-      AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
+      abort_create(to_ref, claimed_version);
       return Err(fss::ErrorKind::kBadGateway,
                  "无法解析 persistent 存储：" + persistent_store.error().message());
     }
@@ -803,7 +827,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
     if (!existing.ok() || !existing.value().exists) {
       //  位置记录说"已经迁过"，但对象不在 → 依赖故障（或被人删过）。
       //  绝不能静默写一条指向空对象的记录。
-      AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
+      abort_create(to_ref, claimed_version);
       return Err(fss::ErrorKind::kBadGateway,
                  "persistent 对象缺失（位置记录已迁移但对象不存在）");
     }
@@ -845,7 +869,7 @@ fss::Result<std::string> CreateFileMetadata::Execute(
       //  ★ 第 7 步失败也属于第 12 步的"任一步 6/7/9 失败"：必须**回滚删除**已搬迁的对象，
       //    并释放领取（否则 claiming 行残留、该 fileSource 无法重试）。
       //    此前这里是 `FSS_TRY`，直接 return 就漏掉了回滚（C6.3 的故障注入点③抓到）。
-      AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
+      abort_create(to_ref, claimed_version);
       return Err(fss::ErrorKind::kBadGateway,
                  "计算校验和失败：" + computed.error().message());
     }
@@ -866,11 +890,38 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   // 8/9. ★ C1：把 claiming 行推到 ready，并一次性落库**最终**记录（含上面刚算出的 checksum）。
   //      ADR-009 §4.2 的顺序：领取（复制之前）→ 复制 → 算校验和 → claiming→ready。
   //      `MarkReady` 必须发生在成功事件/审计**之前**：客户端绝不能看到"SUCCESS 但记录仍 claiming"。
-  const auto created =
-      ports_.metadata.MarkReady(caller.partition, out.id, claimed_version, out);
-  if (!created.ok()) {
-    AbortClaimedCreate(ports_, caller, to_ref, file_source, out.id, claimed_version);
-    return Err(fss::ErrorKind::kInternal, "写入元数据记录失败：" + created.error().message());
+  //
+  //  ★★ 能力分支（本切片）：`atomic_claim=true` → `MarkReady`（本地/PG 仓储，语义与接线前逐字一致）；
+  //     `=false`（remote）→ `Create`（`PUT /records`，远端分配 version，记录 id 由远端适配器
+  //     按 (partition, file_source) **确定性派生** —— 调用方给的随机 UUID 会被覆盖，R5）。
+  //     两条路径**都**在成功事件/审计之前落库，因此客户端永远不会看到"事件先于记录"。
+  domain::FileMetadataRecord created_record;
+  if (atomic_claim) {
+    //  与接线前**逐字一致**：失败用 `kInternal` + 固定前缀包装（既有故障注入用例依赖它）。
+    const auto marked =
+        ports_.metadata.MarkReady(caller.partition, out.id, claimed_version, out);
+    if (!marked.ok()) {
+      abort_create(to_ref, claimed_version);
+      return Err(fss::ErrorKind::kInternal, "写入元数据记录失败：" + marked.error().message());
+    }
+    created_record = marked.value();
+  } else {
+    const auto created = ports_.metadata.Create(caller.partition, out);
+    if (!created.ok()) {
+      abort_create(to_ref, claimed_version);
+      //  ★ remote 的 `Create` 失败原因（不可达/超时/非 2xx/401/403/坏响应）已经由适配器
+      //    fail-closed 映射成**带 ErrorKind 的可读错误**；这里再包一层会是"第二个错误文案
+      //    覆盖第一个"。因此按 `kBadGateway`（依赖出站失败 → 502）**透传消息**，但保留
+      //    适配器判定的**认证/授权**两态（否则运维会把"token 错"读成"存储服务挂了"）。
+      const fss::ErrorKind kind = created.error().kind();
+      const bool keep = kind == fss::ErrorKind::kUnavailable ||
+                        kind == fss::ErrorKind::kUnauthenticated ||
+                        kind == fss::ErrorKind::kPermissionDenied ||
+                        kind == fss::ErrorKind::kNotFound;
+      return Err(keep ? kind : fss::ErrorKind::kBadGateway,
+                 "远端元数据记录写入失败：" + created.error().message());
+    }
+    created_record = created.value();
   }
 
   //  ★ C2：记录已 ready → 租约使命完成。**必须**在 MarkReady 之后才释放：在此之前
@@ -879,8 +930,10 @@ fss::Result<std::string> CreateFileMetadata::Execute(
   if (lease_guard != nullptr) lease_guard->ReleaseNow();
 
   // 10. 成功事件（非致命）：**两个**事件，顺序与上游一致（先 status，再 datasetDetails）
-  PublishStatus(ports_, caller, "SUCCESS", created.value().version, created.value().id);
-  PublishDatasetDetails(ports_, caller, created.value().id, created.value().version);
+  //  ★ 用 `created_record`（= 落库后的**权威**记录）：remote 形态下记录 id 由远端适配器
+  //    确定性派生、version 由 Storage Service 分配，因此**绝不能**用调用方给的 `out`。
+  PublishStatus(ports_, caller, "SUCCESS", created_record.version, created_record.id);
+  PublishDatasetDetails(ports_, caller, created_record.id, created_record.version);
 
   // 位置记录迁到 persistent（zone 更新）并记上传者（getFileList 的 UserID 过滤）
   domain::FileLocation persistent_location = location;
@@ -906,14 +959,14 @@ fss::Result<std::string> CreateFileMetadata::Execute(
       staging_removed = removal.ok();
       if (!staging_removed) {
         (void)RecordAudit(ports_, "createMetadataStagingCleanupFailure", caller,
-                          created.value().id, false);
+                          created_record.id, false);
       }
     }
   }
   (void)staging_removed;
-  audit.SetObjectId(created.value().id);
+  audit.SetObjectId(created_record.id);
   FSS_TRY(audit.Success());
-  return created.value().id;
+  return created_record.id;
 }
 
 // =============================================================================

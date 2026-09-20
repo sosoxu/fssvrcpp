@@ -60,6 +60,12 @@ namespace fss::adapters::grpc {
           response->set_text(text);
           return ::grpc::Status(::grpc::StatusCode::UNAVAILABLE, text);
         }
+        //  ★ 本切片：共享状态探针存在时它是**唯一**判据（与 REST 逐字同源）。
+        //    remote 仓储的 `List` 恒 `kUnimplemented`，继续走下面的最小探针会让 readiness
+        //    永远 not ready；PG 形态下最小探针本来就恒成立，跳过无行为影响。
+        response->set_status(osdu::file::v1::CheckResponse::SERVING_STATUS_SERVING);
+        response->set_text("File service is ready");
+        return ::grpc::Status::OK;
       }
       const auto probe = ports_.metadata.List("__readiness__", fss::domain::MetadataQuery{});
       if (!probe.ok()) {

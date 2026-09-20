@@ -20,7 +20,7 @@
 | **P7** | gRPC 适配层 + 双协议等价性 | RPC 面（14 一元 + 3 流式/代理）+ 双协议等价性矩阵 | `ctest -L phase7` | ✅ **已完成（C7.1~C7.10 全部满足；17/17 RPC；6 测试 / 5378 断言）** |
 | **P8** | 认证授权与多租户 | `IAuthorizer`、JWT 解析、角色映射、分区隔离、跨租户拒绝 | `ctest -L phase8` | ✅ **已完成（C8.1~C8.8 全部满足；C8.9 配置级 + C8.10 机制级完成；6 测试 / 1323 断言）** |
 | **P9** | 硬化与交付 | 并发/容量基线（独立负载进程）、故障注入、指标、GC、打包、部署模板、运维手册；**定稿 ADR-006** | `ctest -L phase9 && scripts/run_all_gates.sh` | ✅ **已完成（C9.1~C9.13、C9.15、C9.16、C9.25、C9.31、C9.32 满足；C9.8/C9.12 有独立证据文件；环境不具备的判据登记为未验证）**。**C9.31 为 P9 补交（P10 期间完成）**：GC 的 HTTP 按需端点 `POST /v2/gc:run` + `GcTask` 单飞护栏（证据 `docs/test-evidence/phase9.md` §12）。**C9.32 也为 P9 补交（P10 期间完成）**：`main()` 顶层兜底 → 未预期异常以 **exit 70（EX_SOFTWARE）+ 可读原因** 结束；容器 `--pids-limit=64` 真实回归 **ExitCode 70**（证据 `phase9.md` §14、`phase9-image.md` §10.12） |
-| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | ✅ **切片 1/2/3/4/5/6a/6b 全部完成（C10.1~C10.20）**：三态 157 键 **生效 137 / 拒绝启动 14 / 已读但无效果 6**（`docs/operations.md` §1.3；B2a/B2b/E1b/ADR-006 后；ADR-008 的 P4 +1、**C10.20** 的 6 键、**E1b** 的 1 键、**ADR-006 的 7 键：拒绝启动 −1 / 已读但无效果 −6 / 生效 +7**）；真实二进制证据见 `docs/test-evidence/phase10.md`。**期间补交 P9 的 C9.31**（GC 按需端点；不改任何配置键，三态计数不变） |
+| **P10** | 配置面接线 | `--config`/`--set`/`--print-config` + `fss::config::Load` 接入组合根、旧环境变量别名兼容、生产强校验、`docs/operations.md` 接通状态逐键更新 | `ctest -L phase10 && scripts/verify_config_wiring.sh` | ✅ **切片 1/2/3/4/5/6a/6b 全部完成（C10.1~C10.20）**：三态 157 键 **生效 141 / 拒绝启动 14 / 已读但无效果 2**（`docs/operations.md` §1.3；B2a/B2b/E1b/ADR-006 后；ADR-008 的 P4 +1、**C10.20** 的 6 键、**E1b** 的 1 键、**ADR-006 的 7 键：拒绝启动 −1 / 已读但无效果 −6 / 生效 +7**）；真实二进制证据见 `docs/test-evidence/phase10.md`。**期间补交 P9 的 C9.31**（GC 按需端点；不改任何配置键，三态计数不变）。**本切片（`metadata.remote.*` 落地）**：`metadata.repository=remote` + 远端 4 键 → **生效**（+4）：远端 Storage Service 元数据仓储（ADR-004 的**可选实现**），`capabilities().atomic_claim=false`（无 C1 原子领取 ⇒ 仅 `single` + `leases.enabled=false`），**确定性记录 id**（R5），三态 **137/14/6 → 141/14/2**（键数仍 157）；证据 `docs/test-evidence/phase10.md` §26 |
 
 **全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P10 并全绿。
 任何阶段的门槛脚本一旦被加入，后续阶段不得使其退化。
@@ -998,14 +998,21 @@ sanitizers:                           # 与功能测试并行，任一失败即�
 P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、切片 2（GC/expiry/拒绝语义）、
 切片 3（审计 fail-closed / SQLite 调优 / 鉴权与 gRPC 面）、切片 4（数据面 PUT 上限 + SQLite PRAGMA）
 与切片 5（`self_signed` 三键：`key_id` + 自签 TTL 上界）与 **C10.16 / C10.16 续** 已完成**（见文末「阶段 10」）。
-三态（ADR-006 后的当前值）：**生效 137 / 拒绝启动 14 / 已读但无效果 6 = 157**（`docs/operations.md` §1.3；B2a/B2b/E1b 的净变化见该节末尾）。
+三态（**`metadata.remote.*` 落地后**的当前值）：**生效 141 / 拒绝启动 14 / 已读但无效果 2 = 157**（`docs/operations.md` §1.3；B2a/B2b/E1b/ADR-006/本切片的净变化见该节末尾）。
 **下一步 = 阶段 10 的后续切片**，按 §1.3.3 的"已读但无效果"清单收敛：
 
 1. ~~**C10.16**~~ ✅ 已完成（`partition.file.opendes.max_file_bytes` → 413；校验算法 → exit 78）；
    ~~`storage.posix.*` 细节键与容器名无字段可接~~ → **C10.16 续已完成**：`PosixBlobStoreOptions` /
    `PartitionConfig` 加上真实字段并接通（5 + 2 键生效、3 键拒绝启动，见文末）；
 2. GC 的 **HTTP 端点**（周期调度与 `--once` 已在切片 2 交付；手动触发/查询未做）；
-3. `storage.proxy_mode=always` / 远端 Storage Service（`metadata.repository=remote`）；
+3. ~~`storage.proxy_mode=always` / 远端 Storage Service（`metadata.repository=remote`）~~
+   **远端 Storage Service 已交付（本切片）**：`metadata.repository=remote` + `metadata.remote.*` 4 键生效
+   （L2 `src/infra/metadata/remote/remote_metadata_repository.{h,cpp}`；线协议按 `docs/01-osdu-research.md`
+   的 Storage 端点、由 `mock_validators.py --mode storage` 钉住；**确定性记录 id**（R5）；
+   `capabilities().atomic_claim=false` → 用例走无领取路径；组合根四条 fail-closed 前置 + 就绪探针；
+   证据 `tests/integration/test_remote_metadata_repository.cpp` + `docs/test-evidence/phase10.md` §26）。
+   ⚠️ **仍未做**：与真实 Storage Service 联调、`token_provider` 只支持 `static`（OAuth 未实现）、
+   响应形状只由 mock 钉住、remote **仅单实例**（并发同一 `fileSource` 无互斥）。`storage.proxy_mode=always` **仍未做**；
 4. PG 仓储/租约 + `deployment.mode=multi` 运行形态（ADR-009）—— 同时解锁 `leases.*`/`leader_election.*`；
 5. ~~`server.http.large_file_plane.*` 与 sendfile 数据面（ADR-006 §6）~~ **已交付（本轮）**：进程内第二个监听面（方案③），复用控制面**同一个**已包装 handler；7 键全部生效（`docs/operations.md` §1.3.1）；证据 `tests/integration/test_large_file_plane.cpp`（P1~P12）与 `docs/test-evidence/phase10.md` §25。⚠️ **仍未完成**：ADR-006 §6 第 5 条（真实存储/网卡上的受控基线复核 → `scripts/bench_sendfile_ab.sh` 移交生产）；
 6. `metadata.sqlite.{journal_mode,synchronous,max_write_concurrency,group_commit*}` /
@@ -1072,7 +1079,7 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
 * **C10.10**：`config/fss.example.json` 作为 `--config`（只覆盖路径/端口/密钥）**启动成功且
   readiness 200**；改坏 `server.http.port` → exit 78。
 * **C10.11**：16 个未实现能力的非默认值 → **exit 78 +「未实现 + 下一步」**；
-  `docs/operations.md` 逐键三态化（**当前为 生效 137 / 拒绝启动 14 / 已读但无效果 6 = 157**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
+  `docs/operations.md` 逐键三态化（**当前为 生效 141 / 拒绝启动 14 / 已读但无效果 2 = 157**；各切片的历史计数与理由见 `docs/test-evidence/phase10.md`）。
 * **C10.12**：`expiry.default`/`expiry.max` → `app::ExpiryPolicy`（作用于签发 URL 的 TTL；
   超上限**静默夹紧**、边界通过、非法仍 400 + 固定消息）。
 * 证据：`ctest -L phase10`（`tests/integration/test_config_wiring.cpp`，16 用例 / 288 断言）+
@@ -1163,16 +1170,16 @@ P0~P9 已完成并通过门槛；**阶段 10 的切片 1（配置面接线）、
   组合根三分支：`log`（默认，既有 `LogEventPublisher` 逐字不变）/ `webhook` / `none`（内联 `NoopEventPublisher`，  **显式关闭**）；横幅打印 publisher/端点/timeout/topic（**不打印密钥**）。
   `src/app/usecases/usecases.cpp` 的 `PublishStatus` 补上 `record_id`（第 10 步/幂等命中路径带真实 id；  第 1 步 IN_PROGRESS 发生在建记录前 → 空），使 `statusChanged.body.recordId` 与上游形状一致。
   用例：`tests/integration/test_webhook_publisher.cpp`（真实进程 + `mock_validators.py --mode webhook`；  `--observe-file` 新增 `bodies` 列表断言两个 kind 都发了）+ `tests/unit/test_composition_root_guard.cpp` 清单加   `WebhookEventPublisher`。**未交付**：异步有界发布队列、重试退避、投递保证、与真实消息总线/中间件联调。
-* 三态计数（ADR-006 后的当前值）：**生效 137 / 拒绝启动 14 / 已读但无效果 6 = 157**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
+* 三态计数（ADR-006 后的当前值）：**生效 141 / 拒绝启动 14 / 已读但无效果 2 = 157**（`operations.md` §1.3 + `test_operations_doc` 机械断言）。
   其中「拒绝启动」+1 来自 C10.18 的**伴随更正**（`auth.remote_entitlements.fail_closed`），
   与"6 个键接通"是两件事（落点不同：一个进「生效」、一个进「拒绝启动」）。
 
 **未做（本阶段不承诺）**：**异步有界事件发布队列 / 重试退避 / 投递保证**与真实消息总线联调（同步 webhook 发布器已在**切片 6b（C10.19）**交付；ADR-013 §9.4 登记了未交付项）、
-`metadata/location.repository=postgres|remote`、`leader_election.*`/`leases.*` 的 PG 语义、
+`metadata.repository=postgres`/`location.repository=postgres`、`leader_election.*`/`leases.*` 的 PG 语义、
 `storage.proxy_mode`/`driver_report_override`/`provider_key_override`（DMS 响应整形，需先定契约）、
 `gc` 的 HTTP 端点。这些仍为"拒绝启动"或"已读但无效果（附理由与下一步）"，**不得**改成静默忽略。
 
 **未做（本阶段不承诺）**：`gc.*` 的 HTTP 端点（只做周期调度与一次性运行）；
-PG 仓储/租约与 `mode=multi` 运行形态、`storage.proxy_mode`/远端 Storage Service、
+PG 仓储/租约与 `mode=multi` 运行形态、`storage.proxy_mode`（远端 Storage Service 已交付，见「下一步」第 3 条）、
 `leader_election.*`/`leases.*`（依赖 PG）、~~sendfile 数据面（ADR-006 §6）~~（**已交付**，本轮；仅 §6 第 5 条"真实存储/网卡复核"仍未完成）、
 `observability.audit_fail_closed` 的"致命审计"行为**已在 C10.13 交付**（见 §8 的 `operations.md` 说明）。

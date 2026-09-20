@@ -4007,3 +4007,186 @@ ctest --test-dir build-pg -N -L phase10   → Total Tests: 12
 - 它的**新测试不被门槛执行**，这条由我修复并自证；
 - 未验证项以 §25.6 与 `AGENTS.md` §0.1 为准，其中 **ADR-006 §6 第 5 条（真实存储上的受控基线复核）
   在本环境不可能完成** ⇒ 本切片**未达"§6 全部满足"**，不得写成"门槛通过"。
+
+---
+
+## 26. metadata.remote.*（本切片）：远端 Storage Service 元数据仓储落地
+
+**一句话**：`metadata.repository=remote` 从「**未交付 → exit 78**」变成**真的可运行** —— 记录归
+**远端 Storage Service**（`PUT {base}/records` / `GET {base}/records/{id}` /
+`POST {base}/records/{id}:delete`，**必须 204**；ADR-004），因此 OSDU Search / Indexer 能看到记录；
+`metadata.remote.{base_url,token_provider,static_token,timeout_ms}` **4 个键 → 生效**；
+三态 **137/14/6 → 141/14/2**（键数仍 **157**）。
+
+> ⚠️ **本环境没有真实 Storage Service**：线协议是按 `docs/01-osdu-research.md` 的 Storage 端点写的，
+> 由 `tests/tools/mock_validators.py --mode storage` **钉住**，**未与真实 Storage Service 联调**。
+
+### 26.1 交付物
+
+| 类型 | 路径 | 说明 |
+| --- | --- | --- |
+| L2 适配器 | `src/infra/metadata/remote/remote_metadata_repository.{h,cpp}` | libcurl；`base_url` 是**基址**（追加 `/records`，与 `legal/schema.remote.base_url` **相反**）；fail-closed 错误映射（401→`kUnauthenticated`、403→`kPermissionDenied`、404→`kNotFound`、其余→`kUnavailable`）；`DeriveRemoteRecordId`（纯函数）；`Probe()` 就绪探针（**404 = 服务活着**）；指标 `fss_metadata_remote_requests_total{op,outcome}`（op=put/get/delete/probe） |
+| 端口能力 | `src/domain/ports/ports.h` | 新增 **defaulted** `MetadataCapabilities{atomic_claim, backend_name}`（默认 `{true,"local"}`）：只有 remote 覆盖成 `{false,"remote"}` —— **不假装**远端能实现 ADR-009 §4.2 的原子领取 |
+| 用例分支 | `src/app/usecases/usecases.cpp`（`CreateFileMetadata`） | `atomic_claim=false` → **无领取路径**（幂等预检 → 复制 → checksum → `Create` → 事件/审计），**不调用** `ClaimForWrite`/`MarkReady`/`ReleaseClaim`，**不做任何租约动作**；四个领取原语在 remote 上返回 `kUnimplemented` |
+| 组合根 | `src/main/server_main.cpp` | 四条 fail-closed 前置（`deployment.mode=single` + `metadata.remote.base_url` 非空 + `token_provider=static` + `leases.enabled=false`）任一不满足 → **exit 78 + 点名键/理由/修法**；装配就绪探针到 `ports.shared_state_probe`；启动横幅打印 base_url / token_provider / timeout / `atomic_claim=false`（**不打印 static_token**） |
+| 适配层修正 | `src/adapters/http/router.cpp`、`src/adapters/grpc/file_service_adapter.cpp` | `shared_state_probe` 存在时它是 readiness 的**唯一**判据（否则 remote 的 `List` 恒 `kUnimplemented` ⇒ readiness **永远** 503；I5 注入钉住这条） |
+| 新 mock | `tests/tools/mock_validators.py --mode storage` | `PUT/GET/POST :delete` + 版本按 id 递增 + `--observe-file`（method/path/headers/body 计数）+ 故障开关 `--fail-put/--fail-get/--timeout-ms/--require-token/--put-envelope/--delete-status/--malformed` |
+| RAII 包装 | `tests/framework/mock_storage.h` | `popen` + 轮询 `LISTENING <port>` + 析构 `SIGTERM`→轮询→`SIGKILL`；支持**固定端口**（M10 的"杀掉→同端口重启"） |
+| 新测试 | `tests/integration/test_remote_metadata_repository.cpp` | **13 用例 / 365 断言**，`LABELS "integration;remote-meta;phase10"`（**无 pg**） |
+| 护栏 | `tests/unit/test_capability_guard.cpp`、`tests/unit/test_composition_root_guard.cpp` | 前者新增**接收者受限**的允许点（`app/usecases/usecases.cpp` 只放行 `metadata.capabilities()`，`store->capabilities()` 仍失败）；后者把 `RemoteMetadataRepository` 收录进"只在组合根装配"清单 |
+| 文档 | `docs/operations.md` §1.2.7/§1.3/§8、`docs/adr/ADR-004-*.md`、`docs/00-final-design.md` §5.cc、`docs/02-design.md` §9、`docs/04-implementation-plan.md` §9、`docs/runbook.md` §2.1、`docs/03-api-contract.md` §1.5/§8、`tests/unit/test_operations_doc.cpp` | 三态计数与跨文档一致性；确定性 id 偏离 + 无互斥降级 + 未联调，逐处登记 |
+
+### 26.2 实测（命令 + 输出）
+
+```text
+$ cmake --build build -j4
+[100%] Built target test_remote_metadata_repository        # EXIT=0
+
+$ ./build/bin/test_remote_metadata_repository
+All tests passed (365 assertions in 13 test cases)
+
+$ ctest --test-dir build -N -L phase10        # 新测试真的进了门槛集合（AGENTS §4.3 的标签陷阱）
+Test #88: test_remote_metadata_repository
+Total Tests: 10                                # 本切片前 = 9
+
+$ ctest --test-dir build -L phase10
+100% tests passed, 0 tests failed out of 10
+
+$ ctest --test-dir build                      # 全量（本切片前 90/90）
+100% tests passed, 0 tests failed out of 91
+Total Test time (real) = 108.24 sec
+
+$ ./build/bin/test_operations_doc
+All tests passed (43 assertions in 3 test cases)           # 141/14/2 + 跨文档一致
+
+$ ./scripts/check_docs.sh
+D1 检查了 65 个本地链接 / D3 13 个 ADR / D4 P0~P10 / D5 148 条门槛
+全部检查通过（D1~D5）
+
+$ cmake --build build-pg -j4
+[98%] Built target test_remote_metadata_repository         # EXIT=0（含 fss_metadata_remote / fss_server）
+```
+
+M9（真实进程端到端）断言到的启动横幅片段（**R11：真实依赖可见**）：
+
+```text
+repositories   : metadata=remote（远端 Storage Service：http://127.0.0.1:<mock>/api/storage/v2；
+                 token_provider=static static_token=空 timeout=3000ms（连接超时=min(1000,timeout)）；
+                 ★ atomic_claim=false —— 无 C1 原子领取，仅单实例，并发同一 FileSource 可能产生两条版本；
+                 base_url 是**基址**（追加 /records））
+```
+
+M10（依赖挂 → readiness 503 而 liveness 200）的 503 文本（可读原因，REST 与 gRPC 同源）：
+
+```text
+File service is not ready: 远端 Storage Service 不可达或超时（GET /records/{probe_id}（就绪探针；
+404 = 服务活着），op=probe，timeout=3000ms）：Failed to connect to 127.0.0.1 port <p>: Connection refused
+```
+
+### 26.3 R1 注入（I1~I6；每条都是 注入 → 重建 → 失败 → 还原 → 重建 → 绿）
+
+**基线/还原后的绿**：`All tests passed (365 assertions in 13 test cases)`（6 条注入还原后各复跑一次）。
+
+| id | 注入（改什么） | 必须失败的用例 | 实测失败断言与文本 | 区分力 |
+| --- | --- | --- | --- | --- |
+| **I1** | 适配器 `Call()` 里丢掉 `Authorization` 头（`if (false && !static_token.empty())`） | **M7** | `test_remote_metadata_repository.cpp:512 FAILED: REQUIRE( created.ok() )`，`ErrOf(created) := "kUnauthenticated: 远端 Storage Service 拒绝认证（HTTP 401，op=put，fail-closed → 401）：请检查 metadata.remote.static_token（当前已配置）…"` | ✅ 有 |
+| **I2** | `DeriveRemoteRecordId` 用 `crypto::RandomHex(16)` 代替代 `Sha256Hex`（随机 id） | **M1 / M2 / M9**（M3 也失败） | M1 `:270 REQUIRE( created.value().id == expected_id )`；M2 `:323 REQUIRE( first_id == DeriveRemoteRecordId("opendes", first.file_source) )`；M9 `:662 REQUIRE( id == DeriveRemoteRecordId("opendes", created.file_source) )`（3 用例 / 0 通过） | ✅ 有（幂等失效可证） |
+| **I3** | 用例把 `atomic_claim` 硬写成 `true`（保留 `capabilities()` 调用以过护栏），即"忽略能力、总是 `ClaimForWrite`" | **M2 / M9** | M2 `:321 REQUIRE( first.create_status == 201 )` → `501`；M9 `:660 REQUIRE( created.create_status == 201 )` → `501`，体为 `{"code":501,"message":"远端 Storage Service …不支持原子领取（capabilities().atomic_claim=false）…"}` | ✅ 有（能力分支是承重的） |
+| **I4** | 适配器 `Create` 忽略 HTTP 状态码（500 也继续解析体并当成功；mock 的 500 体是"伪装成功的记录 version=999"） | **M8** | `:556 FAILED: REQUIRE_FALSE( created.ok() )`（500 被当成成功，返回了 version=999 的记录） | ✅ 有 |
+| **I5** | 组合根不装配 remote 就绪探针（`if (false && remote_metadata_probe != nullptr)`） | **M10** | `:717 FAILED: REQUIRE( WaitReady(port) )` —— 没有探针时适配层退回 `metadata.List`，remote 诚实返回 `kUnimplemented` ⇒ readiness **恒 503**（服务起不来） | ✅ 有 |
+| **I6** | `DeriveRemoteRecordId` 返回**纯 hex**（不格式化 8-4-4-4-12） | **M3** | `:352 FAILED: REQUIRE( golden == "opendes:dataset--File.Generic:5b9b934d-2064-726b-0d4a-f85673f6fba3" )` | ✅ 有 |
+
+**没有"无区分力"的注入**：I1~I6 全部产生了失败断言（上表"区分力"列全 ✅）。
+
+### 26.4 固定输入的确切派生 id（M3 的 golden）
+
+```text
+DeriveRemoteRecordId("opendes", "/data/remote-meta-golden.txt")
+  = opendes:dataset--File.Generic:5b9b934d-2064-726b-0d4a-f85673f6fba3
+  （= SHA-256("opendes" || 0x00 || "/data/remote-meta-golden.txt") 的前 128 bit，8-4-4-4-12）
+```
+
+### 26.5 未覆盖与未验证（诚实清单）
+
+| # | 项 | 为什么 / 现状 |
+| --- | --- | --- |
+| 1 | **与真实 Storage Service 联调** | 本环境**没有**该服务。线协议按 `docs/01-osdu-research.md` 的端点实现、由 mock 钉住；**未联调** |
+| 2 | **PUT/GET 的响应形状** | 适配器同时接受「整条记录 JSON」（mock 默认）与 OSDU 的 `{recordCount,recordIds,versions}` 信封（`--put-envelope` 覆盖），但真实服务返回哪一种**未验证** |
+| 3 | **`token_provider` 只有 `static`** | OAuth / service-account 换取流程**未实现**（非 `static` → exit 78）。真实平台的认证形态（core-common / Entitlements 中转）**未实现** |
+| 4 | **`DataLakeStorageService` / core-common 中介** | **未实现**：本适配器**直接**调 Storage 端点，不经过上游的 core-common 转发层 |
+| 5 | **单实例 / 无互斥** | `atomic_claim=false` ⇒ 并发同一 `FileSource` 的创建**没有互斥**，可能复制两次并产生两条版本（**按设计**，非 bug）。组合根强制 single + 无租约；**多实例未验证**（明确不支持） |
+| 6 | **确定性 id 偏离上游** | 上游让 Storage 分配随机 id；本项目按 R5 改为确定性派生。**未与真实 Search/Indexer 验证**该 id 形状被接受 |
+| 7 | **`state` / `is_latest` 在远端没有对应物** | 远端版本链由 Storage Service 自管；`claiming` 状态机在 remote 形态**不存在** ⇒ "读路径只返回 ready"由"没有 claiming 状态"保证（**未用真实服务验证**） |
+| 8 | **`List` 未实现** | ADR-004 草图与调研都没有"按条件列举记录"的端点依据 ⇒ 诚实 `kUnimplemented`，**不发明**未文档化的 query 端点 |
+| 9 | **libcurl 缺失分支** | `find_package(CURL REQUIRED)`（`src/CMakeLists.txt:94`）⇒ 成功的构建里 `FSS_WITH_LIBCURL` 恒定义，组合根的 `#ifndef FSS_WITH_LIBCURL` 分支**在本环境不可执行**（按 AGENTS 纪律登记） |
+| 10 | **`/v2/info` 的 `connectedOuterServices`** | ADR-004 的"后果"要求在其中反映实际后端；**未交付**（仍是恒定的 `["storage"]`）。运维核对入口 = 启动横幅 `repositories : metadata=remote（…）` |
+| 11 | **缺必需字段的响应体** | M8 只用 `--malformed`（非 JSON）覆盖；"合法 JSON 但缺 `kind`/`data` 且无 `versions`"这条分支**未单独注入**（M8 里以 `SUCCEED` 显式标注，不假装测过） |
+
+## 父代理独立复核（metadata.remote）
+
+
+**复核人：父代理（不采信子代理自报数字；以下每条都是我自己跑出来的）。**
+
+### 1. 数字复核（我自己跑）
+
+| 命令 | 我的实测 |
+| --- | --- |
+| `./build/bin/test_remote_metadata_repository` | **365 断言 / 13 用例** |
+| `./build/bin/test_operations_doc` | 43 断言 / 3 用例 |
+| `ctest --test-dir build` | **91/91 passed**（切片前 90） |
+| `ctest --test-dir build -N -L phase10` | **10**（含新测试 ⇒ 门槛会跑它） |
+| **`ctest -L pg`（本机 14.24 与目标 12.6）** | **各 12/12**（关键：本切片改了 readiness 判定路径，而默认 ctest 不覆盖 PG 用例） |
+| `./scripts/check_docs.sh` | 全部通过（D1~D5） |
+
+### 2. 独立消融：能力分支承重
+
+运行期开关**谎报** `capabilities().atomic_claim=true`（`src/infra/metadata/remote/*.h`，复核后已删）：
+
+```text
+基线：            *M2*,*M9*  → All tests passed (109 assertions in 2 test cases)
+谎报 atomic_claim：*M2*,*M9*  → REQUIRE( first.create_status == 201 ) / REQUIRE( created.create_status == 201 )
+                              test cases: 2 | 0 passed | 2 failed
+```
+
+⇒ 用例分派**真的**由能力位决定；若 remote 谎报有能力，端到端创建会立刻失败（501）。
+
+### 3. 独立核对派生 id（我自己的 SHA-256）
+
+```text
+SHA-256("opendes" || 0x00 || "/data/remote-meta-golden.txt") 前 128 bit，8-4-4-4-12：
+  opendes:dataset--File.Generic:5b9b934d-2064-726b-0d4a-f85673f6fba3   ← 与子代理报告**逐字一致**
+```
+
+### 4. 真机端到端复核（我自己起 mock + 自己起 fss_server + 自己 curl）
+
+- **写入/幂等**：正确走上传（uploadURL→PUT 200）→ `POST /v2/files/metadata` **201** ×2，两次
+  **同 id**（`opendes:dataset--File.Generic:78f4a21c-…`，该 fileSource 的实际派生值），
+  mock 观测到 **PUT 次数 = 1** ⇒ 幂等路径真的没重复写远端。
+- **鉴权头**：mock 观测到的请求头是 `Authorization: Bearer tok-123`（`static_token` 真的发出去了）。
+- **读路径**：`GET /v2/files/{id}/metadata` 返回 **全字段**，与直接 `GET` mock 的 `records/{id}` 逐字段一致
+  （`acl, data, id, kind, legal, meta, version`）。
+- **就绪语义**（本切片最关键的改动）：mock 活着 → readiness **200**；`kill` mock 后 readiness
+  **503** 且原因可读（`远端 Storage Service 不可达或超时（GET…`），**liveness 仍 200**。
+- **拒绝启动矩阵**（我自己构造 4 份配置，各自 **exit 78** 且点名键）：无 `base_url` /
+  `token_provider=oauth` / `leases.enabled=true` / `deployment.mode=multi`。
+
+### 5. 我自己的两次假警报（如实记录，避免被当成"缺陷"读）
+
+1. 我第一次 `POST metadata` 少了 `authorization` 头 → 401；第二次 ACL 主体写了 `"v"`/`"o"`
+   （不符合 ACL 正则）→ 400；第三次 FileSource 是**凭空编的**（没有先上传）→ 400
+   `Invalid source file path to copy from`。三次都是**我的请求**不合法，不是产品缺陷。
+2. 我看到 `POST /v2/files/metadata` 的响应只有 `{"id": …}`，一度怀疑"remote 形态把记录字段丢了"，
+   于是单独隔离：`GET .../metadata` 返回**全字段**、mock 直读也全字段。最后在
+   `src/adapters/http/router.cpp:386-390` 确认：**POST 的 `{"id"}` 是既有产品语义**
+   （契约 §2.6），与 remote 无关 —— 我把 GET 的"全字段"要求错读成 POST 的。**结论：不是缺陷**；
+   记录下来是因为"先隔离再下结论"这一步正是避免误报的原因。
+
+### 6. 复核结论
+
+- 子代理的 365/13、91/91、M1~M12 与 I1~I6 **成立**；我用**不同机制**独立复现了三条最关键的：
+  能力分支承重（运行期开关谎报能力）、派生 id 算法（自己算 SHA-256）、就绪语义（自己 kill mock）；
+- **readiness 判定路径的改动**（`shared_state_probe` 存在时成为唯一判据）经**两引擎 `ctest -L pg` 各 12/12**
+  确认没有回归既有 B2a/B2b 就绪用例；
+- 未验证项以 §26.5 与 `AGENTS.md` §0.1 为准，其中最重要的是：**没有真实 Storage Service**（线协议由 mock 钉住、
+  未联调）、`token_provider` 只支持 `static`、remote 形态**并发同一 fileSource 无互斥**（有意降级）、
+  `List` 未实现（不发明未文档化端点）。

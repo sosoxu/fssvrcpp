@@ -825,6 +825,22 @@ fss_add_test(test_webhook_publisher
 add_dependencies(test_webhook_publisher fss_server)
 
 # =============================================================================
+#  本切片：`metadata.repository=remote` + `metadata.remote.*`（ADR-004）
+#    远端 Storage Service 元数据仓储。M1~M8/M8b 是**仓储级**（直接构造
+#    `RemoteMetadataRepository` + 可控 mock `tests/tools/mock_validators.py --mode storage`）；
+#    M2/M9/M10/M11/M12 是**真实进程**（`build/bin/fss_server` + mock）—— 证明组合根
+#    按配置真的选中了 remote（而不是静默落回 SQLite）。
+#    · 链接 fss_metadata_remote（L2 适配器）+ fss_json；libcurl 由该目标传递。
+#    · **无 pg 标签**（默认构建即全绿）
+#    · `phase10` 标签是硬要求：`run_all_gates.sh` 只跑 `ctest -L phaseN`
+# =============================================================================
+fss_add_test(test_remote_metadata_repository
+  SOURCES integration/test_remote_metadata_repository.cpp
+  LIBS    fss_metadata_remote fss_json Threads::Threads
+  LABELS  "integration;remote-meta;phase10")
+add_dependencies(test_remote_metadata_repository fss_server)
+
+# =============================================================================
 #  C9.30 的**第三半**（P10 期间补交）：`/v2/info` 与指标暴露
 #  `ioEngine` / `ioUringAvailable`（ADR-010 的 R11；语义见文件头的"可用 ≠ 已启用"）。
 #    ① REST：真 JSON 解析（python3 `json`）断言字段**存在**+**类型**+取值，既有字段正控；

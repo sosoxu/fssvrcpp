@@ -84,6 +84,49 @@ df -i "$FSS_STORAGE_ROOT"
 | `PRAGMA quick_check` 非 `ok` | SQLite 文件损坏 | 停进程 → 备份 `.db` → 用 `sqlite3 .recover` 导出 → 重建；**不要**直接删库（元数据与位置记录都在里面） |
 | 版本链异常（同一 `file_source` 多条 `is_latest`） | 部分唯一索引被误删 | 参见 `db/tests/001_verify_invariants.sql`；**先清数据再重建唯一索引**（R10） |
 
+### 2.1 `metadata.repository=remote`：Storage Service 不可用 / 记录归属
+
+> 适用形态：`metadata.repository=remote`（记录归**远端 Storage Service**，不是本服务的
+> SQLite）。**默认形态是 `sqlite`**，本节只在显式选了 remote 时适用。
+
+**症状**：`createMetadata`（`POST /v2/files/metadata`）返回 **503**（`x-fss-error-kind: unavailable`）；
+`GET /v2/readiness_check` 返回 **503** 且体里带 "远端 Storage Service 不可达或超时…"；
+而 `GET /v2/liveness_check` **仍是 200**（本进程活着，是**依赖**挂了）。
+
+**诊断**（按顺序）：
+```bash
+BASE=http://127.0.0.1:8080/api/file
+curl -sS "$BASE/v2/readiness_check"   # 读可读原因（含"不可达/超时/HTTP <码>/认证"）
+curl -sS "$BASE/v2/liveness_check"    # 必须仍 200 —— 否则是**本进程**的问题，走 §1/§2
+curl -sS http://127.0.0.1:8080/metrics | grep 'fss_metadata_remote_requests_total'  # op/outcome
+# 启动横幅里有真实依赖（R11）：repositories : metadata=remote（远端 Storage Service：<base_url>；… atomic_claim=false）
+```
+判读 `fss_metadata_remote_requests_total`：`outcome="error"` 的 `op` 直接指路 ——
+`op="put"` 是写入路径（createMetadata）、`op="get"` 是读/幂等预检、`op="delete"` 是删除、
+`op="probe"` 是**就绪探针**（只有它失败 = readiness 变 503 的唯一原因）。
+
+**处置**：
+| 原因 | 处置 |
+| --- | --- |
+| 连不上 / 超时（`op` 任意） | 修 `metadata.remote.base_url`（**基址**，适配器追加 `/records`；填了完整端点会 404）或排查网络/TLS；`metadata.remote.timeout_ms` 是**连接 + 整体**超时 |
+| `HTTP 401`（`kUnauthenticated`） | token 错，**不是**停机：检查 `metadata.remote.static_token` 与 `token_provider=static`（`Authorization: Bearer`） |
+| `HTTP 403`（`kPermissionDenied`） | 该 token 没有 Storage 记录写权限 —— 找 Storage 管理员授权，别改本服务配置 |
+| `HTTP 404`（读/幂等预检） | 记录确实不在远端（可能被人删过）；若是刚创建就 404，查 `base_url` 是否少了/多了路径段 |
+| `HTTP 5xx` | Storage Service 侧故障；本服务 fail-closed（**绝不**把失败当成功、**绝不**落回本地 SQLite） |
+
+**禁令（Important）**：
+1. **不要**把 `metadata.repository` 从 `remote` 临时改成 `sqlite` 来"绕开故障" —— 那会让
+   记录**分裂到两处**：改回去之前写进本地 SQLite 的记录永远不会被 OSDU Search/Indexer 看到。
+2. **不要**手工编辑 Storage Service 里的记录 id。本形态的记录 id 是
+   **确定性派生**的（`<partition>:dataset--File.Generic:<sha256(partition\0fileSource) 前128bit>`，
+   见 `docs/03-api-contract.md` §3 与 `docs/operations.md` §1.2.7）：手改 id 会让
+   同一 `fileSource` 的下一次创建/重试指向**另一个** id，直接产生重复记录。
+   要改 id，改的是**数据**（`fileSource`），不是 id。
+3. **不要**在 remote 形态下开启 `leases.enabled` 或 `deployment.mode=multi`（组合根会
+   **exit 78**）：remote **没有**原子领取（`atomic_claim=false`），多实例并发同一
+   `FileSource` 会复制两次并产生两条版本 —— 这是"remote 仅单实例"的设计代价，
+   不是可以通过开租约修好的缺陷。生产多实例请用 `metadata.repository=postgres`。
+
 ---
 
 ## 3. 上传/下载失败（数据面）
@@ -429,8 +472,8 @@ FSS_STARTUP_FAULT_INJECT=throw_system_error ./build/bin/fss_server; echo "exit=$
 #   常见原因：容器 --pids-limit 过小导致线程创建 EAGAIN（见 docs/runbook.md）；或内存不足（bad_alloc）。
 ```
 
-**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 137 / 拒绝启动 14 /
-已读但无效果 6；ADR-006 后）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
+**为什么它不是配置键**：`docs/operations.md` 的 157 个叶子键三态清单（生效 141 / 拒绝启动 14 /
+已读但无效果 2；`metadata.remote.*` 落地后）由 `test_operations_doc` 与 `config/fss.example.json` **机械比对**；
 它也不是运维语义（没有"生产上要不要让启动抛异常"这种配置）。
 
 > **禁令**：**不要**在生产/预发设置 `FSS_STARTUP_FAULT_INJECT`（任何非空取值都会让启动
@@ -491,7 +534,7 @@ FSS_CLAIM_HOLD_MS=15000 ./build/bin/fss_server --config config/fss.json &
 > 所以生产路径（未设置该变量）的行为与引入本接缝之前逐字节一致。
 >
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 137 / 拒绝启动 14 / 已读但无效果 6）由 `test_operations_doc` **机械比对**；
+> （生效 141 / 拒绝启动 14 / 已读但无效果 2）由 `test_operations_doc` **机械比对**；
 > "让每个 `createMetadata` 故意卡住 N 毫秒"不是运维语义，生产上只会制造事故。
 > 若写成配置项会按**未知键 → exit 78** 被拒。
 >
@@ -525,7 +568,7 @@ FSS_CLOCK_SKEW_INJECT_MS=1000 ./build/bin/fss_server --config config/fss.json &
 > 避免演练结论被误读成"这台机器钟真的偏了"。**默认不注入**，生产路径逐字节不变。
 >
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 137 / 拒绝启动 14 / 已读但无效果 6）由 `test_operations_doc` **机械比对**；
+> （生效 141 / 拒绝启动 14 / 已读但无效果 2）由 `test_operations_doc` **机械比对**；
 > "让实例钟走偏"不是运维语义，生产上只会制造事故。若写成配置项会按**未知键 → exit 78** 被拒。
 >
 > **禁令**：**不要**在生产/预发设置 `FSS_CLOCK_SKEW_INJECT_MS`。它只用于 B2a 的
@@ -549,7 +592,7 @@ FSS_SERVICE_VERSION_OVERRIDE=9.9.9 ./build/bin/fss_server --config config/fss.js
 ```
 
 > **为什么它不是配置键**：同 `FSS_STARTUP_FAULT_INJECT` —— 157 键三态清单
-> （生效 137 / 拒绝启动 14 / 已读但无效果 6）由 `test_operations_doc` **机械比对**；
+> （生效 141 / 拒绝启动 14 / 已读但无效果 2）由 `test_operations_doc` **机械比对**；
 > "让实例谎报版本"不是运维语义（真实滚动升级应通过部署流程控制），
 > 若写成配置项会按**未知键 → exit 78** 被拒。
 >

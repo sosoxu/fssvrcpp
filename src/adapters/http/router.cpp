@@ -178,6 +178,12 @@ void Router::Register(fss::http::Server& server) {
                    return fss::http::Response::Text(
                        503, "File service is not ready: " + shared.error().message());
                  }
+                 //  ★ 本切片（metadata.repository=remote）：共享状态探针存在时它是**唯一**判据。
+                 //    以前这里会继续执行下面的"仓储可达"最小探针；对 remote 仓储那一步是
+                 //    `metadata.List(...)` —— remote **诚实地**返回 `kUnimplemented`（没有
+                 //    文档化的列举端点），于是 readiness 会**永远** 503（判据与目标相反）。
+                 //    PG 形态下这条最小探针本来就恒成立（多余），因此跳过它对行为无影响。
+                 return fss::http::Response::Text(200, "File service is ready");
                }
                //  依赖就绪的**最小探针**：仓储可达即可
                //  （共享状态探针为空时它是唯一判据，与接线前逐字一致；

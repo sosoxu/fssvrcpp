@@ -197,9 +197,35 @@ struct MetadataClaim {
   MetadataState state = MetadataState::kReady;  // claimed=false 时既有记录的状态
 };
 
+//  ★ 本切片（`metadata.repository=remote`）：仓储的**能力声明**（不是"假装接口一样"）。
+//
+//  为什么必须有它：`IMetadataRepository` 比 ADR-004 的三方法草图丰富得多 —— 它带着
+//  ADR-009 §4.2 的 **C1 原子领取协议**（`ClaimForWrite` / `MarkReady` / `ReleaseClaim`）
+//  与 `state` / `is_latest` 这两个**仓储列**。远端 Storage Service 的 OSDU 记录里
+//  **既没有 `state` 列，也没有"条件插入"这个数据库原语**（它的 `PUT /records` 只是
+//  upsert；判定幂等靠我们派生出的确定性 id，见 `DeriveRemoteRecordId`）。
+//  因此 remote 形态**无法**诚实地实现"原子领取"。
+//
+//  做法：给端口一个**默认实现**的能力访问器（与 `IBlobStore::OpenNativeRead` 同一纪律，
+//  R11/R12）—— 默认 = 本地仓储的能力（`atomic_claim=true, backend_name="local"`），
+//  **只有** `RemoteStorageServiceRepository` 覆盖成 `{false, "remote"}`。用例据此分支，
+//  而不是让上层去问"仓储是什么类型"（那会破坏依赖倒置）。
+//
+//  `backend_name` 只用于诊断/横幅（R12：具体实现只在组合根创建，这里只是可读标识）。
+struct MetadataCapabilities {
+  //  ADR-009 §4.2 的原子领取需要"条件插入"这一数据库原语 + 一个**不属于 OSDU 记录**的
+  //  state 列。远端 Storage Service 两者都没有 ⇒ remote 形态为 false。
+  bool atomic_claim = true;
+  std::string backend_name = "local";
+};
+
 class IMetadataRepository {
  public:
   virtual ~IMetadataRepository() = default;
+
+  //  ★ 能力声明（默认 = 本地仓储：有原子领取）。远端实现覆盖它。
+  virtual MetadataCapabilities capabilities() const { return {}; }
+
   //  创建：**幂等**（同 partition + 同 FileSource 重复创建必须返回同一条记录，R5）。
   //  ★ C1：本方法按新的原语实现（claim → mark ready），可观测语义与接线前逐字一致。
   virtual Result<FileMetadataRecord> Create(std::string_view partition,

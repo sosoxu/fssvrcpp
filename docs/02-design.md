@@ -769,13 +769,23 @@ Result<LocationPage> List(std::string_view partition, const LocationQuery& query
 | 实现 | 语义 | 适用 | 是否上游能力 |
 | --- | --- | --- | --- |
 | `SqliteMetadataRepository` | 自管版本链：`(partition_id, id, version)` 联合主键，`is_latest` 标记，`previous_version` 指针 | **默认**，独立部署 | ❌ **本项目新增** |
-| `RemoteStorageServiceRepository` | 转发到 OSDU Storage Service 的 `/api/storage/v2/records`（`PUT`/`GET`/`POST /records/{id}:delete` 需 204） | 部署在完整 OSDU 平台中 | ✅ 与上游一致 |
+| `RemoteStorageServiceRepository` | 转发到 OSDU Storage Service 的 `/api/storage/v2/records`（`PUT`/`GET`/`POST /records/{id}:delete` 需 204） | 部署在完整 OSDU 平台中 | ✅ 与上游一致（**本切片已交付**：`metadata.repository=remote`） |
 
-配置项 `metadata.repository = sqlite | remote`，默认 `sqlite`。
+配置项 `metadata.repository = sqlite | postgres | remote`，默认 `sqlite`。
+`remote` 的实现是 L2 `src/infra/metadata/remote/remote_metadata_repository.{h,cpp}`（`base_url`
+是**基址**、适配器追加 `/records`）；它**不假装**支持 ADR-009 §4.2 的原子领取
+（`capabilities().atomic_claim=false`），因此组合根强制 `deployment.mode=single` +
+`leases.enabled=false` + `token_provider=static`，否则 **exit 78**。详见
+[ADR-004](adr/ADR-004-persistence-strategy.md) 的「本切片的交付与偏离」。
 
 > ⚠️ **必须在交付文档中明确的限制**：
 > 使用内置 `sqlite` 时，记录**不会**进入 Storage Service，因此**不会被 OSDU Search 检索到**。
-> 若需要该能力，必须改为 `remote`。该限制会在 `/v2/info` 的 `connectedOuterServices` 中体现。
+> 若需要该能力，必须改为 `remote`。⚠️ 该限制**没有**按原计划在 `/v2/info` 的
+> `connectedOuterServices` 中体现（那里仍是恒定的 `["storage"]`，**未交付**）；运维核对
+> 仓储实现的入口是启动横幅的 `repositories : metadata=remote（…）` 一行（R11）。
+> remote 形态的三个已知边界（**设计取舍，不是缺陷**）：① 并发同一 `fileSource` 的创建
+> **没有互斥**（可能产生两条版本）；② 记录 id 是**确定性派生**的（偏离上游的随机 id，
+> 见 ADR-004 偏离表第 1 条）；③ **未与真实 Storage Service 联调**（协议由 mock 钉住）。
 
 ```sql
 CREATE TABLE IF NOT EXISTS file_metadata_records (
@@ -1283,10 +1293,10 @@ flush、`BeforeCommit` 把"事务开着"变成确定性可观察点）、`ISqlit
 `config/fss.example.json` —— **阶段 10 切片 1 已修**（`--config`/`--set` + 优先级 +
 exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、`expiry.*` 接进组合根，
 并把 16 个未实现键改为"非默认值 → 拒绝启动"（后续切片与 C10.16 / C10.16 续 / 切片 4 / 切片 5 / **切片 6a（C10.18）** 继续收敛，当前三态为
-**生效 137 / 拒绝启动 14 / 已读但无效果 6**（ADR-006 后）；逐键登记在 `docs/operations.md` §1.2/§1.3）；
+**生效 141 / 拒绝启动 14 / 已读但无效果 2**（`metadata.remote.*` 落地后；此前 ADR-006 后为 137/14/6）；逐键登记在 `docs/operations.md` §1.2/§1.3）；
 ② 多实例相关的 `one_filesystem_per_partition` 已接通（**E1b**：`true` 时启动期校验规则 A/B，
 违规 → exit 78；§1.2/§1.3.1 的该键行；`shared_mount_required` 已在 **B2b** 接通；
-§1.3.3 的「已读但无效果」清单已在 E1b 后清空至「能力未实现」的 6 个键）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ ~~sendfile 数据面实现（ADR-006 §6 的门槛）~~ **已交付（本轮）**；剩余的是 ADR-006 **§6 第 5 条**（真实存储/网卡上的受控基线复核）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
+§1.3.3 的「已读但无效果」清单已在 **`metadata.remote.*` 落地**后只剩 2 个**按决策不投入**的键（`*.sqlite.max_write_concurrency`），**没有**「能力未实现」残留）；③ PG 仓储/租约与 `deployment.mode=multi` 运行形态；④ ~~sendfile 数据面实现（ADR-006 §6 的门槛）~~ **已交付（本轮）**；剩余的是 ADR-006 **§6 第 5 条**（真实存储/网卡上的受控基线复核）；⑤ 真实硬件/多进程/容器类判据（C9.14、C9.17–C9.22、C9.26–C9.30）。
 
 ---
 
@@ -1297,7 +1307,7 @@ exit 78 失败语义）；**阶段 10 切片 2 进一步**把 GC 周期调度、
 | [ADR-001](adr/ADR-001-rpc-as-extension.md) | 以 gRPC/RPC 作为**平台外扩展**协议，而非 OSDU 合规接口 | 已采纳 |
 | [ADR-002](adr/ADR-002-http-framework.md) | 使用上游 cpp-httplib（源码 vendored）作传输层 + 自建 `fss_http` 强化包装层 | 已采纳（**修订版，取代初版"完全自研"结论**） |
 | [ADR-003](adr/ADR-003-storage-abstraction.md) | 以单一 `IBlobStore` 端口统一"集中存储"与"对象存储" | 已采纳 |
-| [ADR-004](adr/ADR-004-persistence-strategy.md) | 位置/元数据持久化：内置 SQLite + 可选远端 Storage Service | 已采纳（阶段 6 复核） |
+| [ADR-004](adr/ADR-004-persistence-strategy.md) | 位置/元数据持久化：内置 SQLite + 可选远端 Storage Service | 已采纳（**远端实现已交付**：`metadata.repository=remote`，见该 ADR 的「本切片的交付与偏离」） |
 | [ADR-005](adr/ADR-005-s3-driver.md) | S3 驱动：**自研 SigV4**（OpenSSL）+ libcurl 数据面 + 原生预签名；编码/签名/寻址/错误映射约定与兼容矩阵 | 已采纳（P5 定稿；与 libcurl/Go SDK 的 4 处实测差异见其 §4） |
 | [ADR-006](adr/ADR-006-large-file-data-plane.md) | 大文件数据面：**采纳 `sendfile` 方向**（P9 受控复核几何平均 **2.12x ≥ 1.5x**）；**下载面已交付**（进程内第二个监听面，复用控制面**同一个**已包装 handler；可关闭、默认关闭）。⚠️ §6 第 5 条（真实存储/网卡复核）**未完成** | 已交付（下载面）/ §6 第 5 条未完成；证据 `docs/test-evidence/phase9-adr006.md` + `docs/test-evidence/phase10.md` §25 |
 | [ADR-007](adr/ADR-007-async-and-coroutines.md) | 异步/协程采纳策略：分层决策 + 量化触发条件（T1–T3），现在不整体重写 | 已采纳 |

@@ -134,6 +134,7 @@ target_link_libraries(fss_server PRIVATE
   fss_http_adapter fss_grpc_adapter fss_auth_local fss_auth_remote fss_legal_remote
   fss_schema_remote fss_event_webhook fss_blob_posix fss_blob_s3
   fss_blob_metered fss_metrics fss_location_sqlite fss_location_memory fss_metadata_sqlite
+  fss_metadata_remote
   fss_transfer fss_metadata_memory fss_logging fss_config Threads::Threads)
 
 # -----------------------------------------------------------------------------
@@ -220,6 +221,24 @@ add_library(fss_metadata_memory STATIC
 target_include_directories(fss_metadata_memory PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # IClock 声明在 L1（fss_time），元数据仓储用它记录 created_at
 target_link_libraries(fss_metadata_memory PUBLIC fss_domain fss_time)
+
+# -----------------------------------------------------------------------------
+#  L2 远端元数据仓储（`metadata.repository=remote` / ADR-004）：HTTP + libcurl
+#    · 记录归属 = 远端 **Storage Service**（`PUT/GET {base}/records`），因此这是
+#      ADR-004 的"可选实现"，默认仍是内置 SQLite；
+#    · base_url 是**基址**（追加 `/records`），与 `legal/schema.remote.base_url`
+#      （完整端点，不追加路径）**相反** —— 见 `infra/metadata/remote/*.h` 的头注释；
+#    · 失败方向：除 404→kNotFound、401/403→认证/授权错外，一律 kUnavailable（fail-closed）；
+#    · 指标 `fss_metadata_remote_requests_total{op,outcome}`（fss_metrics）；
+#    · `FSS_WITH_LIBCURL` 发布给 tests/server：组合根据此给出"本构建没有 libcurl →
+#      exit 78"的可执行路径（与 PG 的 `FSS_HAVE_LIBPQ` 同一写法）。
+# -----------------------------------------------------------------------------
+add_library(fss_metadata_remote STATIC
+  infra/metadata/remote/remote_metadata_repository.cpp)
+target_include_directories(fss_metadata_remote PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fss_metadata_remote PUBLIC
+  fss_domain fss_json fss_crypto fss_metrics fss_logging CURL::libcurl)
+target_compile_definitions(fss_metadata_remote PUBLIC FSS_WITH_LIBCURL=1)
 
 # -----------------------------------------------------------------------------
 #  L2：PostgreSQL 共享状态（ADR-009）—— 多实例的位置仓储 + 在途租约

@@ -1,8 +1,10 @@
 # ADR-004：位置记录与元数据记录的持久化策略
 
-- 状态：已采纳（Accepted，待阶段 6 实现后复核）
-- 日期：2025
-- 相关文档：`docs/01-osdu-research.md` §5.5、`docs/02-design.md` §9
+- 状态：已采纳（Accepted；**2025 复核更新：可选实现 `RemoteStorageServiceRepository` 已交付**
+  —— `metadata.repository=remote` 现在是**真的可运行**的形态，不再是 exit 78；见文末
+  「本切片的交付与偏离」）
+- 日期：2025（复核更新：`metadata.remote.*` 落地切片）
+- 相关文档：`docs/01-osdu-research.md` §5.5、`docs/02-design.md` §9、`docs/operations.md` §1.2.7/§1.3
 
 ## 背景
 
@@ -90,9 +92,37 @@ class IMetadataRepository {
 
 ## 待办（阶段 2 定义端口，阶段 6 实现）
 
-- [ ] `IMetadataRepository` / `IFileLocationRepository` 签名定稿（含 `CallerContext`）
-- [ ] `SqliteMetadataRepository` 的版本链与并发写测试
-- [ ] `tests/tools/mock_storage_service.py`（`PUT/GET /records`、`POST /records/{id}:delete` → 204）
-- [ ] `RemoteStorageServiceRepository` 契约测试（对 mock）
-- [ ] 在 `docs/operations.md` 中说明两种 `metadata.repository` 的适用场景与迁移注意事项
-- [ ] 在 `/v2/info` 中输出当前仓储实现，供运维核对
+- [x] `IMetadataRepository` / `IFileLocationRepository` 签名定稿（含 `CallerContext`）
+- [x] `SqliteMetadataRepository` 的版本链与并发写测试
+- [x] `tests/tools/mock_storage_service.py`（`PUT/GET /records`、`POST /records/{id}:delete` → 204）
+      —— **实际落在** `tests/tools/mock_validators.py --mode storage`（复用既有 mock 基建，
+      见 `tests/framework/mock_storage.h`）
+- [x] `RemoteStorageServiceRepository` 契约测试（对 mock）：`tests/integration/test_remote_metadata_repository.cpp`
+- [x] 在 `docs/operations.md` 中说明两种 `metadata.repository` 的适用场景与迁移注意事项（§1.2.7/§1.3）
+- [ ] 在 `/v2/info` 中输出当前仓储实现，供运维核对 —— **未交付**：`/v2/info` 的
+      `connectedOuterServices` 仍是恒定的 `["storage"]`（与本仓库既有实现一致），
+      运维核对仓储实现的入口是**启动横幅**的 `repositories : metadata=remote（…）` 一行（R11）。
+
+## 本切片的交付与偏离（`metadata.repository=remote`）
+
+> 实现：`src/infra/metadata/remote/remote_metadata_repository.{h,cpp}`（L2）；
+> 组合根 `src/main/server_main.cpp` 的四条 fail-closed 前置条件；用例
+> `src/app/usecases/usecases.cpp` 的**无领取路径**；指标
+> `fss_metadata_remote_requests_total{op,outcome}`；就绪探针经 `ports.shared_state_probe`
+> 接入 REST 与 gRPC（同源）。判据见 `docs/test-evidence/phase10.md` §26。
+
+`IMetadataRepository` 的实际签名**比上面的 3 方法草图丰富**（多了 C1 的 `ClaimForWrite` /
+`MarkReady` / `ReleaseClaim` / `ReclaimStaleClaiming` 与 `State`/`is_latest` 语义）。
+本切片**没有**假装远端能实现它们，而是把差异显式化：
+
+| # | 偏离 | 说明与理由 |
+| --- | --- | --- |
+| 1 | **确定性记录 id**（偏离上游"服务端分配随机 id"） | `id = "<partition>:dataset--File.Generic:<8-4-4-4-12>"`，hex = `SHA-256(partition \|\| '\0' \|\| file_source)` 的前 128 bit。理由 = **R5**：幂等键必须建在幂等键上；上游那种随机 id 会让"同 `fileSource` 重试"变成两条记录。代价：id 不再是服务端不可猜的随机值（记录 id 本就可由对端枚举，不构成额外泄露）。`docs/01-osdu-research.md` §2.1 第 4 步是上游的随机形态 |
+| 2 | **`atomic_claim = false`** | 远端 Storage Service 既没有"条件插入"原语，也没有一个**不属于 OSDU 记录**的 `state` 列 ⇒ ADR-009 §4.2 的原子领取在远端无法诚实实现。`capabilities()` 如实报告；四个领取原语返回 `kUnimplemented`；用例走**无领取路径**（幂等预检 → 复制 → `Create`）。**有意的降级**：并发同一 `fileSource` 没有互斥，可能复制两次并产生两条版本 —— 因此组合根强制 `deployment.mode=single` + `leases.enabled=false`（否则 exit 78）。生产多实例用 `postgres` |
+| 3 | **`state` / `is_latest` 在远端没有对应物** | 它们是本仓库 SQLite/PG 仓储的**列**（`claiming → ready` 状态机 + 版本链的最新标记）。远端记录的版本链由 Storage Service 自己管（`GET /records/{id}` 返回最新版本），本服务不把 `state` 写进 OSDU JSON（这是既有硬要求）。代价：远端形态下"读路径只返回 ready"这条不变量由**没有 claiming 状态**来保证（没有在途记录） |
+| 4 | **不使用未文档化的 query 端点** | `GetLatestByFileSource` = `GET {base}/records/{派生 id}`（不是 `?fileSource=`）。`List` 诚实地返回 `kUnimplemented`（ADR-004 的三方法草图与 `docs/01-osdu-research.md` 都没有"按条件列举记录"的端点依据）。附带修正：readiness 的兜底探针改为"`shared_state_probe` 存在时它是唯一判据"，否则 remote 的 `List` 会让 readiness **永远 503** |
+| 5 | **`base_url` 是基址（与 `legal/schema.remote.base_url` 相反）** | 本适配器追加 `/records`、`/records/{id}`、`/records/{id}:delete`；legal/schema 的 `base_url` 是完整端点（ADR-013 §2）。两者混用会打到 `.../records/records`（404）。已在配置行、适配器头注释与运维文档显式写明 |
+| 6 | **`token_provider` 只交付 `static`** | 静态 `Authorization: Bearer`；OAuth / service-account 换取流程**未实现**（非 `static` → exit 78）。**未与真实 Storage Service 联调** |
+
+`/v2/info` 的 `connectedOuterServices` 未按原"后果"一节改动（仍是 `["storage"]`），
+登记为未交付项（见上）；运维可见性由启动横幅承担。

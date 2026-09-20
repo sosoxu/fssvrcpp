@@ -115,6 +115,18 @@
 | ACL 组名 | `^data\.[a-zA-Z0-9_+&*-]+(?:\.[a-zA-Z0-9_+&*-]+)*@(?:[a-zA-Z](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$` |
 | `FileSource` | `"/" + "<userId>/<epochMillis>-<yyyy-MM-dd-HH-mm-ss-SSS>/<fileID>"`，**带前导斜杠**；Azure 路径上限 **1024** 字符 |
 
+> ★ **记录 id 的后端差异（`metadata.repository=remote`）**：默认形态（`sqlite`/`postgres`）
+> 的记录 id 是**服务端随机**的 `"<partition>:dataset--File.Generic:<uuid 去横线>"`；
+> `metadata.repository=remote` 形态下，记录归远端 **Storage Service**，其 id 由本服务
+> **确定性派生**以保证幂等（**R5**）：
+> `id = "<partition>:dataset--File.Generic:<8-4-4-4-12>"`，其中 8-4-4-4-12 是
+> `SHA-256(partition || 0x00 || file_source)` 的**前 128 bit**（32 个小写 hex 字符）。
+> 两种形态的 **id 形状都满足本节的行内约定**（`<partition>:dataset--File.Generic:<uuid 形状>`）；
+> 差异只在"随机 vs 确定性"。⚠️ 因此**不要**手工编辑 Storage Service 里的记录 id
+> （改了 id 等于换了幂等键 → 同一 `fileSource` 的下一次创建会指向另一个 id）。
+> 详见 `docs/operations.md` §1.2.7 与 `docs/adr/ADR-004-persistence-strategy.md` 的
+> 「本切片的交付与偏离」。
+
 ### 1.6 错误体：三种形态 + 兼容开关
 
 本项目对外**默认使用 `AppError`**（它是上游所有 `@ApiResponse` 声明的 schema，也是当前 OSDU 标准）。
@@ -1191,6 +1203,7 @@ datasetDetails : {"topic":T,"kind":"datasetDetails",
 | `tests/integration/test_upload_flow_posix.cpp` | 端到端：uploadURL→PUT→metadata→downloadURL→GET→delete | 4 |
 | `tests/integration/test_upload_flow_s3.cpp` | 同上，S3 驱动 + mock-S3 独立验签 | 5 |
 | `tests/integration/test_large_file_plane.cpp` | §2.12 的 `largeFilePlane` + ADR-006 下载数据面：基本/ Range 矩阵 / 鉴权租户 / 硬化 / 零拷贝计数 / 连接上限 / RSS / **等价性矩阵** / `enabled=false` / HEAD / 访问日志字段同源 / 启动失败 exit 78（P1~P12；`[adr006]`） | 13 |
+| `tests/integration/test_remote_metadata_repository.cpp` | `metadata.repository=remote`（ADR-004）：`PUT/GET /records` + `POST /records/{id}:delete`（**204**）、确定性记录 id（golden + 稳定 + 负控）、幂等（第二次 createMetadata 不发 PUT）、404→`kNotFound`/401→`kUnauthenticated`/500·超时·非 JSON→`kUnavailable`、能力 `atomic_claim=false`、真实进程端到端、就绪探针（依赖挂 → readiness 503 而 liveness 200）、拒绝启动矩阵、sqlite 形态无远端指标族（M1~M12 + M8b；`[remote-meta]`） | 10 |
 
 **门槛规则**：阶段 N 的测试失败 → 不得进入阶段 N+1。
 阶段测试证据（命令、输出摘要、结论）归档到 `docs/test-evidence/phaseN.md`。

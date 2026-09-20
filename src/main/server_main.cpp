@@ -56,6 +56,7 @@
 #include "infra/io/file_sync.h"
 #include "infra/legal/remote_legal_validator.h"
 #include "infra/metadata/postgres/postgres_metadata_repository.h"
+#include "infra/metadata/remote/remote_metadata_repository.h"
 #include "infra/metadata/sqlite/sqlite_metadata_repository.h"
 #include "infra/postgres/pg_leader_election.h"
 #include "infra/postgres/pg_instance_registry.h"
@@ -1479,9 +1480,24 @@ static int RunServer(int argc, char** argv) {
   const std::string s3_driver_report = resolver.Str("storage.driver_report_override", "");
   const std::string s3_provider_key = resolver.Str("storage.provider_key_override", "");
 
-  //  ---- 仓储（ADR-004：单实例 = 内置 SQLite；B1 起 multi = PG）----
+  //  ---- 仓储（ADR-004：单实例 = 内置 SQLite；B1 起 multi = PG；本切片 = 可选 remote）----
   const std::string metadata_repository_name = resolver.Str("metadata.repository", "sqlite");
   const std::string location_repository_name = resolver.Str("location.repository", "sqlite");
+  //  ---- 本切片：`metadata.repository=remote` 的四个键（ADR-004 的可选实现）----
+  //  ★★ `metadata.remote.base_url` 是**基址**（本适配器追加 `/records`、`/records/{id}`、
+  //     `/records/{id}:delete`），与 `legal.remote.base_url` / `schema.remote.base_url`
+  //     （**完整端点 URL**，不追加任何路径，ADR-013）**正好相反**。
+  //     把完整端点填进这里会打到 `.../records/records`（404）—— 这不是能靠猜测纠正的，
+  //     因此两处约定都在运维文档 §1.2.7 与本文件显式写出。
+  //  ★ `token_provider` 只交付 `static`（静态 Bearer token）：OAuth / service-account
+  //     换取流程**未实现**，非 `static` → exit 78（绝不静默当成 static）。
+  //  ★ `timeout_ms` 同时约束**连接**与**整体**（连接超时 = min(1000, timeout_ms)）。
+  const std::string metadata_remote_base_url = resolver.Str("metadata.remote.base_url", "");
+  const std::string metadata_remote_token_provider =
+      resolver.Str("metadata.remote.token_provider", "static");
+  const std::string metadata_remote_static_token =
+      resolver.Str("metadata.remote.static_token", "");
+  const long metadata_remote_timeout_ms = resolver.Int("metadata.remote.timeout_ms", 5000);
   //  ---- B1：PG 仓储的连接参数（`*.postgres.*`）----
   //  ★ 逐键来源（默认值 = `core_schema.cpp` / `config/fss.example.json`）：
   //    `metadata.postgres.{dsn,max_connections,statement_timeout_ms}`（3 个键 → 生效）
@@ -1880,11 +1896,64 @@ static int RunServer(int argc, char** argv) {
   //    clock skew）已经在 `core_schema.cpp` 里先行执行；本文件负责**真的把运行形态装配起来**：
   //      · 本构建没有 libpq → 下面的 `#ifndef FSS_HAVE_LIBPQ` 给出可执行的修复指令；
   //      · 有 libpq → §④ 创建 PG 仓储 + PG 租约 + leader election，任一失败 → exit 78。
-  if (metadata_repository_name != "sqlite" && metadata_repository_name != "postgres") {
-    std::cerr << "拒绝启动：metadata.repository 只支持 sqlite | postgres（当前="
-              << metadata_repository_name
-              << "）；remote 元数据仓储尚未交付（ADR-004/ADR-009）。\n";
+  if (metadata_repository_name != "sqlite" && metadata_repository_name != "postgres" &&
+      metadata_repository_name != "remote") {
+    std::cerr << "拒绝启动：metadata.repository 只支持 sqlite | postgres | remote（当前="
+              << metadata_repository_name << "）。\n";
     return kExitConfigError;
+  }
+  //  ---- 本切片：`metadata.repository=remote` 的 fail-closed 前置条件 ----
+  //  ★ 每条消息都点名「键 + 理由 + 修法」：这是运维唯一能自我修复的入口。
+  //  ★ 顺序在 `#ifndef FSS_HAVE_LIBPQ` 之前：remote 不需要 PG，不能给出误导性的 PG 修法。
+  bool metadata_remote_selected = false;
+  if (metadata_repository_name == "remote") {
+    //  ① 必须显式给**基址**
+    if (metadata_remote_base_url.empty()) {
+      std::cerr
+          << "拒绝启动：metadata.repository=remote 但没有配置 metadata.remote.base_url。\n"
+             "  原因：没有 Storage Service 基址，本实例无法读写任何元数据记录（fail-closed）。\n"
+             "  修法：配置 metadata.remote.base_url=<基址>（例如 "
+             "http://storage.example:8080/api/storage/v2；本适配器会**追加** /records，"
+             "不要填完整端点路径）。\n";
+      return kExitConfigError;
+    }
+    //  ② `token_provider` 只交付 `static`（OAuth / service-account **未实现**）
+    if (metadata_remote_token_provider != "static") {
+      std::cerr << "拒绝启动：metadata.remote.token_provider="
+                << metadata_remote_token_provider
+                << " 未实现（当前只交付 static）。\n"
+                   "  原因：OAuth / service-account 换取流程未实现；把它静默当成 static 会以空 token "
+                   "出站，把认证失败伪装成依赖故障。\n"
+                   "  修法：设 metadata.remote.token_provider=static 并配置 "
+                   "metadata.remote.static_token；若确实需要 OAuth，请先实现并登记。\n";
+      return kExitConfigError;
+    }
+    //  ③ 必须 `deployment.mode=single`（multi 已经在 core_schema 里强制 postgres；
+    //     这里是防御性第二道：schema 规则被改宽时也不会静默装配一个无互斥的多实例形态）
+    if (deployment_mode != "single") {
+      std::cerr << "拒绝启动：metadata.repository=remote 只支持 deployment.mode=single（当前="
+                << deployment_mode << "）。\n"
+                   "  原因：remote 形态没有原子领取（capabilities().atomic_claim=false），"
+                   "多实例并发同一 FileSource 会复制两次并产生两条版本。\n"
+                   "  修法：deployment.mode=single（remote 仅单实例），或改用 "
+                   "metadata.repository=postgres。\n";
+      return kExitConfigError;
+    }
+    //  ④ 必须 `leases.enabled=false`（租约是为 claim 的可回收性存在的；remote 没有 claim）
+    if (leases_enabled) {
+      std::cerr << "拒绝启动：metadata.repository=remote 要求 leases.enabled=false（当前=true）。\n"
+                   "  原因：在途租约的存在意义是让 C1 的 claiming 行可回收；remote 形态没有 claim，"
+                   "租约只会空转，且 GC 的 ReclaimStaleClaiming 在远端不可实现。\n"
+                   "  修法：设 leases.enabled=false，或改用 metadata.repository=postgres（multi）。\n";
+      return kExitConfigError;
+    }
+#ifndef FSS_WITH_LIBCURL
+    std::cerr << "拒绝启动：metadata.repository=remote 需要 libcurl（本二进制未编译 libcurl 支持）。\n"
+                 "  修法：安装 libcurl 开发文件（Debian/Ubuntu: `apt-get install libcurl4-openssl-dev`）"
+                 "后重新 cmake + 重编。\n";
+    return kExitConfigError;
+#endif
+    metadata_remote_selected = true;
   }
   if (location_repository_name != "sqlite" && location_repository_name != "postgres") {
     std::cerr << "拒绝启动：location.repository 只支持 sqlite | postgres（当前="
@@ -2190,6 +2259,10 @@ static int RunServer(int argc, char** argv) {
 
   std::unique_ptr<domain::IMetadataRepository> metadata_repository;
   std::string metadata_repository_backend;
+  //  ★ 本切片：remote 形态的就绪探针不是端口方法（端口不应为一个部署形态膨胀；
+  //    R12 规定具体实现只在组合根创建与持有）。这里留一个**非拥有**指针给
+  //    `ports.shared_state_probe` 捕获（对象生命期 = 本函数的 `metadata_repository`）。
+  infra::RemoteMetadataRepository* remote_metadata_probe = nullptr;
   if (metadata_repository_name == "postgres") {
 #ifdef FSS_HAVE_LIBPQ
     PostgresMetadataRepositoryOptions pg_metadata_options;
@@ -2216,6 +2289,25 @@ static int RunServer(int argc, char** argv) {
                  "下一步：安装 libpq-dev 后重新 cmake + 重编。\n";
     return kExitConfigError;
 #endif
+  } else if (metadata_repository_name == "remote") {
+    //  ★ 本切片：远端 **Storage Service** 元数据仓储（ADR-004 的可选实现）。
+    //    `metadata_remote_selected` 已在上面的 fail-closed 矩阵里校验过全部前置条件。
+    (void)metadata_remote_selected;
+    infra::RemoteMetadataRepositoryOptions remote_options;
+    remote_options.base_url = metadata_remote_base_url;          // 基址（追加 /records）
+    remote_options.static_token = metadata_remote_static_token;  // secret（不打印）
+    remote_options.timeout_ms = static_cast<int>(metadata_remote_timeout_ms);
+    remote_options.metrics = &metrics_registry;  // 注册 `fss_metadata_remote_requests_total`
+    auto remote_repo =
+        std::make_unique<infra::RemoteMetadataRepository>(std::move(remote_options), logger);
+    //  ★ 双保险：Options 层自检（组合根已校验过这四个键；这里防止将来绕过组合根构造）。
+    if (!remote_repo->Ready()) {
+      std::cerr << "拒绝启动：" << remote_repo->NotReadyReason() << "\n";
+      return kExitConfigError;
+    }
+    remote_metadata_probe = remote_repo.get();
+    metadata_repository = std::move(remote_repo);
+    metadata_repository_backend = "remote";
   } else {
     SqliteMetadataRepositoryOptions metadata_sqlite_options;
     metadata_sqlite_options.busy_timeout_millis = static_cast<int>(metadata_sqlite_busy_timeout_ms);
@@ -2899,6 +2991,19 @@ static int RunServer(int argc, char** argv) {
     };
   }
 #endif
+  //  ★ 本切片：`metadata.repository=remote` 的就绪探针。
+  //    remote 形态**不经过**上面的 PG 分支（组合根强制 single + 无租约），因此这里单独装配。
+  //    判据 = 对 Storage Service 发一次 `GET {base}/records/{固定不存在 source 的 id}`：
+  //    **404 = 服务活着**（`RemoteMetadataRepository::Probe`）；连不上/超时/5xx → `kUnavailable`
+  //    ⇒ REST `/v2/readiness_check` 与 gRPC `Check(PROBE_READINESS)` **同源**都变 503 且带
+  //    可读原因；`/v2/liveness_check` **不受影响**（仍是 200 静态文本）—— 这正是运维区分
+  //    "本进程死了"与"依赖挂了"的依据（runbook 的 Storage Service 不可用条目）。
+  //    ⚠️ 若**不**装配这个探针，适配层会退回 `metadata.List("__readiness__", {})`，
+  //    而 remote 的 List 恒 `kUnimplemented` ⇒ readiness 会**永远** 503（I5 注入正是钉这条）。
+  if (remote_metadata_probe != nullptr) {
+    infra::RemoteMetadataRepository* probe = remote_metadata_probe;
+    ports.shared_state_probe = [probe]() -> fss::Result<void> { return probe->Probe(); };
+  }
   //  ★ C9.26：测试专用的崩溃窗口接缝（`FSS_CLAIM_HOLD_MS`，**不是配置键**）。
   //    默认未设置 → 0 → `CreateFileMetadata` 与接线前逐字一致（不 sleep）。
   const std::int64_t claim_hold_millis = ClaimHoldMillisFromEnv();
@@ -3352,7 +3457,18 @@ static int RunServer(int argc, char** argv) {
                           std::to_string(metadata_postgres_max_connections) +
                           " statement_timeout_ms=" +
                           std::to_string(metadata_postgres_statement_timeout_ms) + "）"
-                    : "（" + metadata_db_path + "）")
+                    : (metadata_repository_backend == "remote"
+                           //  ★ R11：实际依赖必须可见。打印 base_url / token_provider / timeout
+                           //  与 **atomic_claim=false**；**绝不**打印 static_token。
+                           ? "（远端 Storage Service：" + metadata_remote_base_url +
+                                 "；token_provider=" + metadata_remote_token_provider +
+                                 " static_token=" +
+                                 (metadata_remote_static_token.empty() ? "空" : "***") +
+                                 " timeout=" + std::to_string(metadata_remote_timeout_ms) +
+                                 "ms（连接超时=min(1000,timeout)）；★ atomic_claim=false —— "
+                                 "无 C1 原子领取，仅单实例，并发同一 FileSource 可能产生两条版本；"
+                                 "base_url 是**基址**（追加 /records））"
+                           : "（" + metadata_db_path + "）"))
             << " | location=" << location_repository_backend
             << (location_repository_backend == "postgres"
                     ? "（location.postgres.dsn=*** max_connections=" +

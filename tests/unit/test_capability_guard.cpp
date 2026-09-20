@@ -8,6 +8,13 @@
 //     `capabilities()` 只允许被 `app/services/location_issuer.cpp` 与
 //     `app/services/storage_instruction_service.cpp` 调用。
 //
+//  ★ 本切片（ADR-004 `metadata.repository=remote`）新增一个**受限**调用点：
+//     `app/usecases/usecases.cpp` 的 `CreateFileMetadata` 必须按
+//     `IMetadataRepository::capabilities().atomic_claim` 分支（无领取路径）。它不是
+//     "随便分支"的口子：该文件里**每一处** `capabilities()` 调用都必须是
+//     `metadata.capabilities()`（接收者受限）；写 `store->capabilities()` 仍会失败。
+//     这条"接收者受限"的判据本身也有正反自证（见文件末尾的 `IsMetadataCapabilityLine`）。
+//
 //  ⚠️ 启发式边界（如实说明）：扫描的是 `.capabilities(` / `->capabilities(` 两种形态，
 //     因此"通过一个中间引用再调用"（如 `auto s = &store; s->capabilities()`）仍然叫
 //     `s->capabilities(`，能被抓到；但"把能力拷进别的结构再读"抓不到。护栏不是证明，
@@ -58,6 +65,17 @@ const std::vector<std::string>& PassThroughCallSites() {
 bool IsPassThrough(const std::string& rel) {
   const auto& allowed = PassThroughCallSites();
   return std::find(allowed.begin(), allowed.end(), rel) != allowed.end();
+}
+
+//  ★ 接收者受限的允许点（本切片）：`app/usecases/usecases.cpp` 只有在调用
+//  `metadata.capabilities()` 时才放行 —— 同一文件里的 `store->capabilities()` 仍是违规。
+bool IsReceiverRestrictedSite(const std::string& rel) {
+  return rel == "app/usecases/usecases.cpp";
+}
+
+bool IsMetadataCapabilityLine(const std::string& rel, const std::string& line) {
+  return IsReceiverRestrictedSite(rel) &&
+         line.find("metadata.capabilities()") != std::string::npos;
 }
 
 //  取源文件第 `line` 行（1 基；越界返回空串）
@@ -204,6 +222,16 @@ TEST_CASE("护栏扫描器本身有效（合成的越权调用必须被检出）
   //  白名单文件里的调用能被检出（用于下面的非空洞性断言）
   REQUIRE(ScanText("app/services/location_issuer.cpp", "const auto caps = store->capabilities();")
               .size() == 1);
+
+  //  ★ 接收者受限判据的正反自证（R1/R16）：`metadata.capabilities()` 放行的同时，
+  //    同文件里的 `store->capabilities()` / 别的文件里的 `metadata.capabilities()` 都不放行。
+  REQUIRE(IsMetadataCapabilityLine(
+      "app/usecases/usecases.cpp",
+      "  const bool atomic_claim = ports_.metadata.capabilities().atomic_claim;"));
+  REQUIRE_FALSE(IsMetadataCapabilityLine("app/usecases/usecases.cpp",
+                                         "  const auto caps = store->capabilities();"));
+  REQUIRE_FALSE(IsMetadataCapabilityLine("app/services/other.cpp",
+                                         "ports_.metadata.capabilities()"));
 }
 
 TEST_CASE("★ C2.7 capabilities() 的调用点只在白名单里（含非空洞性断言）",
@@ -215,6 +243,7 @@ TEST_CASE("★ C2.7 capabilities() 的调用点只在白名单里（含非空洞
   std::vector<Hit> violations;
   bool allowed_file_actually_calls = false;
   bool pass_through_actually_forwards = false;
+  bool metadata_capability_actually_calls = false;
   for (const auto& file : files) {
     const std::string rel = fs::relative(file, src_root).generic_string();
     const std::string content = ReadFile(file);
@@ -234,6 +263,19 @@ TEST_CASE("★ C2.7 capabilities() 的调用点只在白名单里（含非空洞
       }
       continue;
     }
+    //  ★ 接收者受限的允许点（本切片）：只有 `metadata.capabilities()` 放行。
+    if (IsReceiverRestrictedSite(rel)) {
+      bool all_metadata = true;
+      for (const auto& hit : hits) {
+        const std::string text = LineOf(content, hit.line);
+        if (!IsMetadataCapabilityLine(rel, text)) {
+          all_metadata = false;
+          violations.push_back(hit);
+        }
+      }
+      if (all_metadata) metadata_capability_actually_calls = true;
+      continue;
+    }
     for (const auto& hit : hits) violations.push_back(hit);
   }
 
@@ -242,6 +284,8 @@ TEST_CASE("★ C2.7 capabilities() 的调用点只在白名单里（含非空洞
   REQUIRE(allowed_file_actually_calls);
   //  非空洞性（同一纪律）：装饰器白名单里也必须真的有转发调用，否则多出来的是一条死规则
   REQUIRE(pass_through_actually_forwards);
+  //  非空洞性：接收者受限白名单项也必须真的有调用（否则那条规则是死的）
+  REQUIRE(metadata_capability_actually_calls);
 
   std::ostringstream report;
   for (const auto& v : violations) {
