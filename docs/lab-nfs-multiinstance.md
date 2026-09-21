@@ -44,8 +44,8 @@ docker run -d --name fss-nfs-client2 --privileged --network fss-net -v <repo>:/s
 | OS | Deepin 25（crimson），内核 `6.18.36-amd64-desktop-rolling` | 与项目文档里的 Ubuntu 22.04 不同 |
 | `/usr` | **只读 overlay**（不可变系统） | `apt-get install` 不生效；要么走管理员路径，要么解包到前缀/容器 |
 | root | 无 | 依赖用 `apt-get download` + `dpkg-deb -x`，或放进容器 |
-| 网络 | 全部经企业代理 `proxy7...:8080`；`github.com` 会被代理 503 | 见 §3 |
-| Docker | 26.1.5，已配镜像站（`docker.1ms.run` 等）与代理 | 拉镜像走镜像站 |
+| 网络 | **不能直连外网**（需走内网镜像/代理） | 见 §3 |
+| Docker | 26.1.5，已配置内网镜像站 | 拉镜像走镜像站 |
 | 内核模块 | `nfs`/`nfsd` 的 `.ko.zst` 在，但**默认未加载** | 必须先 `modprobe`，否则连 `/proc/filesystems` 里都没有 `nfs4` |
 
 ⚠️ **容器里的日志时间是 UTC，宿主是 CST（+8）**。曾把"22:56 的日志"误判成"8 小时没动静、
@@ -62,8 +62,8 @@ docker run -d --name fss-nfs-client2 --privileged --network fss-net -v <repo>:/s
 docker run -d --init --name fssbuild \
   -v /home/aaa/code/fssvrcpp:/src -w /src ubuntu:22.04 sleep infinity
 
-docker exec -u 0 -e http_proxy=http://proxy7.bj.petrochina:8080 -e https_proxy=http://proxy7.bj.petrochina:8080 \
-  fssbuild bash -lc 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && \
+# 若容器内需要经内网代理/镜像访问 apt，按环境再加 -e http_proxy=... -e https_proxy=...
+docker exec -u 0 fssbuild bash -lc 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && \
   apt-get install -y --no-install-recommends build-essential cmake pkg-config \
     libgrpc++-dev protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
     libcurl4-openssl-dev libsqlite3-dev libssl-dev zlib1g-dev libpq-dev \
@@ -135,23 +135,14 @@ docker exec fssbuild sh -c 'stat -c "shm=%d" /dev/shm; stat -c "tmp=%d" /tmp; st
 
 ---
 
-## 3. 代码同步：`github.com` 被代理挡掉时
+## 3. 依赖与代码获取（受限网络环境）
 
-症状：`git fetch` 报 `CONNECT tunnel failed, response 503`。诊断（经代理探测域名）：
-`github.com` **不可达**，但 `codeload.github.com`、`raw.githubusercontent.com`、`ghproxy.net`、
-`gitclone.com` 都可达。
+本手册假定机器**不能直连外网**：系统依赖走内网 apt 镜像，容器镜像走内网 registry 镜像；
+代码仓库用内网 Git 服务（本文以 `dp/inexus` 为例，见 `dp-git-mbr-workflow.pdf` 的流程要求）。
+第三方库已 vendored 在 `third_party/`，缺失时的恢复方式见 `third_party/README.md`。
 
-处置：**经镜像取，但不要把凭据交给镜像**（用不含 token 的公开 https 地址，`origin` 配置不动）：
-
-```bash
-git fetch https://ghproxy.net/https://github.com/sosoxu/fssvrcpp.git \
-          '+refs/heads/main:refs/remotes/origin/main'
-git merge --ff-only origin/main
-```
-
-镜像报的 SHA 与 `gitclone.com/github.com/<owner>/<repo>.git` 交叉核对一致后再合并。
-
-⚠️ 仓库的 `origin` URL 里内嵌了明文 PAT；别把它拼进镜像 URL，也别忘了轮换。
+⚠️ 不要把任何凭据（账号口令、令牌、私钥）写进仓库文件或远端 URL 里；需要凭据的场合用环境变量
+或凭据管理器，并只授予最小范围。
 
 ---
 
@@ -258,7 +249,7 @@ docker exec fss-pg psql -U fss -d fss -c "INSERT INTO schema_migrations(version,
 }
 ```
 
-⚠️ **给实例的 env 里不要带 `http_proxy`**：Python/curl 会遵从它，请求被企业代理劫走，
+⚠️ **给实例的 env 里不要带 `http_proxy`**：Python/curl 会遵从它，请求被代理劫走，
 报 `ERR_DNS_FAIL` 而不是连到服务。调用服务时用 `env -u http_proxy -u https_proxy ...`。
 
 ### 5.3 启动与验证
@@ -344,7 +335,7 @@ docker exec -u 1000:1000 -e FSS_PG_DSN=postgresql://fss:fsspw@fss-pg:5432/fss \
 | 命令只执行了一半就没了 | `pkill -f "<自己命令行的子串>"` 自杀 | `pkill -x` 或改匹配串 |
 | C10.17 假失败（`wait_gone` 永远不成立） | 容器 PID 1 不回收孤儿进程（无 `--init`） | 容器加 `--init` |
 | sanitizer 门槛在 C9.32 用例上失败 | LSan 的 tracer 线程也撞上被刻意耗尽的 `RLIMIT_NPROC` | 见 §2.4；用 `FSS_GATES_SKIP_SANITIZERS=1` 并在目标环境复核 |
-| `git fetch` 报 `CONNECT tunnel failed, response 503` | 代理挡了 `github.com` | 经镜像 fetch（§3），别把 token 交给镜像 |
+| `git fetch` / 拉镜像报 `CONNECT tunnel failed`、`503` | 受限网络挡了外网域名 | 改用内网 Git / registry 镜像；**不要**把凭据交给第三方镜像（§3） |
 | 把文件 mtime 调老后 GC 仍报 `tmp_skipped_too_young` | GC 用**存储列出的 mtime** 判定年龄，而它跑在另一个容器里，NFS 客户端的**属性缓存**（`acregmax` 默认 60s）还拿着旧值 | 等过缓存窗口（≤60s）再跑；这不是"清理失效" |
 | PG 不可用时 `uploadURL` 返回 **500** 而不是 503 | 位置记录写入失败被投影成 500 | 契约允许 500/502/503；调用方要按"依赖不可用"处理 5xx，不要只看 503 |
 
