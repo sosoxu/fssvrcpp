@@ -239,6 +239,8 @@ curl -sS -X POST "$BASE/v2/gc:run" \
 | `fss_gc_skipped_total{reason="has_record"}` 涨 | GC 按设计**永不删**有记录的对象 | 正常 |
 | `fss_gc_skipped_total{reason="tmp_too_young"}` 涨 | **在途上传被正确保护**（TTL 内） | 正常；持续不降说明有上传卡住（查 §3 的 408） |
 | `fss_gc_tmp_removed_total` 长期不涨但目录里全是 `.tmp.` | **周期调度未启用**：`gc.enabled` 的默认是 `false`（不提供配置时不跑 GC）；也可能是 `gc.dry_run=true` 只报候选 | 应急用 §4.1 的按需端点（**不重启**）；要长期周期清理再配 `gc.enabled=true` + 间隔（看启动横幅的 `gc :` 行）；一次性清理也可用 `--once`。**不要**用 `rm -rf` 清整个容器目录 |
+| **所有实例**都在打 `gc_skipped_leader_election_unavailable`（或按需 GC 返回 503 且措辞是"无法参与领导者选举"） | **不是**"别人是 leader"，而是**本实例的锁连接不可用**（PG 不可达 / 刚重启 / 正在重连）。此时**没有任何实例**在跑 GC | 查 PG 可达性与 `leader_election.lock_key`；锁连接恢复后会**自动**重新选举（≤ 数秒）。**不要**据此改 `leader_election.*` 配置，也不要让每个实例都跑 GC |
+| `--once` 返回 **78** 且 stderr 有"无法参与领导者选举" | 同上：cron 形态下把"选举不可用"如实报成失败（此前会伪装成"正常跳过"并退出 0） | 修 PG 可达性即可；恢复后 `--once` 会回到"0（正常跳过）或 0 + 一轮报告" |
 | 误删/误留（怀疑 TTL 判定） | 时间戳语义问题曾在 P9 被修复（P9-D04/D08） | 升级到修复版本；用 `list()`/`stat()` 的时间戳与 `stat -c %Y` 对照 |
 
 ---

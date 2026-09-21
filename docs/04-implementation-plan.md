@@ -25,6 +25,12 @@
 **全阶段门槛（回归保证）**：`scripts/run_all_gates.sh` 必须按顺序跑 P0→P10 并全绿。
 任何阶段的门槛脚本一旦被加入，后续阶段不得使其退化。
 
+> **另（跨切片回归，ADR-009 §4.4.1）**：实验室实测发现「PG 重启后集群永久失去 leader：
+> `pg_locks` 0 行、GC 全集群停摆、而 readiness 仍 200」的静默失败，已修 —— `IsLeader()` 先重建
+> 锁连接（**1s 冷却**）再参与选举，并把"选举不可用"与"别人是 leader"分成不同日志事件 / 503 措辞 /
+> `--once` 退出码。回归用例 `tests/integration/test_leader_election_reconnect.cpp`（**修复前必然失败**），
+> 证据 `docs/test-evidence/phase10.md` §27。
+
 ---
 
 ## 2. 门槛规则（必须遵守）

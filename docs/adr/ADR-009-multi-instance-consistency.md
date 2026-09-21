@@ -223,6 +223,48 @@ SELECT pg_try_advisory_lock(:gc_lock_key);   -- 拿不到就跳过本轮，下�
   ② 锁连接**只跑短语句**；③ 每条语句带 `statement_timeout`（把滞留窗口夹到
   `statement_timeout_ms` 以内）——空闲态崩溃 51 ms 即可接管，可接受。
 
+### 4.4.1 锁连接**必须可重建**（PG 重启 —— 实验室实测发现的缺陷与修复）
+
+**场景不是"我崩了别人接管"，而是"我的锁连接被整体切断"。** 会话级锁与会话同生共死，
+而"会话断"最常见的原因是 **PG 重启 / 主备切换 / 网络抖动** —— 那时**所有实例**的锁连接
+一起断，而**没有任何一个实例崩溃**（`kill -9` 那种由 §4.4 的"别人接管"覆盖，方向不同）。
+
+**实测症状**（复现步骤与原始输出见 [lab-nfs-multiinstance.md](../lab-nfs-multiinstance.md) §8.1）：
+
+```
+docker restart fss-pg
+→ pg_locks 里 advisory lock 0 行（等 90s 以上也不自愈）
+→ 两个实例每秒都在打 gc_skipped_not_leader
+→ 两个实例的 readiness 仍然 200        ← 静默失败：GC 全集群停摆，监控看不见
+→ 按需 GC 端点对谁都说"我不是 leader"，运维无法手动兜底
+```
+
+**根因**：锁是会话级的，连接被切断后 `leader_` 降级（安全方向正确），但**连接没有被重建** ——
+`TryAcquire()` 在"连接为空"时直接返回 `kUnavailable`，于是一个 leader 都选不出来。
+
+**本次修复的三条不变量**（实现见 `src/infra/postgres/pg_leader_election.cpp`）：
+
+1. **可重建**：`IsLeader()` 的第一步是"连接为空或不健康 ⇒ 重建专用锁连接"（结束旧会话 →
+   `PgConnection::Connect` → 立刻 `TryAcquire()`），带 **1s 冷却**避免 PG 长时间不可达时的
+   每 tick 重连风暴。
+2. **降级必须安全**：连接不健康/ping 失败时仍**立即**降级（取消 leader 身份），绝不"猜锁还在"
+   —— 重建是"下一轮"的事，二者顺序不能反。
+3. **"选举不可用"要能与"别人是 leader"分开**：前者意味着**所有**实例都跑不了 GC，
+   日志用独立事件 `gc_skipped_leader_election_unavailable`（带 `NotReadyReason()` 的可读原因），
+   按需 GC 端点也据此给出不同的 503 措辞。
+
+**验证**（本机 NFS + PG 双实例实验室，修复后重跑同一注入）：
+
+| 观察点 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `docker restart fss-pg` 后 advisory lock | 90 s 仍 0 行 | **≤2 s 恢复到 1 行**，且持有者是**新后端**（`pg_stat_activity.backend_start` 晚于 PG 重启） |
+| GC | 全集群停摆 | 新 leader 立刻继续 `gc_run`（对端正常跳过） |
+| 可观测性 | 只有"我不是 leader"（误导） | 两个实例各记 **1 次** `gc_skipped_leader_election_unavailable`，随后恢复 |
+
+**回归用例**：`tests/integration/test_leader_election_reconnect.cpp`（正控：先持锁；负控：同键第二实例
+不得自称 leader；用 `pg_terminate_backend` 切断持锁会话后**必须**在有限时间内重新当选；收尾不留脏锁）。
+该用例在修复前**必然失败**（`recovered_ms = -1`），修复后通过 —— 这就是 R1 要求的自证对照。
+
 ### 4.5 实例本地必须唯一化的东西
 
 | 项 | 要求 |

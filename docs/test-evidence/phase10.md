@@ -4190,3 +4190,57 @@ SHA-256("opendes" || 0x00 || "/data/remote-meta-golden.txt") 前 128 bit，8-4-4
 - 未验证项以 §26.5 与 `AGENTS.md` §0.1 为准，其中最重要的是：**没有真实 Storage Service**（线协议由 mock 钉住、
   未联调）、`token_provider` 只支持 `static`、remote 形态**并发同一 fileSource 无互斥**（有意降级）、
   `List` 未实现（不发明未文档化端点）。
+---
+
+## 27. 实验室实测发现的缺陷与修复：PG 重启后集群**永久失去 leader**（2026-09-21）
+
+> 发现场景：NFS × 多实例实验室（[`docs/lab-nfs-multiinstance.md`](../lab-nfs-multiinstance.md)），
+> 用 `docker restart fss-pg` 注入"锁连接整体断开"。设计不变量与修法见
+> [ADR-009 §4.4.1](../adr/ADR-009-multi-instance-consistency.md)。
+
+### 27.1 现象（修复前，可重复）
+
+```
+$ docker restart fss-pg
+$ docker exec fss-pg psql -U fss -d fss -tAc "SELECT count(*) FROM pg_locks WHERE locktype='advisory'"
+0                       # 等 90s 以上仍为 0
+# 两个实例的日志每秒都在打 gc_skipped_not_leader；两者 readiness 仍为 200
+```
+
+⇒ GC **全集群停摆**（暂存 tmp / 孤儿对象 / 崩溃者 claiming 行都不再回收），按需 GC 端点对所有实例
+都返回"我不是 leader"（运维无法手动兜底），而 readiness/liveness 全绿 —— **静默失败**。
+
+### 27.2 根因
+
+`src/infra/postgres/pg_leader_election.cpp`：leader 在"连接不健康 / ping 失败"时
+`connection_.reset(); leader_ = false;`（方向正确），但随后的 `!leader_` 分支调用的
+`TryAcquire()` 在 `connection_ == nullptr` 时**直接返回 `kUnavailable`**，**没有任何重连**；
+非 leader 实例被 PG 重启打断的死连接同样不会被重建 ⇒ 所有实例永久答"我不是 leader"。
+
+### 27.3 修复（三条不变量）
+
+1. **可重建**：`IsLeader()` 第一步 `EnsureConnection()` —— 连接为空/不健康 ⇒ 结束旧会话并
+   重建专用锁连接（**1s 冷却**避免重连风暴），随后立刻 `TryAcquire()` 参与选举；
+2. **降级仍然安全**：连接不健康时**立即**取消 leader 身份，绝不"猜锁还在"（重建是下一轮的事）；
+3. **可观测**：新增独立事件 `gc_skipped_leader_election_unavailable`（带
+   `NotReadyReason()` 原因），按需 GC 端点与 `--once` 也据此给出**不同**措辞/退出码 ——
+   "选举不可用"（所有实例都跑不了 GC）不再与"别人是 leader"共用一句话。
+
+### 27.4 证据（R1：先证明测试能失败）
+
+| 步骤 | 命令 | 结果 |
+| --- | --- | --- |
+| 修复前跑新用例 | `./build-pg/bin/test_leader_election_reconnect`（`FSS_PG_DSN` 指向实验室 PG） | **失败**：`REQUIRE( recovered_ms >= 0 )` → `-1 >= 0`（15 s 内未恢复）；其余 15 条断言通过 |
+| 修复后跑新用例 | 同上 | **通过**：20 条断言（锁键用 pid+计数生成 ⇒ 断言条数确定）；连跑 5 次稳定通过 |
+| 真实拓扑复测 | 双实例 + `docker restart fss-pg` | **≤2 s** advisory lock 恢复为 1 行，且持有者是新后端（`pg_stat_activity.backend_start` 晚于 PG 重启）；新 leader 立刻继续 `gc_run` |
+| 可观测性 | 同期日志 | 两实例各记 **1 次** `gc_skipped_leader_election_unavailable`，随后恢复正常跳过（`gc_skipped_not_leader`） |
+
+回归用例：`tests/integration/test_leader_election_reconnect.cpp`（正控：先持锁；负控：同键第二实例
+不得自称 leader；`pg_terminate_backend` 切断持锁会话后必须有限时间内重新当选；收尾不留脏锁）。
+
+### 27.5 顺带登记（非本次修复范围）
+
+- PG 重启瞬间，leader 的**一轮** GC 会以 `errors: 2`（`fss_gc_runs_total{outcome="error"}`）结束，
+  下一轮即恢复正常 —— 瞬时依赖不可用的预期行为，登记备查。
+- `scripts/run_all_gates.sh` 的 sanitizer 段（C1.7）在本环境仍受 C9.32 与 LSan 的交互影响
+  （见 `docs/lab-nfs-multiinstance.md` §2.4），与本修复无关。

@@ -208,9 +208,21 @@ FSS_GATES_SKIP_SANITIZERS=1 ./scripts/run_all_gates.sh   # 临时跳过
 | 陷阱 | 说明 |
 | --- | --- |
 | `proto3 optional` | protobuf 3.12 **不支持**，用 message 包裹表达可选性 |
-| NFS | 本机无 NFS 可挂载 → NFS 语义（`rename` 原子性、close-to-open、`syncfs` 耐久性）**未验证**，见 ADR-009 §6.1（门槛 C9.27 为**上生产硬前提**） |
+| NFS | 本机**没有** NFS 设备，但**可以在容器里搭出 NFSv4.2（Linux knfsd）实验室**：`scripts/check_nfs_semantics.sh` 在这种挂载上已实测全绿（详见 [lab-nfs-multiinstance.md](lab-nfs-multiinstance.md)）。⚠️ 这只证明 **knfsd 的协议语义**，**不能**替代目标环境（真实 NFS 设备 / 跨主机 / 断电）的复核 —— C9.27 仍是**上生产硬前提**（ADR-009 §6.1） |
 | `kill -9` 与 advisory lock | PG 默认 `client_connection_check_interval=0` 时，**正在跑长查询**的后端不会察觉客户端已死，会话锁不会被释放。`dev_postgres.sh` 已设为 `1s`；设计上还要求"持锁会话保持空闲/只做心跳"（ADR-009 §4.4） |
 | `syncfs` 的全局影响 | 它是**文件系统级**操作；多实例共盘时会互相干扰 → 建议按 partition 分盘（ADR-008 §3.2 / ADR-009 §6.3） |
 | `bash` 后台任务取 PID | 不能用 `PID="$(spawn)"`（命令替换会创建子 shell，任务成孤儿，`wait`/`kill` 都失效）。用全局变量 |
 | **io_uring 被容器 seccomp 阻断** | Docker 自 2023 起默认 profile 屏蔽 `io_uring_*`（实测 `EPERM`；`seccomp=unconfined` 才通）。因此 I/O 引擎默认是**阻塞线程池**；启用 io_uring 前用 `./scripts/check_io_uring.sh` 在**目标环境**验证（ADR-010） |
 | `liburing` 版本能力差异 | jammy 的 liburing 2.1 **没有** `io_uring_prep_sendfile`（只有 `splice`）→ 本版本无法把零拷贝与 io_uring 直接结合 |
+
+---
+
+## 7. NFS × 多实例实验室（用容器替代 NFS 设备）
+
+本机既没有 NFS 设备、也没有 root，但 **Docker 足以搭出**"NFSv4.2 共享存储 + PostgreSQL + 两个真实
+`fss_server`"的多实例环境，用来逐条验证 ADR-009 的判据（选举 / GC 门控 / 在途租约 / 崩溃回收 /
+共享挂载探针 / 滚动升级护栏）。
+
+**怎么搭、每一步为什么、踩过哪些坑 → 见 [lab-nfs-multiinstance.md](lab-nfs-multiinstance.md)**
+（含：rpcbind / rpc_pipefs / rpc.mountd 三个必需组件，`--init` 与僵尸进程，LSan 与 C9.32 的冲突，
+`http_proxy` 劫持容器内 HTTP 调用，迁移版本行缺失导致 readiness 503，等等）。

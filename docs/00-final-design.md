@@ -336,6 +336,17 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | 3 | 上游形态：「生成记录 id：`"<partition>:dataset--File.Generic:<uuid-去掉横线>"`」（`docs/01-osdu-research.md` §2.1 第 4 步；即**服务端分配随机 id**） | **有意偏离**：`id = "<partition>:dataset--File.Generic:<8-4-4-4-12>"`，hex = `SHA-256(partition \|\| '\0' \|\| file_source)` 的前 128 bit（`DeriveRemoteRecordId`，纯函数）。理由 = **R5**：幂等键必须建在幂等键上 —— 随机 id 会让"同 `fileSource` 重试"变成两条记录，只能靠应用层 check-then-insert（R5 明确禁止的形态）。副作用（正面）：**不需要任何未文档化的 query 端点**，`GetLatestByFileSource` = `GET /records/{派生 id}` | 记录 id 不再是服务端不可猜的随机值（记录本就可被对端枚举，不构成额外泄露）；**运维禁令**：不要手工编辑 Storage Service 里的记录 id（改了 id 等于换了幂等键 → 重复记录），见 `docs/runbook.md` §2.1。契约 §3 记录 id 小节同步说明（`docs/03-api-contract.md`） |
 | 4 | （隐含）「线协议在真实 Storage Service 上验证过」 | **未验证（诚实登记）**：本环境**没有真实 Storage Service**。线协议按 `docs/01-osdu-research.md` 的端点写，由 `mock_validators.py --mode storage` **钉住**；响应的两种形状（① 整条记录 JSON；② OSDU 的 `{recordCount,recordIds,versions}` 信封）都被接受，但只有 mock 覆盖过。`token_provider` **只交付 `static`**（OAuth / service-account 换取流程**未实现**，非 `static` → exit 78）；`state`/`is_latest` 在远端没有对应物（远端版本链由 Storage Service 自管）；`List` 诚实 `kUnimplemented`。**`/v2/info` 的 `connectedOuterServices` 未按 ADR-004 的"后果"改动**（仍恒 `["storage"]`），运维核对入口是启动横幅 | 未验证项：与真实 Storage Service 联调、真实响应形状、OAuth、多实例（remote 明确不支持）、`DataLakeStorageService`/core-common 中介（**未实现**：本适配器直接调 Storage 端点，不经 core-common）、真实 Search/Indexer 索引可见性 |
 
+### 5.dd 本轮更正的既有结论（ADR-009 §4.4.1：锁连接必须可重建 —— PG 重启后仍能选出 leader）
+
+> 发现场景：NFS × 多实例实验室（`docs/lab-nfs-multiinstance.md` §8.1）；
+> 证据：`docs/test-evidence/phase10.md` §27。
+
+| # | 旧结论（记录于） | 现状（依据） | 影响 |
+| --- | --- | --- | --- |
+| 1 | 「已是 leader → 做一次廉价往返（`SELECT 1`）验证连接；不是 leader → 每轮 `TryAcquire()`」⇒ 隐含"锁连接断了也能在下一轮重新接管"（`src/infra/postgres/pg_leader_election.h` 头文件注释、ADR-009 §4.4） | **修正（本轮 / 实验室实测）**：老实现只在"已是 leader"分支降级并 `connection_.reset()`，而 `TryAcquire()` 在 `connection_ == nullptr` 时**直接返回 `kUnavailable`** —— **没有任何重连**。因此 **PG 重启 / 主备切换 / 网络抖动**（所有实例的锁连接一起断）之后：`pg_locks` 里 0 行、**GC 全集群停摆**、按需 GC 对所有实例都答"我不是 leader"（运维无法手动兜底），而 readiness 仍是 **200**（静默失败）。修法：`IsLeader()` 先 `EnsureConnection()`（**重建**专用锁连接 + **1s 冷却**）再 `TryAcquire()`；并把"选举不可用"与"别人是 leader"分成**不同**的日志事件、503 措辞与 `--once` 退出码（ADR-009 §4.4.1） | ① 新回归用例 `tests/integration/test_leader_election_reconnect.cpp`：修复前**必然失败**（`recovered_ms = -1`），修复后 20 断言通过、ASan/UBSan/LSan 下亦通过；② 实验室双实例 + `docker restart fss-pg` → **≤2 s** 重新选主（持有者是**新后端**，`backend_start` 晚于 PG 重启），GC 继续、对端打正常的 `gc_skipped_not_leader`；③ `docs/operations.md`（`leader_election.enabled` 行）与 `docs/runbook.md`（GC 症状表）已同步；④ 该修复**不新增配置键**（冷却钉在代码里） |
+
+---
+
 ## 6. 最终关键参数（默认值及其依据）
 
 | 参数 | 最终值 | 依据 |
@@ -359,6 +370,7 @@ adapters/http  →  fss_http（本项目：硬上限 / Range 归一化 / 中间�
 | `self_signed.single_use_nonce` | **`false`** | 本地 nonce 表在多实例下不成立 |
 | `deployment.mode=multi` 强制校验 | **7 条，任一条不满足 → 拒绝启动**（B1 起校验通过后还会**真的装配** PG 仓储/租约/leader election） | 防止把 SQLite 误配进多实例 |
 | PG `client_connection_check_interval` | **`1s`** | 默认 0 时崩溃的持锁会话不会释放锁 → leader 永久失联 |
+| leader election 锁连接重连冷却 | **`1s`**（钉住，**不**新增配置键） | PG 重启 / 网络抖动后必须能自动重新选主；冷却只用于限制重连频率（ADR-009 §4.4.1） |
 
 ---
 
