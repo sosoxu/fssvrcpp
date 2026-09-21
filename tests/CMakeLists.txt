@@ -167,6 +167,22 @@ if(FSS_WITH_PG)
     TIMEOUT 900)
 
   # ===========================================================================
+  #  ADR-009 §4.4 回归（实验室实测发现）：**锁连接被对端切断后必须重连并重新当选**
+  #    · 覆盖"PG 重启 / 主备切换 / 网络抖动"这类**会话整体断开**的场景 —— 它不是
+  #      "别人崩了我接管"（那由 test_multi_mode 的 B1-4 覆盖），而是"我的锁连接没了"；
+  #    · 正控：先持锁；负控：同键的第二个实例不得自称 leader；
+  #    · 用 `pg_terminate_backend` 切断持锁会话（比重启 PG 更快、更确定，等价于同一故障模式）；
+  #    · 连不上 PG 就失败（REQUIRE），绝不静默跳过。
+  # ===========================================================================
+  fss_add_test(test_leader_election_reconnect
+    SOURCES integration/test_leader_election_reconnect.cpp
+    LIBS    fss_pg Threads::Threads
+    LABELS  "pg;infra")
+  set_tests_properties(test_leader_election_reconnect PROPERTIES
+    FIXTURES_REQUIRED pg
+    TIMEOUT 300)
+
+  # ===========================================================================
   #  B2a（ADR-009 §5.3/§6.4/§8.1 + C9.28）：**生产就绪检查**的真实进程判据
   #    · `metadata.postgres.schema_version_check`：版本不符 → not ready（原因可读）；
   #      正确迁移 → ready；`false` → 跳过版本比对（仍 ready）；

@@ -1019,13 +1019,15 @@ class GcScheduler {
  public:
   GcScheduler(fss::app::GcTask& task, std::string partition, fss::app::GcOptions options,
               std::int64_t interval_seconds, const fss::logging::ILogger& logger,
-              std::function<bool()> is_leader = {})
+              std::function<bool()> is_leader = {},
+              std::function<std::string()> leader_unavailable_reason = {})
       : task_(task),
         partition_(std::move(partition)),
         options_(options),
         interval_seconds_(interval_seconds),
         logger_(logger),
-        is_leader_(std::move(is_leader)) {}
+        is_leader_(std::move(is_leader)),
+        leader_unavailable_reason_(std::move(leader_unavailable_reason)) {}
 
   ~GcScheduler() { Stop(); }
   GcScheduler(const GcScheduler&) = delete;
@@ -1062,10 +1064,21 @@ class GcScheduler {
     //  ★ B1：先做 leader 判定，再决定是否调用 `GcTask::Run`。
     //    非 leader **不调用** Run ⇒ `fss_gc_runs_total` 不增加（可观测判据）。
     if (is_leader_ && !is_leader_()) {
-      fss::logging::Warn(logger_, "gc_skipped_not_leader",
-                         {{"partition", partition_},
-                          {"reason", "本实例不是 leader（leader_election.enabled=true）→ "
-                                     "跳过本轮；fss_gc_runs_total 不增加"}});
+      //  ★ 区分两种"没跑 GC"：① 别人是 leader（正常）；② **选举本身不可用**
+      //    （锁连接断开且尚未重建成功）。后者会让**所有**实例都跳过 ⇒ GC 全集群停摆，
+      //    必须能与"正常跳过"分开告警（否则又是一次静默失败，见
+      //    docs/lab-nfs-multiinstance.md §8.1）。
+      const std::string unavailable =
+          leader_unavailable_reason_ ? leader_unavailable_reason_() : std::string{};
+      if (!unavailable.empty()) {
+        fss::logging::Warn(logger_, "gc_skipped_leader_election_unavailable",
+                           {{"partition", partition_}, {"reason", unavailable}});
+      } else {
+        fss::logging::Warn(logger_, "gc_skipped_not_leader",
+                           {{"partition", partition_},
+                            {"reason", "本实例不是 leader（leader_election.enabled=true）→ "
+                                       "跳过本轮；fss_gc_runs_total 不增加"}});
+      }
       return;
     }
     const auto report = task_.Run(partition_, options_);
@@ -1097,6 +1110,9 @@ class GcScheduler {
   const fss::logging::ILogger& logger_;
   //  ★ B1：空 = 不做 leader 门控（leader election 未启用）。
   std::function<bool()> is_leader_;
+  //  ★ 非空 = 选举**自身**不可用（锁连接断开/重建中）时的可读原因；用于把
+  //    "别人是 leader"与"谁都当不了 leader"这两种跳过区分开。
+  std::function<std::string()> leader_unavailable_reason_;
   std::thread thread_;
   std::mutex mutex_;
   std::condition_variable cv_;
@@ -2386,6 +2402,9 @@ static int RunServer(int argc, char** argv) {
   std::unique_ptr<infra::PgLeaderElection> pg_leader_election;
 #endif
   std::function<bool()> gc_leader_check;  // 返回 true = 本实例可以跑单例任务（GC）
+  //  非空字符串 = 选举**自身**不可用（锁连接断开且尚未重建成功）的可读原因。
+  //  它与"别人是 leader"是两回事：前者意味着**所有**实例都跑不了 GC。
+  std::function<std::string()> gc_leader_unavailable_reason;
   std::string leader_state_banner =
       "未启用（leader_election.enabled=false；GC 在每个实例都会跑）";
   if (leader_election_enabled) {
@@ -2417,6 +2436,10 @@ static int RunServer(int argc, char** argv) {
     }
     const bool startup_leader = acquired.value();
     gc_leader_check = [&pg_leader_election]() { return pg_leader_election->IsLeader(); };
+    gc_leader_unavailable_reason = [&pg_leader_election]() -> std::string {
+      if (pg_leader_election->Ready()) return {};  // 连接健康 ⇒ 只是"别人持锁"
+      return pg_leader_election->NotReadyReason();
+    };
     leader_state_banner =
         "启用（backend=" + leader_election_backend +
         " lock_key=" + std::to_string(leader_election_lock_key) + "）；启动时本实例=" +
@@ -3045,6 +3068,15 @@ static int RunServer(int argc, char** argv) {
     //  ★ B1：`--once` 也做 leader 门控 —— 否则 multi 下每个实例的 cron 都会真删，
     //    与"GC 单例运行"矛盾。非 leader 不是错误（退出码 0），但要明确说明跳过了。
     if (gc_leader_check && !gc_leader_check()) {
+      //  ★ 与周期调度 / 按需端点同一判据：区分"别人是 leader"与"选举本身不可用"
+      //    （后者意味着所有实例都跑不了 GC，cron 不该把它当成正常跳过）。
+      const std::string unavailable =
+          gc_leader_unavailable_reason ? gc_leader_unavailable_reason() : std::string{};
+      if (!unavailable.empty()) {
+        std::cerr << "gc once : 跳过（本实例无法参与领导者选举：" << unavailable
+                  << "；锁连接恢复后会自动重新选举）\n";
+        return kExitConfigError;
+      }
       std::cout << "gc once : 跳过（本实例不是 leader；leader_election.enabled=true，"
                    "单例 GC 由持锁实例负责）\n";
       return 0;
@@ -3105,12 +3137,25 @@ static int RunServer(int argc, char** argv) {
   adapters::http::GcCallbacks gc_callbacks;
   gc_callbacks.partition = gc_partition;
   gc_callbacks.scheduled = gc_schedule;
-  gc_callbacks.run = [&gc_task, &gc_options, &gc_partition, &ports, &logger, &gc_leader_check](
+  gc_callbacks.run = [&gc_task, &gc_options, &gc_partition, &ports, &logger, &gc_leader_check,
+                      &gc_leader_unavailable_reason](
                          const app::CallerContext& caller,
                          bool force_dry_run) -> Result<app::GcReport> {
     //  ★ B1：leader 门控（与周期调度**同一判据**）。非 leader **不调用** `GcTask::Run`
     //    ⇒ `fss_gc_runs_total` 不增加；HTTP 侧以 503 + 可读原因回应（与单飞护栏同族的语义）。
     if (gc_leader_check && !gc_leader_check()) {
+      //  ★ 与周期调度同一判据：把"选举不可用"与"别人是 leader"分开表述，否则运维
+      //    在"谁都跑不了 GC"时会收到与正常跳过一样的措辞（见 §GcScheduler::RunOnce）。
+      const std::string unavailable =
+          gc_leader_unavailable_reason ? gc_leader_unavailable_reason() : std::string{};
+      if (!unavailable.empty()) {
+        logging::Warn(logger, "gc_skipped_leader_election_unavailable",
+                      {{"partition", gc_partition}, {"reason", unavailable}});
+        return Err(fss::ErrorKind::kUnavailable,
+                   "GC 未运行：本实例无法参与领导者选举（" + unavailable +
+                       "）。锁连接恢复后会自动重新选举；若长时间如此，请检查 PostgreSQL "
+                       "可达性与 leader_election 配置。");
+      }
       logging::Warn(logger, "gc_skipped_not_leader",
                     {{"partition", gc_partition},
                      {"reason", "按需 GC 被跳过：本实例不是 leader"
@@ -3524,7 +3569,8 @@ static int RunServer(int argc, char** argv) {
   //  ---- 启动周期调度（在横幅之后：横幅要先回答"它会不会跑"）----
   if (gc_schedule) {
     gc_scheduler = std::make_unique<GcScheduler>(gc_task, gc_partition, gc_options,
-                                                 gc_interval_seconds, logger, gc_leader_check);
+                                                 gc_interval_seconds, logger, gc_leader_check,
+                                                 gc_leader_unavailable_reason);
     gc_scheduler->Start();
   }
 

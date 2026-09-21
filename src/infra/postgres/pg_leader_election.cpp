@@ -13,6 +13,10 @@ constexpr const char* kUnlockSql = R"pglock(SELECT pg_advisory_unlock($1::bigint
 //  廉价往返：把"锁连接真的活着"变成一次真实 I/O（PQstatus 可能过时，见头文件）。
 constexpr const char* kPingSql = R"pglock(SELECT 1)pglock";
 
+//  重连冷却：PG 长时间不可达时，`IsLeader()` 每个 GC tick（默认 1s）都会被调用，
+//  没有冷却就会变成每秒一次的连接风暴。1s 只用于限制频率，不改变恢复时延的量级。
+constexpr auto kReconnectCooldown = std::chrono::seconds(1);
+
 }  // namespace
 
 fss::Result<std::unique_ptr<PgLeaderElection>> PgLeaderElection::Open(
@@ -82,8 +86,31 @@ fss::Result<void> PgLeaderElection::Release() {
   return Ok();
 }
 
+bool PgLeaderElection::EnsureConnection() {
+  if (connection_ != nullptr && connection_->Healthy()) return true;
+
+  const auto now = std::chrono::steady_clock::now();
+  if (now < next_connect_attempt_) return false;  // 冷却中：不重试，也不改状态
+  next_connect_attempt_ = now + kReconnectCooldown;
+
+  //  结束旧会话（若还有）：PG 会随之释放该会话持有的 advisory lock —— 这正是
+  //  "锁连接断了就必须认为锁没了"的物理保证。
+  connection_.reset();
+  leader_ = false;  // 新会话一定还没持锁；重建成功后再由 TryAcquire() 决定
+
+  auto fresh = PgConnection::Connect(options_.pg);
+  if (!fresh.ok()) {
+    last_error_ = fresh.error().message();
+    return false;
+  }
+  connection_ = std::move(fresh).value();
+  last_error_.clear();
+  return true;
+}
+
 bool PgLeaderElection::IsLeader() {
-  if (!connection_) return false;
+  //  ① 连接为空或不健康 ⇒ 先尝试重建（PG 重启 / 网络抖动后的恢复路径，见头文件）。
+  if (!EnsureConnection()) return false;
 
   //  ---- 不是 leader：尝试接管（短语句，一次往返）----
   //  ★ 这一步让"选举"具备 failover：当前 leader 崩溃、PG 结束其会话并释放锁之后，

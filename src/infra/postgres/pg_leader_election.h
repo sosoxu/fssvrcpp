@@ -55,11 +55,26 @@
 #include "common/result/result.h"
 #include "infra/postgres/pg_connection.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 
 namespace fss::infra {
+
+//  ★★ 锁连接**必须可重建**（实验室实测发现的缺陷，见 docs/lab-nfs-multiinstance.md §8.1）
+//  ---------------------------------------------------------------------------
+//  锁是**会话级**的：会话断 = 锁没了。断的方式不止"kill -9 我的进程"，更常见的是
+//  **PG 重启 / 主备切换 / 网络抖动** —— 那时**所有实例**的锁连接会一起被切断：
+//    · 老实现只在"已是 leader"的分支里 `connection_.reset()` 降级，方向正确；但随后的
+//      `TryAcquire()` 在 `connection_ == nullptr` 时直接返回 `kUnavailable`，**没有任何
+//      重连** ⇒ 所有实例永久答"我不是 leader"：`pg_locks` 0 行、GC 全集群停摆，
+//      而 readiness 仍是 200（静默失败）。
+//    · 现在 `IsLeader()` 的第一件事是 `EnsureConnection()`：连接为空或不健康时**重建**
+//      专用锁连接（带冷却，避免 PG 长时间不可达时每个 tick 都重连），重建成功后立刻
+//      走 `TryAcquire()` 参与选举。
+//    · 冷却窗口内的失败不影响 `last_error_`/`NotReadyReason()` 的可读性：调用方可据此
+//      把"选举不可用"与"别人是 leader"区分开（组合根用后者做告警措辞）。
 
 //  ★ `pg` 是第一个成员（与配置组 `metadata.postgres.*` 的字段顺序一致）。
 //    `max_connections` 对本类**无意义**（本类只用一条专用连接），保留它只是因为
@@ -103,11 +118,17 @@ class PgLeaderElection {
  private:
   PgLeaderElection() = default;
 
+  //  确保锁连接可用：为空/不健康 → 结束旧会话（PG 由此释放锁）并重建（带冷却）。
+  //  返回 false 表示"当前没有可用连接"，调用方必须按"不是 leader"处理（fail-safe）。
+  bool EnsureConnection();
+
   PgLeaderElectionOptions options_{};
   //  专用锁连接（不从 `PgPool` 借，见文件头）。
   std::unique_ptr<PgConnection> connection_;
   bool leader_ = false;
   std::string last_error_;
+  //  重建尝试的冷却截止时间（`steady_clock`，不受墙钟跳变影响）。
+  std::chrono::steady_clock::time_point next_connect_attempt_{};
 };
 
 }  // namespace fss::infra
