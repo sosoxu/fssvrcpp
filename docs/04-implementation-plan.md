@@ -753,7 +753,7 @@ cmake --build build -j"$(nproc)" && ctest --test-dir build -L phase8 --output-on
 | `Dockerfile`、`deploy/` | 容器镜像 + 部署模板（含 production 强制 `auth.mode=jwt`） |
 | `scripts/run_all_gates.sh` | 顺序执行 P0–P9 全部门槛 |
 | `docs/operations.md`、`docs/runbook.md` | 运维手册、故障处置手册 |
-| `README.md` | 构建/运行/测试/配置入门 |
+| `README.md` | **对外介绍**：定位 / 能力总览 / 架构 / 快速开始 / 质量与边界 / 文档地图（内部构建与门槛细节在 `docs/development.md`、`docs/04-implementation-plan.md`） |
 
 **任务清单**
 
