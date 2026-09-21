@@ -187,7 +187,7 @@ fdatasync(3)                                     ← 全批改名落盘
 | 既有条目 | 需要的修改 |
 | --- | --- |
 | `config/fss.example.json` 的 `fsync_policy: by_size` | 改为 `durability: batch \| per_file`，并保留按大小的例外；新增 `group_commit_max_batch` |
-| `docs/05-capacity-and-concurrency.md` §5.5 与 README 的"58,741 文件/秒" | **更正为 31,478（P4，安全）**，并注明原数字来自不安全协议 |
+| `docs/05-capacity-and-concurrency.md` §5.5 与 README 的"58,741 文件/秒"（该数字与容量小节**只在旧版 README** 里；README 改版为对外介绍后，容量内容以 `docs/05` 为准） | **更正为 31,478（P4，安全）**，并注明原数字来自不安全协议 |
 | 门槛 C9.21（fsync 摊销收益） | 数值更正；并增加"必须为 P4 顺序"的断言 |
 | ADR-007 §8.3 | 加更正批注（已在原处标注） |
 
@@ -256,4 +256,3 @@ fdatasync(3)                                     ← 全批改名落盘
 | **C9.24（`syncfs` 全局 flush 对他人的影响）** | **未验证（干扰量级）** | 无多租户共盘场景可测；缓解方向（按 partition 分盘）的配置键 `storage.posix.one_filesystem_per_partition` 已在 **E1b** 接通（启动期校验规则 A/B，违规 → exit 78），但该键只保证"分盘这件事成立"，**不测量**干扰量级 |
 | **吞吐数字** | **不迁移** | §3/§4 的 31,478 文件/秒、82.3×、383 文件/秒来自**显式批量写** 5000 文件 / 批 500 场景；本实现是并发驱动的组提交，**顺序单文件写仍是一文件一次提交**（拿不到摊销），只有**并发**写才有摊销。不得把 ADR 数字当成本实现成绩；本切片未重测基线 |
 | **批窗口敏感性（推荐默认值与上限）** | **未做** | 窗口是具名常量而非配置键；只在"批大小上限"一维上可由 `tests/integration/test_posix_batch_commit.cpp` 覆盖（N=8/C=4 → 2；C=1 → 8） |
-
