@@ -11,5 +11,9 @@ compile_commands.json
 *~
 .cache/
 
+# Python 字节码（测试会 import tests/tools/*.py 并重编译：入库会让每次跑测试都脏工作区）
+__pycache__/
+*.pyc
+
 # ★ 本机凭据（GitHub 账号信息）—— 永不入库
 github.txt
